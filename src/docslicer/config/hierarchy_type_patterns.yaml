@@ -1,0 +1,255 @@
+version: 1.0.0
+
+# FYI Only
+document_profiles:
+  generic:
+    description: "Catch-all documents without a specific domain fingerprint."
+  finance:
+    description: "Financial / SEC-like documents (10-K, 10-Q, annual reports)."
+  legal:
+    description: "Contracts, agreements, statutes, legal opinions."
+  government:
+    description: "Codes, regulations, rulemakings, public laws."
+  technical:
+    description: "Technical specs, manuals, software docs."
+  academic:
+    description: "Academic papers, theses, research reports."
+
+
+hierarchy_rules:
+
+# TODO: Add title, subtitle
+
+  # =========================
+  # Named headings - these are case sensitive
+  # =========================
+
+  # --- SEC Common Heading Types ---
+
+  - hierarchy_type: item        # Example: "Item 1A. Risk Factors"
+    applies_to_profiles: [finance, legal, government]
+    patterns:
+      - regex: '^\s*(?:Item|ITEM)\s+'
+
+  - hierarchy_type: part        # Example: "Part II — Other Information"
+    applies_to_profiles: [finance, legal, government]
+    patterns:
+      - regex: '^\s*(?:Part|PART)\s+'
+
+  - hierarchy_type: note        # Example: "Note 3 — Revenue Recognition"
+    applies_to_profiles: [finance]
+    patterns:
+      - regex: '^\s*(?:Note|NOTE)\s+'
+
+  - hierarchy_type: annex       # Example: "Annex A – Form of Agreement"
+    applies_to_profiles: [finance, legal]
+    patterns:
+      - regex: '^\s*(?:Annex|ANNEX)\s+'
+
+  - hierarchy_type: article     # Example: "Article IV – Term"
+    applies_to_profiles: [finance, legal, government]
+    patterns:
+      - regex: '^\s*(?:Article|ARTICLE)\s+'
+
+  - hierarchy_type: section     # Example: "Section 4.2(a) Indemnification"
+    applies_to_profiles: [finance, legal, government]
+    patterns:
+      - regex: '^\s*(?:Section|SECTION)\s+'
+
+  - hierarchy_type: proposal     # Example: "PROPOSAL 3: ADJOURNMENT OF THE SPECIAL MEETING"
+    applies_to_profiles: [finance, government]
+    patterns:
+      - regex: '^\s*(?:Proposal|PROPOSAL)\s+'
+
+  # --- Government / Legal Structural Heading Types ---
+
+  - hierarchy_type: section_abbreviated   # Example: "Sec. 10033 — Filing Requirements"
+    applies_to_profiles: [government, legal]
+    patterns:
+      - regex: '^\s*(?:Sec\.|SEC\.)\s+'
+
+  - hierarchy_type: section_symbol   # § 1.101 Definitions
+    applies_to_profiles: [government, legal]
+    patterns:
+      - regex: '^\s*§+\s*'
+
+  - hierarchy_type: schedule    # Example: "Schedule 1 — Closing Deliverables"
+    applies_to_profiles: [legal]
+    patterns:
+      - regex: '^\s*(?:Schedule|SCHEDULE)\s+'
+
+  - hierarchy_type: title       # Example: "Title 26 — Internal Revenue Code"
+    applies_to_profiles: [government]
+    patterns:
+      - regex: '^\s*(?:Title|TITLE)\s+'
+
+  - hierarchy_type: subtitle     # Example: "SUBTITLE I — INCOME TAXES"
+    applies_to_profiles: [government]
+    patterns:
+      - regex: '^\s*(?:Subtitle|SUBTITLE)\s+'
+
+  - hierarchy_type: subpart     # Example: "Subpart B — Procedures"
+    applies_to_profiles: [government]
+    patterns:
+      - regex: '^\s*(?:Subpart|SUBPART)\s+'
+
+  - hierarchy_type: chapter               # Example: "CHAPTER 3"
+    applies_to_profiles: [generic, legal, government, technical, academic]
+    patterns:
+      - regex: '^\s*(?:Chapter|CHAPTER)\s+'
+
+  - hierarchy_type: amendment     # Example: "Amendment No. 5"
+    applies_to_profiles: [government]
+    patterns:
+      - regex: '^\s*(?:Amendment|AMENDMENT)\s+'
+
+  - hierarchy_type: rule     # Example: Rule 10b-5 — Employment of Manipulative"
+    applies_to_profiles: [government]
+    patterns:
+      - regex: '^\s*(?:Rule|RULE)\s+'
+
+  - hierarchy_type: figure     # Example: Figure 3.2: System Architecture"
+    applies_to_profiles: [government]
+    patterns:
+      - regex: '^\s*(?:Figure|FIGURE)\s+'
+  
+  - hierarchy_type: table     # Table 1 — Summary Statistics"
+    applies_to_profiles: [government]
+    patterns:
+      - regex: '^\s*(?:Table|TABLE)\s+(?!(?i:of\s+contents?\b))' # excludes "Table of contents"
+
+  - hierarchy_type: appendix     # Appendix B: Methodology"
+    applies_to_profiles: [government]
+    patterns:
+      - regex: '^\s*(?:Appendix|APPENDIX)\s+'
+
+  - hierarchy_type: exhibit     # Exhibit A — Certificate of Incorporation"
+    applies_to_profiles: [government]
+    patterns:
+      - regex: '^\s*(?:Exhibit|EXHIBIT)\s+'
+
+
+  # =========================
+  # Parenthetical headings
+  # =========================
+
+  # --- Counter-based headings ---
+
+  - hierarchy_type: single_parens_numeric   # Example: "(28) Financial instruments"
+    applies_to_profiles: [finance, legal, government]
+    patterns:
+      #- regex: '^\s*\(\d+\)'
+      - regex: '^\s*\(\d+\)(?!\s*[-]?\d{3}\b)' # exludes US phone numbers
+        flags: 'i'
+
+  - hierarchy_type: bracketed_numeric   # [1] Introduction"
+    applies_to_profiles: [finance, legal, government]
+    patterns:
+      - regex: '^\s*\[\d+\]'
+        flags: 'i'
+
+  - hierarchy_type: single_parens_roman     # Example: "(iv) Termination"
+    applies_to_profiles: [finance, legal, government]
+    patterns:
+      # Starts with a parenthesized Roman numeral, any valid length
+      - regex: '^\s*\(M{0,3}(CM|CD|D?C{0,3})(XC|XL|L?X{0,3})(IX|IV|V?I{0,3})\)'
+        flags: 'i'
+
+  # --- Alpha-based headings ---
+
+  - hierarchy_type: single_parens_single_alpha     # Example: "(a) Exhibits"
+    applies_to_profiles: [finance, legal, government]
+    patterns:
+      - regex: '^\s*\([A-Za-z]\)'
+        flags: 'i'
+
+  - hierarchy_type: single_parens_double_alpha     # Example: "(aa) Conditions"
+    applies_to_profiles: [finance, legal, government]
+    patterns:
+      - regex: '^\s*\([A-Za-z]{2}\)'
+        flags: 'i'
+
+  - hierarchy_type: single_parens_triple_alpha     # Example: "(ccc) Special Provisions"
+    applies_to_profiles: [finance, legal, government]
+    patterns:
+      - regex: '^\s*\([A-Za-z]{3}\)'
+        flags: 'i'
+
+  - hierarchy_type: single_parens_quadruple_alpha  # Example: "(zzzz) Miscellaneous"
+    applies_to_profiles: [finance, legal, government]
+    patterns:
+      - regex: '^\s*\([A-Za-z]{4}\)'
+        flags: 'i'
+
+  # --- Multi Layer Parenthetical headings ---
+
+  - hierarchy_type: double_parens      # Example: "(a)(1) Definitions"
+    applies_to_profiles: [finance, legal, government]
+    patterns:
+      - regex: '^\s*\([A-Za-z0-9]+\)\s*\([A-Za-z0-9]+\)'
+        flags: 'i'
+
+  - hierarchy_type: triple_parens      # Example: "(a)(1)(i) Special Provisions"
+    applies_to_profiles: [finance, legal, government]
+    patterns:
+      - regex: '^\s*\([A-Za-z0-9]+\)\s*\([A-Za-z0-9]+\)\s*\([A-Za-z0-9]+\)'
+        flags: 'i'
+
+  - hierarchy_type: quadruple_parens      # Example: "(a)(1)(i)(A) Additional Terms"
+    applies_to_profiles: [finance, legal, government]
+    patterns:
+      - regex: '^\s*\([A-Za-z0-9]+\)\s*\([A-Za-z0-9]+\)\s*\([A-Za-z0-9]+\)\s*\([A-Za-z0-9]+\)'
+        flags: 'i'
+
+  - hierarchy_type: quintuple_parens      # Example: "(a)(1)(i)(A)(2) Exceptions"
+    applies_to_profiles: [finance, legal, government]
+    patterns:
+      - regex: '^\s*\([A-Za-z0-9]+\)\s*\([A-Za-z0-9]+\)\s*\([A-Za-z0-9]+\)\s*\([A-Za-z0-9]+\)\s*\([A-Za-z0-9]+\)'
+        flags: 'i'
+
+  # =========================
+  # Numbered headings
+  # =========================
+
+  - hierarchy_type: numbered_section        # Example: "10.2 Revenue", "1. Introduction" -- excludes years like 1920, 2020, etc.
+    applies_to_profiles: [generic, finance, technical, academic, legal, government]
+    patterns:
+      #- regex: '^(?!\s*(19|20)\d{2}\b)\s*\d+(?:\.\d+)*\.?'
+      - regex: '^(?!\s*(19|20)\d{2}\b)\s*\d+(?:\.\d+)*(?:\.(?=\s+(?-i:[A-Z]))|(?=\s+(?-i:[A-Z])))' # stricter version with lookahead, either followed by a dot or a capital letter
+        flags: 'i'
+
+  - hierarchy_type: roman_numbered_section         # Example: "II. Background"
+    applies_to_profiles: [finance, generic, technical, academic, legal]
+    patterns:
+      #- regex: '^\s*[ivxlcdm]+\.'
+      - regex: '^\s*[ivxlcdm]+(?:\.(?=\s+(?-i:[A-Z]))|(?=\s+(?-i:[A-Z])))'
+        flags: 'i'
+
+  # =========================
+  # Alpha-numbered headings
+  # =========================
+
+  - hierarchy_type: alpha_dotted_numbered_section   # Example: "A.1 Tasks", "A1.2.3 Overview"
+    applies_to_profiles: [finance, generic, technical, academic, legal]
+    patterns:
+      #- regex: '^\s*[A-Za-z]\.?\d+(?:\.\d+)*'
+      - regex: '^\s*[A-Za-z]\.?\d+(?:\.\d+)*\.?(?=\.\s+|[A-Z])'
+        flags: 'i'
+
+  - hierarchy_type: alpha_numbered_section         # Example: "A Additional", "A. Additional"
+    applies_to_profiles: [finance, generic, technical, academic, legal]
+    patterns:
+      #- regex: '^\s*[A-Za-z]\.?\s+'
+      - regex: '^\s*[A-Za-z]\.?\d+(?:\.\d+)*\.?(?:\.(?=\s+(?-i:[A-Z]))|(?=\s+(?-i:[A-Z])))'
+        flags: 'i'
+
+  
+  # =========================
+  # Academic / Technical labels
+  # =========================
+  # DISABLED FOR NOW
+  #- heading_type: academic_label        # Example: "Abstract" / "Methods" / "Results" -- subordinated to other headings
+  #  applies_to_profiles: [academic, technical]
+  #  patterns:
+  #    - regex: '^\s*(abstract|introduction|background|methods?|results?|discussion|conclusion|references)\s*$'
+  #      flags: 'i'

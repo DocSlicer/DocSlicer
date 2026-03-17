@@ -1,0 +1,1677 @@
+# step_06_chunk_builder.py
+
+from __future__ import annotations
+
+import hashlib
+import uuid
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+import numpy as np
+import pandas as pd
+import tiktoken
+
+from .._utils.hierarchical_aggregator import (
+    build_standard_agg_spec,
+    aggregate_hierarchical,
+)
+
+# =======================================================================================================================
+# CONFIG
+# =======================================================================================================================
+
+# Default chunking parameters
+_DEFAULT_MAX_CHUNK_CHARS = 3200       # Only split if active_heading_id content exceeds this
+_DEFAULT_OPTIMAL_CHUNK_CHARS = 1600   # Used to split when content exceeds this
+_DEFAULT_SOFTMIN_CHUNK_CHARS = 700    # Chunks below this size become undesirable
+_DEFAULT_MIN_CHUNK_CHARS = 400        # Min boundary for chunking
+_DEFAULT_OVERLAP_CHUNK_CHARS = 200    # Overlap between chunks if splitting is necessary
+
+# Bounds for chunking parameters (validation limits)
+_MAX_CHUNK_CHARS_MIN = 800
+_MAX_CHUNK_CHARS_MAX = 8000
+_OPTIMAL_CHUNK_CHARS_MIN = 400
+_OPTIMAL_CHUNK_CHARS_MAX = 4000
+_SOFTMIN_CHUNK_CHARS_MIN = 200
+_SOFTMIN_CHUNK_CHARS_MAX = 2000
+_MIN_CHUNK_CHARS_MIN = 100
+_MIN_CHUNK_CHARS_MAX = 1000
+
+# Block roles that should be removed from chunk content
+_NOISE_BLOCK_ROLES= {"hr", "page_label", "image", "suppressed_repeated_heading", "navigation", "watermark"}
+
+# Block roles that should be treated as headings (for chunk_heading)
+_HEADING_BLOCK_ROLES = {"heading", "toc_header", "exhibit_header"}
+
+
+# =======================================================================================================================
+# PARAMETER VALIDATION
+# =======================================================================================================================
+
+def _validate_chunking_params(
+    max_chunk_chars: int,
+    optimal_chunk_chars: int,
+    softmin_chunk_chars: int,
+    min_chunk_chars: int,
+) -> Tuple[int, int, int, int]:
+    """
+    Validate and clamp chunking parameters to reasonable bounds.
+    
+    Also ensures logical ordering: min <= softmin <= optimal <= max
+    
+    Returns:
+        Tuple of (max_chunk_chars, optimal_chunk_chars, softmin_chunk_chars, min_chunk_chars)
+    """
+    # Clamp to absolute bounds
+    max_chunk_chars = max(_MAX_CHUNK_CHARS_MIN, min(max_chunk_chars, _MAX_CHUNK_CHARS_MAX))
+    optimal_chunk_chars = max(_OPTIMAL_CHUNK_CHARS_MIN, min(optimal_chunk_chars, _OPTIMAL_CHUNK_CHARS_MAX))
+    softmin_chunk_chars = max(_SOFTMIN_CHUNK_CHARS_MIN, min(softmin_chunk_chars, _SOFTMIN_CHUNK_CHARS_MAX))
+    min_chunk_chars = max(_MIN_CHUNK_CHARS_MIN, min(min_chunk_chars, _MIN_CHUNK_CHARS_MAX))
+    
+    # Ensure logical ordering
+    if min_chunk_chars > softmin_chunk_chars:
+        min_chunk_chars = softmin_chunk_chars
+    if softmin_chunk_chars > optimal_chunk_chars:
+        softmin_chunk_chars = optimal_chunk_chars
+    if optimal_chunk_chars > max_chunk_chars:
+        optimal_chunk_chars = max_chunk_chars
+    
+    return max_chunk_chars, optimal_chunk_chars, softmin_chunk_chars, min_chunk_chars
+
+
+# =======================================================================================================================
+# STEP 1: Prepare DataFrame
+# =======================================================================================================================
+
+def _prepare_blocks_df(blocks_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Prepare the blocks dataframe for chunking:
+    - Add 'active_heading_id' column that propagates heading_id values downward
+    - Remove blocks with noise block roles
+    
+    Args:
+        blocks_df: DataFrame from block merger step
+        
+    Returns:
+        Prepared DataFrame ready for chunk building
+    """
+    df = blocks_df.copy()
+    
+    # Add active_heading_id column - forward fill heading_id values
+    # This propagates each heading_id to all blocks below it until the next heading
+    if 'heading_id' in df.columns:
+        # Convert to string to handle Int64 dtype properly
+        heading_id_str = df['heading_id'].astype(str).replace(['<NA>', 'nan', 'None'], '')
+        df['active_heading_id'] = heading_id_str.replace('', np.nan).ffill().fillna('')
+    else:
+        # If heading_id doesn't exist, create empty active_heading_id
+        df['active_heading_id'] = ''
+    
+    # Remove noise blocks
+    if 'block_role' in df.columns:
+        df = df[~df['block_role'].isin(_NOISE_BLOCK_ROLES)].reset_index(drop=True)
+    
+    return df
+
+
+# =======================================================================================================================
+# STEP 2: Assign Chunk IDs (Decision Logic)
+# =======================================================================================================================
+
+# ------------------------------
+# Oversize block pre-split (Decision-layer only; creates virtual rows)
+# ------------------------------
+
+def _find_best_split_point(text: str, target_pos: int, max_search_range: int = 200) -> int:
+    """
+    Find the best position to split text near target_pos.
+    
+    Priority:
+    1. Newline (\n) within search range
+    2. Sentence boundary (. ! ?) followed by space/newline within search range
+    3. Comma (,) followed by space within search range
+    4. Word boundary (space) within search range
+    5. Exact target_pos as fallback
+    
+    Args:
+        text: Text to split
+        target_pos: Ideal split position
+        max_search_range: Maximum distance to search for better break point
+        
+    Returns:
+        Best split position
+    """
+    n = len(text)
+    if target_pos >= n:
+        return n
+    if target_pos <= 0:
+        return 0
+    
+    # Define search window
+    search_start = max(0, target_pos - max_search_range)
+    search_end = min(n, target_pos + max_search_range)
+    
+    # Look for newlines first (highest priority)
+    # Search backward first (prefer breaking earlier to keep chunks smaller)
+    for i in range(target_pos, search_start - 1, -1):
+        if text[i] == '\n':
+            return i + 1  # Split after the newline
+    
+    # Search forward for newline
+    for i in range(target_pos + 1, search_end):
+        if text[i] == '\n':
+            return i + 1
+    
+    # Look for sentence boundaries (. ! ?) followed by space or newline
+    # Search backward first
+    for i in range(target_pos, search_start - 1, -1):
+        if i > 0 and text[i - 1] in '.!?' and (i >= n or text[i] in ' \n\t'):
+            return i  # Split after the punctuation + space
+    
+    # Search forward for sentence boundary
+    for i in range(target_pos + 1, search_end):
+        if i > 0 and text[i - 1] in '.!?' and (i >= n or text[i] in ' \n\t'):
+            return i
+    
+    # Look for comma followed by space
+    # Search backward first
+    for i in range(target_pos, search_start - 1, -1):
+        if i > 0 and text[i - 1] == ',' and (i >= n or text[i] in ' \n\t'):
+            return i  # Split after the comma + space
+    
+    # Search forward for comma
+    for i in range(target_pos + 1, search_end):
+        if i > 0 and text[i - 1] == ',' and (i >= n or text[i] in ' \n\t'):
+            return i
+    
+    # Look for word boundaries (spaces)
+    # Search backward first
+    for i in range(target_pos, search_start - 1, -1):
+        if text[i] == ' ':
+            return i + 1  # Split after the space
+    
+    # Search forward for word boundary
+    for i in range(target_pos + 1, search_end):
+        if text[i] == ' ':
+            return i + 1
+    
+    # Fallback: use exact target position
+    return target_pos
+
+
+def _split_text_into_parts(
+    text: str,
+    max_chars: int,
+    target_chars: int,
+    softmin_chars: int,
+) -> List[str]:
+    """
+    Split text into parts:
+      1) Prefer paragraph boundaries (\n\n)
+      2) Then line boundaries (\n)
+      3) Finally hard-slice
+
+    Goal: parts roughly near target_chars, all <= max_chars when possible.
+    No overlap by default.
+    """
+    if not text:
+        return [""]
+
+    if len(text) <= max_chars:
+        return [text]
+
+    # Prefer paragraph/line boundaries as "units"
+    units: List[str] = []
+    if "\n\n" in text:
+        units = [u for u in text.split("\n\n") if u != ""]
+        joiner = "\n\n"
+    elif "\n" in text:
+        units = [u for u in text.split("\n") if u != ""]
+        joiner = "\n"
+    else:
+        units = []
+        joiner = ""
+
+    # If we have units, pack them into parts near target_chars, respecting max_chars
+    parts: List[str] = []
+    if units:
+        buf: List[str] = []
+        buf_len = 0
+
+        def flush():
+            nonlocal buf, buf_len
+            if not buf:
+                return
+            parts.append(joiner.join(buf))
+            buf = []
+            buf_len = 0
+
+        for u in units:
+            u_len = len(u)
+            # if a single unit is too large, fall back to hard slicing that unit
+            if u_len > max_chars:
+                flush()
+                parts.extend(_split_text_into_parts(u, max_chars=max_chars, target_chars=target_chars, softmin_chars=softmin_chars))
+                continue
+
+            sep = 0 if not buf else len(joiner)
+            next_len = buf_len + sep + u_len
+
+            # if adding would exceed max, flush first
+            if buf and next_len > max_chars:
+                flush()
+
+            # if buffer is already "good enough" and adding would push far past target, flush to keep balance
+            if buf and buf_len >= softmin_chars and (buf_len >= target_chars) and (buf_len + sep + u_len) > (target_chars + (target_chars // 2)):
+                flush()
+
+            # add to buffer
+            sep = 0 if not buf else len(joiner)
+            buf_len = buf_len + sep + u_len
+            buf.append(u)
+
+        flush()
+
+        # If last part is tiny, rebalance with previous if possible
+        if len(parts) >= 2 and len(parts[-1]) < softmin_chars:
+            last = parts.pop()
+            prev = parts.pop()
+            candidate = prev + joiner + last if joiner else prev + last
+            if len(candidate) <= max_chars:
+                parts.append(candidate)
+            else:
+                # put back
+                parts.append(prev)
+                parts.append(last)
+
+        return parts
+
+    # Hard slice fallback: make near-target pieces with smart break points
+    # This handles cases where text has no paragraph/line boundaries,
+    # or when individual units are too large
+    parts = []
+    i = 0
+    n = len(text)
+    step = min(max_chars, max(1, target_chars))
+    
+    while i < n:
+        # Calculate initial target end position
+        initial_j = min(n, i + step)
+        
+        # If we're at the end, just take the rest
+        if initial_j == n:
+            parts.append(text[i:n])
+            break
+        
+        # Find smart break point near the target position
+        # Search range: allow going back/forward up to 200 chars to find good break
+        smart_j = _find_best_split_point(text, initial_j, max_search_range=200)
+        
+        # Safety check: ensure we're making progress
+        if smart_j <= i:
+            smart_j = initial_j
+        
+        # Ensure we don't exceed max_chars (unless unavoidable)
+        if smart_j - i > max_chars:
+            # If smart break point would create too large chunk, use max_chars boundary
+            smart_j = i + max_chars
+            # But try to find a better break within this constrained range
+            smart_j = _find_best_split_point(text, smart_j, max_search_range=50)
+            if smart_j <= i:
+                smart_j = i + max_chars
+        
+        parts.append(text[i:smart_j])
+        i = smart_j
+
+    # Rebalance tail
+    if len(parts) >= 2 and len(parts[-1]) < softmin_chars:
+        tail = parts.pop()
+        prev = parts.pop()
+        # borrow from prev if possible
+        need = softmin_chars - len(tail)
+        if need > 0 and len(prev) - need >= softmin_chars:
+            parts.append(prev[:-need])
+            parts.append(prev[-need:] + tail)
+        else:
+            parts.append(prev)
+            parts.append(tail)
+
+    return parts
+
+
+def _explode_oversize_blocks_within_group(
+    group_df: pd.DataFrame,
+    max_chunk_chars: int,
+    optimal_chunk_chars: int,
+    softmin_chunk_chars: int,
+) -> pd.DataFrame:
+    """
+    Replace any row with embed_char_count > max_chunk_chars by multiple "virtual" rows.
+
+    Adds:
+      - sub_block_index (0 for original non-split blocks, 1..N for split parts)
+      - is_virtual_sub_block (bool)
+      - orig_row_id (stable id within this function)
+    Keeps order by original sort + sub_block_index.
+    """
+    g = group_df.copy()
+
+    if "embed_char_count" not in g.columns:
+        g["embed_char_count"] = g["text"].astype("string").fillna("").str.len().astype(int)
+
+    # provide a stable original ordering key within the group
+    g = g.reset_index(drop=False).rename(columns={"index": "_orig_index"})
+    g["sub_block_index"] = 0
+    g["is_virtual_sub_block"] = False
+
+    rows_out: List[pd.Series] = []
+
+    for _, row in g.iterrows():
+        L = int(row["embed_char_count"])
+        if L <= max_chunk_chars:
+            rows_out.append(row)
+            continue
+
+        # Oversize: split into ~optimal-sized parts (DP-friendly atoms)
+        text = str(row.get("text", "") or "")
+        parts = _split_text_into_parts(
+            text=text,
+            max_chars=max_chunk_chars,
+            target_chars=optimal_chunk_chars,
+            softmin_chars=softmin_chunk_chars,
+        )
+
+        # Emit one row per part (virtual rows)
+        for si, part in enumerate(parts, start=1):
+            r2 = row.copy()
+            r2["text"] = part
+            r2["embed_char_count"] = int(len(part))
+            r2["sub_block_index"] = int(si)
+            r2["is_virtual_sub_block"] = True
+            rows_out.append(r2)
+
+    out = pd.DataFrame(rows_out)
+
+    # Order: original order, then sub_block_index (0 comes before 1..N but oversize rows only have 1..N)
+    out = out.sort_values(["_orig_index", "sub_block_index"], kind="mergesort").reset_index(drop=True)
+
+    return out
+
+
+# ------------------------------
+# Main Decision Engine
+# ------------------------------
+
+def _score_chunk_len(
+    L: int,
+    max_chunk_chars: int,
+    optimal_chunk_chars: int,
+    softmin_chunk_chars: int,
+    min_chunk_chars: int,
+) -> float:
+    """
+    Scoring / penalty for a candidate chunk length L.
+
+    Hard constraints:
+      - L > max_chunk_chars  => invalid (inf)
+    Soft preferences:
+      - prefer near optimal_chunk_chars
+      - discourage < softmin_chunk_chars
+      - strongly discourage < min_chunk_chars
+    """
+    if L > max_chunk_chars:
+        return float("inf")
+
+    # Base: distance to optimal
+    cost = float((L - optimal_chunk_chars) ** 2)
+
+    # Hard min: very strong penalty (but not inf, so we can "choose the least bad" if forced)
+    if L < min_chunk_chars:
+        cost += 50.0 * float((min_chunk_chars - L) ** 2)
+    # Soft min: moderate penalty
+    elif L < softmin_chunk_chars:
+        cost += 5.0 * float((softmin_chunk_chars - L) ** 2)
+
+    return cost
+
+# Dynamic Programming Algorithm (DP)
+def _partition_blocks_dp( 
+    block_lens: List[int],
+    heading_chars: int,
+    max_chunk_chars: int,
+    optimal_chunk_chars: int,
+    softmin_chunk_chars: int,
+    min_chunk_chars: int,
+) -> List[Tuple[int, int]]:
+    """
+    Partition ordered blocks into k contiguous groups using DP, where
+    each group's effective length is heading_chars + sum(block_lens[group]).
+
+    Returns list of (start_idx, end_idx) inclusive indices into block_lens.
+    """
+    n = len(block_lens)
+    if n == 0:
+        return []
+
+    prefix = np.zeros(n + 1, dtype=np.int64)
+    for i, v in enumerate(block_lens, start=1):
+        prefix[i] = prefix[i - 1] + int(v)
+
+    def seg_sum(a: int, b: int) -> int:
+        # inclusive [a,b]
+        return int(prefix[b + 1] - prefix[a])
+
+    total = heading_chars + int(prefix[n])
+
+    k_min = int(np.ceil(total / max_chunk_chars))
+    k_target = int(np.ceil(total / optimal_chunk_chars))
+
+    # Only try a small range of k values (balanced vs feasible)
+    k_lo = max(1, k_min)
+    k_hi = max(k_lo, min(n, k_target + 1))  # +1 gives a bit of flexibility
+
+    best_cost = float("inf")
+    best_cuts: Optional[List[Tuple[int, int]]] = None
+
+    # DP for each k candidate
+    for k in range(k_lo, k_hi + 1):
+        # dp[c][i] = min cost to partition first i blocks into c groups
+        dp = np.full((k + 1, n + 1), float("inf"), dtype=np.float64)
+        prev = np.full((k + 1, n + 1), -1, dtype=np.int64)
+        dp[0, 0] = 0.0
+
+        for c in range(1, k + 1):
+            for i in range(1, n + 1):
+                # last group ends at i-1, starts at j
+                # require at least c-1 blocks before if we want non-empty groups
+                j_start = c - 1
+                for j in range(j_start, i):
+                    L = heading_chars + seg_sum(j, i - 1)
+                    cost = _score_chunk_len(L, max_chunk_chars, optimal_chunk_chars, softmin_chunk_chars, min_chunk_chars)
+                    if not np.isfinite(cost):
+                        continue
+                    cand = dp[c - 1, j] + cost
+                    if cand < dp[c, i]:
+                        dp[c, i] = cand
+                        prev[c, i] = j
+
+        final_cost = float(dp[k, n])
+        if final_cost < best_cost:
+            # reconstruct
+            cuts: List[Tuple[int, int]] = []
+            c = k
+            i = n
+            while c > 0 and i > 0:
+                j = int(prev[c, i])
+                if j < 0:
+                    break
+                cuts.append((j, i - 1))
+                i = j
+                c -= 1
+            cuts.reverse()
+
+            if cuts and len(cuts) == k and cuts[0][0] == 0 and cuts[-1][1] == n - 1:
+                best_cost = final_cost
+                best_cuts = cuts
+
+    # Fallback: single chunk
+    if best_cuts is None:
+        return [(0, n - 1)]
+    return best_cuts
+
+
+# ------------------------------
+# Assign Chunk Indices
+# ------------------------------
+
+def _assign_chunk_indices(
+    blocks_df: pd.DataFrame,
+    max_chunk_chars: int,
+    optimal_chunk_chars: int,
+    softmin_chunk_chars: int,
+    min_chunk_chars: int,
+) -> pd.DataFrame:
+    """
+    Assign chunk_index to each block based on chunk partitioning strategy.
+    
+    This is the pure decision logic that determines which blocks belong together.
+    chunk_index is a global sequential counter (1, 2, 3...) across the entire document.
+    
+    Strategy:
+      1. Group by active_heading_id
+      2. Within each group:
+         - Identify heading block(s) and content blocks
+         - If total chars (heading + content) <= max_chunk_chars => all blocks get same chunk_index
+         - If total > max_chunk_chars => use DP to partition content blocks optimally
+         - Each partition gets a unique chunk_index
+         - Heading blocks get the chunk_index of the first content partition
+      3. chunk_index counts up globally across all active_heading_id groups
+    
+    Args:
+        blocks_df: Blocks dataframe with active_heading_id
+        max_chunk_chars: Maximum chunk size in characters
+        optimal_chunk_chars: Target chunk size in characters
+        softmin_chunk_chars: Soft minimum chunk size (discouraged but allowed)
+        min_chunk_chars: Hard minimum chunk size (strongly discouraged)
+        
+    Returns:
+        Same df with "chunk_index" column added
+    
+    Adds:
+      - chunk_index (global, 1..N)
+      - needs_block_split (flag on original rows that exceeded max before explosion)
+      - sub_block_index (0 for normal rows, 1..N for virtual sub-blocks)
+      - is_virtual_sub_block (bool)
+
+    Important:
+      - If an oversize block is exploded into virtual rows, chunk_index is assigned to those virtual rows.
+      - You can later aggregate chunks using (active_heading_id, chunk_index) and ignore sub-block metadata if desired.
+    """
+    if blocks_df is None or blocks_df.empty:
+        out = blocks_df.copy()
+        out["chunk_index"] = 0
+        return out
+
+    df0 = blocks_df.copy()
+
+    # Ensure embed_char_count exists
+    if "embed_char_count" not in df0.columns:
+        df0["embed_char_count"] = df0["text"].astype("string").fillna("").str.len().astype(int)
+
+    # Mark original oversize rows
+    df0["needs_block_split"] = df0["embed_char_count"].astype(int) > int(max_chunk_chars)
+
+    # Stable sort
+    sort_cols = [c for c in ["page_number", "block_id"] if c in df0.columns]
+    if sort_cols:
+        df0 = df0.sort_values(sort_cols, kind="mergesort").reset_index(drop=True)
+    else:
+        df0 = df0.reset_index(drop=True)
+
+    # We'll build an expanded working df for decisioning,
+    # then merge chunk_index back to original df0 if you don't want to keep virtual rows.
+    expanded_rows: List[pd.DataFrame] = []
+
+    for active_hid, g in df0.groupby("active_heading_id", sort=False):
+        g2 = g.copy().reset_index(drop=True)
+
+        # If any oversize in this heading group, explode them into virtual rows (DP-friendly atoms)
+        if (g2["embed_char_count"].astype(int) > int(max_chunk_chars)).any():
+            g2 = _explode_oversize_blocks_within_group(
+                g2,
+                max_chunk_chars=max_chunk_chars,
+                optimal_chunk_chars=optimal_chunk_chars,
+                softmin_chunk_chars=softmin_chunk_chars,
+            )
+        else:
+            # ensure expected columns exist
+            if "sub_block_index" not in g2.columns:
+                g2["sub_block_index"] = 0
+            if "is_virtual_sub_block" not in g2.columns:
+                g2["is_virtual_sub_block"] = False
+
+        expanded_rows.append(g2)
+
+    df = pd.concat(expanded_rows, ignore_index=True)
+
+    # Initialize chunk_index on expanded df
+    df["chunk_index"] = 0
+
+    # Global counter
+    global_chunk_idx = 1
+
+    # Now do DP per heading group on expanded rows
+    for active_hid, g_indices in df.groupby("active_heading_id", sort=False).groups.items():
+        g = df.loc[g_indices].copy()
+
+        block_roles = g.get("block_role", pd.Series([""] * len(g), index=g.index)).astype("string").str.strip().str.lower()
+        heading_mask = block_roles.isin(_HEADING_BLOCK_ROLES)
+
+        heading_indices = g.index[heading_mask].tolist()
+        content_indices = g.index[~heading_mask].tolist()
+
+        heading_chars = 0
+        if heading_indices:
+            heading_chars = int(df.loc[heading_indices, "embed_char_count"].sum())
+
+        if not content_indices:
+            df.loc[g.index, "chunk_index"] = global_chunk_idx
+            global_chunk_idx += 1
+            continue
+
+        block_lens = [int(x) for x in df.loc[content_indices, "embed_char_count"].tolist()]
+        total_len = heading_chars + int(np.sum(block_lens))
+
+        if total_len <= max_chunk_chars:
+            df.loc[g.index, "chunk_index"] = global_chunk_idx
+            global_chunk_idx += 1
+            continue
+
+        cuts = _partition_blocks_dp(
+            block_lens,
+            heading_chars=heading_chars,
+            max_chunk_chars=max_chunk_chars,
+            optimal_chunk_chars=optimal_chunk_chars,
+            softmin_chunk_chars=softmin_chunk_chars,
+            min_chunk_chars=min_chunk_chars,
+        )
+
+        for local_idx, (a, b) in enumerate(cuts, start=1):
+            segment_indices = content_indices[a : b + 1]
+            df.loc[segment_indices, "chunk_index"] = global_chunk_idx
+
+            if local_idx == 1 and heading_indices:
+                df.loc[heading_indices, "chunk_index"] = global_chunk_idx
+
+            global_chunk_idx += 1
+
+    return df
+
+# ------------------------------
+# Join Chunk Text
+# ------------------------------
+
+def _join_chunk_text(blocks_with_chunk_index: pd.DataFrame, chunks_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build text for each chunk by joining block texts.
+    
+    Includes headings inside the chunk text with ## prefix for non-merged chunks.
+    Also extracts chunk_heading metadata from heading blocks based on active_heading_id.
+    
+    Args:
+        blocks_with_chunk_index: Blocks df with chunk_index column
+        chunks_df: Aggregated chunks df (from hierarchical_aggregator)
+        
+    Returns:
+        chunks_df with "text", "chunk_heading", and "contains_table" columns added
+    """
+    if blocks_with_chunk_index.empty or chunks_df.empty:
+        chunks_df["text"] = ""
+        chunks_df["chunk_heading"] = ""
+        chunks_df["contains_table"] = False
+        chunks_df["embed_char_count"] = 0
+        return chunks_df
+    
+    # First, extract heading metadata per active_heading_id
+    # All chunks from the same active_heading_id should have the same heading metadata
+    heading_cols_to_map = [
+        "heading_type",
+        "heading_id", 
+        "heading_fp_id",
+        "heading_fingerprint",
+        "heading_hash",
+        "heading_level",
+        "parent_heading_id",
+    ]
+    
+    heading_metadata = {}
+    if "active_heading_id" in blocks_with_chunk_index.columns:
+        for active_hid, g in blocks_with_chunk_index.groupby("active_heading_id", sort=False):
+            # Treat heading, toc_header, and exhibit_header as heading blocks
+            block_roles = g.get("block_role", pd.Series([""] * len(g))).astype("string").str.strip().str.lower()
+            heading_mask = block_roles.isin(_HEADING_BLOCK_ROLES)
+            
+            metadata = {"chunk_heading": ""}
+            
+            if heading_mask.any():
+                heading_row = g.loc[heading_mask].iloc[0]
+                # Extract heading text
+                heading_text = heading_row.get("text", "")
+                metadata["chunk_heading"] = str(heading_text) if pd.notna(heading_text) else ""
+                
+                # Extract all heading metadata columns
+                for col in heading_cols_to_map:
+                    if col in heading_row.index:
+                        val = heading_row[col]
+                        metadata[col] = val if pd.notna(val) else None
+                    else:
+                        metadata[col] = None
+            else:
+                # No heading block - set all to None/empty
+                for col in heading_cols_to_map:
+                    metadata[col] = None
+            
+            heading_metadata[active_hid] = metadata
+    
+    # Build chunk text per chunk_index, including heading with ## prefix
+    # We need to pass active_heading_id to look up the heading for multi-chunk sections
+    def _build_chunk_text_with_heading(group: pd.DataFrame) -> pd.Series:
+        """Build text for one chunk, including heading with ## prefix at the start.
+        
+        For chunks that don't contain the heading block (e.g., continuation chunks from 
+        a split heading section), we look up the heading text from the active_heading_id.
+        """
+        chunk_idx = group.name  # chunk_index
+        
+        if group.empty:
+            return pd.Series({"text": "", "active_heading_id": ""})
+        
+        # Get the active_heading_id for this chunk
+        active_hid = group["active_heading_id"].iloc[0] if "active_heading_id" in group.columns else ""
+        
+        # Get heading text - first try from heading block in this chunk
+        block_roles = group.get("block_role", pd.Series([""] * len(group))).astype("string").str.strip().str.lower()
+        heading_mask = block_roles.isin(_HEADING_BLOCK_ROLES)
+        
+        heading_text = ""
+        if heading_mask.any():
+            # This chunk contains the heading block
+            heading_row = group.loc[heading_mask].iloc[0]
+            heading_text = str(heading_row.get("text", "")) if pd.notna(heading_row.get("text")) else ""
+        elif active_hid and active_hid in heading_metadata:
+            # This chunk doesn't have the heading block, but it belongs to a heading section
+            # Look up the heading text from metadata
+            heading_text = heading_metadata[active_hid].get("chunk_heading", "")
+        
+        # Get content blocks (exclude headings)
+        content_blocks = group.loc[~heading_mask]
+        block_texts = content_blocks["text"].astype("string").fillna("")
+        content_text = "\n\n".join([t for t in block_texts if t])
+        
+        # Combine heading (with ##) and content
+        if heading_text and content_text:
+            final_text = f"## {heading_text}\n\n{content_text}"
+        elif heading_text:
+            final_text = f"## {heading_text}"
+        else:
+            final_text = content_text
+        
+        return pd.Series({"text": final_text, "active_heading_id": active_hid})
+    
+    # Group by chunk_index and build text
+    text_df = (
+        blocks_with_chunk_index.groupby("chunk_index", sort=False, observed=True)
+        .apply(_build_chunk_text_with_heading, include_groups=False)
+        .reset_index()
+    )
+    
+    # Drop active_heading_id from text_df since chunks_df already has it
+    # (The text_df version is just for internal use in the function)
+    if "active_heading_id" in text_df.columns:
+        text_df = text_df.drop(columns=["active_heading_id"])
+    
+    # Check if each chunk contains at least one table block
+    def _check_contains_table(blocks: pd.DataFrame) -> bool:
+        """Check if any block in the chunk has block_role = 'table'."""
+        if blocks.empty or "block_role" not in blocks.columns:
+            return False
+        block_roles = blocks["block_role"].astype("string").str.strip().str.lower()
+        return (block_roles == "table").any()
+    
+    contains_table_df = (
+        blocks_with_chunk_index.groupby("chunk_index", sort=False, observed=True)
+        .apply(_check_contains_table, include_groups=False)
+        .reset_index()
+        .rename(columns={0: "contains_table"})
+    )
+    
+    # Merge text and contains_table into chunks_df
+    chunks_df = chunks_df.merge(text_df, on="chunk_index", how="left")
+    chunks_df = chunks_df.merge(contains_table_df, on="chunk_index", how="left")
+    chunks_df["text"] = chunks_df["text"].fillna("")
+    chunks_df["contains_table"] = chunks_df["contains_table"].fillna(False)
+    
+    # Add chunk_heading and all heading metadata based on active_heading_id
+    # (repeats for all chunks from same heading)
+    if "active_heading_id" in chunks_df.columns:
+        # Map chunk_heading
+        chunks_df["chunk_heading"] = chunks_df["active_heading_id"].map(
+            lambda aid: heading_metadata.get(aid, {}).get("chunk_heading", "")
+        )
+        
+        # Map all heading metadata columns
+        for col in heading_cols_to_map:
+            chunks_df[col] = chunks_df["active_heading_id"].map(
+                lambda aid: heading_metadata.get(aid, {}).get(col, None)
+            )
+    else:
+        chunks_df["chunk_heading"] = ""
+        for col in heading_cols_to_map:
+            chunks_df[col] = None
+    
+    # Calculate embed_char_count = length of the text field
+    chunks_df["embed_char_count"] = chunks_df["text"].astype("string").str.len()
+    
+    return chunks_df
+
+# =======================================================================================================================
+# STEP 3: Merge Chunk Candidates (where necessary)
+# =======================================================================================================================
+
+# ------------------------------
+# Small Chunk Merge Decision Engine
+# ------------------------------
+
+@dataclass(frozen=True)
+class MergePlanConfig:
+    max_chunk_chars: int
+    softmin_chunk_chars: int
+    min_children_to_merge: int = 2  # require at least 2 tiny siblings to merge
+    # If you want to allow merging a single tiny child with its neighbor, set to 1.
+
+
+def _norm_id(v: Any) -> str:
+    """
+    Normalize heading ids so that:
+      23, 23.0, "23", "23.0", np.int64(23) -> "23"
+    Keeps non-numeric ids (UUIDs etc.) as stripped strings.
+    """
+    if v is None:
+        return ""
+    if isinstance(v, (np.integer, int)):
+        return str(int(v))
+    if isinstance(v, (np.floating, float)):
+        if np.isfinite(v) and float(v).is_integer():
+            return str(int(v))
+        return str(v).strip()
+
+    s = str(v).strip()
+    if not s:
+        return ""
+
+    # handle "23.0" style strings
+    try:
+        f = float(s)
+        if np.isfinite(f) and f.is_integer():
+            return str(int(f))
+    except Exception:
+        pass
+
+    return s
+
+
+def assign_merged_chunk_id(chunks_df: pd.DataFrame, cfg: MergePlanConfig) -> pd.DataFrame:
+    """
+    Pure decision engine.
+
+    Path A (parent_plus_children):
+      Merge parent chunk row (heading_id == parent_id) with ALL its children if:
+        - parent chunk exists
+        - all children are tiny (< softmin)
+        - all children are leaf headings (do NOT absorb subtrees)
+        - parent + children total <= max
+
+    Path B (children_tail):
+      Merge only consecutive tiny LEAF siblings under the same parent_heading_id,
+      contiguity enforced by chunk_index adjacency (no jumping).
+
+    Output cols:
+      - merged_chunk_id (int): pd.NA = no merge
+      - merge_mode (str): "", "parent_plus_children", "children_tail"
+      - merge_group_parent_heading_id (str)
+      - merge_member_heading_ids (list[str])  # debug
+    """
+    if chunks_df is None or chunks_df.empty:
+        out = (chunks_df.copy() if chunks_df is not None else pd.DataFrame())
+        out["merged_chunk_id"] = pd.Series([pd.NA] * len(out), dtype="Int64")
+        out["merge_mode"] = ""
+        out["merge_group_parent_heading_id"] = ""
+        out["merge_member_heading_ids"] = [[] for _ in range(len(out))]
+        return out
+
+    df = chunks_df.copy()
+
+    required = ["embed_char_count", "heading_id", "parent_heading_id"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise KeyError(f"assign_merged_chunk_id missing required columns: {missing}")
+
+    # stable doc order
+    sort_cols = [c for c in ["page_number", "chunk_index"] if c in df.columns]
+    if sort_cols:
+        df = df.sort_values(sort_cols, kind="mergesort").reset_index(drop=True)
+    else:
+        df = df.reset_index(drop=True)
+
+    # normalize ids into helper columns
+    df["_hid_norm"] = df["heading_id"].map(_norm_id)
+    df["_pid_norm"] = df["parent_heading_id"].map(_norm_id)
+
+    # init outputs
+    df["merged_chunk_id"] = pd.Series([pd.NA] * len(df), dtype="Int64")
+    df["merge_mode"] = ""
+    df["merge_group_parent_heading_id"] = ""
+    df["merge_member_heading_ids"] = [[] for _ in range(len(df))]
+
+    # detect parents globally (normed)
+    parent_id_set: Set[str] = set([p for p in df["_pid_norm"].tolist() if p])
+    df["_is_parent_heading"] = df["_hid_norm"].isin(parent_id_set)
+    df["_is_leaf_heading"] = ~df["_is_parent_heading"]
+
+    # tiny + leaf eligibility
+    df["_is_tiny"] = df["embed_char_count"].fillna(0).astype(int) < int(cfg.softmin_chunk_chars)
+    df["_is_tiny_leaf"] = df["_is_tiny"] & df["_is_leaf_heading"]
+
+    # map norm heading_id -> row index (first occurrence)
+    hid_to_idx: Dict[str, int] = {}
+    for i, hid in enumerate(df["_hid_norm"].tolist()):
+        if hid and hid not in hid_to_idx:
+            hid_to_idx[hid] = i
+
+    # parent_norm -> children indices
+    by_parent: Dict[str, List[int]] = {}
+    for i, pid in enumerate(df["_pid_norm"].tolist()):
+        if not pid:
+            continue
+        by_parent.setdefault(pid, []).append(i)
+
+    next_merge_id = 1
+
+    def _assign_group(member_idxs: List[int], mode: str, parent_norm: str) -> None:
+        nonlocal next_merge_id
+        if not member_idxs:
+            return
+        if not df.loc[member_idxs, "merged_chunk_id"].isna().all():
+            return
+
+        member_heading_ids = df.loc[member_idxs, "_hid_norm"].tolist()
+
+        df.loc[member_idxs, "merged_chunk_id"] = next_merge_id
+        df.loc[member_idxs, "merge_mode"] = mode
+        df.loc[member_idxs, "merge_group_parent_heading_id"] = parent_norm
+        for m in member_idxs:
+            df.at[m, "merge_member_heading_ids"] = member_heading_ids
+
+        next_merge_id += 1
+
+    def _try_assign_children_run(run_idxs: List[int], parent_norm: str) -> None:
+        if len(run_idxs) < int(cfg.min_children_to_merge):
+            return
+        if not df.loc[run_idxs, "merged_chunk_id"].isna().all():
+            return
+        run_sum = int(df.loc[run_idxs, "embed_char_count"].sum())
+        if run_sum > int(cfg.max_chunk_chars):
+            return
+        _assign_group(run_idxs, mode="children_tail", parent_norm=parent_norm)
+
+    for parent_norm, child_idxs in by_parent.items():
+        # -------------------------
+        # Path A: parent + ALL children (safe only if children are tiny AND leaf)
+        # -------------------------
+        parent_row_idx = hid_to_idx.get(parent_norm)
+
+        if parent_row_idx is not None and pd.isna(df.at[parent_row_idx, "merged_chunk_id"]):
+            all_children_tiny = bool(df.loc[child_idxs, "_is_tiny"].all())
+            all_children_leaf = bool(df.loc[child_idxs, "_is_leaf_heading"].all())
+            total_chars = int(df.at[parent_row_idx, "embed_char_count"]) + int(df.loc[child_idxs, "embed_char_count"].sum())
+
+            if (
+                all_children_tiny
+                and all_children_leaf
+                and total_chars <= int(cfg.max_chunk_chars)
+                and df.loc[child_idxs, "merged_chunk_id"].isna().all()
+            ):
+                _assign_group([parent_row_idx] + child_idxs, mode="parent_plus_children", parent_norm=parent_norm)
+                continue  # don't do tail merges inside this parent
+
+        # -------------------------
+        # Path B: consecutive tiny LEAF children runs, contiguous by chunk_index (no jumping)
+        # -------------------------
+        run: List[int] = []
+
+        for idx in child_idxs:
+            if not bool(df.at[idx, "_is_tiny_leaf"]):
+                if run:
+                    _try_assign_children_run(run, parent_norm)
+                    run = []
+                continue
+
+            if not run:
+                run = [idx]
+                continue
+
+            prev_ci = int(df.at[run[-1], "chunk_index"]) if "chunk_index" in df.columns else run[-1]
+            curr_ci = int(df.at[idx, "chunk_index"]) if "chunk_index" in df.columns else idx
+
+            if curr_ci == prev_ci + 1:
+                run.append(idx)
+            else:
+                _try_assign_children_run(run, parent_norm)
+                run = [idx]
+
+        if run:
+            _try_assign_children_run(run, parent_norm)
+
+    # drop helpers
+    df = df.drop(
+        columns=[
+            "_hid_norm",
+            "_pid_norm",
+            "_is_parent_heading",
+            "_is_leaf_heading",
+            "_is_tiny",
+            "_is_tiny_leaf",
+        ],
+        errors="ignore",
+    )
+
+    return df
+
+
+# ------------------------------
+# Rebuild Merged Chunks
+# ------------------------------
+
+def _aggregate_merged_chunks_fields(group: pd.DataFrame) -> pd.Series:
+    """
+    Aggregate all fields across chunks being merged using standard hierarchical aggregation.
+    
+    This properly aggregates:
+    - Geometry (bbox coordinates, width, height)
+    - Counts (char_count, word_count, alpha_count, etc.)
+    - Style fields (font_size, colors, etc.)
+    - Flags (has_link, is_bold, etc.)
+    
+    Args:
+        group: DataFrame containing all chunks being merged together
+        
+    Returns:
+        Series with aggregated values for all fields
+    """
+    # Add a temporary group column for aggregation
+    group = group.copy()
+    group['_merge_group'] = 1
+    
+    # Build aggregation spec for chunks
+    # Include all standard fields that might be present in chunks
+    agg_spec = build_standard_agg_spec(
+        identity_cols=['page_number', 'document_region', 'page_label', 'page_label_type', 'page_label_value'],
+        include_hierarchy=True,
+        include_geometry=True,
+        include_style=True,
+        include_counts=True,
+        include_metadata=True,
+        include_table=False,
+        include_html_provenance=False,
+    )
+    
+    # Add chunk-specific fields
+    # These use "first" since they're structural identifiers from the parent/first chunk
+    agg_spec.update({
+        'chunk_index': 'first',
+        'heading_id': 'first',
+        'parent_heading_id': 'first',
+        'heading_level': 'first',
+        'heading_type': 'first',
+    })
+    
+    # Aggregate the group
+    aggregated = aggregate_hierarchical(
+        df=group,
+        group_col='_merge_group',
+        agg_spec=agg_spec,
+        compute_derived=True
+    )
+    
+    # Return the single aggregated row as a Series
+    return aggregated.iloc[0] if not aggregated.empty else pd.Series()
+
+
+def _rebuild_merged_chunks(chunks_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Rebuild the complete dataframe based on merging of chunks.
+    
+    For merged chunks (where merged_chunk_id is not NA):
+    - merge_mode = parent_plus_children: 
+      - chunk_heading becomes the parent only
+      - text includes the children's texts (which already have ## headings inside)
+    - merge_mode = children_tail:
+      - chunk_heading becomes the children's headings pipe delimited
+      - text includes the children's texts (which already have ## headings inside)
+    
+    Args:
+        chunks_df: DataFrame with merged_chunk_id, merge_mode, chunk_heading, text columns
+        
+    Returns:
+        Rebuilt DataFrame with merged chunks consolidated
+    """
+    if chunks_df is None or chunks_df.empty:
+        return chunks_df
+    
+    df = chunks_df.copy()
+    
+    # Check if there are any merged chunks
+    if "merged_chunk_id" not in df.columns or df["merged_chunk_id"].isna().all():
+        return df
+    
+    # Separate merged and non-merged chunks
+    merged_mask = df["merged_chunk_id"].notna()
+    merged_chunks = df[merged_mask].copy()
+    non_merged_chunks = df[~merged_mask].copy()
+    
+    if merged_chunks.empty:
+        return df
+    
+    # Group merged chunks by merged_chunk_id
+    merged_groups = []
+    
+    for merge_id, group in merged_chunks.groupby("merged_chunk_id", sort=False):
+        # Get the merge mode (should be same for all in group)
+        merge_mode = group["merge_mode"].iloc[0] if "merge_mode" in group.columns else ""
+        parent_heading_id = group["merge_group_parent_heading_id"].iloc[0] if "merge_group_parent_heading_id" in group.columns else ""
+        
+        # Sort by chunk_index to maintain order
+        if "chunk_index" in group.columns:
+            group = group.sort_values("chunk_index", kind="mergesort")
+        
+        if merge_mode == "parent_plus_children":
+            # Find parent chunk (heading_id matches parent_heading_id)
+            # Use the same normalization as assign_merged_chunk_id
+            group_heading_ids_norm = group["heading_id"].map(_norm_id)
+            parent_heading_id_norm = _norm_id(parent_heading_id)
+            
+            parent_mask = group_heading_ids_norm == parent_heading_id_norm
+            parent_chunk = group[parent_mask]
+            children_chunks = group[~parent_mask]
+            
+            if not parent_chunk.empty:
+                # Use parent's chunk_heading
+                new_chunk_heading = parent_chunk["chunk_heading"].iloc[0] if "chunk_heading" in parent_chunk.columns else ""
+                
+                # Build text: Start with parent heading, then add parent content (if any), then children
+                text_parts = []
+                
+                # Get parent's full text (should be "## Parent Title\n\nContent" or just "## Parent Title")
+                parent_text = str(parent_chunk["text"].iloc[0]) if "text" in parent_chunk.columns else ""
+                parent_text = parent_text.strip()
+                
+                # If parent text exists, use it as the base
+                if parent_text:
+                    text_parts.append(parent_text)
+                elif new_chunk_heading:
+                    # If parent text is empty but we have a heading, add it
+                    text_parts.append(f"## {new_chunk_heading}")
+                
+                # Then add ALL children's texts (already have ## headings inside)
+                # Sort children by chunk_index to maintain order
+                if "chunk_index" in children_chunks.columns and not children_chunks.empty:
+                    children_chunks = children_chunks.sort_values("chunk_index", kind="mergesort")
+                
+                for _, child_row in children_chunks.iterrows():
+                    child_text = str(child_row.get("text", "") or "").strip()
+                    if child_text:
+                        text_parts.append(child_text)
+                
+                new_text = "\n\n".join(text_parts)
+                
+                # Aggregate all fields across the merged chunks (bbox, counts, styles, etc.)
+                merged_row = _aggregate_merged_chunks_fields(group)
+                
+                # Override with merge-specific values
+                merged_row["chunk_heading"] = new_chunk_heading
+                merged_row["text"] = new_text
+                merged_row["embed_char_count"] = len(new_text)
+                
+                merged_groups.append(merged_row)
+            else:
+                # Fallback: if no parent found, aggregate all chunks
+                merged_row = _aggregate_merged_chunks_fields(group)
+                merged_groups.append(merged_row)
+        
+        elif merge_mode == "children_tail":
+            # chunk_heading = children's headings pipe delimited
+            headings = []
+            text_parts = []
+            
+            # Sort by chunk_index to maintain order
+            if "chunk_index" in group.columns:
+                group = group.sort_values("chunk_index", kind="mergesort")
+            
+            for _, child_row in group.iterrows():
+                child_heading = str(child_row.get("chunk_heading", "") or "").strip()
+                child_text = str(child_row.get("text", "") or "").strip()
+                
+                if child_heading:
+                    headings.append(child_heading)
+                
+                # Add text (already has ## heading inside)
+                if child_text:
+                    text_parts.append(child_text)
+            
+            new_chunk_heading = " | ".join(headings)
+            new_text = "\n\n".join(text_parts)
+            
+            # Aggregate all fields across the merged chunks (bbox, counts, styles, etc.)
+            merged_row = _aggregate_merged_chunks_fields(group)
+            
+            # Override with merge-specific values
+            merged_row["chunk_heading"] = new_chunk_heading
+            merged_row["text"] = new_text
+            merged_row["embed_char_count"] = len(new_text)
+            
+            merged_groups.append(merged_row)
+        
+        else:
+            # Unknown merge mode, aggregate all chunks
+            merged_row = _aggregate_merged_chunks_fields(group)
+            merged_groups.append(merged_row)
+    
+    # Combine merged groups back into dataframe
+    if merged_groups:
+        merged_df = pd.DataFrame(merged_groups)
+        
+        # Combine with non-merged chunks
+        result_df = pd.concat([non_merged_chunks, merged_df], ignore_index=True)
+        
+        # Sort by original order (page_number, chunk_index)
+        sort_cols = [c for c in ["page_number", "chunk_index"] if c in result_df.columns]
+        if sort_cols:
+            result_df = result_df.sort_values(sort_cols, kind="mergesort").reset_index(drop=True)
+        else:
+            result_df = result_df.reset_index(drop=True)
+        
+        return result_df
+    
+    return df
+
+
+# =======================================================================================================================
+# STEP 4: Add Token Count & Chunk IDs
+# =======================================================================================================================
+
+def _add_token_count(chunks_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add token_count to each chunk using tiktoken.
+    
+    Simplified to just tokenize the text field (which already includes headings with ##).
+    
+    Args:
+        chunks_df: DataFrame with text column
+        
+    Returns:
+        DataFrame with token_count column added
+    """
+    if chunks_df is None or chunks_df.empty:
+        chunks_df = chunks_df.copy() if chunks_df is not None else pd.DataFrame()
+        chunks_df["token_count"] = 0
+        return chunks_df
+    
+    df = chunks_df.copy()
+    
+    # Initialize tiktoken encoder (using cl100k_base which is standard for GPT models)
+    try:
+        encoding = tiktoken.get_encoding("cl100k_base")
+    except Exception:
+        # Fallback if encoding not available
+        encoding = None
+    
+    def _calculate_token_count(text: str) -> int:
+        """Calculate token count for text."""
+        if encoding is None:
+            return 0
+        
+        text = str(text) if pd.notna(text) else ""
+        return len(encoding.encode(text))
+    
+    df["token_count"] = df["text"].apply(_calculate_token_count)
+    
+    return df
+
+
+def _add_chunk_ids_and_reindex(chunks_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add chunk_id (UUID v4), parent_chunk_id (UUID v4), and reindex chunk_index to remove gaps.
+    
+    Logic:
+    - Generate UUID v4 for each chunk as chunk_id
+    - For each chunk, find parent chunk where heading_id == parent_heading_id
+    - Set parent_chunk_id to parent chunk's chunk_id (or None if no parent)
+    - Reindex chunk_index to be sequential (1, 2, 3, ...) with no gaps
+    
+    Args:
+        chunks_df: DataFrame with heading_id, parent_heading_id, and chunk_index columns
+        
+    Returns:
+        DataFrame with chunk_id, parent_chunk_id added and chunk_index reindexed
+    """
+    if chunks_df is None or chunks_df.empty:
+        chunks_df = chunks_df.copy() if chunks_df is not None else pd.DataFrame()
+        chunks_df["chunk_id"] = ""
+        chunks_df["parent_chunk_id"] = None
+        return chunks_df
+    
+    df = chunks_df.copy()
+    
+    # Sort by chunk_index first to maintain order (before generating IDs)
+    if "chunk_index" in df.columns:
+        sort_cols = [c for c in ["page_number", "chunk_index"] if c in df.columns]
+        if sort_cols:
+            df = df.sort_values(sort_cols, kind="mergesort").reset_index(drop=True)
+    
+    # Generate UUID v4 for each chunk
+    df["chunk_id"] = [str(uuid.uuid4()) for _ in range(len(df))]
+    
+    # Initialize parent_chunk_id column
+    df["parent_chunk_id"] = None
+    
+    # Build parent_chunk_id lookup if heading columns exist
+    if "heading_id" in df.columns and "parent_heading_id" in df.columns:
+        # Normalize heading_id and parent_heading_id for matching (vectorized)
+        # Handles int, float, and string IDs - converts all to normalized strings
+        # e.g., 1 -> "1", 1.0 -> "1", "h-1" -> "h-1", None -> ""
+        def _normalize_id_series(series: pd.Series) -> pd.Series:
+            """Normalize heading IDs to strings for consistent matching."""
+            # Convert to string
+            normalized = series.astype(str)
+            # Replace string representations of None/NaN with empty string
+            normalized = normalized.replace(["None", "nan", "NaN", "<NA>"], "")
+            # Remove trailing .0 from float-like strings (e.g., "1.0" -> "1")
+            normalized = normalized.str.replace(r"\.0+$", "", regex=True)
+            # Strip whitespace
+            normalized = normalized.str.strip()
+            return normalized
+        
+        df["_heading_id_norm"] = _normalize_id_series(df["heading_id"])
+        df["_parent_heading_id_norm"] = _normalize_id_series(df["parent_heading_id"])
+        
+        # Create a lookup: heading_id -> chunk_id (vectorized)
+        # For each unique heading_id, map it to the chunk_id of the FIRST chunk with that heading_id
+        # Filter out blank heading_ids, then drop duplicates keeping first occurrence
+        valid_headings = df["_heading_id_norm"] != ""
+        lookup_df = df.loc[valid_headings, ["_heading_id_norm", "chunk_id"]].drop_duplicates(
+            subset=["_heading_id_norm"], keep="first"
+        )
+        heading_to_chunk_id = dict(zip(lookup_df["_heading_id_norm"], lookup_df["chunk_id"]))
+        
+        # Set parent_chunk_id using vectorized map (much faster than apply)
+        # Map parent_heading_id_norm -> chunk_id, returns NaN for missing keys
+        df["parent_chunk_id"] = df["_parent_heading_id_norm"].map(heading_to_chunk_id)
+        
+        # Convert empty parent_heading_id_norm to None (root level chunks)
+        df.loc[df["_parent_heading_id_norm"] == "", "parent_chunk_id"] = None
+        
+        # Clean up helper columns
+        df = df.drop(columns=["_heading_id_norm", "_parent_heading_id_norm"])
+    
+    # Reindex chunk_index to be sequential (1, 2, 3, ...) with no gaps
+    # (df is already sorted from earlier)
+    if "chunk_index" in df.columns:
+        # Create new sequential chunk_index
+        df["chunk_index"] = range(1, len(df) + 1)
+    
+    return df
+
+
+def _add_chunk_path(chunks_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add chunk_path column showing the hierarchical path from root to current chunk.
+    
+    The path is formatted as markdown headings with increasing levels:
+    # Part I
+    ## Item 1. Business
+    ### Our Company
+    
+    Algorithm:
+    1. For each chunk, look up its parent_heading_id
+    2. Find the first row in df where heading_id == parent_heading_id
+    3. Collect that chunk's heading and repeat until no parent (root)
+    4. Build path by joining all headings from root to current chunk
+    
+    Args:
+        chunks_df: DataFrame with heading_id, parent_heading_id, chunk_heading, heading_level columns
+        
+    Returns:
+        DataFrame with chunk_path column added
+    """
+    if chunks_df is None or chunks_df.empty:
+        chunks_df = chunks_df.copy() if chunks_df is not None else pd.DataFrame()
+        chunks_df["chunk_path"] = ""
+        return chunks_df
+    
+    df = chunks_df.copy()
+    
+    # Check if required columns exist
+    required = {"heading_id", "parent_heading_id", "chunk_heading"}
+    if not required.issubset(df.columns):
+        df["chunk_path"] = ""
+        return df
+    
+    # Normalize heading IDs for consistent lookup
+    def _normalize_id(val):
+        """Normalize heading ID to string for matching."""
+        if pd.isna(val) or val == "" or val == "None":
+            return None
+        s = str(val).strip()
+        # Remove trailing .0 from float-like strings
+        s = s.replace(".0", "")
+        return s if s else None
+    
+    # Build lookup: heading_id -> (chunk_heading, parent_heading_id, heading_level)
+    # Use first occurrence of each heading_id
+    heading_info = {}
+    for _, row in df.iterrows():
+        heading_id = _normalize_id(row.get("heading_id"))
+        if heading_id is None or heading_id in heading_info:
+            continue  # Skip if already processed (keep first occurrence)
+        
+        chunk_heading = row.get("chunk_heading", "")
+        parent_heading_id = _normalize_id(row.get("parent_heading_id"))
+        heading_level = row.get("heading_level", 1)
+        
+        # Normalize heading and level
+        if pd.isna(chunk_heading):
+            chunk_heading = ""
+        if pd.isna(heading_level):
+            heading_level = 1
+        else:
+            heading_level = int(heading_level)
+        
+        heading_info[heading_id] = (chunk_heading, parent_heading_id, heading_level)
+    
+    # Cache for computed paths: heading_id -> path string
+    # This avoids recomputing the same parent paths multiple times
+    path_cache = {}
+    
+    def _get_path_for_heading(heading_id: str) -> str:
+        """Get the full path for a heading_id, with caching."""
+        # Check cache first
+        if heading_id in path_cache:
+            return path_cache[heading_id]
+        
+        # Get heading info
+        if heading_id not in heading_info:
+            path_cache[heading_id] = ""
+            return ""
+        
+        chunk_heading, parent_heading_id, level = heading_info[heading_id]
+        
+        # Collect parent headings by walking up the hierarchy
+        parent_headings = []
+        visited = {heading_id}  # Prevent infinite loops
+        current_parent = parent_heading_id
+        
+        while current_parent is not None:
+            # Check for cycles
+            if current_parent in visited:
+                break
+            visited.add(current_parent)
+            
+            # Look up parent info
+            if current_parent not in heading_info:
+                break
+            
+            parent_chunk_heading, next_parent_id, parent_level = heading_info[current_parent]
+            
+            # Add parent heading to list (if not empty)
+            if parent_chunk_heading:
+                parent_headings.append((parent_chunk_heading, parent_level))
+            
+            # Move to next parent
+            current_parent = next_parent_id
+        
+        # Reverse to get path from root to current
+        parent_headings.reverse()
+        
+        # Build markdown path
+        path_parts = []
+        for heading_text, heading_level in parent_headings:
+            formatted = "#" * max(1, heading_level) + " " + heading_text
+            path_parts.append(formatted)
+        
+        # Add current heading if not empty
+        if chunk_heading:
+            formatted = "#" * max(1, level) + " " + chunk_heading
+            path_parts.append(formatted)
+        
+        path = "\n".join(path_parts)
+        path_cache[heading_id] = path
+        return path
+    
+    # Build paths for all chunks using the cached lookup
+    def _build_path_for_chunk(row) -> str:
+        """Build path by looking up the heading_id in the cache."""
+        heading_id = _normalize_id(row.get("heading_id"))
+        if heading_id is None:
+            return ""
+        return _get_path_for_heading(heading_id)
+    
+    # Build paths for all chunks
+    df["chunk_path"] = df.apply(_build_path_for_chunk, axis=1)
+    
+    return df
+
+
+# =======================================================================================================================
+# Public API
+# =======================================================================================================================
+
+def build_chunks(
+    blocks_df: pd.DataFrame,
+    max_chunk_chars: int = _DEFAULT_MAX_CHUNK_CHARS,
+    optimal_chunk_chars: int = _DEFAULT_OPTIMAL_CHUNK_CHARS,
+    softmin_chunk_chars: int = _DEFAULT_SOFTMIN_CHUNK_CHARS,
+    min_chunk_chars: int = _DEFAULT_MIN_CHUNK_CHARS,
+    merge_small_chunks: bool = True,
+) -> pd.DataFrame:
+    """
+    Build semantic chunks from blocks with heading hierarchy.
+    
+    Process:
+      1. Prepare blocks (add active_heading_id, remove noise blocks)
+      2. Assign chunk indices (decision logic using DP partitioning)
+      3. Aggregate to chunk level (using hierarchical_aggregator)
+      4. Join text and extract chunk headings
+      5. Sort by document order
+      6. Merge chunk candidates (if merge_small_chunks=True)
+      7. Add token count
+      8. Add chunk IDs and parent_chunk_id
+      9. Add chunk_path (hierarchical heading path)
+    
+    Args:
+        blocks_df: Blocks-level DataFrame from block merger
+        max_chunk_chars: Maximum chunk size in characters (bounded: 800-8000, default: 3200)
+        optimal_chunk_chars: Target chunk size in characters (bounded: 400-4000, default: 1200)
+        softmin_chunk_chars: Soft minimum chunk size - discouraged but allowed (bounded: 200-2000, default: 700)
+        min_chunk_chars: Hard minimum chunk size - strongly discouraged (bounded: 100-1000, default: 400)
+        
+    Returns:
+        Chunks-level DataFrame with semantic chunks
+    """
+    if blocks_df is None or blocks_df.empty:
+        return pd.DataFrame()
+    
+    # -------------------------
+    # VALIDATE PARAMETERS
+    # -------------------------
+    max_chunk_chars, optimal_chunk_chars, softmin_chunk_chars, min_chunk_chars = _validate_chunking_params(
+        max_chunk_chars, optimal_chunk_chars, softmin_chunk_chars, min_chunk_chars
+    )
+    
+    # -------------------------
+    # STEP 1: PREPARE
+    # -------------------------
+    df = _prepare_blocks_df(blocks_df)
+    
+    if df.empty:
+        return pd.DataFrame()
+    
+    # Ensure required columns exist for aggregation DEPRECATED
+    #df = prepare_for_aggregation(
+    #    df,
+    #    required_cols=["page_number", "block_id", "text", "active_heading_id"],
+    #    optional_cols=STANDARD_OPTIONAL_COLUMNS,
+    #)
+    
+    # -------------------------
+    # STEP 2: ASSIGN CHUNK INDICES
+    # -------------------------
+    df = _assign_chunk_indices(
+        df,
+        max_chunk_chars=max_chunk_chars,
+        optimal_chunk_chars=optimal_chunk_chars,
+        softmin_chunk_chars=softmin_chunk_chars,
+        min_chunk_chars=min_chunk_chars,
+    )
+    
+    # -------------------------
+    # STEP 3: AGGREGATE
+    # -------------------------
+    agg_spec = build_standard_agg_spec(
+        identity_cols=["page_number", "active_heading_id"],
+        include_hierarchy=True,
+        include_geometry=True,
+        include_style=True,
+        include_counts=True,
+        include_metadata=True,
+        include_table=True,
+        count_col="block_id",
+        extra_first=["layout_id", "layout_type"],
+    )
+    
+    chunks_df = aggregate_hierarchical(
+        df,
+        group_col="chunk_index",
+        agg_spec=agg_spec,
+        rename_group_col=None,  # Keep chunk_index as is (will be preserved from reset_index)
+        rename_count_col={"block_id": "block_count"},
+        compute_derived=True,
+    )
+    
+    # -------------------------
+    # STEP 4: JOIN TEXT
+    # -------------------------
+    chunks_df = _join_chunk_text(df, chunks_df)
+    
+    # -------------------------
+    # STEP 5: SORT
+    # -------------------------
+    sort_cols = [c for c in ["page_number", "chunk_index"] if c in chunks_df.columns]
+    if sort_cols:
+        chunks_df = chunks_df.sort_values(sort_cols, kind="mergesort").reset_index(drop=True)
+
+    # -------------------------
+    # STEP 6: MERGE CHUNK CANDIDATES
+    # -------------------------
+    if merge_small_chunks:
+        cfg = MergePlanConfig(
+            max_chunk_chars=max_chunk_chars,
+            softmin_chunk_chars=softmin_chunk_chars,
+            min_children_to_merge=2,
+        )
+
+        chunks_df = assign_merged_chunk_id(chunks_df, cfg)
+        
+        # Rebuild the complete df based on the merging of chunks
+        chunks_df = _rebuild_merged_chunks(chunks_df)
+    
+    # -------------------------
+    # STEP 7: ADD TOKEN COUNT
+    # -------------------------
+    chunks_df = _add_token_count(chunks_df)
+    
+    # -------------------------
+    # STEP 8: ADD CHUNK IDS AND REINDEX
+    # -------------------------
+    chunks_df = _add_chunk_ids_and_reindex(chunks_df)
+    
+    # -------------------------
+    # STEP 9: ADD CHUNK PATH
+    # -------------------------
+    try:
+        chunks_df = _add_chunk_path(chunks_df)
+    except RecursionError:
+        # If there's a recursion error (e.g., circular parent references),
+        # skip adding the chunk_path column and continue without it
+        pass
+    
+    return chunks_df

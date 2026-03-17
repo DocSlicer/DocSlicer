@@ -1,0 +1,68 @@
+﻿profile,type,keyword,score,language
+finance,,form 10-k,1,en
+finance,,form 10-q,1,en
+finance,,form 8-k,1,en
+finance,,item 1a,1,en
+finance,,risk factors,1,en
+finance,,discussion and analysis,1,en
+finance,,consolidated statements of operations,1,en
+finance,,senior notes,1,en
+finance,,common stock,1,en
+finance,,cash flow,1,en
+finance,,balance sheet,1,en
+finance,,income statement,1,en
+finance,,prospectus,1,en
+finance,,forward-looking statements,1,en
+finance,,proxy statement,1,en
+finance,,shareholder,1,en
+finance,,board of directors,1,en
+finance,,market share,1,en
+legal,transactions,whereas,1,en
+legal,transactions,in witness whereof,1,en
+legal,transactions,this agreement,1,en
+legal,transactions,governing law,1,en
+legal,transactions,indemnification,1,en
+legal,transactions,indenture,1,en
+legal,transactions,recitals,1,en
+legal,transactions,waiver of jury trial,1,en
+legal,transactions,no recourse,1,en
+legal,transactions,"now, therefore",1,en
+legal,transactions,license agreement,1,en
+legal,transactions,hereinafter referred to as,1,en
+legal,transactions,for and in consideration of,1,en
+legal,transactions,limitation of liability,1,en
+legal,transactions,survival of indemnities,1,en
+legal,judicial,per curiam,1,en
+legal,judicial,it is so ordered,1,en
+legal,judicial,plaintiff,1,en
+legal,judicial,opinion of the court,1,en
+legal,transactions,witnesseth,1,en
+legal,transactions,"whereas,",1,en
+legal,judicial,circuit court,1,en
+legal,judicial,court of appeals,1,en
+academic,,abstract,1,en
+academic,,references,1,en
+academic,,bibliography,1,en
+academic,,doi,1,en
+academic,,arxiv,1,en
+academic,,introduction,1,en
+academic,,methodology,1,en
+academic,,results,1,en
+academic,,conclusion,1,en
+academic,,we propose a method,1,en
+academic,,experimental results show,1,en
+academic,,in this study we,1,en
+academic,,et al.,1,en
+academic,,journal of,1,en
+academic,,international conference,1,en
+academic,,symposium,1,en
+government,,federal register,1,en
+government,,cfr,1,en
+government,,u.s.c.,1,en
+government,,usc,1,en
+government,,proposed rule,1,en
+government,,final rule,1,en
+government,,docket no.,1,en
+government,,agency:,1,en
+government,,action:,1,en
+government,,be it enacted,1,en

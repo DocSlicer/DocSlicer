@@ -1,0 +1,20 @@
+# Local dev / scratch
+test_jelle/
+PLAN.md
+.claude
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Env
+.venv/
+venv/
+.env
+
+# OS
+.DS_Store

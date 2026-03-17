@@ -1,0 +1,42 @@
+# page_label_patterns.yaml
+# Page label token detection patterns
+# Single source of truth for both Python (d03_page_numbers.py) and JS (extract_boxes.js)
+#
+# Examples of valid page labels:
+#   - Arabic: 1, 2, 3, 123
+#   - Roman: i, ii, iii, iv, x, XII
+#   - Alpha-numeric: F-1, S-1, A-12, A12
+#   - Alpha-roman: S-iv, F-ii, A-vii
+#   - Roman-numeric: II-3, IV-12, III-10
+
+version: 1.0.0
+
+max_length: 8  # allows II-12, III-10, S-iv, etc.
+
+patterns:
+  # Pure numbers: 1, 2, 3, 123
+  - name: arabic
+    regex: '^\d{1,3}$'
+    flags: ''
+  
+  # Roman numerals: i, ii, iii, iv, x
+  - name: roman
+    #regex: '^[ivxlcdm]{1,7}$' -- Too broad, matches LLC, Civil, ...
+    regex: '^M?(CM|CD|D?C{0,3})(XC|XL|L?X{0,3})(IX|IV|V?I{0,3})$'
+    flags: 'i'
+  
+  # Alpha-numeric: F-1, S-1, A-12, A12
+  - name: alpha_numeric
+    regex: '^[A-Za-z]{1}-?\d{1,3}$'
+    flags: ''
+  
+  # Alpha-roman: S-iv, F-ii, A-vii
+  - name: alpha_roman
+    regex: '^[A-Za-z]{1}-[ivxlcdm]{1,7}$'
+    flags: 'i'
+  
+  # Roman-numeric compound: II-3, IV-12, III-10
+  - name: roman_numeric
+    regex: '^[IVXLCDM]{1,6}-\d{1,3}$'
+    flags: 'i'
+

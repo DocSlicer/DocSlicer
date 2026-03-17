@@ -1,0 +1,129 @@
+# exhibit_patterns.yaml
+# Minimal patterns for:
+# 1) Exhibit rows (e.g., (c)(1), 3.1, Exhibit A ...)
+# 2) Exhibit section titles / headers (Item ... Exhibits, EXHIBIT INDEX, EXHIBITS)
+
+version: 1.0.0
+
+# =========================
+# Exhibit ROW patterns
+# =========================
+exhibit_row_patterns:
+  # Multiple parens: (c)(1), (a)(2)(iii), (c)-(2) - STRONG indicator
+  - name: multi_parens
+    regex: '^\s*\([A-Za-z0-9]+\)(?:[-\s]*\([^)]*\))+'
+    flags: 'i'
+    strength: strong
+
+  # a(1), c(iii), a-(2)(v) - STRONG
+  - name: alpha_with_parens
+    regex: '^\s*[A-Za-z](?:[-\s]*\([^)]*\))+'
+    flags: 'i'
+    strength: strong
+
+  # 16(a)(2)(v), 16(c)(xii) - STRONG
+  - name: number_with_parens
+    regex: '^\s*\d{1,3}(?:[-\s]*\([^)]*\))+'
+    flags: 'i'
+    strength: strong
+
+  # 4.3(a), 10.1(b) - dotted number + parens - STRONG
+  - name: dotted_with_parens
+    regex: '^\s*\d{1,3}\.\d+\([A-Za-z0-9]+\)\s'
+    flags: 'i'
+    strength: strong
+
+  # 3.1, 99.1, 104 - WEAK indicator
+  - name: numeric_or_dotted
+    regex: '^\s*\d{1,3}(?:\.\d+)*\s'
+    flags: ''
+    strength: weak
+
+  # Exhibit A ..., Exhibit 31.1 ... - STRONG
+  - name: exhibit_prefix_row
+    regex: '^\s*exhibit\s+(?!index\b)(?P<code>[A-Za-z0-9.]+)\b(?P<rest>.*)$' # Excludes "exhibit index"
+    flags: 'i'
+    strength: strong
+  
+  # EX-101.PRE Inline XBRL Taxonomy - STRONG
+  - name: ex_code_row
+    regex: '^\s*EX-\d{3}\.[A-Za-z0-9]+(?P<rest>.*)$'
+    flags: 'i'
+    strength: strong
+
+  # (d) Not applicable. - STRONG
+  - name: subpart_not_applicable
+    regex: '^\s*\([a-z]\)\s+not\s+applicable\.?\s*$'
+    flags: 'i'
+    strength: strong
+
+  # 101, 107, Exhibit 101 ... - STRONG
+  - name: hundred_series_exhibit
+    regex: '^\s*(?:exhibit\s+)?(?P<code>1\d{2})\b(?P<rest>.*)$'
+    flags: 'i'
+    strength: strong
+
+# =========================
+# Exhibit ROW anti-patterns
+# =========================
+# These patterns indicate the row is NOT an exhibit (e.g., financial data, tables)
+
+# This is not used for now - just keeping it here for future reference
+exhibit_row_anti_patterns:
+  - name: percentage_at_start
+    # Only reject if % appears in first 6 characters (avoids rejecting "3.8 Certificate of Designations for 4.55% Stock")
+    regex: '^.{0,6}%'
+    flags: ''
+  
+  - name: currency
+    regex: '\$'
+    flags: ''
+  
+  - name: multiple_numbers
+    regex: '\d+\s+\d+'
+    flags: ''
+  
+  - name: parenthetical_negative
+    # Only reject parenthetical numbers near the start (financial negatives like "(12.7)")
+    # Allows "(incorporated by reference" or "(File No. 1-5805)" later in the text
+    regex: '^.{0,30}\(\d+\.?\d*\)'
+    flags: ''
+  
+  - name: high_precision_decimal
+    regex: '\d+\.\d{3,}'
+    flags: ''
+  
+  - name: multiple_asterisks
+    regex: '\*\s*\*'
+    flags: ''
+
+
+
+
+# =========================
+# Exhibit TITLE / HEADER patterns
+# =========================
+exhibit_header_patterns:
+  # General "Item ... Exhibits ..." – covers:
+  # - "Item 21. Exhibits and Financial Statement Schedules."
+  # - "Item 15. Financial Statements and Exhibits."
+  # - "ITEM 36.2. EXHIBITS"
+  - name: item_any_exhibits
+    regex: '^\s*item\s+\d+(\.\d+)?[\.\s\-–—:]*\s+.*exhibit[s]?\b'
+    flags: 'i'
+
+  # EXHIBIT INDEX
+  - name: exhibit_index
+    regex: '^\s*exhibit\s+index.*'
+    flags: 'i'
+
+  # INDEX TO EXHIBITS
+  - name: index_to_exhibits
+    regex: '^\s*index\s+to\s+exhibit[s]?\s*$'
+    flags: 'i'
+
+  # NEW: title cell that is just "Exhibit" / "Exhibits"
+  # e.g. a table cell with only "EXHIBITS" in it.
+  - name: exhibits_only
+    regex: '^\s*exhibits\s*\.?\s*$'
+    flags: 'i'
