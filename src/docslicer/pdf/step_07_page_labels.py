@@ -7,9 +7,9 @@ Goal (Phase 1 only):
 
 Rules:
 - For each page_number:
-  - Take cells from top _MAX_LINES_TOP temp_line_id’s
-  - Take cells from bottom _MAX_LINES_BOTTOM temp_line_id’s
-  - Exclude temp_line_id’s with more cells than _MAX_CELLS_PER_LINE (likely a table)
+  - Take cells from top _MAX_LINES_TOP line_id’s
+  - Take cells from bottom _MAX_LINES_BOTTOM line_id’s
+  - Exclude line_id’s with more cells than _MAX_CELLS_PER_LINE (likely a table)
 
 Candidate extraction:
 - Normalize tokens
@@ -336,7 +336,7 @@ def mark_pdf_page_label_candidates(
 
     Required columns:
       - page_number
-      - temp_line_id
+      - line_id
       - cell_id
       - text
 
@@ -355,7 +355,7 @@ def mark_pdf_page_label_candidates(
     """
     out = df_cells.copy()
 
-    required = {"page_number", "temp_line_id", "cell_id", "text"}
+    required = {"page_number", "line_id", "cell_id", "text"}
     missing = required - set(out.columns)
     if missing:
         raise ValueError(f"mark_pdf_page_label_candidates: missing columns: {sorted(missing)}")
@@ -372,27 +372,27 @@ def mark_pdf_page_label_candidates(
 
     # Precompute cells per (page, line)
     line_cell_counts = (
-        out.groupby(["page_number", "temp_line_id"], sort=False)["cell_id"]
+        out.groupby(["page_number", "line_id"], sort=False)["cell_id"]
         .size()
         .rename("cells_in_line")
         .reset_index()
     )
 
     # Join counts back (fast enough; avoids per-page groupby sizes)
-    out = out.merge(line_cell_counts, on=["page_number", "temp_line_id"], how="left")
+    out = out.merge(line_cell_counts, on=["page_number", "line_id"], how="left")
 
     # Process page by page
     for page_val, g in out.groupby("page_number", sort=False):
-        # Determine top/bottom temp_line_ids
-        # Assumes temp_line_id increases top->bottom (typical if built that way).
-        line_ids = g["temp_line_id"].dropna().unique()
+        # Determine top/bottom line_ids
+        # Assumes line_id increases top->bottom (typical if built that way).
+        line_ids = g["line_id"].dropna().unique()
         if len(line_ids) == 0:
             continue
 
         try:
             line_ids_sorted = sorted(line_ids)
         except Exception:
-            # If temp_line_id isn't sortable, fall back to pandas sort
+            # If line_id isn't sortable, fall back to pandas sort
             line_ids_sorted = sorted(list(line_ids), key=lambda x: str(x))
 
         top_lines = set(line_ids_sorted[: max_lines_top])
@@ -401,7 +401,7 @@ def mark_pdf_page_label_candidates(
         candidate_lines = top_lines.union(bottom_lines)
 
         # Exclude table-ish lines (too many cells)
-        g_focus = g[g["temp_line_id"].isin(candidate_lines)]
+        g_focus = g[g["line_id"].isin(candidate_lines)]
         g_focus = g_focus[g_focus["cells_in_line"].fillna(0).astype(int) <= int(max_cells_per_line)]
 
         if g_focus.empty:
@@ -482,7 +482,7 @@ def add_page_label_score(
 
     Boundary bonus (+0.5):
       - closest candidate to top/bottom boundary per page
-      - uses y_top/y_bottom if available; else temp_line_id fallback
+      - uses y_top/y_bottom if available; else line_id fallback
     """
     out = df.copy()
 
@@ -660,8 +660,8 @@ def add_page_label_score(
         score += np.where(dist_boundary.notna() & (dist_boundary == min_dist_boundary_on_page), boundary_bonus, 0.0)
 
     else:
-        if "temp_line_id" in out.columns:
-            line_id = pd.to_numeric(c["temp_line_id"], errors="coerce")
+        if "line_id" in out.columns:
+            line_id = pd.to_numeric(c["line_id"], errors="coerce")
             page_min_line = line_id.groupby(c["page_number"]).transform("min")
             page_max_line = line_id.groupby(c["page_number"]).transform("max")
 

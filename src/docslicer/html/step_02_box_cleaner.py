@@ -10,7 +10,7 @@ from typing import Iterable, Mapping
 
 import pandas as pd
 
-from docslicer._utils.text_feature_enhancer import add_calculated_text_features
+from docslicer._utils.text_utils import add_calculated_text_features
 from docslicer._utils.hierarchical_aggregator import (
     build_standard_agg_spec,
     aggregate_hierarchical,

@@ -58,7 +58,7 @@ from typing import Tuple, Optional, Any, Dict, List
 import numpy as np
 import pandas as pd
 
-from ._utils.cell_underline_assessor import assign_cell_underlines
+from .step_07_cell_builder import assign_cell_underlines
 from .._utils.line_merger import assign_line_id
     
 # ================================================================================
@@ -1271,7 +1271,7 @@ def build_cells(
             page_width, page_height
 
     df_shapes : pd.DataFrame, optional
-        Shape dataframe (from step_04_shape_enhancer).
+        Shape dataframe (from step_04_shape_merger).
         If provided, will add rectangle and vertical line relationships to cells.
 
     df_links : pd.DataFrame, optional

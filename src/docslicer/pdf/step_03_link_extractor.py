@@ -14,7 +14,7 @@ Responsibility:
       - link_dest (serialized internal dest / target)
       - link_type: "external" if uri else "internal"
 
-Output columns (per row), matching a subset of LinkSchema:
+Output columns (per row):
     page_number            (1-based)
 
     link_id                (global counter across document)
@@ -28,13 +28,10 @@ Output columns (per row), matching a subset of LinkSchema:
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import fitz  # PyMuPDF
 import pandas as pd
-
-if TYPE_CHECKING:
-    from ..models import LinkSchema  # TypedDict for type-checking only
 
 
 # ==================================================
@@ -85,7 +82,7 @@ def _serialize_dest_from_link(link_dict: Dict[str, Any]) -> Optional[str]:
 
 def _normalize_link_type(uri: Optional[str]) -> str:
     """
-    Map raw uri into one of the LinkSchema link_type values.
+    Map raw uri into a link_type value.
     - "external" if a URI is present
     - "internal" otherwise (dest / named / goto)
     """
@@ -101,16 +98,16 @@ def _extract_links_for_page(
     page_number: int,
     *,
     start_link_id: int,
-) -> Tuple[List["LinkSchema"], int]:
+) -> Tuple[List[Dict[str, Any]], int]:
     """
-    Extract LinkSchema-like dicts for a single PyMuPDF page using page.get_links().
+    Extract link dicts for a single PyMuPDF page using page.get_links().
 
     Returns:
         (list_of_link_dicts, next_link_id)
     """
     link_dicts: List[Dict[str, Any]] = page.get_links() or []
 
-    records: List["LinkSchema"] = []
+    records: List[Dict[str, Any]] = []
     next_link_id = start_link_id
 
     for link in link_dicts:
@@ -126,7 +123,7 @@ def _extract_links_for_page(
 
         next_link_id += 1
 
-        rec: "LinkSchema" = {
+        rec: Dict[str, Any] = {
             "page_number": page_number,
 
             # Geometry
@@ -158,7 +155,7 @@ def extract_links(
     High-level API:
 
     Given a PDF path, return a DataFrame with one row per link
-    (in the shape of LinkSchema, plus page_number).
+    Given a PDF path, return a DataFrame with one row per link.
 
     Only minimal fields are populated:
       - page_number
@@ -167,7 +164,7 @@ def extract_links(
     """
     pdf_path = Path(pdf_path).expanduser().resolve()
 
-    all_records: List["LinkSchema"] = []
+    all_records: List[Dict[str, Any]] = []
     next_link_id = 0
 
     with fitz.open(pdf_path) as doc:

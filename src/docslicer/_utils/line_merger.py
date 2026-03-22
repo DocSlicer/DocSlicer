@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
+import numpy as np
 import pandas as pd
 
 # -----------------------
@@ -18,7 +19,7 @@ YAlignment = Literal["top", "center", "bottom"]
 class LineMergerConfig:
     # Do not merge rows with these block_roles (case-insensitive)
     blocked_block_roles: tuple[str, ...] = ("image", "hr")
-    
+
     # Vertical tolerances (points)
     TOL_BASE: float = 5.0          # default tolerance on selected y key
     TOL_EXPANDED: float = 8.0      # expanded tolerance when overlap is good
@@ -52,111 +53,114 @@ def assign_line_id(
         raise KeyError(f"assign_line_id: missing required columns: {missing}")
 
     out = df.copy()
-    out["line_id"] = 0  # Initialize all to 0
 
-    # Calculate y_key based on alignment
-    y_top = out["y_top"].astype("float64")
-    y_bottom = out["y_bottom"].astype("float64")
-    
+    # Extract all columns as numpy arrays up front — avoids per-row .at overhead
+    y_top_arr    = out["y_top"].to_numpy(dtype=float)
+    y_bottom_arr = out["y_bottom"].to_numpy(dtype=float)
+
     if y_alignment == "top":
-        y_key = y_top
+        y_key_arr = y_top_arr
     elif y_alignment == "bottom":
-        y_key = y_bottom
+        y_key_arr = y_bottom_arr
     else:
-        y_key = (y_top + y_bottom) / 2.0
+        y_key_arr = (y_top_arr + y_bottom_arr) / 2.0
+
+    page_arr = out["page_number"].to_numpy()
 
     has_table_row_id = "table_row_id" in out.columns
-    has_block_role = "block_role" in out.columns
+    has_block_role   = "block_role"   in out.columns
+
+    table_row_arr = out["table_row_id"].to_numpy() if has_table_row_id else None
+    block_role_arr = out["block_role"].to_numpy()  if has_block_role   else None
+
+    # Pre-compute blocked mask if needed
+    if has_block_role:
+        blocked_arr = np.zeros(len(out), dtype=bool)
+        for i, role in enumerate(block_role_arr):
+            if role is not None and not (isinstance(role, float) and np.isnan(role)):
+                if str(role).strip().lower() in config.blocked_block_roles:
+                    blocked_arr[i] = True
+    else:
+        blocked_arr = None
+
+    # Pre-compute table_row notna mask
+    if has_table_row_id:
+        table_notna_arr = np.array([
+            v is not None and not (isinstance(v, float) and np.isnan(v))
+            for v in table_row_arr
+        ], dtype=bool)
+    else:
+        table_notna_arr = None
+
+    line_id_arr  = np.zeros(len(out), dtype=np.int64)
     line_counter = 1
 
-    # Process each page
     for page_num in out["page_number"].unique():
-        page_mask = out["page_number"] == page_num
-        page_indices = out[page_mask].index
-        
-        if len(page_indices) == 0:
+        page_pos = np.where(page_arr == page_num)[0]
+        if len(page_pos) == 0:
             continue
-        
-        # Initialize tracking variables
-        current_line_id = None
-        current_y = None
-        current_top = None
-        current_bottom = None
+
+        current_line_id      = None
+        current_y            = None
+        current_top          = None
+        current_bottom       = None
         current_table_row_id = None
-        
-        for idx in page_indices:
-            row_y = float(y_key.loc[idx])
-            row_top = float(out.at[idx, "y_top"])
-            row_bottom = float(out.at[idx, "y_bottom"])
-            
-            if has_table_row_id:
-                row_table_id = out.at[idx, "table_row_id"]
-            else:
-                row_table_id = None
-            
-            # Check if row has blocked block_role
-            is_blocked = False
-            if has_block_role:
-                row_block_role = out.at[idx, "block_role"]
-                if pd.notna(row_block_role):
-                    role_str = str(row_block_role).strip().lower()
-                    if role_str in config.blocked_block_roles:
-                        is_blocked = True
-            
+
+        for pos in page_pos:
+            row_y      = y_key_arr[pos]
+            row_top    = y_top_arr[pos]
+            row_bottom = y_bottom_arr[pos]
+
             # Blocked rows get their own line_id
-            if is_blocked:
-                out.at[idx, "line_id"] = line_counter
+            if blocked_arr is not None and blocked_arr[pos]:
+                line_id_arr[pos] = line_counter
                 line_counter += 1
                 continue
-            
+
+            row_table_id     = table_row_arr[pos]  if has_table_row_id else None
+            row_table_notna  = table_notna_arr[pos] if has_table_row_id else False
+
             # First row on page
             if current_line_id is None:
-                current_line_id = line_counter
-                out.at[idx, "line_id"] = current_line_id
-                line_counter += 1
-                
-                current_y = row_y
-                current_top = row_top
-                current_bottom = row_bottom
+                current_line_id      = line_counter
+                line_id_arr[pos]     = current_line_id
+                line_counter        += 1
+                current_y            = row_y
+                current_top          = row_top
+                current_bottom       = row_bottom
                 current_table_row_id = row_table_id
                 continue
-            
+
             # Check if should merge with current line
             merge = False
-            
-            # Check table_row_id match
-            if has_table_row_id and pd.notna(row_table_id) and row_table_id == current_table_row_id:
+            if has_table_row_id and row_table_notna and row_table_id == current_table_row_id:
                 merge = True
             else:
-                # Check y tolerance
-                dy = abs(row_y - current_y)
+                dy      = abs(row_y - current_y)
                 overlap = min(row_bottom, current_bottom) - max(row_top, current_top)
-                
                 if dy <= config.TOL_BASE:
                     merge = True
                 elif dy <= config.TOL_EXPANDED and overlap >= config.MIN_VERTICAL_OVERLAP:
                     merge = True
-            
+
             if merge:
-                # Assign to current line
-                out.at[idx, "line_id"] = current_line_id
-                # Update bounding box
-                current_top = min(current_top, row_top)
-                current_bottom = max(current_bottom, row_bottom)
+                line_id_arr[pos] = current_line_id
+                current_top      = min(current_top, row_top)
+                current_bottom   = max(current_bottom, row_bottom)
             else:
-                # Start new line
-                current_line_id = line_counter
-                out.at[idx, "line_id"] = current_line_id
-                line_counter += 1
-                
-                current_y = row_y
-                current_top = row_top
-                current_bottom = row_bottom
+                current_line_id      = line_counter
+                line_id_arr[pos]     = current_line_id
+                line_counter        += 1
+                current_y            = row_y
+                current_top          = row_top
+                current_bottom       = row_bottom
                 current_table_row_id = row_table_id
-    
-    # Compute bucket columns
+
+    # Single bulk assignment instead of per-row .at writes
+    out["line_id"] = line_id_arr
+
     _compute_buckets_inplace(out, y_alignment)
-    
+
     return out
 
 
@@ -172,7 +176,6 @@ def _compute_buckets_inplace(out: pd.DataFrame, y_alignment: YAlignment) -> None
     - center_bucket: true center of line bbox (min y_top, max y_bottom)
     """
     if "line_id" not in out.columns or (out["line_id"] == 0).all():
-        # No valid line_ids, add empty bucket column
         if y_alignment == "top":
             out["top_bucket"] = pd.Series(dtype="Int64")
         elif y_alignment == "bottom":
@@ -180,8 +183,7 @@ def _compute_buckets_inplace(out: pd.DataFrame, y_alignment: YAlignment) -> None
         else:
             out["center_bucket"] = pd.Series(dtype="Int64")
         return
-    
-    # Group by line_id (exclude 0 if present)
+
     valid_mask = out["line_id"] > 0
     if not valid_mask.any():
         if y_alignment == "top":
@@ -191,23 +193,22 @@ def _compute_buckets_inplace(out: pd.DataFrame, y_alignment: YAlignment) -> None
         else:
             out["center_bucket"] = pd.Series(dtype="Int64")
         return
-    
+
     g = out[valid_mask].groupby("line_id")
-    
+
     if y_alignment == "top":
         top_min = g["y_top"].min()
         top_bucket = top_min.round().astype("Int64")
         out["top_bucket"] = out["line_id"].map(top_bucket)
-    
+
     elif y_alignment == "bottom":
         bottom_min = g["y_bottom"].min()
         bottom_bucket = bottom_min.round().astype("Int64")
         out["bottom_bucket"] = out["line_id"].map(bottom_bucket)
-    
+
     else:
-        # Center bucket: true center of merged line bbox
-        top_min = g["y_top"].min()
+        top_min    = g["y_top"].min()
         bottom_max = g["y_bottom"].max()
-        center_true = (top_min.astype("float64") + bottom_max.astype("float64")) / 2.0
+        center_true   = (top_min.astype("float64") + bottom_max.astype("float64")) / 2.0
         center_bucket = center_true.round().astype("Int64")
         out["center_bucket"] = out["line_id"].map(center_bucket)

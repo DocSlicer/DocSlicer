@@ -11,7 +11,8 @@ Pipeline Steps:
     02b. Shape Extraction - Extract shapes/lines from PDF (pdfplumber)
     03. Link Extraction - Extract hyperlinks (PyMuPDF)
     04. Shape Enhancer - Enhance/merge shape metadata
-    05. Gutter Detection - Detect column gutters (future use)
+    05a. Line Number Detection - Flag margin line numbers in df_words
+    05b. Gutter Detection - Detect column gutters (future use)
     06. Cell Builder - Build cells from words + shapes
     07. Page Labels - Assign page labels
     08. Temp Line Builder - Build temporary lines
@@ -35,9 +36,10 @@ from .step_01_word_extractor import extract_words
 from .step_02_image_extractor import extract_images
 from .step_02_shape_extractor import extract_shapes
 from .step_03_link_extractor import extract_links
-from .step_04_shape_enhancer import enhance_shapes
-from .step_05_gutter_extractor import detect_and_annotate_gutters  # Imported but not yet used
-from .step_06_cell_builder import build_cells
+from .step_04_shape_merger import merge_shapes
+from .step_05_line_number_detector import detect_line_numbers
+from .step_06_gutter_detector import detect_and_annotate_gutters  # Imported but not yet used
+from .step_07_cell_builder import build_cells
 from .step_07_page_labels import assign_pdf_page_labels
 from .step_08_temp_line_builder import build_temp_lines
 from .step_09_layout_detector import build_layout
@@ -154,11 +156,14 @@ def run_pipeline(
             on_stage("hierarchy")
         
         # Step 04 - Shape Enhancement
-        df_shapes = enhance_shapes(df_shapes, merge_lines=True)
+        df_shapes = merge_shapes(df_shapes, merge_lines=True)
         
-        # Step 05 - Gutter Detection (imported but not yet integrated)
+        # Step 05a - Line Number Detection
+        df_words = detect_line_numbers(df_words)
+
+        # Step 05b - Gutter Detection (imported but not yet integrated)
         # df_words = detect_and_annotate_gutters(df_words)  # Future use
-        
+
         # Step 06 - Cell Builder
         df_cells, df_words = build_cells(df_words, df_shapes, df_links)
         
