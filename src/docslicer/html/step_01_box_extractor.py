@@ -1,7 +1,6 @@
 # d01_box_extractor.py
 from __future__ import annotations
 
-import re
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -19,84 +18,11 @@ BROWSER_USER_AGENT = (
 PIPELINE_DIR = Path(__file__).parent  # document_pipeline/
 EXTRACTOR_JS_PATH = PIPELINE_DIR / "js" / "extract_boxes.js"
 
-
-# ----------------------------
-# JS injection: isPageLabelToken
-# ----------------------------
-def _generate_js_is_page_label_token(config: dict) -> str:
-    """
-    Generate JavaScript isPageLabelToken function from config dict (YAML).
-    Ensures Python and JS share identical pattern logic.
-
-    Expected config schema:
-      {
-        "max_length": 8,
-        "patterns": [
-          {"name": "...", "regex": "...", "flags": "i" or ""}
-        ]
-      }
-    """
-    max_length = int(config.get("max_length", 8))
-    patterns = config.get("patterns", [])
-
-    tests: list[str] = []
-    for i, p in enumerate(patterns):
-        name = p.get("name", f"p{i}")
-        regex = p.get("regex", "")
-        flags = p.get("flags", "")
-
-        # JS regex literal
-        js_regex = f"/{regex}/{flags}" if flags else f"/{regex}/"
-
-        # Join with || except last
-        sep = " ||" if i < len(patterns) - 1 else ""
-        tests.append(f"{js_regex}.test(s){sep}  /* {name} */")
-
-    tests_joined = "\n        ".join(tests) if tests else "false"
-
-    # IMPORTANT: empty text is NOT a page label token
-    # (prevents over-triggering HR-border on empty bordered containers)
-    return f"""// AUTO-GENERATED from page_label_patterns.yaml - DO NOT EDIT DIRECTLY
-  const isPageLabelToken = (t) => {{
-    const s = normalize(t);
-    if (!s) return false;
-    if (s.length > {max_length}) return false;
-    return (
-        {tests_joined}
-    );
-  }};
-"""
-
-
-def _inject_is_page_label_token(js_code: str, page_label_config: dict) -> str:
-    start_marker = "// __MF_INJECT_IS_PAGE_LABEL_TOKEN_START__"
-    end_marker = "// __MF_INJECT_IS_PAGE_LABEL_TOKEN_END__"
-
-    start_idx = js_code.find(start_marker)
-    end_idx = js_code.find(end_marker)
-
-    if start_idx == -1 or end_idx == -1 or end_idx <= start_idx:
-        raise ValueError(
-            "Could not find injection markers in extract_boxes.js. "
-            "Add the marker block:\n"
-            f"{start_marker}\n...\n{end_marker}"
-        )
-
-    generated_fn = _generate_js_is_page_label_token(page_label_config)
-
-    # Replace everything between markers (exclusive) with generated_fn
-    before = js_code[: start_idx + len(start_marker)]
-    after = js_code[end_idx:]
-
-    # Ensure clean spacing
-    return before + "\n" + generated_fn + "\n" + after
-
 # ----------------------------
 # Public API
 # ----------------------------
 def extract_boxes_with_playwright(
     html: str,
-    page_label_dict: dict,
     source_url: str = None,
 ) -> tuple[List[Dict[str, Any]], str]:
     """
@@ -111,7 +37,7 @@ def extract_boxes_with_playwright(
         source_url: Optional URL - if provided, will navigate instead of setting content
 
     Returns:
-        Tuple of (boxes list, rendered_html string) - rendered_html is what was actually parsed
+        Tuple of (boxes list, rendered_html string, page_dimensions dict)
     """
     if (html is None and source_url is None) or (html is not None and source_url is not None):
         raise ValueError("Exactly one of 'html' or 'url' must be provided")
@@ -124,7 +50,7 @@ def extract_boxes_with_playwright(
     VIEWPORT_HEIGHT = 800
     
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=HEADLESS)
+        browser = p.chromium.launch(headless=HEADLESS, args=["--disable-http2"])
         context = browser.new_context(
             user_agent=BROWSER_USER_AGENT,
             viewport={"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT}
@@ -163,19 +89,11 @@ def extract_boxes_with_playwright(
 
         # Get the rendered HTML
         rendered_html = page.content()
-        
-        # Capture full-page screenshot for pixel-perfect overlay
-        # This is the ONLY way to guarantee alignment
-        import base64
-        screenshot_bytes = page.screenshot(full_page=True, type="png")
-        screenshot_base64 = base64.b64encode(screenshot_bytes).decode('utf-8')
-        
+
         # Get the actual page height after rendering
-        # IMPORTANT: Use VIEWPORT_WIDTH for width since screenshot is captured at viewport width
-        # scrollWidth can differ due to content layout, but screenshot width = viewport width
         page_height = page.evaluate("document.documentElement.scrollHeight")
         page_dimensions = {
-            'width': VIEWPORT_WIDTH,  # Screenshot width is always viewport width
+            'width': VIEWPORT_WIDTH,
             'height': page_height
         }
 
@@ -215,5 +133,4 @@ def extract_boxes_with_playwright(
         box['page_height'] = page_dimensions['height']
         valid_boxes.append(box)
 
-    # Return boxes, rendered HTML, screenshot, and dimensions
-    return valid_boxes, rendered_html, screenshot_base64, page_dimensions
+    return valid_boxes, rendered_html, page_dimensions

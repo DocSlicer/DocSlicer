@@ -40,11 +40,7 @@ from .step_04_shape_merger import merge_shapes
 from .step_05_line_number_detector import detect_line_numbers
 from .step_06_gutter_detector import detect_and_annotate_gutters  # Imported but not yet used
 from .step_07_cell_builder import build_cells
-from .step_07_page_labels import assign_pdf_page_labels
-from .step_08_temp_line_builder import build_temp_lines
-from .step_09_layout_detector import build_layout
-from .step_10_table_processor import process_tables
-from .step_11_line_merger import merge_cells_to_lines
+from .step_08_page_label_detector import assign_pdf_page_labels
 
 # Config loaders
 from .._utils.yaml_loader import load_yamls

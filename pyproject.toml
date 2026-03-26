@@ -36,6 +36,7 @@ dependencies = [
     "lxml>=5.0",
     "scipy>=1.14",
     "matplotlib>=3.9",
+    "httpx>=0.28",
 ]
 
 [project.optional-dependencies]
@@ -45,10 +46,6 @@ html = [
 ocr = [
     "pytesseract>=0.3",
     "opencv-python>=4.8",
-]
-fetch = [
-    "playwright>=1.49",
-    "httpx>=0.28",
 ]
 parquet = [
     "pyarrow>=18.0",

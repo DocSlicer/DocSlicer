@@ -37,7 +37,7 @@ import fitz  # PyMuPDF
 import pandas as pd
 import numpy as np
 
-from ._utils.color_utils import pdf_color_to_hex
+from .._utils.color_utils import pdf_color_to_hex
 from .._utils.text_utils import add_calculated_text_features
 
 

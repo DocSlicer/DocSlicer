@@ -41,7 +41,7 @@ import hashlib
 import fitz  # PyMuPDF
 import pandas as pd
 
-from ._utils.color_utils import pdf_color_to_hex
+from .._utils.color_utils import pdf_color_to_hex
 
 
 def _classify_drawing_type(item: Dict[str, Any]) -> str:

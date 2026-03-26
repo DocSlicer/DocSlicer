@@ -4,9 +4,25 @@ step_05_gutter_extractor.py
 
 from __future__ import annotations
 
+import re
+
 import pandas as pd
 
 from .._utils.text_utils import is_list_marker
+
+# Numeric value: optional currency prefix, number body (123 / 1,23 / 1.23 / (123)), optional % or currency suffix
+_NUMERIC_VALUE_RE = re.compile(
+    r'^[\$€£¥₹₩₪₫₭₮₯₰₱₲₳₴₵₶₷₸₹₺₻₼₽₾]?\(?\d[\d,\.]*\)?[\$€£¥₹₩₪₫₭₮₯₰₱₲₳₴₵₶₷₸₹₺₻₼₽₾%]?$'
+)
+_DASH_TOKENS = {"-", "–", "—", "−"}
+
+
+def _is_numeric_or_dash(text: object) -> bool:
+    """True if text is a numeric value (possibly with currency/percent) or a dash."""
+    if text is None or (isinstance(text, float) and pd.isna(text)):
+        return False
+    t = str(text).strip()
+    return bool(t) and (t in _DASH_TOKENS or bool(_NUMERIC_VALUE_RE.match(t)))
 
 # =======================================================================================================================
 # CONFIG
@@ -944,21 +960,27 @@ def promote_gutter_candidates_to_gutters(gutters_df: pd.DataFrame, words_df: pd.
 
 
 # ------------------------------
-# Reject gutters whose left side is entirely list markers
+# Reject gutters whose left or right side fails content checks
 # ------------------------------
 
-def reject_list_marker_gutters(
+def reject_non_content_gutters(
     gutters_df: pd.DataFrame,
     candidates_df: pd.DataFrame,
     words_df: pd.DataFrame,
 ) -> pd.DataFrame:
     """
-    Remove promoted gutters where every internal-gap left word is a list/bullet
-    marker (e.g. "1.", "(a)", "•").  A real column gutter will have normal text
-    words on both sides; a list-indent gap will only ever have markers on the left.
+    Remove promoted gutters where the internal-gap left or right words uniformly
+    look like non-content columns.  A gutter is rejected if ANY of these hold for
+    either the left or the right side:
+
+    1. All words are list/bullet markers  (e.g. "1.", "(a)", "•").
+    2. All words are short  (< 10 characters each).
+    3. All words are numeric values or dashes  (123, 1,23, 1.23, (123), $5, 12%,
+       or dash variants).
+    4. All words are identical  (e.g. the same date/label repeated on every row).
 
     Requires candidates_df to have: gutter_candidate_id (list), candidate_type,
-    left_word_id.  Requires words_df to have: word_id, text.
+    left_word_id, right_word_id.  Requires words_df to have: word_id, text.
     """
     if gutters_df is None or gutters_df.empty:
         return gutters_df
@@ -984,12 +1006,33 @@ def reject_list_marker_gutters(
     if exploded.empty:
         return gutters_df
 
-    exploded["_left_text"] = exploded["left_word_id"].map(word_text)
-    exploded["_is_marker"] = exploded["_left_text"].apply(is_list_marker)
+    exploded["_left_text"]  = exploded["left_word_id"].map(word_text)
+    exploded["_right_text"] = exploded["right_word_id"].map(word_text)
 
-    # A gutter is rejected only when ALL its internal-gap left words are markers
-    all_markers = exploded.groupby("gutter_candidate_id")["_is_marker"].all()
-    bad_ids = set(all_markers[all_markers].index)
+    def _side_is_bad(grp: pd.DataFrame, col: str) -> bool:
+        """Return True if the side (col) looks like a non-content column."""
+        texts = grp[col].dropna()
+        if texts.empty:
+            return False
+        strs = texts.apply(lambda t: str(t).strip())
+        # 1. All list/bullet markers
+        if strs.apply(is_list_marker).all():
+            return True
+        # 2. All short (< 7 chars)
+        if strs.apply(len).lt(7).all():
+            return True
+        # 3. All numeric values or dashes
+        if strs.apply(_is_numeric_or_dash).all():
+            return True
+        # 4. All identical
+        if strs.nunique() == 1:
+            return True
+        return False
+
+    bad_ids: set = set()
+    for gutter_id, grp in exploded.groupby("gutter_candidate_id"):
+        if _side_is_bad(grp, "_left_text") or _side_is_bad(grp, "_right_text"):
+            bad_ids.add(gutter_id)
 
     if not bad_ids:
         return gutters_df
@@ -1297,17 +1340,14 @@ def detect_and_annotate_gutters(df_words: pd.DataFrame, df_shapes: pd.DataFrame)
     # 4) Promote gutter candidates to actual gutters
     df_gutters = promote_gutter_candidates_to_gutters(df_gutter_candidates, df_words)
 
-    # 4.1) Reject gutters whose entire left side consists of list markers
-    df_gutters = reject_list_marker_gutters(df_gutters, df_gutter_candidates, df_words)
+    # 4.1) Reject gutters whose left or right side looks like non-content (markers, short, numeric, or repeated)
+    df_gutters = reject_non_content_gutters(df_gutters, df_gutter_candidates, df_words)
 
     # 4.5) Annotate gutters with intersecting horizontal line shape_ids
     df_gutters = filter_gutters_by_horizontal_lines(df_gutters, df_shapes)
     
     # 4.6) Filter gutters with no intersecting lines and assign gutter_id
     df_gutters = filter_and_assign_gutter_ids(df_gutters)
-
-    # 5) Group words together to validate gutter candidates
-    # df_word_groups = build_word_groups_in_sliding_windows(df_words) -- not needed, just for debug purposes
 
     # 5) Merge gutters onto words
     df_words = merge_gutters_onto_words(df_words, df_gutters)

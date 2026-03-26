@@ -168,7 +168,7 @@ def _build_result(
 # ─────────────────────────────────────────────
 
 def _run_pipeline(
-    content: str | bytes,
+    content: str | bytes | None,
     content_type: Literal["html", "pdf"],
     source_url: str | None,
     config: ParseConfig,
@@ -180,15 +180,16 @@ def _run_pipeline(
             pdf_bytes=content, source_url=source_url
         )
     elif content_type == "html":
-        if not isinstance(content, str):
+        if content is not None and not isinstance(content, str):
             raise TypeError("HTML content must be a string")
         try:
-            from .html.html_orchestrator import run_pipeline as _run_html_pipeline
+            from playwright.sync_api import sync_playwright as _pw  # noqa: F401
         except ImportError:
             raise ImportError(
                 "HTML parsing requires playwright. Install it with: "
                 "pip install 'docslicer[html]' && playwright install"
             )
+        from .html.html_orchestrator import run_pipeline as _run_html_pipeline
         discovered_metadata, df_lines, df_table_cells = _run_html_pipeline(
             html=content, source_url=source_url
         )

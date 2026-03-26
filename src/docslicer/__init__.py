@@ -84,8 +84,12 @@ def parse_html(
     """Parse an HTML document and return a ParseResult.
 
     Args:
-        source: HTML string, file path, or file-like object.
-        source_url: Original URL of the page (used for link normalisation).
+        source: HTML string, URL, file path, or file-like object.
+            When a URL is passed (starts with http:// or https://), the page is
+            fetched automatically — SEC/Congress URLs use a rate-limited fetcher,
+            all others are rendered via Playwright for full JS execution.
+        source_url: Original URL of the page (used for link normalisation when
+            source is an HTML string or file, not a URL).
         max_chunk_size: Maximum characters per chunk (default 3200).
         optimal_chunk_size: Target characters per chunk (default 1500).
         extract_tables: Include table extraction (default True).
@@ -99,6 +103,9 @@ def parse_html(
         regions=regions,
         debug=debug,
     )
+    # URL passed as source — route through the fetch pipeline
+    if isinstance(source, str) and source.startswith(("http://", "https://")):
+        return _run_pipeline(None, "html", source_url=source, config=config)
     content = _load_text(source)
     return _run_pipeline(content, "html", source_url=source_url, config=config)
 
