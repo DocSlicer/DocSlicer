@@ -27,12 +27,8 @@ import numpy as np
 # HELPERS
 # =============================================================================
 
-def _mode_or_first(series: pd.Series) -> Any:
-    """
-    Return the most prevalent value, or first non-null if all unique.
-    
-    This is used for aggregating categorical/string columns like font_name, color, etc.
-    """
+def _mode_or_first(series: pd.Series) -> Any: #Slow, no longer used
+    """Return the most prevalent value, or first non-null if all unique."""
     if series is None or series.empty:
         return None
     vc = series.value_counts(dropna=True)
@@ -42,68 +38,117 @@ def _mode_or_first(series: pd.Series) -> Any:
     return s2.iloc[0] if not s2.empty else None
 
 
+class _AlphaWeightedStyleSentinel:
+    """
+    Sentinel for style columns in build_standard_agg_spec.
+
+    aggregate_hierarchical intercepts columns marked with this and uses a single
+    vectorised groupby().idxmax() on alpha_count to pick the style from the
+    row with the most real text — faster than per-group value_counts() and
+    immune to bullet/symbol fonts overriding the dominant style.
+
+    Falls back to mode-or-first (via __call__) when alpha_count is absent,
+    so the sentinel is safe to leave in the agg spec without special handling.
+    """
+    def __repr__(self) -> str:
+        return "ALPHA_WEIGHTED_STYLE"
+
+    def __call__(self, series: pd.Series) -> Any:
+        return _mode_or_first(series)
+
+
+ALPHA_WEIGHTED_STYLE = _AlphaWeightedStyleSentinel()
+
+
 def _collect_unique_list(series: pd.Series) -> Optional[List[Any]]:
     """
-    Collect all unique non-null values into a list.
-    
-    This is used for aggregating fields like ixbrl_id where we want to preserve
-    all unique values across the group (e.g., ['f-5', 'f-6', 'f-7']).
-    
-    If values are already lists (from previous aggregation), they are flattened
-    and then deduplicated.
-    
-    Returns:
-        List of unique values, or None if series is empty/all null/only empty strings
+    Collect all unique non-null values into a list, flattening any nested lists.
+
+    Used as a fallback aggregator when called directly per-group by pandas.
+    For bulk aggregation prefer :func:`_fast_agg_unique_list` which filters
+    nulls once at the column level instead of allocating a new Series per group.
     """
     if series is None or series.empty:
         return None
-    
-    all_values = []
-    for val in series.dropna():
+    seen: set = set()
+    unique_vals: List[Any] = []
+    for val in series:
+        if val is None or (type(val) is float and val != val):  # fast NaN check
+            continue
         if isinstance(val, list):
-            # Flatten lists (e.g., ['f-7', 'f-8'] from previous aggregation)
-            all_values.extend(val)
-        elif val != "":
-            # Single value
-            all_values.append(val)
-    
-    if not all_values:
-        return None
-    
-    # Deduplicate while preserving order
-    seen = set()
-    unique_vals = []
-    for v in all_values:
-        if v not in seen and v != "":
-            seen.add(v)
-            unique_vals.append(v)
-    
+            for v in val:
+                if v and v != "" and v not in seen:
+                    seen.add(v)
+                    unique_vals.append(v)
+        elif val != "" and val not in seen:
+            seen.add(val)
+            unique_vals.append(val)
     return unique_vals if unique_vals else None
 
 
 def _merge_dicts(series: pd.Series) -> Optional[Dict[str, Any]]:
     """
-    Merge all dictionaries in the series into a single dictionary.
-    
-    This is used for aggregating fields like html_data_attrs where each row
-    might have {"key1": "val1"} and we want to consolidate into one dict.
-    Later values overwrite earlier ones for duplicate keys.
-    
-    Returns:
-        Merged dictionary, or None if series is empty/all null
+    Merge all dicts in the series into one dict (later values win on duplicate keys).
+
+    Used as a fallback aggregator when called directly per-group by pandas.
+    For bulk aggregation prefer :func:`_fast_agg_merge_dicts`.
     """
     if series is None or series.empty:
         return None
-    
-    merged = {}
-    for val in series.dropna():
+    merged: Dict[str, Any] = {}
+    for val in series:
+        if val is None or (type(val) is float and val != val):
+            continue
         if isinstance(val, dict):
             merged.update(val)
-        elif val:  # Handle string representations of dicts if needed
-            # Could add json.loads here if string dicts are common
-            pass
-    
     return merged if merged else None
+
+
+def _fast_agg_unique_list(df: pd.DataFrame, group_col: str, col: str) -> pd.Series:
+    """
+    Aggregate ``col`` into per-group unique value lists without calling
+    ``Series.dropna()`` once per group.
+
+    Strategy: drop NAs once at the column level (one vectorised C op), explode
+    any already-list values, then use pandas' native ``agg(list)`` (C-level)
+    and deduplicate in a single ``map`` pass over the result — O(1) Python
+    overhead regardless of the number of groups.
+
+    Returns a Series indexed by ``group_col``.
+    """
+    sub = df[[group_col, col]].dropna(subset=[col])
+    if sub.empty:
+        return pd.Series(dtype=object, name=col)
+
+    # Flatten cells that already contain lists (from a prior aggregation pass)
+    if sub[col].apply(lambda v: isinstance(v, list)).any():
+        sub = sub.explode(col).dropna(subset=[col])
+
+    sub = sub[sub[col] != ""]
+    if sub.empty:
+        return pd.Series(dtype=object, name=col)
+
+    raw = sub.groupby(group_col, sort=False)[col].agg(list)
+    return raw.map(lambda lst: list(dict.fromkeys(lst)) or None)
+
+
+def _fast_agg_merge_dicts(df: pd.DataFrame, group_col: str, col: str) -> pd.Series:
+    """
+    Merge dict-valued cells per group without calling ``Series.dropna()`` per group.
+
+    Returns a Series indexed by ``group_col``.
+    """
+    sub = df[[group_col, col]].dropna(subset=[col])
+    if sub.empty:
+        return pd.Series(dtype=object, name=col)
+
+    sub = sub[sub[col].apply(lambda v: isinstance(v, dict))]
+    if sub.empty:
+        return pd.Series(dtype=object, name=col)
+
+    return sub.groupby(group_col, sort=False)[col].agg(
+        lambda s: {k: v for d in s for k, v in d.items()} or None
+    )
 
 
 def _ensure_columns(df: pd.DataFrame, defaults: Dict[str, Any]) -> pd.DataFrame:
@@ -160,17 +205,23 @@ def build_standard_agg_spec(
     # Identity columns (take first value in group)
     if identity_cols is None:
         identity_cols = [
-            "page_number", # TODO: This may become a list if chunk spans multiple pages
+            "page_number",
+            "page_width",
+            "page_height",
+            "page_format",
+            "page_label",
+            "page_label_type",
+            "page_label_value",
             "layout_id",
             "layout_type",
             "block_role",
             "document_region",
-            "page_width",
-            "page_height",
-            "page_format", # US Letter, A4, etc.
-            "page_label", # TODO: This may become a list if chunk spans multiple pages
-            "page_label_type",
-            "page_label_value",
+            # PDF-pipeline columns (harmless no-ops on other pipelines)
+            "reading_column",
+            "gutter_id_left",
+            "gutter_id_right",
+            "is_sentence_like",
+            "sentence_score",
         ]
     
     for col in identity_cols:
@@ -200,22 +251,22 @@ def build_standard_agg_spec(
             "x_right": "max",
             "y_top": "min",
             "y_bottom": "max",
-            "layout_align": _mode_or_first,
-            "text_align": _mode_or_first,
+            "layout_align": ALPHA_WEIGHTED_STYLE,
+            "text_align": ALPHA_WEIGHTED_STYLE,
         })
 
     # Style (most prevalent)
     if include_style:
         spec.update({
-            "font_size": _mode_or_first,
-            "font_weight": _mode_or_first,
-            "font_name": _mode_or_first,
-            "font_family": _mode_or_first,
-            "text_orientation": _mode_or_first,
-            "non_stroking_color": _mode_or_first,
-            "stroking_color": _mode_or_first,
-            "background_non_stroking_color": _mode_or_first,
-            "background_stroking_color": _mode_or_first,
+            "font_size": ALPHA_WEIGHTED_STYLE,
+            "font_weight": ALPHA_WEIGHTED_STYLE,
+            "font_name": ALPHA_WEIGHTED_STYLE,
+            "font_family": ALPHA_WEIGHTED_STYLE,
+            "text_orientation": ALPHA_WEIGHTED_STYLE,
+            "non_stroking_color": ALPHA_WEIGHTED_STYLE,
+            "stroking_color": ALPHA_WEIGHTED_STYLE,
+            "background_non_stroking_color": ALPHA_WEIGHTED_STYLE,
+            "background_stroking_color": ALPHA_WEIGHTED_STYLE,
         })
 
         spec.update({
@@ -251,8 +302,8 @@ def build_standard_agg_spec(
         spec.update({
             "has_link": "max",
             "link_url": _collect_unique_list, 
-            "link_dest": _mode_or_first,
-            "link_type": _mode_or_first,
+            "link_dest": ALPHA_WEIGHTED_STYLE,
+            "link_type": ALPHA_WEIGHTED_STYLE,
             "ixbrl_id": _collect_unique_list,  # Consolidate all unique ixbrl IDs into list
             "html_data_attrs": _merge_dicts,   # Merge all data attributes into single dict
         })
@@ -263,7 +314,7 @@ def build_standard_agg_spec(
             "table_id": "first",
             "table_row_id": "first", # Needed for Line Merger
             "table_header_flag": "first",
-            "table_type": "first",
+
             "row_start": "first",
             "col_start": "first",
         })
@@ -332,40 +383,97 @@ def aggregate_hierarchical(
         Aggregated dataframe with derived columns added
     """
     df = df.copy()
-    
+
     # -------------------------
     # PREPARATION: Compute weighted ratio numerators for correct aggregation
     # -------------------------
     if "bold_ratio" in df.columns and "char_count" in df.columns:
         df["_bold_char_est"] = df["bold_ratio"].fillna(0.0) * df["char_count"].fillna(0.0)
-    
+
     if "italic_ratio" in df.columns and "char_count" in df.columns:
         df["_italic_char_est"] = df["italic_ratio"].fillna(0.0) * df["char_count"].fillna(0.0)
-    
+
     if "underlined_ratio" in df.columns and "char_count" in df.columns:
         df["_underlined_char_est"] = df["underlined_ratio"].fillna(0.0) * df["char_count"].fillna(0.0)
-    
+
     # -------------------------
     # AGGREGATION: Filter spec to existing columns and aggregate
     # -------------------------
     # Filter agg_spec to only include columns that exist in df (pick and mix)
     # Exclude the group_col itself (it becomes the index and is restored by reset_index)
-    filtered_spec = {col: agg_func for col, agg_func in agg_spec.items() 
+    filtered_spec = {col: agg_func for col, agg_func in agg_spec.items()
                      if col in df.columns and col != group_col}
-    
+
+    # Intercept ALPHA_WEIGHTED_STYLE columns for vectorised idxmax treatment.
+    # When alpha_count is present this is both faster and more accurate than
+    # calling the sentinel's _mode_or_first fallback per-group.
+    # When alpha_count is absent the sentinel stays in filtered_spec and is
+    # called directly as _mode_or_first via its __call__ — no special casing needed.
+    alpha_style_cols: List[str] = []
+    if "alpha_count" in df.columns:
+        alpha_style_cols = [
+            col for col, fn in list(filtered_spec.items())
+            if fn is ALPHA_WEIGHTED_STYLE
+        ]
+        for col in alpha_style_cols:
+            del filtered_spec[col]
+
+    # Columns whose aggregators call Series.dropna() once per group — extract them
+    # so they can be handled with a single vectorised pre-filter pass instead.
+    unique_list_cols = [col for col, fn in list(filtered_spec.items()) if fn is _collect_unique_list]
+    merge_dict_cols  = [col for col, fn in list(filtered_spec.items()) if fn is _merge_dicts]
+    for col in unique_list_cols + merge_dict_cols:
+        del filtered_spec[col]
+
     # Aggregate
     grouped = df.groupby(group_col, sort=False, observed=True).agg(filtered_spec).reset_index()
-    
+
     # Rename columns
     renames = {}
     if rename_group_col:
         renames[group_col] = rename_group_col
     if rename_count_col:
         renames.update(rename_count_col)
-    
+
     if renames:
         grouped = grouped.rename(columns=renames)
-    
+
+    merge_key = rename_group_col if rename_group_col else group_col
+
+    # Merge back the expensive columns using the fast pre-filter approach
+    for col in unique_list_cols:
+        if col in df.columns:
+            col_result = _fast_agg_unique_list(df, group_col, col)
+            if col_result.empty:
+                grouped[col] = None
+            else:
+                col_df = col_result.reset_index().rename(columns={group_col: merge_key})
+                grouped = grouped.merge(col_df, on=merge_key, how="left")
+        else:
+            grouped[col] = None
+
+    for col in merge_dict_cols:
+        if col in df.columns:
+            col_result = _fast_agg_merge_dicts(df, group_col, col)
+            if col_result.empty:
+                grouped[col] = None
+            else:
+                col_df = col_result.reset_index().rename(columns={group_col: merge_key})
+                grouped = grouped.merge(col_df, on=merge_key, how="left")
+        else:
+            grouped[col] = None
+
+    # Alpha-weighted style assignment: pick style from the row with the highest
+    # alpha_count in each group (one vectorised idxmax, no per-group Python calls).
+    if alpha_style_cols:
+        style_idx  = df.groupby(group_col, sort=False)["alpha_count"].idxmax()
+        style_rows = (
+            df.loc[style_idx.values, [group_col] + alpha_style_cols]
+            .rename(columns={group_col: merge_key})
+            .reset_index(drop=True)
+        )
+        grouped = grouped.merge(style_rows, on=merge_key, how="left")
+
     if not compute_derived:
         return grouped
     

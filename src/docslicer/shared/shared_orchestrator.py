@@ -24,12 +24,12 @@ logger = logging.getLogger(__name__)
 from .step_01_toc_detector import detect_and_annotate_tocs
 from .step_02_exhibit_detector import detect_and_mark_exhibits
 from .step_03_navigation_detector import detect_navigation_blocks
-from .step_05_doc_region_assigner import assign_doc_region
-from .step_06_hierarchy_assigner import assign_doc_hierarchy
+from .step_04_doc_region_assigner import assign_doc_region
+from .step_05_hierarchy_assigner import assign_doc_hierarchy
 
 # Shared Pipeline Steps
-from .step_07_block_merger import merge_blocks
-from .step_08_chunk_builder import build_chunks
+from .step_06_block_merger import merge_blocks
+from .step_07_chunk_builder import build_chunks
 
 # Config loaders
 from .._utils.yaml_loader import load_yamls

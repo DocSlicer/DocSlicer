@@ -16,7 +16,7 @@ BROWSER_USER_AGENT = (
 
 # JS lives in document_pipeline/js folder
 PIPELINE_DIR = Path(__file__).parent  # document_pipeline/
-EXTRACTOR_JS_PATH = PIPELINE_DIR / "js" / "extract_boxes.js"
+EXTRACTOR_JS_PATH = PIPELINE_DIR / "extract_boxes.js"
 
 # ----------------------------
 # Public API
@@ -37,7 +37,7 @@ def extract_boxes_with_playwright(
         source_url: Optional URL - if provided, will navigate instead of setting content
 
     Returns:
-        Tuple of (boxes list, rendered_html string, page_dimensions dict)
+        Tuple of (boxes list, rendered_html string)
     """
     if (html is None and source_url is None) or (html is not None and source_url is not None):
         raise ValueError("Exactly one of 'html' or 'url' must be provided")
@@ -59,11 +59,13 @@ def extract_boxes_with_playwright(
 
         # For URLs: navigate to execute client-side JS (React, etc.)
         # For files: set content directly
+        navigated_url = False
         if source_url and source_url.startswith(('http://', 'https://')):
             try:
                 # Navigate and wait for DOM to be loaded
                 # domcontentloaded is more reliable than networkidle for pages with ongoing network activity
                 page.goto(source_url, wait_until="domcontentloaded", timeout=30000)
+                navigated_url = True
             except Exception as e:
                 # If we have html as fallback, use it
                 if html:
@@ -74,7 +76,12 @@ def extract_boxes_with_playwright(
         else:
             # For file uploads or when URL is not provided
             page.set_content(html, wait_until="load")
-        
+
+        # For URL navigation, wait for fonts to finish loading before measuring layout.
+        # set_content("load") already guarantees this; goto("domcontentloaded") does not.
+        if navigated_url:
+            page.evaluate("document.fonts.ready")
+
         # Inject CSS reset to ensure consistent margins (removes default body margin)
         # This must be done BEFORE extracting coordinates
         page.add_style_tag(content="""
@@ -84,9 +91,6 @@ def extract_boxes_with_playwright(
             html { scrollbar-width: none; }
         """)
         
-        # Wait a moment for styles to apply and fonts to load
-        page.wait_for_timeout(500)
-
         # Get the rendered HTML
         rendered_html = page.content()
 
@@ -133,4 +137,4 @@ def extract_boxes_with_playwright(
         box['page_height'] = page_dimensions['height']
         valid_boxes.append(box)
 
-    return valid_boxes, rendered_html, page_dimensions
+    return valid_boxes, rendered_html

@@ -94,7 +94,7 @@ MASTER_COLUMN_ORDER: List[str] = [
     "table_id",
     "table_row_id",
     "table_header_flag",
-    "table_type",
+
     "row_start",
     "col_start",
 

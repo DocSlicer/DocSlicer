@@ -38,7 +38,6 @@ Notes:
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, List, Set, Tuple
 
 import numpy as np
 import pandas as pd
@@ -219,37 +218,38 @@ def _assign_column_layout(df_cells: pd.DataFrame) -> pd.DataFrame:
         3. SPLIT detection: if a single column receives ≥2 disjoint same-line
            cells that each hit only that column, split it into subcolumns.
     """
-    def _ranges_overlap(a_left, a_right, b_left, b_right):
-        return a_left < b_right and b_left < a_right
+    # Columns are stored as two parallel Python lists (faster than list-of-dicts).
+    def _find_hits(x_left, x_right, col_lefts, col_rights):
+        hits = []
+        for i in range(len(col_lefts)):
+            if x_left < col_rights[i] and col_lefts[i] < x_right:
+                hits.append(i)
+        return hits
 
-    def _find_overlapping(x_left, x_right, columns):
-        return [
-            i for i, col in enumerate(columns)
-            if _ranges_overlap(x_left, x_right, col["x_left"], col["x_right"])
-        ]
-
-    def _process_cell(x_left, x_right, columns):
-        hits = _find_overlapping(x_left, x_right, columns)
-        if len(hits) == 0:
-            pos = len(columns)
-            for i, col in enumerate(columns):
-                if x_right <= col["x_left"]:
+    def _process_cell(x_left, x_right, col_lefts, col_rights):
+        hits = _find_hits(x_left, x_right, col_lefts, col_rights)
+        if not hits:
+            pos = len(col_lefts)
+            for i, cl in enumerate(col_lefts):
+                if x_right <= cl:
                     pos = i
                     break
-            columns.insert(pos, {"x_left": x_left, "x_right": x_right})
+            col_lefts.insert(pos, x_left)
+            col_rights.insert(pos, x_right)
             return [pos]
         if len(hits) == 1:
             i = hits[0]
-            columns[i]["x_left"]  = min(x_left,  columns[i]["x_left"])
-            columns[i]["x_right"] = max(x_right, columns[i]["x_right"])
+            col_lefts[i]  = min(x_left,  col_lefts[i])
+            col_rights[i] = max(x_right, col_rights[i])
         return hits
 
-    def _maybe_split(line_cells, columns):
+    def _maybe_split(xl_arr, xr_arr, col_lefts, col_rights):
+        # xl_arr / xr_arr are numpy float arrays — no itertuples overhead.
         sole: dict[int, list[tuple[float, float]]] = {}
-        for cell in line_cells.itertuples():
-            hits = _find_overlapping(cell.x_left, cell.x_right, columns)
+        for xl, xr in zip(xl_arr, xr_arr):
+            hits = _find_hits(xl, xr, col_lefts, col_rights)
             if len(hits) == 1:
-                sole.setdefault(hits[0], []).append((float(cell.x_left), float(cell.x_right)))
+                sole.setdefault(hits[0], []).append((xl, xr))
         splits = []
         for col_idx, intervals in sole.items():
             if len(intervals) < 2:
@@ -258,7 +258,7 @@ def _assign_column_layout(df_cells: pd.DataFrame) -> pd.DataFrame:
             segs: list[tuple[float, float]] = []
             cl, cr = ivs[0]
             for a, b in ivs[1:]:
-                if _ranges_overlap(cl, cr, a, b):
+                if cl < b and a < cr:  # ranges_overlap
                     cr = max(cr, b)
                 else:
                     segs.append((cl, cr))
@@ -267,57 +267,70 @@ def _assign_column_layout(df_cells: pd.DataFrame) -> pd.DataFrame:
             if len(segs) > 1:
                 splits.append((col_idx, segs))
         for col_idx, segs in sorted(splits, key=lambda t: t[0], reverse=True):
-            columns[col_idx:col_idx + 1] = [
-                {"x_left": s, "x_right": e} for s, e in segs
-            ]
+            col_lefts[col_idx:col_idx + 1]  = [s for s, _ in segs]
+            col_rights[col_idx:col_idx + 1] = [e for _, e in segs]
 
     result = df_cells.copy()
-    result["col_start"]      = -1
-    result["col_end"]        = -1
-    result["colspan"]        = -1
+    result["col_start"]       = -1
+    result["col_end"]         = -1
+    result["colspan"]         = -1
     result["band_total_cols"] = -1
 
-    for (page, band), band_df in result.groupby(["page_number", "horizontal_band_id"]):
+    for _, band_df in result.groupby(["page_number", "horizontal_band_id"]):
         line_cell_counts = band_df.groupby("line_id").size()
         seed_line_id     = line_cell_counts.idxmax()
 
-        seed_cells = band_df[band_df["line_id"] == seed_line_id].sort_values("x_left")
-        columns: list[dict] = [
-            {"x_left": float(r.x_left), "x_right": float(r.x_right)}
-            for r in seed_cells.itertuples()
-        ]
+        # Pre-group by line_id once; store sorted numpy arrays to avoid
+        # repeated DataFrame filtering and itertuples overhead.
+        line_groups: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+        for lid, grp in band_df.groupby("line_id"):
+            grp_sorted = grp.sort_values("x_left")
+            line_groups[lid] = (
+                grp_sorted["x_left"].to_numpy(dtype=float),
+                grp_sorted["x_right"].to_numpy(dtype=float),
+            )
 
-        all_line_ids  = sorted(band_df["line_id"].unique())
-        seed_idx      = all_line_ids.index(seed_line_id)
-        lines_below   = all_line_ids[seed_idx + 1:]
-        lines_above   = list(reversed(all_line_ids[:seed_idx]))
+        seed_xl, seed_xr = line_groups[seed_line_id]
+        col_lefts:  list[float] = list(seed_xl)
+        col_rights: list[float] = list(seed_xr)
 
-        for line_id in lines_below:
-            lc = band_df[band_df["line_id"] == line_id].sort_values("x_left")
-            _maybe_split(lc, columns)
-            for _, cell in lc.iterrows():
-                _process_cell(float(cell["x_left"]), float(cell["x_right"]), columns)
+        all_line_ids = sorted(band_df["line_id"].unique())
+        seed_idx     = all_line_ids.index(seed_line_id)
+        lines_below  = all_line_ids[seed_idx + 1:]
+        lines_above  = list(reversed(all_line_ids[:seed_idx]))
 
-        for line_id in lines_above:
-            lc = band_df[band_df["line_id"] == line_id].sort_values("x_left")
-            _maybe_split(lc, columns)
-            for _, cell in lc.iterrows():
-                _process_cell(float(cell["x_left"]), float(cell["x_right"]), columns)
+        for line_id in lines_below + lines_above:
+            xl_arr, xr_arr = line_groups[line_id]
+            _maybe_split(xl_arr, xr_arr, col_lefts, col_rights)
+            for xl, xr in zip(xl_arr, xr_arr):
+                _process_cell(xl, xr, col_lefts, col_rights)
 
-        total_cols = len(columns)
-        band_mask  = (
-            (result["page_number"] == page) &
-            (result["horizontal_band_id"] == band)
-        )
-        result.loc[band_mask, "band_total_cols"] = total_cols
+        total_cols = len(col_lefts)
 
-        for cell in band_df.itertuples():
-            hits = _find_overlapping(cell.x_left, cell.x_right, columns)
-            col_start = hits[0]  if hits else total_cols
-            col_end   = hits[-1] if hits else total_cols
-            result.loc[result["cell_id"] == cell.cell_id, "col_start"] = col_start
-            result.loc[result["cell_id"] == cell.cell_id, "col_end"]   = col_end
-            result.loc[result["cell_id"] == cell.cell_id, "colspan"]   = col_end - col_start + 1
+        # Vectorised final assignment: broadcast (n_cells, 1) vs (1, n_cols).
+        # This replaces the per-cell result.loc[mask] loop which was O(n²).
+        band_xl = band_df["x_left"].to_numpy(dtype=float)
+        band_xr = band_df["x_right"].to_numpy(dtype=float)
+
+        if total_cols > 0:
+            cl_np = np.array(col_lefts)
+            cr_np = np.array(col_rights)
+            overlap = (band_xl[:, None] < cr_np[None, :]) & \
+                      (cl_np[None, :] < band_xr[:, None])   # (n_cells, n_cols)
+            has_hit = overlap.any(axis=1)
+            cs_arr  = np.where(has_hit, overlap.argmax(axis=1), total_cols)
+            ce_arr  = np.where(has_hit,
+                               total_cols - 1 - np.fliplr(overlap).argmax(axis=1),
+                               total_cols)
+        else:
+            cs_arr = np.full(len(band_df), total_cols, dtype=np.intp)
+            ce_arr = np.full(len(band_df), total_cols, dtype=np.intp)
+
+        # Assign to result in one shot using the original DataFrame index.
+        result.loc[band_df.index, "col_start"]       = cs_arr
+        result.loc[band_df.index, "col_end"]         = ce_arr
+        result.loc[band_df.index, "colspan"]         = ce_arr - cs_arr + 1
+        result.loc[band_df.index, "band_total_cols"] = total_cols
 
     return result
 
@@ -471,148 +484,6 @@ def _classify_layout_types(df_cells: pd.DataFrame) -> pd.DataFrame:
 # STEP 5: Build table structure
 # ============================================================
 
-# --- table sub-type classification (standard / matrix / narrative) ---
-
-_NUMERIC_RE = re.compile(
-    r"""
-    ^\s*
-    [\(\[]?                    # optional opening bracket
-    [+\--–—]?                  # optional sign
-    \$?                        # optional dollar
-    \d{1,3}(?:,\d{3})*|\d+     # integer with optional thousands OR plain integer
-    (?:\.\d+)?                 # optional decimal part
-    %?                         # optional percentage
-    [\)\]]?                    # optional closing bracket
-    \s*$
-    """,
-    re.VERBOSE,
-)
-
-
-def _is_numeric_cell(text: Any) -> bool:
-    if not isinstance(text, str):
-        return False
-    stripped = text.strip()
-    if not stripped or any(ch.isalpha() for ch in stripped):
-        return False
-    return bool(_NUMERIC_RE.match(stripped))
-
-
-def _compute_table_metrics(table_df: pd.DataFrame) -> dict:
-    n_cells = len(table_df)
-    if n_cells == 0:
-        return {
-            "numeric_density": 0.0, "median_cells_per_line": 0.0,
-            "median_cells_per_line_ratio": 0.0, "numeric_cols_ratio": 0.0,
-            "band_total_cols": 0, "cells_per_col_cv": 0.0, "avg_table_row_score": 0.0,
-        }
-
-    band_total_mode = table_df["band_total_cols"].mode()
-    band_total_cols = int(band_total_mode.iloc[0]) if len(band_total_mode) > 0 else int(table_df["band_total_cols"].max())
-
-    numeric_density = float(table_df["text"].map(_is_numeric_cell).mean())
-
-    line_col = "line_id" if "line_id" in table_df.columns else "temp_line_id"
-    per_line_counts = table_df.groupby(line_col)["cell_id"].count()
-    median_cells_per_line = float(per_line_counts.median())
-    median_cells_per_line_ratio = median_cells_per_line / band_total_cols if band_total_cols > 0 else 0.0
-
-    per_col = table_df.groupby("col_start")
-    per_col_counts = per_col["cell_id"].count()
-    per_col_numeric = per_col["text"].apply(lambda s: sum(_is_numeric_cell(t) for t in s))
-    numeric_cols_ratio = float((per_col_numeric / per_col_counts >= 0.5).sum()) / band_total_cols if band_total_cols > 0 else 0.0
-
-    cells_per_col_cv = (
-        float(per_col_counts.std(ddof=0) / per_col_counts.mean())
-        if len(per_col_counts) > 1 and per_col_counts.mean() != 0 else 0.0
-    )
-
-    avg_table_row_score = float(
-        table_df["average_table_score"].mean() if "average_table_score" in table_df.columns
-        else table_df["table_row_score"].mean()
-    )
-
-    return {
-        "numeric_density": numeric_density,
-        "median_cells_per_line": median_cells_per_line,
-        "median_cells_per_line_ratio": median_cells_per_line_ratio,
-        "numeric_cols_ratio": numeric_cols_ratio,
-        "band_total_cols": band_total_cols,
-        "cells_per_col_cv": cells_per_col_cv,
-        "avg_table_row_score": avg_table_row_score,
-    }
-
-
-def _score_table_types(metrics: dict) -> dict[str, int]:
-    nd   = metrics["numeric_density"]
-    ratio = metrics["median_cells_per_line_ratio"]
-    ncr  = metrics["numeric_cols_ratio"]
-    bc   = metrics["band_total_cols"]
-    cv   = metrics["cells_per_col_cv"]
-    avg  = metrics["avg_table_row_score"]
-
-    scores: dict[str, int] = {"standard": 0, "matrix": 0, "narrative": 0}
-
-    if nd >= 0.60:       scores["standard"] += 3
-    elif nd >= 0.30:     scores["standard"] += 1
-    elif nd <= 0.10:     scores["matrix"] += 2; scores["narrative"] += 2
-
-    if ratio >= 0.9:     scores["standard"] += 2; scores["matrix"] += 3
-    elif ratio >= 0.7:   scores["standard"] += 2; scores["matrix"] += 2
-    elif ratio <= 0.5:   scores["narrative"] += 3
-
-    if ncr >= 0.5:       scores["standard"] += 3
-    elif ncr >= 0.2:     scores["standard"] += 1
-    elif ncr <= 0.1:     scores["matrix"] += 1; scores["narrative"] += 1
-
-    if bc >= 6:          scores["standard"] += 2
-    elif 2 <= bc <= 4:   scores["matrix"] += 1; scores["narrative"] += 1
-
-    if cv <= 0.3:        scores["standard"] += 1; scores["matrix"] += 3
-    elif cv < 0.7:       scores["standard"] += 1; scores["matrix"] += 1; scores["narrative"] += 1
-    else:                scores["narrative"] += 3
-
-    if avg >= 4.0:       scores["standard"] += 2
-    else:                scores["matrix"] += 1; scores["narrative"] += 1
-
-    return scores
-
-
-def _infer_table_type(metrics: dict) -> str:
-    scores = _score_table_types(metrics)
-    max_score = max(scores.values())
-    candidates = [t for t, s in scores.items() if s == max_score]
-    if len(candidates) == 1:
-        return candidates[0]
-    nd    = metrics["numeric_density"]
-    ratio = metrics["median_cells_per_line_ratio"]
-    cv    = metrics["cells_per_col_cv"]
-    if nd >= 0.4:                    return "standard"
-    if ratio >= 0.8 and cv <= 0.4:   return "matrix"
-    return "narrative"
-
-
-def _classify_table_types(
-    df_cells: pd.DataFrame,
-    df_table_cells: pd.DataFrame,
-) -> pd.DataFrame:
-    """
-    Classify each table layout as standard | matrix | narrative.
-
-    Metrics are derived from df_cells (which carries band_total_cols, col_start,
-    line_id, table_row_score) grouped by layout_id.  The result is merged onto
-    df_table_cells as the table_type column.
-    """
-    table_cells_only = df_cells[df_cells["layout_type"] == "table"]
-
-    type_map: dict[int, str] = {
-        int(layout_id): _infer_table_type(_compute_table_metrics(group))
-        for layout_id, group in table_cells_only.groupby("layout_id")
-    }
-
-    result = df_table_cells.copy()
-    result["table_type"] = result["layout_id"].map(type_map)
-    return result
 
 # --- helpers (underline-aware row building) ---
 
@@ -1135,13 +1006,13 @@ def build_tables(
     df_table_cells : pd.DataFrame
         One row per assembled table cell.  Contains: table_cell_id, page_number,
         layout_id, table_id, row_start, col_start, rowspan, colspan, text,
-        text_raw_lines, cell_ids, line_ids, role, table_type.
+        text_raw_lines, cell_ids, line_ids, role.
     """
     if df_cells.empty:
         empty_tcells = pd.DataFrame(columns=[
             "table_cell_id", "page_number", "layout_id", "table_id",
             "row_start", "col_start", "rowspan", "colspan",
-            "text", "text_raw_lines", "cell_ids", "line_ids", "role", "table_type",
+            "text", "text_raw_lines", "cell_ids", "line_ids", "role",
         ])
         return df_lines.copy(), df_cells.copy(), empty_tcells
 
@@ -1166,6 +1037,7 @@ def build_tables(
         .reset_index()
     )
     df_lines = df_lines.merge(line_layout, on="line_id", how="left")
+    df_lines.loc[df_lines["layout_type"] == "table", "block_role"] = "table"
 
     # Step 5 — build table cells
     df_table_cells = _build_table_cells(df_cells)
@@ -1173,9 +1045,29 @@ def build_tables(
     if not df_table_cells.empty:
         df_table_cells = _assign_cell_roles(df_table_cells)
 
-        df_table_cells = _classify_table_types(df_cells, df_table_cells)
+        # Propagate table_id to df_lines via line_ids (explode list → line_id mapping).
+        line_table_map = (
+            df_table_cells[["table_id", "line_ids"]]
+            .explode("line_ids")
+            .rename(columns={"line_ids": "line_id"})
+            .dropna(subset=["line_id"])
+            .drop_duplicates("line_id")
+        )
+        line_table_map["line_id"] = line_table_map["line_id"].astype(df_lines["line_id"].dtype)
+        df_lines = df_lines.merge(line_table_map, on="line_id", how="left")
+
+        cell_table_map = (
+            df_table_cells[["table_id", "cell_ids"]]
+            .explode("cell_ids")
+            .rename(columns={"cell_ids": "cell_id"})
+            .dropna(subset=["cell_id"])
+            .drop_duplicates("cell_id")
+        )
+        cell_table_map["cell_id"] = cell_table_map["cell_id"].astype(df_cells["cell_id"].dtype)
+        df_cells = df_cells.merge(cell_table_map, on="cell_id", how="left")
     else:
-        df_table_cells["role"]       = pd.Series(dtype=str)
-        df_table_cells["table_type"] = None
+        df_table_cells["role"] = pd.Series(dtype=str)
+        df_lines["table_id"] = pd.NA
+        df_cells["table_id"] = pd.NA
 
     return df_lines, df_cells, df_table_cells

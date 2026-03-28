@@ -20,24 +20,18 @@ def _create_line_text(df: pd.DataFrame) -> dict:
     Returns:
         Dict mapping line_id -> text string
     """
-    line_text_map = {}
-    
     if "line_id" not in df.columns or "text" not in df.columns:
-        return line_text_map
-    
-    for line_id, group in df.groupby("line_id", sort=False):
-        # Sort by x_left within the line
-        sorted_group = group.sort_values("x_left")
-        
-        # Extract text, filter out NaN/empty
-        texts = sorted_group["text"].dropna().astype(str)
-        texts = [t.strip() for t in texts if t.strip()]
-        
-        # Join with spaces
-        line_text = " ".join(texts)
-        line_text_map[line_id] = line_text
-    
-    return line_text_map
+        return {}
+
+    # Operate on the full DataFrame at once instead of per-group
+    working = df[["line_id", "x_left", "text"]].copy()
+    working = working[working["text"].notna()]
+    working["text"] = working["text"].astype(str).str.strip()
+    working = working[working["text"] != ""]
+
+    # Single global sort, then one groupby+join
+    working = working.sort_values(["line_id", "x_left"])
+    return working.groupby("line_id", sort=False)["text"].agg(" ".join).to_dict()
 
 
 def _remove_single_row_tables(df: pd.DataFrame) -> pd.DataFrame:
@@ -74,97 +68,18 @@ def _remove_single_row_tables(df: pd.DataFrame) -> pd.DataFrame:
     
     # Reindex remaining table_ids (1-based sequential)
     remaining_tables = df[df["table_id"].notna()]["table_id"].unique()
-    if len(remaining_tables) > 0:
+    if len(remaining_tables):
         # Sort to maintain order
         remaining_tables = sorted(remaining_tables)
         table_id_map = {old_id: new_id for new_id, old_id in enumerate(remaining_tables, start=1)}
         df["table_id"] = df["table_id"].map(lambda x: table_id_map.get(x) if pd.notna(x) else None)
-    
+
     # Add block_role = "table" for remaining tables (preserve existing values)
     if "block_role" not in df.columns:
         df["block_role"] = None
     has_table = df["table_id"].notna()
     no_existing_role = df["block_role"].isna()
     df.loc[has_table & no_existing_role, "block_role"] = "table"
-    
-    return df
-
-
-
-
-#def _add_layout_id(df: pd.DataFrame) -> pd.DataFrame:  ## NOTE: HTML Lines are different than PDF Lines - 1 line can span many visible lines
-    """
-    Add layout_id column based on page changes, table groups, and style fingerprints.
-    
-    Rules:
-    1. Start at 1 for the very first line
-    2. Increment when page_number changes
-    3. Rows with same table_id get same layout_id (increment at start/end of table groups)
-    4. For non-table lines, increment when style fingerprint changes
-       Fingerprint: (font_family, font_size, font_weight, text_align, non_stroking_color)
-    
-    Args:
-        df: DataFrame with lines
-        
-    Returns:
-        DataFrame with layout_id column added
-    """
-    if df is None or df.empty:
-        return df
-    
-    df = df.copy()
-    
-    # Initialize tracking variables
-    layout_ids = []
-    current_layout_id = 1
-    prev_page = None
-    prev_table_id = None
-    prev_fingerprint = None
-    
-    # Style columns for fingerprint
-    style_cols = ["block_role", "font_family", "font_size", "font_weight", "text_align", "non_stroking_color"]
-    
-    for idx, row in df.iterrows():
-        page = row.get("page_number")
-        table_id = row.get("table_id")
-        
-        # Rule 2: Increment when page_number changes
-        if prev_page is not None and page != prev_page:
-            current_layout_id += 1
-            prev_table_id = None
-            prev_fingerprint = None
-        
-        # Check if current row is part of a table
-        has_table = pd.notna(table_id)
-        
-        if has_table:
-            # Rule 3: Handle table groups
-            if table_id != prev_table_id:
-                # Entering a new table group or switching tables
-                if prev_page is not None:  # Not the first row
-                    current_layout_id += 1
-                prev_table_id = table_id
-                prev_fingerprint = None
-        else:
-            # Non-table line
-            if prev_table_id is not None:
-                # Exiting a table group
-                current_layout_id += 1
-                prev_table_id = None
-            
-            # Rule 4: Create fingerprint for non-table lines
-            fingerprint = tuple(row.get(col) for col in style_cols)
-            
-            if prev_fingerprint is not None and fingerprint != prev_fingerprint:
-                # Fingerprint changed
-                current_layout_id += 1
-            
-            prev_fingerprint = fingerprint
-        
-        layout_ids.append(current_layout_id)
-        prev_page = page
-    
-    df["layout_id"] = layout_ids
     
     return df
 
@@ -195,7 +110,7 @@ def _add_layout_id(df: pd.DataFrame) -> pd.DataFrame:
     prev_page = None
     prev_table_id = None
     
-    for idx, row in df.iterrows():
+    for _, row in df.iterrows():
         page = row.get("page_number")
         table_id = row.get("table_id")
         
@@ -231,7 +146,6 @@ def _add_layout_id(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-
 # =========================
 # Public API
 # =========================
@@ -255,7 +169,7 @@ def merge_boxes_to_lines(
         return boxes_df
     
     # Step 1: Assign line_id
-    boxes_with_lines = assign_line_id(boxes_df)
+    boxes_with_lines = assign_line_id(boxes_df, y_alignment="top")
     
     # Step 2: Create text for each line (sorted by x_left, joined with spaces)
     line_text_map = _create_line_text(boxes_with_lines)
@@ -293,6 +207,3 @@ def merge_boxes_to_lines(
     lines_df = _add_layout_id(lines_df)
     
     return lines_df
-
-
-

@@ -23,11 +23,15 @@ import re
 # Pre-filter forbidden heading line formats (text that will never be a heading)
 # ================================================================================
 
-_FORBIDDEN_BLOCK_ROLES = {"table", "image", "hr", "page_label", "navigation", "watermark", "toc", "exhibits"}
+_FORBIDDEN_BLOCK_ROLES = {"table", "image", "hr", "page_label", "navigation", "toc", "exhibits"}
 
 _FORBIDDEN_SUBSTRINGS = {
     # signature indicators
-    "/s/", "signed:", "page"
+    "/s/", "signed:", 
+    # urls
+    "http:", "https", "www.",
+    #other
+    "page"
 }
 
 _FORBIDDEN_START_TEXT = {
@@ -39,6 +43,8 @@ _FORBIDDEN_START_TEXT = {
     "✓", "✔", "✗", "✘", "✖", "✕",
     # Other
     "©", "®", "™", "§", "¶", "†", "‡", "•", "…", "‹", "›", "“", "”", "‘", "’", "„", "«", "»",
+    # signature indicators
+    "By:", "Name:", "Title:", "Date:"
 }
 
 # Parenthesized line patterns:
@@ -94,6 +100,77 @@ def pre_filter_lines(lines_df: pd.DataFrame) -> pd.DataFrame:
             keep &= ~text_lower.str.contains(re.escape(substring), na=False)
 
     return df.loc[keep].copy()
+
+
+# ================================================================================
+# Named heading candidate detection
+# ================================================================================
+
+
+def _detect_marker_candidates(
+    lines_df: pd.DataFrame,
+    compiled_patterns,
+) -> pd.DataFrame:
+    """
+    Adds hierarchy marker detection columns:
+      - hierarchy_marker : str | None   (the matched prefix text)
+      - hierarchy_type   : str | None   (e.g. numbered_section, note, ...)
+
+    Detection logic:
+    - For EACH row, test patterns in order
+    - First matching hierarchy_type wins
+    - Only matches at START of text
+    - Works row-wise but vector-friendly enough for current scale
+
+    compiled_patterns: HierarchyTypePatternConfig object with .patterns attribute
+    """
+
+    out = lines_df.copy()
+
+    out["hierarchy_marker"] = None
+    out["hierarchy_type"] = None
+
+    if "text" not in out.columns:
+        return out
+
+    texts = out["text"].astype("string").fillna("")
+
+    # Extract patterns from HierarchyTypePatternConfig object
+    pattern_list = compiled_patterns.patterns if hasattr(compiled_patterns, 'patterns') else []
+
+    # Track the best match per row: longest match wins so that e.g. "(a)(1)" is
+    # classified as double_parens rather than single_parens_single_alpha.
+    # Ties are broken by YAML order (lower index = higher priority).
+    best_marker: dict = {}   # idx -> marker string
+    best_type: dict = {}     # idx -> hierarchy_type
+    best_len: dict = {}      # idx -> len of matched marker
+
+    for pattern in pattern_list:
+        h_type = pattern.hierarchy_type
+        rx = pattern.compiled
+
+        matches = texts.str.match(rx)
+        if not matches.any():
+            continue
+
+        for idx in texts[matches].index:
+            m = rx.match(texts[idx])
+            if not m:
+                continue
+            marker = m.group(0).rstrip('. \t')
+            marker_len = len(marker)
+            if marker_len > best_len.get(idx, -1):
+                best_len[idx] = marker_len
+                best_marker[idx] = marker
+                best_type[idx] = h_type
+
+    if best_marker:
+        idx_list = list(best_marker.keys())
+        out.loc[idx_list, "hierarchy_marker"] = [best_marker[i] for i in idx_list]
+        out.loc[idx_list, "hierarchy_type"] = [best_type[i] for i in idx_list]
+
+    return out
+
 
 
 # ================================================================================
@@ -153,8 +230,6 @@ def _safe_div(num: pd.Series, den: pd.Series, fill: float = 0.0) -> pd.Series:
 
 
 # ----- Core heading scoring function ----- #
-
-# TODO: Lower the score of items that are ubiquitous in their layout_id (bold, ratio > 1, but the whole block is like that, then it's not a heading)
 
 def add_heading_score(lines_df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -269,83 +344,62 @@ def add_heading_score(lines_df: pd.DataFrame) -> pd.DataFrame:
         bonus = (nsc_norm.notna()) & (nsc_norm != prevalent) & (~is_basic)
         score += bonus.astype("float64") * 1.0
 
-    # =====================
-    # only for pdf's
-    # =====================
-
-    # --- pdf-specific: layout_id has only 1 line (row) in that layout
-    layout_id = out.get("layout_id")
-    if layout_id is not None:
-        # If layout_id is missing for some rows, treat as not single-line.
-        grp_size = out.groupby("layout_id")["layout_id"].transform("size")
-        score += np.where(grp_size == 1, 1.0, 0.0)
+    # --- hierarchy_type marker bonus (+0.5 if a structural marker was detected)
+    if "hierarchy_type" in out.columns:
+        ht = out["hierarchy_type"].fillna("").astype(str).str.strip()
+        score += (ht != "").astype("float64") * 0.5
 
     out["heading_score"] = score
     return out
 
 # ================================================================================
-# Named heading candidate detection
+# Contextual score adjustments
 # ================================================================================
 
 
-def _detect_marker_candidates(
-    lines_df: pd.DataFrame,
-    compiled_patterns,
-) -> pd.DataFrame:
+def _apply_contextual_score_adjustments(lines_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Adds hierarchy marker detection columns:
-      - hierarchy_marker : str | None   (the matched prefix text)
-      - hierarchy_type   : str | None   (e.g. numbered_section, note, ...)
+    Neighborhood-aware adjustments applied to heading_score on the full df.
 
-    Detection logic:
-    - For EACH row, test patterns in order
-    - First matching hierarchy_type wins
-    - Only matches at START of text
-    - Works row-wise but vector-friendly enough for current scale
-
-    compiled_patterns: HierarchyTypePatternConfig object with .patterns attribute
+    +1  line is the only line in its layout_id block (isolated element)
+    -2  layout_id block has 3+ lines (line lives in a multi-line visual block)
+        OR line is part of a run of 3+ consecutive lines sharing identical styling
+        (only one -2 penalty fires per line, not both)
     """
-
     out = lines_df.copy()
 
-    out["hierarchy_marker"] = None
-    out["hierarchy_type"] = None
-
-    if "text" not in out.columns:
+    if "heading_score" not in out.columns:
         return out
 
-    texts = out["text"].astype("string").fillna("")
+    adj = pd.Series(0.0, index=out.index, dtype="float64")
+    layout_penalized = pd.Series(False, index=out.index)
 
-    # Extract patterns from HierarchyTypePatternConfig object
-    pattern_list = compiled_patterns.patterns if hasattr(compiled_patterns, 'patterns') else []
+    # --- layout_id block size signals ---
+    layout_id = out.get("layout_id")
+    if layout_id is not None:
+        grp_size = out.groupby("layout_id")["layout_id"].transform("size")
+        adj += np.where(grp_size == 1, 1.0, 0.0)
+        layout_penalized = grp_size >= 3
+        adj += np.where(layout_penalized, -2.0, 0.0)
 
-    for pattern in pattern_list:
-        h_type = pattern.hierarchy_type
-        rx = pattern.compiled
+    # --- consecutive style-run penalty ---
+    # Build a style key from boolean style flags + bucketed font_size_ratio.
+    # Uses vectorized cumsum-groupby trick: no row loops.
+    style_parts = []
+    for col in ["hierarchy_type", "font_size_ratio", "non_stroking_color", "is_bold", "is_italic", "is_underlined", "is_uppercase"]:
+        if col in out.columns:
+            style_parts.append(out[col].fillna(False).astype(str))
+    if "font_size_ratio" in out.columns:
+        style_parts.append(out["font_size_ratio"].fillna(1.0).round(1).astype(str))
 
-        # vectorized startswith-style regex match
-        matches = texts.str.match(rx)
+    if style_parts:
+        style_key = pd.concat(style_parts, axis=1).agg("|".join, axis=1)
+        run_group = (style_key != style_key.shift()).cumsum()
+        run_len = run_group.map(run_group.value_counts())
+        style_run_penalty = (run_len >= 3) & ~layout_penalized
+        adj += np.where(style_run_penalty, -2.0, 0.0)
 
-        # only fill where not already matched by a higher-priority rule
-        assign_mask = matches & out["hierarchy_type"].isna()
-
-        if not assign_mask.any():
-            continue
-
-        # extract the actual marker substring - we want the FULL match, not just capture groups
-        # Use apply with match.group(0) to get the complete matched string
-        def extract_full_match(text):
-            m = rx.match(text)
-            if m:
-                # group(0) is the entire match, strip trailing dots/spaces
-                return m.group(0).rstrip('. \t')
-            return None
-        
-        extracted = texts[assign_mask].apply(extract_full_match)
-
-        out.loc[assign_mask, "hierarchy_marker"] = extracted
-        out.loc[assign_mask, "hierarchy_type"] = h_type
-
+    out["heading_score"] = (out["heading_score"] + adj).astype("float64")
     return out
 
 
@@ -769,38 +823,77 @@ def suppress_and_merge_headings(
                         out.loc[suppress_mask, c] = np.nan
 
     # =========================================================================
-    # (2) Coverpage: keep only first heading per page_number (which may already be merged)
+    # (2) Coverpage / page-1: suppress all headings when 3+ consecutive heading
+    #     line_ids exist, keeping only the best one (FORM/SCHEDULE prefix >
+    #     highest heading_score > lowest line_id).
     # =========================================================================
-    """ --> TODO: Hold off on this until a better algorithm is developed, it trims too much
-    # Enable largest font, or if starts with FORM, SCHEDULE, COPY, COPIES
-    # Recompute headings after merging
     is_heading = _is_heading_mask(out[block_role_col])
 
-    if (
-        document_region_col in out.columns
-        and is_heading.any()
-    ):
-        is_cover = out[document_region_col].astype("string").fillna("").str.strip().str.lower().eq(coverpage_value)
-        cover_heading_idx = out.index[is_heading & is_cover]
+    if is_heading.any():
+        has_coverpage = (
+            document_region_col in out.columns
+            and out.loc[is_heading, document_region_col]
+            .astype("string").str.strip().str.lower()
+            .eq(coverpage_value).any()
+        )
 
-        if len(cover_heading_idx) > 0:
-            suppress_mask = pd.Series(False, index=out.index)
-            
-            if "page_number" in out.columns:
-                # Group by page_number and keep first heading per page
-                cover_headings = out.loc[cover_heading_idx]
-                # Group by page_number and keep first in each group
-                for page_num, group_idx in cover_headings.groupby("page_number", dropna=False).groups.items():
-                    page_heading_indices = list(group_idx)
-                    if len(page_heading_indices) > 1:
-                        # Keep first, suppress rest for this page
-                        suppress_mask.loc[page_heading_indices[1:]] = True
-            else:
-                # Fallback: keep first heading across whole coverpage if page_number not available
-                suppress_mask.loc[cover_heading_idx[1:]] = True
-            
-            _suppress_rows(suppress_mask)
-    """ 
+        if has_coverpage:
+            scope_mask = (
+                out[document_region_col].astype("string").fillna("").str.strip().str.lower()
+                .eq(coverpage_value)
+            )
+        elif "page_number" in out.columns:
+            min_page = out["page_number"].min()
+            scope_mask = out["page_number"].eq(min_page)
+        else:
+            scope_mask = pd.Series(True, index=out.index)
+
+        scope_heading_idx = out.index[is_heading & scope_mask]
+
+        if len(scope_heading_idx) >= 3 and "line_id" in out.columns:
+            line_ids = out.loc[scope_heading_idx, "line_id"]
+            sorted_ids = line_ids.sort_values().values
+            # Check for 3+ consecutive line_ids
+            has_run = any(
+                sorted_ids[i + 2] - sorted_ids[i] == 2
+                for i in range(len(sorted_ids) - 2)
+            )
+
+            if has_run:
+                scope_headings = out.loc[scope_heading_idx].copy()
+
+                # Priority 1: starts with FORM or SCHEDULE (case-insensitive)
+                _FORM_PATTERN = r"^\s*(FORM|SCHEDULE)\b"
+                if text_col in scope_headings.columns:
+                    starts_with_keyword = (
+                        scope_headings[text_col]
+                        .astype("string").fillna("")
+                        .str.contains(_FORM_PATTERN, case=False, regex=True)
+                    )
+                else:
+                    starts_with_keyword = pd.Series(False, index=scope_headings.index)
+
+                keyword_idx = scope_headings.index[starts_with_keyword]
+
+                if len(keyword_idx) > 0:
+                    # Among keyword matches, pick highest heading_score, then lowest line_id
+                    candidates = scope_headings.loc[keyword_idx]
+                else:
+                    candidates = scope_headings
+
+                if "heading_score" in candidates.columns:
+                    hs = pd.to_numeric(candidates["heading_score"], errors="coerce").fillna(-1e9)
+                    best_hs = hs.max()
+                    candidates = candidates.loc[hs == best_hs]
+
+                best_line_id = pd.to_numeric(candidates["line_id"], errors="coerce").min()
+                keep_idx = candidates.index[
+                    pd.to_numeric(candidates["line_id"], errors="coerce") == best_line_id
+                ][0]
+
+                suppress_mask = pd.Series(False, index=out.index)
+                suppress_mask.loc[scope_heading_idx.difference([keep_idx])] = True
+                _suppress_rows(suppress_mask)
 
     return out
 
@@ -1484,9 +1577,9 @@ def assign_doc_hierarchy(
     Orchestrator entrypoint.
 
     Pipeline:
-    0. Prefilter lines (ONLY for step 1 scoring)
-    1. Calculate heading_score (ONLY on prefiltered df)
-    2. Detect hierarchy markers (full df)
+    0. Detect hierarchy markers (full df) — used as scoring input in step 1
+    1. Prefilter lines + calculate heading_score (prefiltered df only)
+    2. Contextual score adjustments (full df)
     3. Make heading decision (full df)
     4. Heading fingerprints + IDs (full df)
 
@@ -1494,10 +1587,11 @@ def assign_doc_hierarchy(
     """
     out = lines_df.copy()
 
-    # ------- Step 0: Prefilter for scoring only ------- #
-    scored_input = pre_filter_lines(out)
+    # ------- Step 0: Hierarchy marker detection (full df) ------- #
+    out = _detect_marker_candidates(out, compiled_patterns)
 
     # ------- Step 1: Heading score (only on prefiltered df) ------- #
+    scored_input = pre_filter_lines(out)
 
     # Initialize heading_score column on FULL df
     if "heading_score" not in out.columns:
@@ -1521,8 +1615,8 @@ def assign_doc_hierarchy(
             idx = scored_slice.index.intersection(out.index)
             out.loc[idx, "heading_score"] = scored_slice.loc[idx, "heading_score"].astype("float64")
 
-    # ------- Step 2: Hierarchy type detection (full df) ------- #
-    out = _detect_marker_candidates(out, compiled_patterns)
+    # ------- Step 2: Contextual score adjustments (full df) ------- #
+    out = _apply_contextual_score_adjustments(out)
 
     # ------- Step 3: Heading decision (full df) ------- #
     out = _add_heading_decision(out)

@@ -327,17 +327,6 @@ def _build_cells_df(df_words: pd.DataFrame) -> pd.DataFrame:
         include_hierarchy=False,
         include_table=False,
         extra_agg={
-            # Style columns: words within a cell are homogeneous → "first" is correct
-            # and avoids the expensive value_counts() call that _mode_or_first uses.
-            "font_size": "first",
-            "font_weight": "first",
-            "font_name": "first",
-            "font_family": "first",
-            "text_orientation": "first",
-            "non_stroking_color": "first",
-            "stroking_color": "first",
-            "layout_align": "first",
-            "text_align": "first",
             "text":    lambda s: " ".join(t for t in s.astype(str) if t.strip()),
             "word_id": list,
         },

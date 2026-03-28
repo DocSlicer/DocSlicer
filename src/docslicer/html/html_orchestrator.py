@@ -25,8 +25,8 @@ logger = logging.getLogger(__name__)
 # HTML-specific step imports
 from .step_01_box_extractor import extract_boxes_with_playwright
 from .step_02_box_cleaner import clean_boxes
-from .step_03_page_labels import assign_page_labels
-from .step_04_line_merger import merge_boxes_to_lines
+from .step_03_page_label_detector import assign_page_labels
+from .step_04_line_builder import merge_boxes_to_lines
 from .step_05_table_extractor import extract_tables_from_html
 
 # Config loaders
@@ -37,6 +37,17 @@ from ..metadata import add_page_and_ocr_info, add_document_information
 
 # Scraping
 from ..scraping.dispatcher import fetch_url, _is_sec_url
+
+
+def _inject_base_url(html: str, base_url: str) -> str:
+    """Inject <base href> so relative URLs resolve correctly in about:blank context."""
+    tag = f'<base href="{base_url}">'
+    if "<head>" in html:
+        return html.replace("<head>", f"<head>{tag}", 1)
+    if "<Head>" in html or "<HEAD>" in html:
+        import re
+        return re.sub(r"<[Hh][Ee][Aa][Dd]>", f"<head>{tag}", html, count=1)
+    return tag + html
 
 
 def run_pipeline(
@@ -66,9 +77,12 @@ def run_pipeline(
     # ============================================================
     if source_url and html is None:
         if _is_sec_url(source_url):
-            # SEC: fetch bytes via rate-limited fetcher, render as static HTML
+            # SEC: fetch bytes via rate-limited fetcher, render as static HTML.
+            # Inject <base href> so relative URLs resolve correctly in Playwright's
+            # about:blank context (otherwise parent.href returns "about:blank/...")
             scraped = fetch_url(source_url)
             html = scraped.raw_bytes.decode(scraped.encoding or "utf-8", errors="replace")
+            html = _inject_base_url(html, scraped.final_url)
             source_url = None  # box extractor will use set_content
         # else: non-SEC → keep source_url=source_url, html=None
         #        box extractor will page.goto(source_url) for full JS rendering
@@ -84,17 +98,18 @@ def run_pipeline(
     # For non-SEC URLs: Playwright navigates directly. If that fails, fall back to
     # fetching bytes via http_fetcher and rendering with set_content.
     try:
-        boxes, rendered_html, page_dimensions = extract_boxes_with_playwright(html, source_url)
+        boxes, rendered_html = extract_boxes_with_playwright(html, source_url)
     except Exception as e:
         if source_url:
             logger.warning(f"Playwright navigation failed for {source_url}, falling back to http_fetcher: {e}")
             scraped = fetch_url(source_url)
             html = scraped.raw_bytes.decode(scraped.encoding or "utf-8", errors="replace")
-            boxes, rendered_html, page_dimensions = extract_boxes_with_playwright(html, source_url=None)
+            html = _inject_base_url(html, scraped.final_url)
+            boxes, rendered_html = extract_boxes_with_playwright(html, source_url=None)
         else:
             raise
     df_boxes = pd.DataFrame(boxes)
-    logger.info(f"Step 01 - Box extraction complete, {len(df_boxes)} boxes, page: {page_dimensions}")
+    logger.info(f"Step 01 - Box extraction complete, {len(df_boxes)} boxes")
 
     if df_boxes.empty:
         logger.warning("Empty DataFrame after box extraction, returning early")
@@ -176,7 +191,7 @@ def run_pipeline(
     # ============================================================
     discovered_metadata["is_password_protected"] = False
     discovered_metadata["has_ocr"] = False
-    discovered_metadata["page_dimensions"] = page_dimensions
+
 
     if df_table_cells is not None and df_table_cells.empty:
         df_table_cells = None

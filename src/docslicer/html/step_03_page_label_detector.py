@@ -20,7 +20,7 @@ Pipeline Overview:
 Key Concepts:
     - FormattingSignature: Identifies sequences by height, font, tag, wrappers
     - AlternationMode: "fixed" (same position) vs "alternating" (left/right pattern)
-    - Sequence Scoring: length^1.5 scoring favors longer sequences
+    - Sequence Scoring: length^2 scoring favors longer sequences
     - Alignment Tracking: Enforces consistent alignment within sequences
 
 Author: MarketFramer
@@ -28,8 +28,7 @@ Author: MarketFramer
 from __future__ import annotations
 
 import re
-import hashlib
-import json
+from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Literal, Set, Union
 
@@ -39,7 +38,8 @@ import pandas as pd
 # Constants
 # =========================
 
-TOP_TOL_PX = 4 # px tolerance for grouping rows into the same "top" band
+TOP_TOL_PX = 4           # px tolerance for grouping rows into the same "top" band
+HR_PAGE_BREAK_MIN_PCT = 80  # HR must span at least this % of page width to signal a page break
 
 # =========================
 # Core Dataclasses
@@ -52,8 +52,8 @@ class FormattingSignature:
     """Properties that define a page label series"""
     height: float
     font_size: float
-    font_weight: str  # Add this - important for differentiation
-    structure_tag: str  # Add this - 'p' vs 'td' matters
+    font_weight: str
+    structure_tag: str
     has_table_id: bool
     has_dash_wrapper: bool
     has_paren_wrapper: bool
@@ -155,53 +155,65 @@ DetectionMethod = Literal[
 # =========================
 
 def assign_page_labels(
-    df: pd.DataFrame, 
-    page_label_config, 
-    tol_px: float = TOP_TOL_PX
+    df: pd.DataFrame,
+    page_label_config,
+    tol_px: float = TOP_TOL_PX,
+    debug: bool = False,
 ) -> Tuple[pd.DataFrame, List[PageLabel], List[PageLabelGroup]]:
     """
     Detect and assign page labels to document boxes.
-    
-    Main entry point for page label detection. Runs full pipeline to identify
+
+    Main entry point for page label detection. Runs the full pipeline to identify
     and validate page label sequences.
 
     Pipeline:
     1. Extract candidate tokens from text
     2. Filter tokens (exclude TOC, XBRL, tables, crowded bands, etc.)
-    3. Build candidate sequences (group by formatting)
+    3. Build candidate sequences (group by formatting + value monotonicity)
     4. Select winning non-overlapping sequences
     5. Convert to validated PageLabel and PageLabelGroup objects
     6. Add page_label columns to DataFrame
     7. Post-processing:
-       - Add block_role column ("page_label" for labeled rows)
-       - Propagate page_label upwards (first label until hr, others until prior label)
-       - Infer page_no if all rows have page_no == 1 (increment on label changes)
+       - Set block_role = "page_label" for labeled rows
+       - Propagate page_label upward (first label until <hr>, others until prior label)
+       - Infer page_number if all rows had page_number == 1
 
     Required columns in df:
       - box_id, y_top, page_number, text
       - structure_tag, height, font_size, font_weight, text_align
-      
+
     Optional columns:
-      - has_link (improves TOC detection if present)
-      - ixbrl_id (excludes XBRL-tagged content if present)
-      - table_id (excludes large tables if present)
-    
+      - has_link    — improves TOC detection
+      - ixbrl_id   — excludes XBRL-tagged content
+      - table_id   — excludes large data tables
+
     Args:
-        df: DataFrame with box metadata
-        page_label_config: Compiled page label pattern configuration
-        tol_px: Tolerance in pixels for top-band grouping (default: 4)
+        df: DataFrame with box metadata.
+        page_label_config: Compiled page label pattern configuration.
+        tol_px: Tolerance in pixels for top-band grouping (default: 4).
+        debug: If True, retain intermediate columns in the returned DataFrame:
+               ``page_label_token`` (filtered candidates),
+               ``page_label_group_id``, and ``alternation_mode``.
+               These columns are dropped by default.
 
     Returns:
         Tuple of (df, page_labels, page_label_groups) where:
-        - df: DataFrame with added columns:
-              - page_label_token: all candidate tokens (for debugging)
-              - page_label: validated page labels (propagated upwards)
-              - page_label_group_id: which group each label belongs to
-              - alternation_mode: fixed/alternating pattern
-              - block_role: "page_label" for labeled rows, None for others
-              - page_no: inferred page numbers (if originally all 1s)
-        - page_labels: List of detected PageLabel objects
-        - page_label_groups: List of PageLabelGroup objects
+
+        - df: Original DataFrame with the following columns added/updated:
+
+          Always present:
+            - page_label        : validated label propagated upward (or None)
+            - page_label_type   : "arabic", "roman", "alpha_numeric", etc. (or None)
+            - block_role        : "page_label" for label rows; existing values preserved
+            - page_number       : updated in-place if originally all 1s
+
+          Only when debug=True:
+            - page_label_token  : filtered, normalized candidate token
+            - page_label_group_id : integer group the label belongs to
+            - alternation_mode  : "fixed" / "alternating" / "mixed" / "unknown"
+
+        - page_labels: List of PageLabel objects for every detected label.
+        - page_label_groups: List of PageLabelGroup objects (one per sequence).
     """
     required = {"box_id", "y_top", "page_number", "text", 
                 "structure_tag", "height", "font_size", "font_weight", "text_align"}
@@ -217,24 +229,26 @@ def assign_page_labels(
     # Step 2: Apply filters (page-aware)
     cand = _filter_page_label_tokens(out, inv, tol_px=tol_px)
 
+    # Attach columns needed by the sequence-detection pipeline.
+    # _raw_token preserves the original string before normalization so that
+    # PageLabel.raw_token carries the true raw value (e.g. "(iv)" not "iv").
     out["page_label_token"] = cand
-    
-    # Add wrapper information temporarily (needed for candidate building)
+    out["_raw_token"] = inv["raw_token"]
     out["_has_dash_wrapper"] = inv["has_dash_wrapper"]
     out["_has_paren_wrapper"] = inv["has_paren_wrapper"]
-    
+
     # Step 3-5: Run full sequence detection pipeline
     page_labels, groups = _detect_page_label_sequence(out, page_label_config)
-    
+
     # Step 6: Add page_label columns
     out["page_label"] = None
     out["page_label_group_id"] = None
     out["alternation_mode"] = None
     out["page_label_type"] = None
-    
+
     # Build lookup: group_id -> alternation_mode
     group_alternation = {g.group_id: g.alternation_mode for g in groups}
-    
+
     # Map page labels to rows
     for label in page_labels:
         mask = out["box_id"] == label.box_id
@@ -243,9 +257,12 @@ def assign_page_labels(
             out.loc[mask, "page_label_group_id"] = label.group_id
             out.loc[mask, "alternation_mode"] = group_alternation.get(label.group_id, "unknown")
             out.loc[mask, "page_label_type"] = label.page_label_type
-    
-    # Drop temporary wrapper columns
-    out = out.drop(columns=["_has_dash_wrapper", "_has_paren_wrapper", "page_label_token", "page_label_group_id", "alternation_mode"])
+
+    # Drop internal temp columns always; drop debug columns only in non-debug mode.
+    always_drop = ["_raw_token", "_has_dash_wrapper", "_has_paren_wrapper"]
+    debug_cols = ["page_label_token", "page_label_group_id", "alternation_mode"]
+    drop_cols = always_drop + ([] if debug else debug_cols)
+    out = out.drop(columns=drop_cols)
     
     # ===== POST-PROCESSING STEPS ===== #
     
@@ -258,7 +275,7 @@ def assign_page_labels(
     # Step 2: Fill page_label upwards with propagation rules
     out = _propagate_page_labels_upward(out)
     
-    # Step 3: Populate page_no intelligently
+    # Step 3: Infer page_number from label changes when all rows have page_number == 1
     out = _infer_page_numbers(out)
     
     return out, page_labels, groups
@@ -270,71 +287,52 @@ def assign_page_labels(
 # Helpers to remove rows with links
 # =========================
 
-def _top_band_mask(df, target_y_top: float, target_page_number: int, tol_px: float = TOP_TOL_PX):
-    """
-    Boolean mask for rows whose `y_top` lies within ± tol_px of target_y_top
-    AND are on the same page_number.
-    
-    Args:
-        df: DataFrame with columns 'y_top' and 'page_number'
-        target_y_top: Target y_top coordinate
-        target_page_number: Target page number
-        tol_px: Tolerance in pixels for grouping rows into same "top" band
-    
-    Returns:
-        Boolean Series mask
-    """
-    top_match = (df["y_top"] >= target_y_top - tol_px) & (df["y_top"] <= target_y_top + tol_px)
-    page_match = df["page_number"] == target_page_number
-    return top_match & page_match
-
-
-# Exclude all box_id's in top bands that has_link = 1
 def _get_box_ids_in_linked_top_bands(df, tol_px: float = TOP_TOL_PX) -> Set[int]:
     """
-    Returns all box_id's that belong to any top-band which contains
-    at least one row with has_link = 1.
-    
-    Considers page_number to avoid cross-page contamination in paginated files.
+    Return all box_ids that belong to any top-band containing at least one linked row.
+
+    Rows are grouped into fixed-grid bands of width ``tol_px`` per page, so that
+    closely positioned elements (within ±tol_px) are treated as the same band.
+    Page-aware: bands are scoped per page_number to avoid cross-page contamination.
 
     Example:
       page_number=1, y_top=100, has_link=1
       page_number=1, y_top=101, has_link=0
-    → both box_ids from page 1 are returned (same page, same band).
-    
-      page_number=2, top=100, has_link=0
+    → both box_ids are returned (same page, same band).
+
+      page_number=2, y_top=100, has_link=0
     → this box_id is NOT returned (different page).
-    
+
     Args:
-        df: DataFrame with columns 'box_id', 'y_top', 'page_number'
-        Optional: 'has_link' (if not present, returns empty set)
-        tol_px: Tolerance in pixels for grouping rows into same "y_top" band
-    
+        df: DataFrame with columns ``box_id``, ``y_top``, ``page_number``.
+            If ``has_link`` is absent, an empty set is returned immediately.
+        tol_px: Band width in pixels (default: TOP_TOL_PX).
+
     Returns:
-        Set of box_ids to exclude
+        Set of box_ids to exclude.
     """
     required = {"box_id", "y_top", "page_number"}
     missing = required - set(df.columns)
     if missing:
         raise ValueError(f"df missing required columns: {sorted(missing)}")
-    
-    out: Set[int] = set()
-    
-    # If has_link column not present, return empty set (no filtering)
+
     if "has_link" not in df.columns:
-        return out
+        return set()
 
-    # rows that explicitly have links (handle both boolean True and integer 1)
-    link_rows = df[df["has_link"].isin([1, True])]
+    # Assign every row to a fixed-grid band key: (page_number, band_index).
+    # Using integer band indices avoids floating-point key collisions.
+    band_idx = (df["y_top"] / tol_px).round().astype(int)
+    band_key = pd.Series(
+        list(zip(df["page_number"], band_idx)), index=df.index, dtype=object
+    )
 
-    if link_rows.empty:
-        return out
+    # Identify band keys that contain at least one linked row.
+    linked_band_keys = set(band_key[df["has_link"].isin([1, True])])
+    if not linked_band_keys:
+        return set()
 
-    for _, row in link_rows.iterrows():
-        band_mask = _top_band_mask(df, row["y_top"], row["page_number"], tol_px)
-        out.update(df.loc[band_mask, "box_id"].tolist())
-
-    return out
+    # Return every box_id whose band key is in the linked set.
+    return set(df.loc[band_key.isin(linked_band_keys), "box_id"])
 
 
 # =========================
@@ -350,6 +348,17 @@ def _match_page_label_type(token: str, cfg) -> str:
 
 _PAREN_WRAPPER_RE = re.compile(r"^\((.+)\)$")
 _DASH_WRAPPER_RE  = re.compile(r"^[-–—]\s*(.+?)\s*[-–—]$")
+
+# Embedded label patterns — used to extract page numbers from compound text.
+#
+# N-of-M: matches "2 of 20", "Page 2 of 20", "... 2 of 20".
+#   - Anchored at end of string to avoid matching "3 of 10 items".
+#   - Limits digits to 1-4 to avoid matching large financial numbers.
+#   - Validated post-match: 0 < N ≤ M.
+_N_OF_M_RE = re.compile(r"\b(\d{1,4})\s+of\s+(\d{1,4})\s*$", re.IGNORECASE)
+
+# HR page-break marker: matches [[HR: 100%]], [[HR: 85.5%]], etc.
+_HR_PCT_RE = re.compile(r"^\[\[HR:\s*(\d+(?:\.\d+)?)\s*%\s*\]\]$", re.IGNORECASE)
 
 
 def _extract_page_label_tokens(text: Any) -> Optional[str]:
@@ -426,6 +435,19 @@ def _has_dash_wrapper(token: str) -> bool:
     return _DASH_WRAPPER_RE.match(s) is not None
 
 
+def _is_pure_negative_number(token) -> bool:
+    """
+    Return True if *token* is a bare negative integer like ``-1`` or ``-23``.
+
+    Excludes dash-wrapped labels such as ``-2-`` (which are legitimate page
+    label wrappers) and non-numeric strings.
+    """
+    if pd.isna(token):
+        return False
+    s = str(token)
+    return s.startswith("-") and not s.endswith("-") and len(s) > 1 and s[1:].isdigit()
+
+
 def _has_paren_wrapper(token: str) -> bool:
     """
     Check if token has parenthesis wrapper like "(ii)" or "(2)".
@@ -439,6 +461,56 @@ def _has_paren_wrapper(token: str) -> bool:
     if not token:
         return False
     return _PAREN_WRAPPER_RE.match(token.strip()) is not None
+
+
+def _try_extract_embedded_label(text: str) -> Optional[str]:
+    """
+    Try to extract a page number token from compound text that would otherwise
+    be rejected by the length gate or fail type matching.
+
+    Supported patterns (checked in order of specificity):
+
+    1. **N-of-M suffix** — ``"... 2 of 20"``, ``"Page 2 of 20"``, ``"2 of 20"``
+
+       Extracts N.  Constraints that limit false positives:
+
+       - End-anchored (``$``): ``"3 of 10 items"`` does **not** match.
+       - Requires a bare integer before ``"of"``: prose such as
+         ``"on behalf of 20"`` does not match.
+       - Validates ``0 < N ≤ M``.
+
+    2. **Pipe-terminated label** — ``"Apple Inc. | Q1 2026 | 2"``
+
+       Takes the last segment after the final ``"|"`` and strips whitespace.
+       Type-matching by the caller rejects segments that are not valid page
+       label tokens (e.g. ``"Header | Some Text"`` is rejected because
+       ``"Some Text"`` does not match any page label pattern).
+
+    Args:
+        text: Raw text string from a document box.
+
+    Returns:
+        Extracted candidate string (still un-normalized), or ``None``.
+    """
+    if not text:
+        return None
+
+    stripped = text.strip()
+
+    # Pattern 1: N of M — most specific, check first.
+    m = _N_OF_M_RE.search(stripped)
+    if m:
+        n, total = int(m.group(1)), int(m.group(2))
+        if 0 < n <= total:
+            return m.group(1)
+
+    # Pattern 2: pipe-terminated — take the last segment.
+    if "|" in stripped:
+        last = stripped.rsplit("|", 1)[-1].strip()
+        if last:
+            return last
+
+    return None
 
 
 def _build_page_label_token_inventory(df: pd.DataFrame, page_label_config) -> pd.DataFrame:
@@ -492,23 +564,41 @@ def _build_page_label_token_inventory(df: pd.DataFrame, page_label_config) -> pd
         has_dash = _has_dash_wrapper(raw_tok)
         has_paren = _has_paren_wrapper(raw_tok)
 
-        # length gate AFTER normalization
-        if not norm or len(norm) > max_len:
-            raw_tokens.append(raw_tok)
-            norm_tokens.append(norm if norm else None)
-            types.append("unknown")
-            is_like.append(False)
-            has_dash_wrappers.append(has_dash)
-            has_paren_wrappers.append(has_paren)
-            continue
+        # Direct match: token must be within the length gate and match a known type.
+        if norm and len(norm) <= max_len:
+            t = _match_page_label_type(norm, page_label_config)
+            if t != "unknown":
+                raw_tokens.append(raw_tok)
+                norm_tokens.append(norm)
+                types.append(t)
+                is_like.append(True)
+                has_dash_wrappers.append(has_dash)
+                has_paren_wrappers.append(has_paren)
+                continue
 
-        t = _match_page_label_type(norm, page_label_config)
-        ok = (t != "unknown")
+        # Direct match failed (too long or unrecognized type).
+        # Try extracting an embedded page number from compound text formats
+        # such as "Header | Subheader | 2" or "Page 2 of 20".
+        # raw_token stays as the original full text; only normalized_token changes.
+        embedded = _try_extract_embedded_label(raw_tok)
+        if embedded:
+            embedded_norm = _normalize_page_label_token(embedded)
+            if embedded_norm and len(embedded_norm) <= max_len:
+                t = _match_page_label_type(embedded_norm, page_label_config)
+                if t != "unknown":
+                    raw_tokens.append(raw_tok)
+                    norm_tokens.append(embedded_norm)
+                    types.append(t)
+                    is_like.append(True)
+                    has_dash_wrappers.append(False)  # wrappers don't apply to embedded labels
+                    has_paren_wrappers.append(False)
+                    continue
 
+        # Nothing matched — record what we have for debugging visibility.
         raw_tokens.append(raw_tok)
-        norm_tokens.append(norm)
-        types.append(t)
-        is_like.append(ok)
+        norm_tokens.append(norm if norm else None)
+        types.append("unknown")
+        is_like.append(False)
         has_dash_wrappers.append(has_dash)
         has_paren_wrappers.append(has_paren)
 
@@ -606,19 +696,15 @@ def _filter_page_label_tokens(
         has_ixbrl = df["ixbrl_id"].notna() & (df["ixbrl_id"] != "")
         cand = cand.where(~has_ixbrl, None)
     
-    # Exclude pure negative numbers like -1, -2, -3 (but not wrapped ones like -2-)
-    # These are common in financial tables as negative values
-    def is_pure_negative(token):
-        """Check if token is a pure negative number like '-1', '-2' (not '-1-')"""
-        if pd.isna(token):
-            return False
-        s = str(token)
-        if s.startswith("-") and not s.endswith("-") and len(s) > 1:
-            # Check if everything after the '-' is digits
-            return s[1:].isdigit()
-        return False
-    
-    is_negative = cand.apply(is_pure_negative)
+    # Exclude bare negative integers like -1, -2, -3 (common in financial tables).
+    # Dash-wrapped labels like -2- are intentionally preserved.
+    filled = cand.fillna("")
+    is_negative = (
+        filled.str.startswith("-")
+        & ~filled.str.endswith("-")
+        & (filled.str.len() > 1)
+        & filled.str[1:].str.isdigit()
+    )
     cand = cand.where(~is_negative, None)
     
     # Exclude rows from tables that are "large enough" to be real data tables:
@@ -639,41 +725,30 @@ def _filter_page_label_tokens(
         in_table_ge3 = table_id_nonblank & table_id.isin(tables_ge3)
         cand = cand.where(~in_table_ge3, None)
     
-    # Exclude rows where the same top band has more than 2 items
-    # Create top band groups (page_number, rounded_top)
-    df_with_rounded_top = df.copy()
-    df_with_rounded_top['rounded_top'] = (df['y_top'] / tol_px).round() * tol_px
-    
-    # Count items per top band (page_number, rounded_top)
-    band_counts = df_with_rounded_top.groupby(['page_number', 'rounded_top']).size()
-    
-    # Identify bands with more than 2 items
-    crowded_bands = band_counts[band_counts > 2].index
-    
-    # Mark rows that belong to crowded bands
-    in_crowded_band = df_with_rounded_top.apply(
-        lambda row: (row['page_number'], row['rounded_top']) in crowded_bands, 
-        axis=1
+    # Build a lightweight working frame for band-level aggregations.
+    # We only add derived columns here; the original df is never mutated.
+    band_df = df[["page_number", "y_top"]].copy()
+    band_df["rounded_top"] = (df["y_top"] / tol_px).round() * tol_px
+    band_key = ["page_number", "rounded_top"]
+
+    # Build a MultiIndex once; reused for all band membership tests below.
+    # pd.MultiIndex.isin() is implemented in C and avoids any Python-level row loop.
+    row_band_midx = pd.MultiIndex.from_arrays(
+        [band_df["page_number"], band_df["rounded_top"]]
     )
+
+    # Exclude rows where the same top band has more than 2 items (likely headers/content).
+    band_counts = band_df.groupby(band_key).size()
+    crowded_midx = band_counts[band_counts > 2].index
+    in_crowded_band = pd.Series(row_band_midx.isin(crowded_midx), index=df.index)
     cand = cand.where(~in_crowded_band, None)
-    
-    # Exclude rows where the same top band has total character length > 50
-    # Need text column for this
+
+    # Exclude rows where the same top band has total character length > 50 (likely text content).
     if "text" in df.columns:
-        # Calculate total character length per band
-        df_with_text_len = df_with_rounded_top.copy()
-        df_with_text_len['text_len'] = df['text'].fillna("").astype(str).str.len()
-        
-        band_char_totals = df_with_text_len.groupby(['page_number', 'rounded_top'])['text_len'].sum()
-        
-        # Identify bands with total char length > 50
-        long_text_bands = band_char_totals[band_char_totals > 50].index
-        
-        # Mark rows that belong to long text bands
-        in_long_text_band = df_with_rounded_top.apply(
-            lambda row: (row['page_number'], row['rounded_top']) in long_text_bands,
-            axis=1
-        )
+        band_df["text_len"] = df["text"].fillna("").astype(str).str.len()
+        band_char_totals = band_df.groupby(band_key)["text_len"].sum()
+        long_text_midx = band_char_totals[band_char_totals > 50].index
+        in_long_text_band = pd.Series(row_band_midx.isin(long_text_midx), index=df.index)
         cand = cand.where(~in_long_text_band, None)
 
     return cand
@@ -688,54 +763,55 @@ def _filter_page_label_tokens(
 def _build_candidates_from_df(df: pd.DataFrame, page_label_config) -> List[PageLabelCandidate]:
     """
     Build a list of PageLabelCandidate objects from a DataFrame with page_label_token column.
-    
+
     Requirements in df:
-      - box_id, page_label_token, structure_tag, height, font_size, font_weight, text_align
+      - box_id, page_label_token, _raw_token
+      - structure_tag, height, font_size, font_weight, text_align
       - _has_dash_wrapper, _has_paren_wrapper (temporary wrapper columns)
     Optional:
       - table_id (for has_table_id detection)
-      
+
     Args:
-        df: DataFrame from assign_page_labels() with page_label_token column
-        page_label_config: Compiled PageLabelPatternConfig (not used here but kept for consistency)
-        
+        df: DataFrame from assign_page_labels() with page_label_token and _raw_token columns.
+        page_label_config: Compiled PageLabelPatternConfig used to infer page_label_type.
+
     Returns:
-        List of PageLabelCandidate objects (only for rows with valid page_label_token)
+        List of PageLabelCandidate objects (only for rows with a valid page_label_token).
     """
-    required = {"box_id", "page_label_token", "structure_tag", "height", "font_size", "font_weight", "text_align",
-                "_has_dash_wrapper", "_has_paren_wrapper"}
+    required = {
+        "box_id", "page_label_token", "_raw_token",
+        "structure_tag", "height", "font_size", "font_weight", "text_align",
+        "_has_dash_wrapper", "_has_paren_wrapper",
+    }
     missing = required - set(df.columns)
     if missing:
         raise ValueError(f"df missing required columns: {sorted(missing)}")
-    
-    # Filter to only rows with valid page_label_token
+
+    # Only process rows that survived filtering
     valid_df = df[df["page_label_token"].notna()].copy()
-    
+
     candidates = []
     for _, row in valid_df.iterrows():
-        token = row["page_label_token"]
-        
-        # Determine page_label_type
-        label_type = row.get("page_label_type", "unknown")
-        if label_type == "unknown" or pd.isna(label_type):
-            # Try to infer from token
-            label_type = _match_page_label_type(token, page_label_config)
-        
-        # Check if table_id is actually present (not None, not NaN, not empty string)
+        normalized = row["page_label_token"]
+        raw = row["_raw_token"] if pd.notna(row["_raw_token"]) else normalized
+
+        # Prefer the type already computed during inventory; re-infer only if missing.
+        label_type = row["page_label_type"] if "page_label_type" in row.index else "unknown"
+        if not label_type or label_type == "unknown" or pd.isna(label_type):
+            label_type = _match_page_label_type(normalized, page_label_config)
+
+        # table_id is truthy only when non-blank
         table_id_val = row.get("table_id")
         has_table_id = pd.notna(table_id_val) and str(table_id_val).strip() != ""
-        
-        # Handle wrapper flags - if None (token was never extracted), default to False
-        dash_wrapper = row["_has_dash_wrapper"]
-        has_dash_wrapper = bool(dash_wrapper) if pd.notna(dash_wrapper) else False
-        
-        paren_wrapper = row["_has_paren_wrapper"]
-        has_paren_wrapper = bool(paren_wrapper) if pd.notna(paren_wrapper) else False
-        
-        candidate = PageLabelCandidate(
+
+        # Wrapper flags default to False when the token was never extracted
+        has_dash_wrapper = bool(row["_has_dash_wrapper"]) if pd.notna(row["_has_dash_wrapper"]) else False
+        has_paren_wrapper = bool(row["_has_paren_wrapper"]) if pd.notna(row["_has_paren_wrapper"]) else False
+
+        candidates.append(PageLabelCandidate(
             box_id=int(row["box_id"]),
-            raw_token=token,  # In this case raw_token = normalized_token
-            normalized_token=token,
+            raw_token=raw,
+            normalized_token=normalized,
             page_label_type=label_type,
             height=float(row["height"]),
             font_size=float(str(row["font_size"]).replace("px", "")),
@@ -744,10 +820,9 @@ def _build_candidates_from_df(df: pd.DataFrame, page_label_config) -> List[PageL
             text_align=str(row["text_align"]),
             has_table_id=has_table_id,
             has_dash_wrapper=has_dash_wrapper,
-            has_paren_wrapper=has_paren_wrapper
-        )
-        candidates.append(candidate)
-    
+            has_paren_wrapper=has_paren_wrapper,
+        ))
+
     return candidates
 
 
@@ -1095,7 +1170,6 @@ def _get_sequence_text_align(seq_info: Dict) -> str:
         return "_".join(unique_aligns)  # e.g., "left_right"
     else:
         # Mixed or unknown - return the most common one
-        from collections import Counter
         most_common = Counter(text_aligns).most_common(1)
         return most_common[0][0] if most_common else "unknown"
 
@@ -1649,133 +1723,149 @@ def _detect_page_label_sequence(
 
 def _propagate_page_labels_upward(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Fill page_label upwards with propagation rules.
-    
-    Rules:
-    - First label (lowest box_id): Copy upwards until hitting structure_tag='hr'
-    - All others: Copy upwards until hitting the prior page_label
-    
+    Fill page_label upwards according to two rules:
+
+    - **First label** (lowest box_id): propagate upward until hitting
+      ``structure_tag='hr'`` or a "table of contents" text row (inclusive stop —
+      the stop row and everything above it remain unlabeled).
+    - **All other labels**: propagate upward until hitting the prior page_label
+      (i.e., each unlabeled gap between two consecutive labels is filled with the
+      label of the one immediately below it).
+
+    Uses ``bfill()`` on the box_id-sorted frame for O(n) vectorized propagation,
+    followed by a single boundary-clipping step for the first-label rule.
+
     Args:
-        df: DataFrame with box_id, page_label, structure_tag columns
-        
+        df: DataFrame with ``box_id``, ``page_label``, and ``structure_tag`` columns.
+
     Returns:
-        DataFrame with page_label filled upwards
+        DataFrame with ``page_label`` (and ``page_label_type`` if present) filled upward.
     """
     if "page_label" not in df.columns or "box_id" not in df.columns or "structure_tag" not in df.columns:
         return df
-    
-    out = df.copy()
-    
-    # Find all rows with page_label
-    labeled_rows = out[out["page_label"].notna()].sort_values("box_id")
-    
-    if labeled_rows.empty:
-        return out
 
-    has_text = "text" in out.columns
-    
-    # Process each page label
-    for idx, (row_idx, row) in enumerate(labeled_rows.iterrows()):
-        current_box_id = row["box_id"]
-        current_label = row["page_label"]
-        current_label_type = row.get("page_label_type")
-        
-        # Determine the stop condition based on whether this is the first label
-        is_first = (idx == 0)
-        
-        # Get all rows with box_id < current_box_id
-        rows_above = out[out["box_id"] < current_box_id].copy()
-        
-        if rows_above.empty:
-            continue
-        
-        # Sort by box_id descending (start from just below current_box_id)
-        rows_above = rows_above.sort_values("box_id", ascending=False)
-        
-        # Propagate upwards
-        for above_idx, above_row in rows_above.iterrows():
-            # Stop conditions
-            if is_first:
-                # First label: stop at hr tag
-                if above_row["structure_tag"] == "hr":
-                    break
-                # Stop at table of contents
-                if has_text:
-                    t = above_row["text"]
-                    if isinstance(t, str) and t.strip().lower() == "table of contents":
-                        break
-            else:
-                # Other labels: stop at prior page_label
-                if pd.notna(above_row["page_label"]):
-                    break
-            
-            # Fill this row with current label and type
-            out.loc[above_idx, "page_label"] = current_label
-            if current_label_type is not None and "page_label_type" in out.columns:
-                out.loc[above_idx, "page_label_type"] = current_label_type
-    
+    out = df.copy().sort_values("box_id")
+
+    labeled_rows = out[out["page_label"].notna()]
+    if labeled_rows.empty:
+        return df
+
+    # bfill() on the ascending-box_id frame propagates each label to all unlabeled
+    # rows above it, stopping naturally at the previous labeled row.
+    # This handles all "other labels" cases in one vectorized pass.
+    out["page_label"] = out["page_label"].bfill()
+    if "page_label_type" in out.columns:
+        out["page_label_type"] = out["page_label_type"].bfill()
+
+    # Handle the first-label boundary: clip any fill that crossed an <hr> or
+    # a "table of contents" row above the first label.
+    first_box_id = labeled_rows["box_id"].min()
+    before_first = out["box_id"] < first_box_id
+
+    cutoff_candidates = out.loc[before_first & (out["structure_tag"] == "hr"), "box_id"]
+
+    if "text" in out.columns:
+        toc_mask = before_first & (
+            out["text"].astype(str).str.strip().str.lower() == "table of contents"
+        )
+        cutoff_candidates = pd.concat([cutoff_candidates, out.loc[toc_mask, "box_id"]])
+
+    if not cutoff_candidates.empty:
+        # Null out every row at or above the last stop marker before the first label.
+        cutoff = cutoff_candidates.max()
+        null_mask = out["box_id"] <= cutoff
+        out.loc[null_mask, "page_label"] = None
+        if "page_label_type" in out.columns:
+            out.loc[null_mask, "page_label_type"] = None
+
+    return out.sort_index()
+
+
+def _infer_page_numbers_from_hr(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Infer page numbers from full-width HR markers when no page labels exist.
+
+    Each row whose ``text`` matches ``[[HR: X%]]`` with X >= ``HR_PAGE_BREAK_MIN_PCT``
+    (default 80) is treated as a page-break separator.  The HR row itself stays on
+    page N; the following row starts page N+1.
+
+    This is the fallback strategy for filings such as 8-Ks that use SEC-style
+    horizontal rules to divide pages but carry no numeric page labels.
+
+    Args:
+        df: DataFrame sorted by ``box_id``, must contain a ``text`` column.
+
+    Returns:
+        DataFrame with ``page_number`` set to inferred values (starting at 1).
+    """
+    if "text" not in df.columns:
+        return df
+
+    out = df.copy()
+
+    # Vectorized HR percentage extraction.
+    hr_pct = (
+        out["text"]
+        .astype(str)
+        .str.strip()
+        .str.extract(_HR_PCT_RE, expand=False)
+    )
+    hr_pct = pd.to_numeric(hr_pct, errors="coerce")
+
+    # A row triggers a page break if its HR width meets the threshold.
+    is_page_break = hr_pct >= HR_PAGE_BREAK_MIN_PCT
+
+    # Shift forward by one so the HR itself stays on page N and the next
+    # row begins page N+1.  fill_value=False keeps the first row on page 1.
+    out["page_number"] = is_page_break.shift(1, fill_value=False).cumsum() + 1
+
     return out
 
 
 def _infer_page_numbers(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Populate page_number intelligently based on page_label changes.
-    
-    Logic:
-    - Check if all rows have page_number == 1 (indicating unpaginated/needs inference)
-    - If yes: Start at 1, increment each time page_label changes (including blank -> something)
-    - If no: Skip (already has real page numbers)
-    
+    Populate ``page_number`` when the source file carries no real pagination.
+
+    Only runs when every row has ``page_number == 1`` (the sentinel that signals
+    an unpaginated file).  Chooses between two strategies:
+
+    - **Label-based** (preferred): increment on each ``page_label`` change.
+      Used whenever at least one page label was detected.
+    - **HR-based** (fallback): increment after each full-width ``[[HR: X%]]``
+      row (X >= ``HR_PAGE_BREAK_MIN_PCT``).  Used for filings such as 8-Ks
+      that have no page labels but use horizontal rules as page separators.
+
     Args:
-        df: DataFrame with page_number, page_label, box_id columns
-        
+        df: DataFrame with ``page_number``, ``page_label``, and ``box_id`` columns.
+
     Returns:
-        DataFrame with page_number populated
+        DataFrame with ``page_number`` updated in-place.
     """
     if "page_number" not in df.columns or "page_label" not in df.columns:
         return df
-    
-    # Check if all rows have page_number == 1 (needs inference)
-    needs_inference = (df["page_number"] == 1).all()
-    
-    if not needs_inference:
-        # Already has real page numbers, skip
-        return df
-    
-    out = df.copy()
-    
-    # Sort by box_id to process in document order
-    out = out.sort_values("box_id")
-    
-    # Track page number and previous label
-    current_page = 1
-    prev_label = None
-    is_first_row = True
-    
-    # Iterate through rows and assign page numbers
-    new_page_nos = []
-    for idx, row in out.iterrows():
-        current_label = row["page_label"]
-        
-        # Normalize None/NaN to None for comparison
-        if pd.isna(current_label):
-            current_label = None
-        
-        # First row always gets page 1
-        # For subsequent rows, increment when page_label changes
-        if not is_first_row and current_label != prev_label:
-            current_page += 1
-        
-        # Update prev_label for next iteration
-        prev_label = current_label
-        is_first_row = False
-        
-        new_page_nos.append(current_page)
-    
-    # Assign new page numbers
-    out["page_number"] = new_page_nos
-    
-    # Restore original order (by index)
-    out = out.sort_index()
-    
-    return out
+
+    out = df.copy().sort_values("box_id")
+
+    if out["page_label"].notna().any():
+        # Label-based inference — always runs when labels were detected,
+        # regardless of existing page_number values.
+        #
+        # Why: some HTML parsers populate page_number only on the exact label
+        # rows (the rows that carry the printed page number), leaving all other
+        # rows at page_number=1.  The old all()==1 guard incorrectly skipped
+        # inference for those files, so propagated-label rows kept page_number=1.
+        # Since our page labels are the authoritative pagination signal, we
+        # always recompute from them.
+        labels = out["page_label"].fillna("__NONE__")
+        changed = labels != labels.shift(1)
+        changed.iloc[0] = False
+        out["page_number"] = changed.cumsum() + 1
+
+    elif (out["page_number"] == 1).all():
+        # No labels detected and every row still has the default page_number=1
+        # (truly unpaginated file).  Fall back to HR-based inference.
+        out = _infer_page_numbers_from_hr(out)
+
+    # else: no labels but page_numbers already vary → trust the existing values.
+
+    return out.sort_index()

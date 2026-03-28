@@ -58,41 +58,36 @@
   // ATOMIC STRUCTURE DETECTION
   // =========================
   
-  // Check if element has structure-tag descendants with visible text
-  const hasStructureDescendants = (el) => {
-    const descendants = el.querySelectorAll("*");
-    for (const node of descendants) {
-      const tag = (node.tagName || "").toUpperCase();
-      if (!STRUCTURE_TAGS.has(tag)) continue;
-      
-      const cs = getCS(node);
-      if (!cs || cs.display === "none" || cs.visibility === "hidden") continue;
-      
-      const text = normalize(node.textContent || "");
-      if (text) return true;
-    }
-    return false;
-  };
-  
   // Find all atomic structure elements (structure tags with no structure descendants)
+  // Uses ancestor-walk instead of querySelectorAll("*") per element to avoid O(n²).
   const findAtomicStructures = (root) => {
-    const candidates = root.querySelectorAll(Array.from(STRUCTURE_TAGS).join(","));
-    const atomic = [];
-    
-    for (const el of candidates) {
+    const allCandidates = root.querySelectorAll(Array.from(STRUCTURE_TAGS).join(","));
+
+    // First pass: filter to visible elements with text, build a Set for O(1) lookup
+    const visible = [];
+    for (const el of allCandidates) {
       const cs = getCS(el);
       if (!cs || cs.display === "none" || cs.visibility === "hidden") continue;
-      
-      const text = normalize(el.textContent || "");
-      if (!text) continue;
-      
-      // Skip if has structure descendants with text
-      if (hasStructureDescendants(el)) continue;
-      
-      atomic.push(el);
+      if (!normalize(el.textContent || "")) continue;
+      visible.push(el);
     }
-    
-    return atomic;
+    const visibleSet = new Set(visible);
+
+    // Second pass: mark non-atomic via ancestor walk.
+    // If an ancestor of el is also in visibleSet, that ancestor is non-atomic
+    // (it has a structure descendant with text).
+    const nonAtomic = new Set();
+    for (const el of visible) {
+      let parent = el.parentElement;
+      while (parent && parent !== root) {
+        if (visibleSet.has(parent)) {
+          nonAtomic.add(parent);
+        }
+        parent = parent.parentElement;
+      }
+    }
+
+    return visible.filter(el => !nonAtomic.has(el));
   };
 
   // =========================
@@ -842,6 +837,11 @@
       }
     }
     
+    // Invariant per structure element — compute once, reuse for every flushed box
+    const hierarchy = extractHierarchy(structEl);
+    const tableContext = findTableContext(structEl);
+    const pageContext = findPageContext(structEl);
+
     // Track current inline context
     let currentText = "";
     let currentInlineTag = structTag; // Start with structure tag
@@ -890,14 +890,6 @@
           // Extract DOM metadata from the inline element
           const domMeta = extractDomMetadata(currentInlineElement);
           
-          // Extract hierarchy from the structure element
-          const hierarchy = extractHierarchy(structEl);
-          
-          // Extract table context from the structure element
-          const tableContext = findTableContext(structEl);
-          
-          // Extract page context from the structure element
-          const pageContext = findPageContext(structEl);
           
           boxes.push({
             box_id: boxIdObj.value++,

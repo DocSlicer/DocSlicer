@@ -29,28 +29,25 @@ Pipeline:
 
 from __future__ import annotations
 
-from typing import Any
+import re
 
 import numpy as np
 import pandas as pd
+
+from docslicer._utils.hierarchical_aggregator import (
+    aggregate_hierarchical,
+    build_standard_agg_spec,
+    _collect_unique_list,
+)
 
 
 # ============================================================
 # CONFIG
 # ============================================================
 
-# Columns that are identical for every cell in a line (set during line_id assignment).
-# Aggregated with "first" — no value_counts() overhead.
-_IDENTITY_COLS = [
-    "page_number",
-    "page_width",
-    "page_height",
-    "reading_column",
-    "gutter_id_left",
-    "gutter_id_right",
-    "is_sentence_like",
-    "sentence_score",
-]
+# Minimum gap threshold (pts) applied after interpolation — prevents over-splitting
+# on tightly packed text where the computed threshold would be very small.
+_MIN_PAGE_GAP_THRESH: float = 3.5
 
 # Boolean flag columns — "max" means True if any cell has it.
 _FLAG_COLS = [
@@ -59,57 +56,37 @@ _FLAG_COLS = [
     "has_vertical_line",
 ]
 
-# Style columns — take the most common value across cells in the line.
-_MODE_COLS = [
-    "font_name",
-    "font_family",
-    "font_size",
-    "font_weight",
-    "non_stroking_color",
-    "stroking_color",
-    "text_orientation",
-]
-
-# Numeric count columns — summed across cells.
-_SUM_COLS = [
-    "char_count",
-    "alpha_count",
-    "digit_count",
-    "uppercase_count",
-    "word_count",
-    "alpha_word_count",
-    "capitalized_word_count",
-]
 
 
 # ============================================================
 # HELPERS
 # ============================================================
 
-def _mode_or_first(series: pd.Series) -> Any:
-    """Return the most prevalent value, or the first non-null if all unique."""
-    if series.empty:
-        return None
-    vc = series.value_counts(dropna=True)
-    if not vc.empty:
-        return vc.index[0]
-    s2 = series.dropna()
-    return s2.iloc[0] if not s2.empty else None
+def _remove_bracketed_text(text: str) -> str:
+    """
+    Remove text within brackets (parentheses, square brackets, curly braces).
+    Used for uppercase detection to ignore mixed-case content in brackets.
+
+    Example: "RECENT NOTABLE DEVELOPMENTS (Since August 5, 2025)" -> "RECENT NOTABLE DEVELOPMENTS "
+    """
+    if not text:
+        return text
+    text = re.sub(r'\([^)]*\)', '', text)
+    text = re.sub(r'\[[^\]]*\]', '', text)
+    text = re.sub(r'\{[^}]*\}', '', text)
+    return text
 
 
-def _union_lists(series: pd.Series) -> list | None:
-    """Union all lists in a series into a deduplicated list, or None if empty."""
-    result: set = set()
-    for val in series:
-        if val is None:
-            continue
-        if isinstance(val, float) and np.isnan(val):
-            continue
-        if isinstance(val, list):
-            result.update(val)
-        else:
-            result.add(val)
-    return sorted(result) if result else None
+def _calc_uppercase_ratio(text: str) -> float:
+    """Return fraction of alphabetic characters that are uppercase, ignoring bracketed text."""
+    if not text or not isinstance(text, str):
+        return 0.0
+    cleaned = _remove_bracketed_text(text)
+    alpha = [c for c in cleaned if c.isalpha()]
+    if not alpha:
+        return 0.0
+    return sum(1 for c in alpha if c.isupper()) / len(alpha)
+
 
 
 def _interpolate_gap_multiplier(
@@ -160,67 +137,38 @@ def _aggregate_cells_to_lines(df_cells: pd.DataFrame) -> pd.DataFrame:
     Cells:    bracketed "[cell1] [cell2] ..." representation.
     Counts:   summed.
     bold/italic ratios: char-count-weighted average across cells.
-    Style:    most common value across cells (_mode_or_first).
+    Style:    most common value across cells.
     Flags:    True if any cell has the flag (max).
     shape_id_vertical_line: union of all vertical line IDs across cells.
     """
-    df = df_cells.sort_values(["line_id", "x_left", "y_top"], kind="mergesort")
-
-    # Pre-compute weighted bold/italic char estimates for ratio recalculation.
-    df = df.copy()
-    df["_bold_char_est"]   = df["bold_ratio"].fillna(0.0)   * df["char_count"].fillna(0.0)
-    df["_italic_char_est"] = df["italic_ratio"].fillna(0.0) * df["char_count"].fillna(0.0)
+    df = df_cells.sort_values(["line_id", "x_left", "y_top"], kind="mergesort").copy()
 
     # Ensure flag columns are present (documents without links/underlines/etc).
     for col in _FLAG_COLS:
         if col not in df.columns:
             df[col] = False
 
-    present = set(df.columns)
+    agg_spec = build_standard_agg_spec(
+        include_hierarchy=False,
+        include_html_provenance=False,
+        include_table=False,
+        extra_agg={
+            "text": lambda s: " ".join(t for t in s.astype(str) if t.strip()),
+        },
+        count_col="cell_id",
+    )
+    if "shape_id_vertical_line" in df.columns:
+        agg_spec["shape_id_vertical_line"] = _collect_unique_list
 
-    agg_spec: dict[str, Any] = {
-        # Geometry
-        "x_left":   "min",
-        "x_right":  "max",
-        "y_top":    "min",
-        "y_bottom": "max",
-        # Weighted ratio helpers
-        "_bold_char_est":   "sum",
-        "_italic_char_est": "sum",
-        # Cell count (will be renamed)
-        "cell_id": "count",
-        # Text
-        "text": lambda s: " ".join(t for t in s.astype(str) if t.strip()),
-        # Identity (same for every cell in a line)
-        **{col: "first" for col in _IDENTITY_COLS if col in present},
-        # Flags
-        **{col: "max" for col in _FLAG_COLS},
-        # Counts
-        **{col: "sum" for col in _SUM_COLS if col in present},
-        # Style
-        **{col: _mode_or_first for col in _MODE_COLS if col in present},
-    }
-
-    # Aggregate shape_id_vertical_line separately (list union).
-    if "shape_id_vertical_line" in present:
-        agg_spec["shape_id_vertical_line"] = _union_lists
-
-    grouped = (
-        df.groupby("line_id", sort=True, observed=True)
-        .agg(agg_spec)
-        .reset_index()
-        .rename(columns={"cell_id": "cell_count"})
+    grouped = aggregate_hierarchical(
+        df,
+        group_col="line_id",
+        agg_spec=agg_spec,
+        rename_count_col={"cell_id": "cell_count"},
     )
 
-    # Derived geometry
-    grouped["width"]  = grouped["x_right"] - grouped["x_left"]
-    grouped["height"] = grouped["y_bottom"] - grouped["y_top"]
-
-    # Recompute bold/italic ratios from weighted estimates
-    total_chars = grouped["char_count"].replace(0, np.nan)
-    grouped["bold_ratio"]   = (grouped["_bold_char_est"]   / total_chars).fillna(0.0)
-    grouped["italic_ratio"] = (grouped["_italic_char_est"] / total_chars).fillna(0.0)
-    grouped = grouped.drop(columns=["_bold_char_est", "_italic_char_est"])
+    # Override is_uppercase: use bracketed-text-aware method for accuracy.
+    grouped["is_uppercase"] = grouped["text"].apply(lambda t: _calc_uppercase_ratio(t) > 0.90)
 
     # Bracketed cells column — separate groupby to avoid lambda collision above.
     cells_col = (
@@ -364,7 +312,7 @@ def _assign_horizontal_bands(df_lines: pd.DataFrame) -> pd.DataFrame:
         # ----------------------------------------------------------------
         if page_gaps:
             median_gap = float(np.median(page_gaps))
-            threshold  = _interpolate_gap_multiplier(median_gap) * median_gap
+            threshold  = max(_MIN_PAGE_GAP_THRESH, _interpolate_gap_multiplier(median_gap) * median_gap)
         else:
             median_gap = 0.0
             threshold  = float("inf")  # single line or empty page → one band

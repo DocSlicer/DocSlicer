@@ -531,26 +531,24 @@ def _format_table_narrated(table_df: pd.DataFrame) -> str:
 def _generate_table_block(
     table_id: str,
     df_lines: pd.DataFrame,
-    table_type: str,
     table_cells_df: pd.DataFrame,
     representation: str = "markdown",
 ) -> str:
     """
     Generate appropriate representation of a table block.
-    
+
     Formats:
       - "markdown": Pipe-separated markdown table
       - "jsonl": One JSON line per row with headers
       - "melted": One fact per row (fully melted)
       - "narrated": Natural language description [TODO]
-    
+
     Args:
         table_id: Unique identifier for the table
         df_lines: Lines belonging to this table block
-        table_type: Type of table (e.g., "data", "layout", etc.)
         table_cells_df: Full table cells dataframe (filtered to this table)
         representation: Format to use for table output
-    
+
     Returns:
         Formatted table text
     """
@@ -728,11 +726,9 @@ def _join_text(
         
         # Strategy 1: Blocks with tables (table, toc, exhibits)
         if block_role == "table" or (block_role in ["toc", "exhibits"] and has_table):
-            table_type = lines["table_type"].iloc[0] if "table_type" in lines.columns else None
             return _generate_table_block(
                 table_id,
                 lines,
-                table_type,
                 table_cells_df,
                 table_representation,
             )

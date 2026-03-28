@@ -36,7 +36,20 @@ def add_document_information(
     Modifies:
         doc_meta dictionary in-place
     """
-    add_author_info(doc_meta, pdf_path=pdf_path, html_content=html_content, df_lines=df_lines)
-    add_title_info(doc_meta, pdf_path=pdf_path, html_content=html_content, df_lines=df_lines)
-    add_language_info(doc_meta, pdf_path=pdf_path, html_content=html_content, df_lines=df_lines)
+    # For HTML, truncate before parsing — metadata is always near the top.
+    # Parsing a full 400-page SEC filing 3× is the main performance bottleneck.
+    # - If <head> exists: use up to </head> (captures all standard meta tags)
+    # - Otherwise: use first 50 KB (enough for <html lang>, <title>, first <h1>)
+    _HTML_FALLBACK_CHARS = 50_000
+    html_head = html_content
+    if html_content:
+        head_end = html_content.lower().find('</head>')
+        if head_end != -1:
+            html_head = html_content[:head_end + 7]
+        elif len(html_content) > _HTML_FALLBACK_CHARS:
+            html_head = html_content[:_HTML_FALLBACK_CHARS]
+
+    add_author_info(doc_meta, pdf_path=pdf_path, html_content=html_head, df_lines=df_lines)
+    add_title_info(doc_meta, pdf_path=pdf_path, html_content=html_head, df_lines=df_lines)
+    add_language_info(doc_meta, pdf_path=pdf_path, html_content=html_head, df_lines=df_lines)
     add_profile_info(doc_meta, df_lines=df_lines)
