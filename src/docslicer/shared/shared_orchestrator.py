@@ -10,9 +10,10 @@ Pipeline Steps:
     02. Exhibit Detection - Detect exhibits
     03. Navigation Detection - Detect navigation blocks
     04. Doc Region Assignment - Assign document regions
-    05. Hierarchy Assignment - Assign heading hierarchy
-    06. Block Merger (lines -> blocks)
-    07. Chunk Builder (blocks -> chunks)
+    05. Hierarchy Assignment - Detect headings and structural markers
+    06. Hierarchy Builder - Fingerprints, weights, parent/level assignment
+    07. Block Merger (lines -> blocks)
+    08. Chunk Builder (blocks -> chunks)
 """
 import pandas as pd
 from typing import Dict, Any, Callable, Optional
@@ -25,11 +26,11 @@ from .step_01_toc_detector import detect_and_annotate_tocs
 from .step_02_exhibit_detector import detect_and_mark_exhibits
 from .step_03_navigation_detector import detect_navigation_blocks
 from .step_04_doc_region_assigner import assign_doc_region
-from .step_05_hierarchy_assigner import assign_doc_hierarchy
+from .step_06_hierarchy_builder import assign_doc_hierarchy
 
 # Shared Pipeline Steps
-from .step_06_block_merger import merge_blocks
-from .step_07_chunk_builder import build_chunks
+from .step_07_block_merger import merge_blocks
+from .step_08_chunk_builder import build_chunks
 
 # Config loaders
 from .._utils.yaml_loader import load_yamls

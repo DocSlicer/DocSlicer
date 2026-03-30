@@ -64,43 +64,6 @@ exhibit_row_patterns:
     strength: strong
 
 # =========================
-# Exhibit ROW anti-patterns
-# =========================
-# These patterns indicate the row is NOT an exhibit (e.g., financial data, tables)
-
-# This is not used for now - just keeping it here for future reference
-exhibit_row_anti_patterns:
-  - name: percentage_at_start
-    # Only reject if % appears in first 6 characters (avoids rejecting "3.8 Certificate of Designations for 4.55% Stock")
-    regex: '^.{0,6}%'
-    flags: ''
-  
-  - name: currency
-    regex: '\$'
-    flags: ''
-  
-  - name: multiple_numbers
-    regex: '\d+\s+\d+'
-    flags: ''
-  
-  - name: parenthetical_negative
-    # Only reject parenthetical numbers near the start (financial negatives like "(12.7)")
-    # Allows "(incorporated by reference" or "(File No. 1-5805)" later in the text
-    regex: '^.{0,30}\(\d+\.?\d*\)'
-    flags: ''
-  
-  - name: high_precision_decimal
-    regex: '\d+\.\d{3,}'
-    flags: ''
-  
-  - name: multiple_asterisks
-    regex: '\*\s*\*'
-    flags: ''
-
-
-
-
-# =========================
 # Exhibit TITLE / HEADER patterns
 # =========================
 exhibit_header_patterns:

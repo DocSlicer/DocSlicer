@@ -8,7 +8,7 @@ import pandas as pd
 
 from .pdf.pdf_orchestrator import run_pipeline as _run_pdf_pipeline
 from .shared.shared_orchestrator import run_pipeline as _run_shared_pipeline
-from .shared.step_06_block_merger import _format_table_markdown
+from .shared.step_07_block_merger import _format_table_markdown
 from ._config import ParseConfig, DEFAULT_CONFIG
 from ._result import Block, Chunk, DocMetadata, ParseResult, Table
 

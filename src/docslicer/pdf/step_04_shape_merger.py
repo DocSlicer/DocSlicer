@@ -90,8 +90,7 @@ def _ensure_shape_columns(
             "page_number", "raw_shape_id", "raw_shape_type",
             "x_left", "y_top", "x_right", "y_bottom",
             "width", "height", "area",
-            "non_stroking_color", "stroking_color",
-            "linewidth", "fill", "stroke", "paint_op",
+            "non_stroking_color",
         ]
     missing = [c for c in required_cols if c not in df.columns]
     if missing:
@@ -445,10 +444,13 @@ def merge_shapes(
     rendered as many small rects is merged into one). Thin rects and curves
     are reclassified as lines based on their dimensions.
 
-    Input columns (from step_02_shape_extractor):
+    Input columns (required):
         page_number, raw_shape_id, raw_shape_type,
         x_left, y_top, x_right, y_bottom, width, height, area,
-        non_stroking_color, stroking_color, linewidth, fill, stroke, paint_op
+        non_stroking_color
+
+    Input columns (optional — PDF-only, pass through as None if absent):
+        stroking_color, linewidth, fill, stroke, paint_op
 
     Output columns (one row per logical shape):
         page_number, shape_id, raw_shape_ids, candidate_group_id,

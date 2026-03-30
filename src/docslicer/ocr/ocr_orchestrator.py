@@ -20,6 +20,7 @@ from .step_02_word_colorizer import colorize_words_df
 from .step_03_shape_extractor import extract_shapes_df, ShapeExtractorConfig
 from .step_04_text_cleaner import clean_words_df
 from .._utils.line_merger import assign_line_id, LineMergerConfig
+from .._utils.text_utils import add_calculated_text_features
 
 
 # ==================================================================================================
@@ -146,12 +147,29 @@ def run_ocr_pipeline(
     for col in bbox_cols_words:
         if col in df_words.columns:
             df_words[col] = df_words[col] / config.dpi_scale
+
+    # Derive font_size from bbox height (best available proxy from Tesseract output)
+    if "height" in df_words.columns:
+        df_words["font_size"] = df_words["height"]
+
+    # Derive page_width / page_height from rendered image dimensions (converted to PT)
+    if "page_number" in df_words.columns and images_bgr:
+        page_dims = {
+            idx + 1: (img.shape[1] / config.dpi_scale, img.shape[0] / config.dpi_scale)
+            for idx, img in enumerate(images_bgr)
+            if img is not None
+        }
+        df_words["page_width"]  = df_words["page_number"].map(lambda p: page_dims.get(p, (0, 0))[0])
+        df_words["page_height"] = df_words["page_number"].map(lambda p: page_dims.get(p, (0, 0))[1])
     
     # Convert shapes bbox from PX to PT and remove x1,y1,x2,y2
-    bbox_cols_shapes = ['x_left', 'x_right', 'y_top', 'y_bottom', 'length']
+    bbox_cols_shapes = ['x_left', 'x_right', 'y_top', 'y_bottom', 'width', 'height', 'area', 'linewidth', 'length']
     for col in bbox_cols_shapes:
         if col in df_shapes.columns:
             df_shapes[col] = df_shapes[col] / config.dpi_scale
+    # area is width*height so it scales by dpi_scale^2 — correct after both dims are divided once each
+    if "area" in df_shapes.columns:
+        df_shapes["area"] = df_shapes["area"] / config.dpi_scale
 
     # Remove x1, y1, x2, y2 from shapes (not used downstream)
     cols_to_drop = ['x1', 'y1', 'x2', 'y2']
@@ -176,6 +194,7 @@ def run_ocr_pipeline(
     # 5) Text cleaning (runs after is_line_start is available for bullet detection)
     t0 = perf_counter()
     df_words = clean_words_df(df_words)
+    df_words = add_calculated_text_features(df_words)
     timings.append(("STEP 5: Text cleaning", perf_counter() - t0))
 
     return df_words, df_shapes, timings

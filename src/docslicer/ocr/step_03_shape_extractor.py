@@ -268,6 +268,35 @@ def _merge_shape_segments(shapes: List[dict], config: ShapeExtractorConfig) -> L
     return merged
 
 
+def _sample_shape_color(
+    img_bgr: np.ndarray,
+    x_left: float,
+    y_top: float,
+    x_right: float,
+    y_bottom: float,
+) -> Optional[str]:
+    """
+    Sample the median pixel color inside the shape bbox, returned as a hex string.
+    For rule lines this captures the ink/line color rather than the background.
+    """
+    H, W = img_bgr.shape[:2]
+    x1 = max(int(round(x_left)), 0)
+    y1 = max(int(round(y_top)), 0)
+    x2 = min(int(round(x_right)), W - 1)
+    y2 = min(int(round(y_bottom)), H - 1)
+    if x2 <= x1 or y2 <= y1:
+        return None
+    patch = img_bgr[y1 : y2 + 1, x1 : x2 + 1]
+    if patch.size == 0:
+        return None
+    pixels = patch.reshape(-1, 3).astype(np.float32)
+    med = np.median(pixels, axis=0)  # BGR order
+    b = max(0, min(255, int(round(float(med[0])))))
+    g = max(0, min(255, int(round(float(med[1])))))
+    r = max(0, min(255, int(round(float(med[2])))))
+    return f"#{r:02X}{g:02X}{b:02X}"
+
+
 def _filter_text_overlapping_shapes(
     shapes: List[dict],
     words_df: Optional[pd.DataFrame],
@@ -387,17 +416,18 @@ def extract_shapes_df(
       - words_df: optional; used for masking text regions if config.mask_words=True
 
     Output schema:
-      page_number, shape_id, shape_type,
+      page_number, raw_shape_id, raw_shape_type,
       x1, y1, x2, y2,
       x_left, x_right, y_top, y_bottom,
+      width, height, area, linewidth, non_stroking_color,
       length, angle_deg
     """
     if not images_bgr:
         return pd.DataFrame(
             columns=[
                 "page_number",
-                "shape_id",
-                "shape_type",
+                "raw_shape_id",
+                "raw_shape_type",
                 "x1",
                 "y1",
                 "x2",
@@ -406,6 +436,11 @@ def extract_shapes_df(
                 "x_right",
                 "y_top",
                 "y_bottom",
+                "width",
+                "height",
+                "area",
+                "linewidth",
+                "non_stroking_color",
                 "length",
                 "angle_deg",
             ]
@@ -550,23 +585,25 @@ def extract_shapes_df(
             )
 
         # Post-processing for this page
-        initial_count = len(page_rows)
-
         # 1. Merge collinear shape segments first (combines broken shapes)
         page_rows = _merge_shape_segments(page_rows, config)
-        after_merge_count = len(page_rows)
 
         # 2. Filter out shapes that overlap heavily with text
         # (do this after merging so we have complete shapes to evaluate)
         page_rows = _filter_text_overlapping_shapes(page_rows, words_df, page_number, config)
-        final_count = len(page_rows)
 
-        # Debug output to show filtering effectiveness
-        if initial_count > 0:
-            merged = initial_count - after_merge_count
-            filtered = after_merge_count - final_count
-            if filtered > 0 or merged > 0:
-                print(f"Page {page_number}: {initial_count} detected -> merged {merged} segments -> filtered {filtered} text overlaps -> {final_count} final")
+        # 3. Augment with derived fields required by the shape merger
+        for shape in page_rows:
+            w = shape["x_right"] - shape["x_left"]
+            h = shape["y_bottom"] - shape["y_top"]
+            shape["width"] = w
+            shape["height"] = h
+            shape["area"] = w * h
+            # linewidth = physical thickness of the rule
+            shape["linewidth"] = h if abs(shape.get("angle_deg", 0.0)) < 45 else w
+            shape["non_stroking_color"] = _sample_shape_color(
+                img_bgr, shape["x_left"], shape["y_top"], shape["x_right"], shape["y_bottom"]
+            )
 
         # Add to all rows
         all_rows.extend(page_rows)
@@ -576,8 +613,8 @@ def extract_shapes_df(
         return pd.DataFrame(
             columns=[
                 "page_number",
-                "shape_id",
-                "shape_type",
+                "raw_shape_id",
+                "raw_shape_type",
                 "x1",
                 "y1",
                 "x2",
@@ -586,13 +623,18 @@ def extract_shapes_df(
                 "x_right",
                 "y_top",
                 "y_bottom",
+                "width",
+                "height",
+                "area",
+                "linewidth",
+                "non_stroking_color",
                 "length",
                 "angle_deg",
             ]
         )
 
     df = df.sort_values(["page_number", "y_top", "x_left"], kind="mergesort").reset_index(drop=True)
-    df.insert(1, "shape_id", np.arange(1, len(df) + 1, dtype=np.int64))
-    df.insert(2, "shape_type", "line")
+    df.insert(1, "raw_shape_id", np.arange(1, len(df) + 1, dtype=np.int64))
+    df.insert(2, "raw_shape_type", "line")
 
     return df
