@@ -237,6 +237,49 @@ _SPLIT_PRIMARY_RE = re.compile(r"[|]+|(?:\s+-\s+)|(?:\s+—\s+)|(?:\s+–\s+)")
 # Reject classic heading patterns like: "4. Title", "2.3 Revenue"
 _HEADING_LIKE_RE = re.compile(r"^\s*\d+(?:\.\d+)*\.\s+\S+")
 
+# "Page 1 of 19", "2 of 20" — end-anchored, 1-4 digits only.
+# End-anchored to avoid "3 of 10 items"; validated post-match: 0 < N ≤ M.
+_N_OF_M_RE = re.compile(r"\b(\d{1,4})\s+of\s+(\d{1,4})\s*$", re.IGNORECASE)
+
+
+def _try_extract_embedded_label(text: str) -> Optional[str]:
+    """
+    Try to extract a page number token from compound text that would otherwise
+    yield the wrong candidate via generic splitting.
+
+    Supported patterns (checked in order of specificity):
+
+    1. **N-of-M suffix** — ``"Page 2 of 20"``, ``"2 of 20"``
+       Extracts N.  Requires ``0 < N ≤ M`` to limit false positives.
+
+    2. **Pipe-terminated label** — ``"Apple Inc. | Q1 2026 | 2"``
+       Takes the last segment after the final ``"|"``.
+       Type-matching by the caller rejects non-label segments.
+
+    Returns:
+        Extracted candidate string (un-normalized), or ``None``.
+    """
+    if not text:
+        return None
+
+    stripped = text.strip()
+
+    # Pattern 1: N of M — most specific, check first.
+    m = _N_OF_M_RE.search(stripped)
+    if m:
+        n, total = int(m.group(1)), int(m.group(2))
+        if 0 < n <= total:
+            return m.group(1)
+
+    # Pattern 2: pipe-terminated — take the last segment.
+    if "|" in stripped:
+        last = stripped.rsplit("|", 1)[-1].strip()
+        if last:
+            return last
+
+    return None
+
+
 # lowercase word, dot or comma, space, Uppercase word
 # Examples:
 #   "dividends. This"
@@ -277,6 +320,13 @@ def _extract_candidate_tokens(raw_text: str, max_len: int, has_link: bool) -> li
     # Prefer: full-string segment, then last segment after separators, then first segment,
     # then whitespace last token, then whitespace first token.
     segs: list[str] = []
+
+    # 0) Embedded patterns — highest priority so they beat generic ws/pipe splits.
+    #    Handles "Page 1 of 19" (extracts "1", not "19") and
+    #    "Apple Inc. | Q1 2026 | 2" (extracts "2").
+    embedded = _try_extract_embedded_label(s)
+    if embedded:
+        segs.append(embedded)
 
     # 1) Whole cell
     segs.append(s)

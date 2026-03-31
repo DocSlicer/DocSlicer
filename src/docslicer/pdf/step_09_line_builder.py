@@ -193,7 +193,7 @@ def _assign_horizontal_bands(df_lines: pd.DataFrame) -> pd.DataFrame:
     Adds columns
     ------------
         line_gap            float  vertical gap above this line (pt)
-        median_gap          float  per-page median of all positive line_gaps
+        median_gap          float  per-page median of line_gaps (negatives clamped to 2.0)
         page_gap_thresh     float  median_gap × _interpolate_gap_multiplier(median_gap)
         horizontal_band_id  int    1-based, increments across the document
 
@@ -207,9 +207,10 @@ def _assign_horizontal_bands(df_lines: pd.DataFrame) -> pd.DataFrame:
         right-column continuation lines
             gap = y_top − y_bottom of the previous line in the same column
 
-    All positive line_gaps are included in the page median — no elements
-    skipped — because the multicol correction already makes every gap
-    geometrically meaningful.
+    All line_gaps are included in the page median. Negative gaps (overlapping
+    lines in tightly-packed PDFs) are clamped to 2.0 before computing the
+    median, preventing a handful of large gaps from dominating and producing
+    an enormous threshold.
     """
     if df_lines.empty:
         return df_lines.assign(
@@ -299,8 +300,7 @@ def _assign_horizontal_bands(df_lines: pd.DataFrame) -> pd.DataFrame:
 
                 per_col_y_bottom[col_key] = yb
 
-            if gap > 0:
-                page_gaps.append(gap)
+            page_gaps.append(gap if gap > 0 else 2.0)
 
             # Update the global high-water mark (used for next gap reference).
             prev_all_y_bottom = (

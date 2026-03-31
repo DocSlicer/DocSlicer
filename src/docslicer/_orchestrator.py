@@ -10,7 +10,7 @@ from .pdf.pdf_orchestrator import run_pipeline as _run_pdf_pipeline
 from .shared.shared_orchestrator import run_pipeline as _run_shared_pipeline
 from .shared.step_07_block_merger import _format_table_markdown
 from ._config import ParseConfig, DEFAULT_CONFIG
-from ._result import Block, Chunk, DocMetadata, ParseResult, Table
+from ._result import BBox, Block, Chunk, DocMetadata, ParseResult, Table, TableCell
 
 _log = logging.getLogger(__name__)
 
@@ -49,11 +49,27 @@ def _resolve_metadata(discovered: dict, source_url: str | None) -> DocMetadata:
 # DataFrame → result objects
 # ─────────────────────────────────────────────
 
-def _bbox(row: pd.Series) -> tuple[float, float, float, float] | None:
+def _bbox(row: pd.Series) -> BBox | None:
     for col in ("x_left", "y_top", "x_right", "y_bottom"):
         if col not in row.index or pd.isna(row[col]):
             return None
-    return (float(row["x_left"]), float(row["y_top"]), float(row["x_right"]), float(row["y_bottom"]))
+    return BBox(
+        x_left=float(row["x_left"]),
+        y_top=float(row["y_top"]),
+        x_right=float(row["x_right"]),
+        y_bottom=float(row["y_bottom"]),
+    )
+
+
+def _str_list(row: pd.Series, col: str) -> list[str]:
+    """Safely extract a list of strings from a column that may hold a list, None, or scalar."""
+    val = row.get(col) if col in row.index else None
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return []
+    if isinstance(val, list):
+        return [str(v) for v in val if v is not None and str(v).strip()]
+    s = str(val).strip()
+    return [s] if s else []
 
 
 def _build_chunks(df_chunks: pd.DataFrame) -> list[Chunk]:
@@ -61,21 +77,36 @@ def _build_chunks(df_chunks: pd.DataFrame) -> list[Chunk]:
     for _, row in df_chunks.iterrows():
         raw_path = row.get("chunk_path", "") if "chunk_path" in row.index else ""
         if isinstance(raw_path, list):
-            hierarchy = raw_path
+            path = raw_path
         elif raw_path:
-            # chunk_path is stored as newline-joined heading strings
-            hierarchy = [s.strip() for s in str(raw_path).split("\n") if s.strip()]
+            path = [s.strip() for s in str(raw_path).split("\n") if s.strip()]
         else:
-            hierarchy = []
+            path = []
+
+        raw_heading = row.get("chunk_heading") if "chunk_heading" in row.index else None
+        heading = str(raw_heading).strip() if raw_heading and not (isinstance(raw_heading, float) and pd.isna(raw_heading)) else None
+
+        raw_label = row.get("page_label") if "page_label" in row.index else None
+        page_label = str(raw_label).strip() if raw_label and not (isinstance(raw_label, float) and pd.isna(raw_label)) else None
+
+        raw_parent = row.get("parent_chunk_id") if "parent_chunk_id" in row.index else None
+        parent_chunk_id = str(raw_parent) if raw_parent and not (isinstance(raw_parent, float) and pd.isna(raw_parent)) else None
+
         out.append(Chunk(
             id=str(row.get("chunk_id", "")),
             text=str(row.get("text", "")),
-            page=int(row.get("page_number", 0)),
-            hierarchy=hierarchy,
-            region=str(row.get("document_region", "")),
+            page_number=int(row.get("page_number", 0)),
+            page_label=page_label,
+            document_region=str(row.get("document_region", "")),
             chunk_index=int(row.get("chunk_index", 0)),
             char_count=int(row.get("embed_char_count", 0)),
+            heading=heading,
+            path=path,
+            parent_chunk_id=parent_chunk_id,
             bbox=_bbox(row),
+            link_url=_str_list(row, "link_url"),
+            ixbrl_ids=_str_list(row, "ixbrl_id"),
+            table_ids=_str_list(row, "table_ids"),
         ))
     return out
 
@@ -83,15 +114,22 @@ def _build_chunks(df_chunks: pd.DataFrame) -> list[Chunk]:
 def _build_blocks(df_blocks: pd.DataFrame) -> list[Block]:
     out = []
     for _, row in df_blocks.iterrows():
+        raw_label = row.get("page_label") if "page_label" in row.index else None
+        page_label = str(raw_label).strip() if raw_label and not (isinstance(raw_label, float) and pd.isna(raw_label)) else None
+
         out.append(Block(
             id=str(row.get("block_id", "")),
             text=str(row.get("text", "")),
-            page=int(row.get("page_number", 0)),
+            page_number=int(row.get("page_number", 0)),
+            page_label=page_label,
             role=str(row.get("block_role", "")),
-            region=str(row.get("document_region", "")),
+            document_region=str(row.get("document_region", "")),
             chunk_id=None,  # block→chunk link not available without re-running chunk assignment
             char_count=int(row.get("embed_char_count", 0)),
             bbox=_bbox(row),
+            link_url=_str_list(row, "link_url"),
+            ixbrl_ids=_str_list(row, "ixbrl_id"),
+            table_ids=_str_list(row, "table_ids"),
         ))
     return out
 
@@ -101,29 +139,48 @@ def _build_tables(df_table_cells: pd.DataFrame | None) -> list[Table]:
         return []
     out = []
     for table_id in df_table_cells["table_id"].unique():
-        cells = df_table_cells[df_table_cells["table_id"] == table_id]
-        page = int(cells["page_number"].iloc[0]) if "page_number" in cells.columns else 0
+        cells_df = df_table_cells[df_table_cells["table_id"] == table_id]
+        page = int(cells_df["page_number"].iloc[0]) if "page_number" in cells_df.columns else 0
+
+        raw_label = cells_df["page_label"].iloc[0] if "page_label" in cells_df.columns else None
+        page_label = str(raw_label).strip() if raw_label and not (isinstance(raw_label, float) and pd.isna(raw_label)) else None
+
         caption = None
-        if "caption" in cells.columns:
-            cap_vals = cells["caption"].dropna()
+        if "caption" in cells_df.columns:
+            cap_vals = cells_df["caption"].dropna()
             caption = str(cap_vals.iloc[0]) if not cap_vals.empty else None
 
-        markdown = _format_table_markdown(cells)
+        markdown = _format_table_markdown(cells_df)
 
-        bbox: tuple[float, float, float, float] | None = None
-        if all(c in cells.columns for c in ("x_left", "y_top", "x_right", "y_bottom")):
-            vals = (cells["x_left"].min(), cells["y_top"].min(),
-                    cells["x_right"].max(), cells["y_bottom"].max())
+        bbox: BBox | None = None
+        if all(c in cells_df.columns for c in ("x_left", "y_top", "x_right", "y_bottom")):
+            vals = (cells_df["x_left"].min(), cells_df["y_top"].min(),
+                    cells_df["x_right"].max(), cells_df["y_bottom"].max())
             if not any(pd.isna(v) for v in vals):
-                bbox = tuple(float(v) for v in vals)  # type: ignore[assignment]
+                bbox = BBox(x_left=float(vals[0]), y_top=float(vals[1]),
+                            x_right=float(vals[2]), y_bottom=float(vals[3]))
+
+        cells = []
+        for _, crow in cells_df.iterrows():
+            cells.append(TableCell(
+                row=int(crow.get("row_start", 0)),
+                col=int(crow.get("col_start", 0)),
+                rowspan=int(crow.get("rowspan", 1)),
+                colspan=int(crow.get("colspan", 1)),
+                role=str(crow.get("role", "")),
+                text=str(crow.get("text", "")),
+                bbox=_bbox(crow),
+            ))
 
         out.append(Table(
             id=str(table_id),
             caption=caption,
-            page=page,
+            page_number=page,
+            page_label=page_label,
             markdown=markdown,
-            chunk_id="",  # linked by _orchestrator after chunk building if needed
+            chunk_id="",
             bbox=bbox,
+            cells=cells,
         ))
     return out
 
@@ -144,8 +201,8 @@ def _build_result(
     # Apply region filter if requested
     if config.regions:
         allowed = set(config.regions)
-        chunks = [c for c in chunks if c.region in allowed]
-        blocks = [b for b in blocks if b.region in allowed]
+        chunks = [c for c in chunks if c.document_region in allowed]
+        blocks = [b for b in blocks if b.document_region in allowed]
 
     pipeline_steps: dict[str, pd.DataFrame] = {}
     if config.debug:

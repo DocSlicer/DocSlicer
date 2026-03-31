@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 from .step_01_toc_detector import detect_and_annotate_tocs
 from .step_02_exhibit_detector import detect_and_mark_exhibits
 from .step_03_navigation_detector import detect_navigation_blocks
+from .step_05_heading_detector import detect_headings
 from .step_04_doc_region_assigner import assign_doc_region
 from .step_06_hierarchy_builder import assign_doc_hierarchy
 
@@ -93,10 +94,13 @@ def run_pipeline(
     
     # Step 04 - Doc Region Assignment
     df = assign_doc_region(df)
-    
-    # Step 05 - Hierarchy Assignment
+
+    # Step 05 - Heading Detection
     if hierarchy_type_pattern_config:
-        df = assign_doc_hierarchy(df, hierarchy_type_pattern_config)
+        df = detect_headings(df, hierarchy_type_pattern_config)
+    
+    # Step 06 - Hierarchy Assignment
+    df = assign_doc_hierarchy(df)
     
     # ============================================================
     # STAGE: CHUNKING

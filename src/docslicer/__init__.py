@@ -4,8 +4,14 @@ import io
 from pathlib import Path
 from typing import Union
 
+try:
+    from importlib.metadata import version as _pkg_version
+    __version__ = _pkg_version("docslicer")
+except Exception:
+    __version__ = "0.1.0"
+
 from ._config import ParseConfig
-from ._result import ParseResult, Chunk, Block, Table, DocMetadata
+from ._result import ParseResult, Chunk, Block, Table, TableCell, DocMetadata, BBox
 from ._orchestrator import _run_pipeline
 
 __all__ = [
@@ -17,7 +23,9 @@ __all__ = [
     "Chunk",
     "Block",
     "Table",
+    "TableCell",
     "DocMetadata",
+    "BBox",
 ]
 
 _Source = Union[str, Path, bytes, io.IOBase]
