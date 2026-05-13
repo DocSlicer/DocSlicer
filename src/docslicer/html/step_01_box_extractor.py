@@ -94,15 +94,25 @@ def extract_boxes_with_playwright(
         # Get the rendered HTML
         rendered_html = page.content()
 
+        # Run extraction once after the initial load state.
+        boxes = page.evaluate(js_code)
+
+        # Some sites render meaningful content after DOMContentLoaded but before
+        # becoming visually stable. Keep the fast path by default, then retry once
+        # with networkidle if the first pass found nothing.
+        if navigated_url and not boxes:
+            try:
+                page.wait_for_load_state("networkidle", timeout=10000)
+                boxes = page.evaluate(js_code)
+            except Exception:
+                pass
+
         # Get the actual page height after rendering
         page_height = page.evaluate("document.documentElement.scrollHeight")
         page_dimensions = {
             'width': VIEWPORT_WIDTH,
             'height': page_height
         }
-
-        # JS file is an IIFE returning rows
-        boxes = page.evaluate(js_code)
 
         # Pause to inspect the rendered page (press Enter to continue)
         #input("⏸️  Browser window open - Press Enter to close and continue...")

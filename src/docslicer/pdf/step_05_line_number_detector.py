@@ -55,9 +55,19 @@ def detect_line_numbers(df_words: pd.DataFrame) -> pd.DataFrame:
     if missing:
         raise KeyError(f"detect_line_numbers: missing columns: {missing}")
 
-    # Assign temporary line IDs on a minimal copy (avoids mutating df_words)
     _tmp_cols = ["page_number", "word_id", "text", "x_left", "x_right", "y_top", "y_bottom"]
-    df_tmp = assign_line_id(df_words[_tmp_cols].copy(), y_alignment="center")
+    if "text_orientation" in df_words.columns:
+        _tmp_cols.append("text_orientation")
+
+    # Assign temporary line IDs on a minimal copy (avoids mutating df_words).
+    # Ignore non-LTR words before line merging so rotated/vertical footer text
+    # cannot become the leftmost word for a line-number row.
+    df_tmp = df_words[_tmp_cols].copy()
+    if "text_orientation" in df_tmp.columns:
+        orientation = df_tmp["text_orientation"].fillna("LTR").astype(str).str.upper()
+        df_tmp = df_tmp[orientation == "LTR"].copy()
+
+    df_tmp = assign_line_id(df_tmp, y_alignment="center")
 
     out = df_words.copy()
     out["line_number_flag"] = False

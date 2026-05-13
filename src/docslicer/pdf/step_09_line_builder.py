@@ -247,6 +247,11 @@ def _assign_horizontal_bands(df_lines: pd.DataFrame) -> pd.DataFrame:
         else:
             rc_arr = np.ones(n, dtype=int)
 
+        if "block_role" in df.columns:
+            block_role_arr = df.loc[sorted_idx, "block_role"].astype(str).str.lower().to_numpy()
+        else:
+            block_role_arr = np.full(n, "", dtype=object)
+
         # Build gutter_id array (None = singlecol).
         gutter_id_arr: list = []
         for idx in sorted_idx:
@@ -334,6 +339,18 @@ def _assign_horizontal_bands(df_lines: pd.DataFrame) -> pd.DataFrame:
         per_col_seen: set = set()
 
         for i in range(n):
+            if block_role_arr[i] == "page_label":
+                band_counter += 1
+                band_ids[i] = band_counter
+
+                # Page labels are standalone bands and should not bridge
+                # neighboring content, even when the vertical gap is tiny.
+                current_band      = 0
+                current_gutter_id = None
+                zone_band.clear()
+                per_col_seen.clear()
+                continue
+
             gid     = gutter_id_arr[i]
             col_key = (gid, int(rc_arr[i]))
 

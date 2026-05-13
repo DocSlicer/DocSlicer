@@ -503,7 +503,7 @@ def add_vertical_line_relationships_to_cells(
 
     v_lines = shapes[
         (shapes.get("shape_type") == "line") &
-        (shapes.get("orientation") == "vertical")
+        (shapes.get("shape_orientation") == "vertical")
     ]
 
     if v_lines.empty:

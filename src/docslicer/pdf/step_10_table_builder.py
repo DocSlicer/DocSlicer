@@ -7,37 +7,19 @@ Public API:
     df_lines, df_cells, df_table_cells = build_tables(df_lines, df_cells, df_words=None)
 
 Pipeline:
-    Step 1: Score lines
-        - Computes ratio features (digit_ratio, width_ratio, gap stats, …)
-        - Adds table_row_score per line, propagated to df_cells
-
-    Step 2: Assign column layout
+    Step 1: Infer column grid
         - Within each (page_number, horizontal_band_id), infers a column grid
         - Adds col_start, col_end, colspan, band_total_cols to df_cells
 
-    Step 3: Merge bands → layout_id
-        - Consecutive bands with matching column structure and small vertical gap
-          are merged into a single layout_id
-
-    Step 4: Classify layouts
-        - Computes average_table_score per layout_id
-        - Classifies each layout_id as "text" or "table"
-        - band_total_cols == 1 is always text; multi-col uses heuristic scoring
-          (justified text can produce multiple cells per line without being a table)
-
-    Step 5: Build table structure
-        - Assembles table cells with row_start, rowspan, colspan
-        - Assigns cell roles: header, row_label, value_numeric, value_text, footnote
-        - Classifies table sub-type: standard, matrix, narrative
+    Step 2: Classify horizontal bands
+        - Single-cell bands are text
+        - Multi-cell bands are scored from inferred grid quality
 
 Notes:
     - temp_line_id (old pipeline) is replaced by line_id throughout.
-    - df_words is optional; if absent, word-gap scoring features default to 0.
 """
 
 from __future__ import annotations
-
-import re
 
 import numpy as np
 import pandas as pd
@@ -50,158 +32,7 @@ _MAX_VERTICAL_GAP = 8.0   # max gap (pt) between bands for layout merging
 
 
 # ============================================================
-# STEP 1: Score lines
-# ============================================================
-
-def _compute_line_ratios(df_lines: pd.DataFrame, df_words: pd.DataFrame | None) -> pd.DataFrame:
-    """
-    Add ratio features used by the table-row scorer.
-
-    Cell-level ratios (derived from df_lines):
-        width_ratio             line_width / page_width
-        digit_ratio             digit_count / char_count
-        capitalized_word_ratio  capitalized_word_count / word_count
-        underlined_ratio        1.0 if is_underlined else 0.0
-
-    Word-level gap stats (derived from df_words with line_id; fully vectorised):
-        median_x0x1_gap     median positive gap between consecutive words
-        max_x0x1_gap        maximum positive gap between consecutive words
-        gap_ratio           max_gap / (median_gap + 1e-6)
-    """
-    df = df_lines.copy()
-
-    df["width_ratio"] = (
-        df["width"] / df["page_width"].replace(0, np.nan)
-    ).fillna(0.0)
-
-    df["digit_ratio"] = (
-        df["digit_count"] / df["char_count"].replace(0, np.nan)
-    ).fillna(0.0)
-
-    df["capitalized_word_ratio"] = (
-        df["capitalized_word_count"] / df["word_count"].replace(0, np.nan)
-    ).fillna(0.0)
-
-    df["underlined_ratio"] = df["is_underlined"].fillna(False).astype(float)
-
-    # --- Word-gap stats (vectorised) ---
-    if (
-        df_words is None
-        or df_words.empty
-        or "line_id" not in df_words.columns
-    ):
-        df["median_x0x1_gap"] = 0.0
-        df["max_x0x1_gap"]    = 0.0
-        df["gap_ratio"]       = 0.0
-        return df
-
-    ws = (
-        df_words[["line_id", "x_left", "x_right"]]
-        .sort_values(["line_id", "x_left"])
-        .copy()
-    )
-
-    ws["_next_x_left"] = ws.groupby("line_id", sort=False)["x_left"].shift(-1)
-    ws["_gap"]         = ws["_next_x_left"] - ws["x_right"]
-
-    positive = ws[ws["_gap"] > 0]
-
-    if positive.empty:
-        df["median_x0x1_gap"] = 0.0
-        df["max_x0x1_gap"]    = 0.0
-        df["gap_ratio"]       = 0.0
-        return df
-
-    gap_stats = (
-        positive.groupby("line_id")["_gap"]
-        .agg(median_x0x1_gap="median", max_x0x1_gap="max")
-        .reset_index()
-    )
-    gap_stats["gap_ratio"] = (
-        gap_stats["max_x0x1_gap"] / (gap_stats["median_x0x1_gap"] + 1e-6)
-    )
-
-    df = df.merge(gap_stats, on="line_id", how="left")
-    for col in ("median_x0x1_gap", "max_x0x1_gap", "gap_ratio"):
-        df[col] = df[col].fillna(0.0)
-
-    return df
-
-
-def _compute_table_row_scores(df_lines: pd.DataFrame) -> pd.DataFrame:
-    """
-    Vectorised table-row scoring.  Adds column: table_row_score (float).
-
-    Inputs expected on df_lines:
-        cell_count, digit_ratio, underlined_ratio, width_ratio,
-        has_vertical_line, median_x0x1_gap, gap_ratio, capitalized_word_ratio
-    """
-    if df_lines.empty:
-        return df_lines.assign(table_row_score=pd.Series(dtype="float64"))
-
-    df = df_lines.copy()
-
-    cc  = df.get("cell_count",             pd.Series(0,     index=df.index)).fillna(0).to_numpy(dtype=float)
-    dr  = df.get("digit_ratio",            pd.Series(0.0,   index=df.index)).fillna(0.0).to_numpy()
-    ur  = df.get("underlined_ratio",       pd.Series(0.0,   index=df.index)).fillna(0.0).to_numpy()
-    wr  = df.get("width_ratio",            pd.Series(0.0,   index=df.index)).fillna(0.0).to_numpy()
-    hvl = df.get("has_vertical_line",      pd.Series(False, index=df.index)).fillna(False).to_numpy(dtype=float)
-    mg  = df.get("median_x0x1_gap",        pd.Series(0.0,   index=df.index)).fillna(0.0).to_numpy()
-    gr  = df.get("gap_ratio",              pd.Series(0.0,   index=df.index)).fillna(0.0).to_numpy()
-    ctr = df.get("capitalized_word_ratio", pd.Series(0.0,   index=df.index)).fillna(0.0).to_numpy()
-
-    score = np.zeros(len(df), dtype=float)
-
-    score += np.where(cc < 3, -1.5,
-             np.where(cc == 3, 0.3,
-             np.where(cc == 4, 0.8, 1.2)))
-
-    score += np.clip((dr - 0.2) * 3.0, -0.5, 1.5)
-    score += np.minimum(ur * 1.5, 1.0)
-    score += np.where(wr < 0.35, -0.5, np.where(wr >= 0.55, 0.3, 0.0))
-    score += hvl * 6.0
-
-    score += np.where(mg < 5.0, -1.5,
-             np.where(mg < 10.0, np.interp(mg, [5.0, 10.0], [0.0, 1.0]),
-             np.where(mg < 15.0, np.interp(mg, [10.0, 15.0], [1.0, 1.5]),
-             1.7)))
-
-    score += np.where(gr < 2.0, -1.5,
-             np.where(gr < 5.0,  np.interp(gr, [2.0, 5.0],  [0.0, 1.0]),
-             np.where(gr < 15.0, np.interp(gr, [5.0, 15.0], [1.0, 2.0]),
-             2.0)))
-
-    ctr_c = np.minimum(ctr, 1.0)
-    score += np.where(ctr < 0.2, -0.5,
-             np.where(ctr < 0.7, np.interp(ctr, [0.2, 0.7], [0.0, 1.0]),
-             np.interp(ctr_c, [0.7, 1.0], [1.0, 1.5])))
-
-    df["table_row_score"] = score
-    return df
-
-
-def _score_lines(
-    df_lines: pd.DataFrame,
-    df_cells: pd.DataFrame,
-    df_words: pd.DataFrame | None,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Compute table_row_score on df_lines and propagate it to df_cells.
-
-    Returns updated (df_lines, df_cells).
-    """
-    df_lines = _compute_line_ratios(df_lines, df_words)
-    df_lines = _compute_table_row_scores(df_lines)
-
-    score_map = df_lines.set_index("line_id")["table_row_score"].to_dict()
-    df_cells = df_cells.copy()
-    df_cells["table_row_score"] = df_cells["line_id"].map(score_map).fillna(0.0)
-
-    return df_lines, df_cells
-
-
-# ============================================================
-# STEP 2: Assign column layout
+# STEP 1: Infer column grid
 # ============================================================
 
 def _assign_column_layout(df_cells: pd.DataFrame) -> pd.DataFrame:
@@ -336,630 +167,300 @@ def _assign_column_layout(df_cells: pd.DataFrame) -> pd.DataFrame:
 
 
 # ============================================================
-# STEP 3: Merge bands → layout_id
+# STEP 2: Classify Horizontal Bands (into Table or Text)
 # ============================================================
 
-def _find_mergeable_bands(
+def _compute_line_grid_metrics(
     df_cells: pd.DataFrame,
-    max_vertical_gap: float = _MAX_VERTICAL_GAP,
-) -> dict[int, int]:
+    df_lines: pd.DataFrame,
+) -> pd.DataFrame:
     """
-    Return a mapping {horizontal_band_id: layout_id}.
+    Precompute all line-level metrics used by the band classifier.
 
-    Consecutive bands on the same page are merged into the same layout_id when:
-      - both have band_total_cols > 1
-      - they have equal band_total_cols
-      - their column boundary positions align exactly
-      - their vertical gap is ≤ max_vertical_gap
-    Single-column bands always get their own layout_id.
+    This replaces the old nested band→line loops. Most work is now dataframe-wide
+    groupby/NumPy arithmetic, with only a small string aggregation for row
+    patterns.
     """
-    def _col_positions(band_cells):
-        pos: set[int] = set()
-        for _, cell in band_cells.iterrows():
-            pos.add(int(cell["col_start"]))
-            pos.add(int(cell["col_end"]) + 1)
-        return sorted(pos)
+    if df_cells.empty:
+        return pd.DataFrame()
 
-    band_to_layout: dict[int, int] = {}
-    layout_counter = 0
+    df = df_cells.sort_values(
+        ["horizontal_band_id", "line_id", "x_left"],
+        kind="mergesort",
+    ).copy()
 
-    for _, page_df in df_cells.groupby("page_number"):
-        bands = sorted(page_df["horizontal_band_id"].unique())
-        current_merge_group = None
+    text = df["text"].fillna("").astype(str)
+    df["_cell_word_count"] = text.str.count(r"\S+").astype("int32")
+    df["_digit_count"] = text.str.count(r"\d").astype("int32")
+    df["_char_count"] = text.str.len().clip(lower=1).astype("int32")
 
-        for i, band_id in enumerate(bands):
-            band_cells   = page_df[page_df["horizontal_band_id"] == band_id]
-            total_cols   = int(band_cells["band_total_cols"].iloc[0])
-
-            if total_cols == 1:
-                layout_counter += 1
-                band_to_layout[band_id] = layout_counter
-                current_merge_group = None
-                continue
-
-            can_merge = False
-            if i > 0 and current_merge_group is not None:
-                prev_id    = bands[i - 1]
-                prev_cells = page_df[page_df["horizontal_band_id"] == prev_id]
-                prev_total = int(prev_cells["band_total_cols"].iloc[0])
-
-                if (
-                    prev_total > 1
-                    and band_id == prev_id + 1
-                    and total_cols == prev_total
-                    and _col_positions(band_cells) == _col_positions(prev_cells)
-                    and (band_cells["y_top"].min() - prev_cells["y_bottom"].max()) <= max_vertical_gap
-                ):
-                    can_merge = True
-
-            if can_merge:
-                band_to_layout[band_id] = current_merge_group
-            else:
-                layout_counter += 1
-                band_to_layout[band_id] = layout_counter
-                current_merge_group = layout_counter
-
-    return band_to_layout
-
-
-# ============================================================
-# STEP 4: Classify layouts
-# ============================================================
-
-def _add_average_table_score(df_cells: pd.DataFrame) -> pd.DataFrame:
-    """
-    Compute average table_row_score per layout_id (one score per line_id)
-    and add it as average_table_score on df_cells.
-    """
-    line_scores = (
-        df_cells.groupby(["layout_id", "line_id"])["table_row_score"]
-        .first()
-        .reset_index()
+    same_line = df["line_id"].eq(df["line_id"].shift())
+    prev_x_right = df["x_right"].shift()
+    df["_gap"] = np.where(
+        same_line,
+        df["x_left"].to_numpy(dtype=float) - prev_x_right.to_numpy(dtype=float),
+        np.nan,
     )
-    layout_avg = (
-        line_scores.groupby("layout_id")["table_row_score"]
-        .mean()
-        .reset_index()
-        .rename(columns={"table_row_score": "average_table_score"})
+    df.loc[df["_gap"] <= 0, "_gap"] = np.nan
+
+    line_gb = df.groupby("line_id", sort=False)
+    metrics = line_gb.agg(
+        horizontal_band_id=("horizontal_band_id", "first"),
+        cell_count=("cell_id", "size"),
+        x_left=("x_left", "min"),
+        x_right=("x_right", "max"),
+        total_cols=("band_total_cols", "max"),
+        max_colspan=("colspan", "max"),
+        digit_count=("_digit_count", "sum"),
+        char_count=("_char_count", "sum"),
+        median_cell_words=("_cell_word_count", "median"),
+        max_gap=("_gap", "max"),
+        median_gap=("_gap", "median"),
     )
-    return df_cells.merge(layout_avg, on="layout_id", how="left")
 
+    gap_std = line_gb["_gap"].std(ddof=0).rename("gap_std")
+    gap_count = line_gb["_gap"].count().rename("gap_count")
+    metrics = metrics.join([gap_std, gap_count])
 
-def _classify_layout_types(df_cells: pd.DataFrame) -> pd.DataFrame:
-    """
-    Classify each layout_id as "text" or "table".
-
-    band_total_cols == 1  → always "text"
-    band_total_cols  > 1  → scored heuristically:
-        score  0 → "text"   (multi-col layout that looks like prose)
-        score  1 → "text"   (borderline; justified text can produce multi-cell lines)
-        score ≥ 2 → "table"
-
-    Scoring (additive):
-        +1  if 2 ≤ band_total_cols ≤ 6
-        +2  if band_total_cols ≥ 7
-        +1  if distinct underline IDs ≥ 2
-        +0/+1/+2 based on average_table_score thresholds (< 1 / 1–2 / ≥ 2)
-    """
-    result = df_cells.copy()
-    layout_types: dict[int, str] = {}
-
-    for layout_id, layout_df in result.groupby("layout_id"):
-        total_cols = int(layout_df["band_total_cols"].iloc[0])
-
-        if total_cols == 1:
-            layout_types[layout_id] = "text"
-            continue
-
-        score = 0
-
-        if 2 <= total_cols <= 6:
-            score += 1
-        elif total_cols >= 7:
-            score += 2
-
-        if "shape_id_underline" in layout_df.columns:
-            if layout_df["shape_id_underline"].nunique() >= 2:
-                score += 1
-
-        if "average_table_score" in layout_df.columns:
-            avg = float(layout_df["average_table_score"].iloc[0])
-            if 1 <= avg < 2:
-                score += 1
-            elif avg >= 2:
-                score += 2
-
-        layout_types[layout_id] = "table" if score >= 2 else "text"
-
-    result["layout_type"] = result["layout_id"].map(layout_types)
-
-    if "block_role" not in result.columns:
-        result["block_role"] = pd.NA
-    result.loc[result["layout_type"] == "table", "block_role"] = "table"
-
-    return result
-
-
-# ============================================================
-# STEP 5: Build table structure
-# ============================================================
-
-
-# --- helpers (underline-aware row building) ---
-
-def _compute_underline_last(df: pd.DataFrame) -> dict[tuple, int]:
-    df_u = df.dropna(subset=["shape_id_underline"]).copy()
-    if df_u.empty:
-        return {}
-    df_u["underline_id"] = df_u["shape_id_underline"].astype(int)
-    last_df = (
-        df_u.groupby(["layout_id", "page_number", "underline_id"])["line_id"]
-        .max()
-        .reset_index()
-        .rename(columns={"line_id": "last_line_id"})
+    metrics[["max_gap", "median_gap", "gap_std"]] = (
+        metrics[["max_gap", "median_gap", "gap_std"]].fillna(0.0)
     )
-    return {
-        (int(r.layout_id), int(r.page_number), int(r.underline_id)): int(r.last_line_id)
-        for r in last_df.itertuples(index=False)
-    }
+    metrics["gap_cv"] = np.where(
+        metrics["gap_count"].to_numpy(dtype=float) > 1,
+        metrics["gap_std"].to_numpy(dtype=float)
+        / (metrics["median_gap"].to_numpy(dtype=float) + 1e-6),
+        0.0,
+    )
 
+    metrics["line_width"] = metrics["x_right"] - metrics["x_left"]
+    metrics["digit_ratio"] = (
+        metrics["digit_count"] / metrics["char_count"].replace(0, np.nan)
+    ).fillna(0.0)
 
-def _compute_covered_cols(group_df: pd.DataFrame) -> set[int]:
-    covered: set[int] = set()
-    for row in group_df.itertuples(index=False):
-        for c in range(int(row.col_start), int(row.col_end) + 1):
-            covered.add(c)
-    return covered
-
-
-def _get_completion_threshold(band_total_cols: int, row_index: int) -> int:
-    if band_total_cols <= 0:
-        return 0
-    if band_total_cols == 1:
-        return 1
-    elif band_total_cols == 2:
-        min_normal, min_top, n_top = 2, 1, 1
-    elif band_total_cols == 3:
-        min_normal, min_top, n_top = 3, 2, 1
-    elif band_total_cols == 4:
-        min_normal, min_top, n_top = 4, 3, 2
-    elif band_total_cols == 5:
-        min_normal, min_top, n_top = 4, 3, 2
-    elif 6 <= band_total_cols <= 8:
-        min_normal, min_top, n_top = 4, 3, 3
+    if "page_width" in df_lines.columns:
+        page_width = df_lines.set_index("line_id")["page_width"]
+        metrics["page_width"] = metrics.index.map(page_width).astype(float)
+        metrics["width_ratio"] = (
+            metrics["line_width"] / metrics["page_width"].replace(0, np.nan)
+        ).fillna(0.0)
+    elif "width" in df_lines.columns:
+        line_width = df_lines.set_index("line_id")["width"]
+        metrics["source_width"] = metrics.index.map(line_width).astype(float)
+        metrics["width_ratio"] = (
+            metrics["source_width"] / metrics["line_width"].replace(0, np.nan)
+        ).fillna(0.0)
     else:
-        min_normal, min_top, n_top = 4, 3, 3
-    return min_top if row_index <= n_top else min_normal
+        metrics["width_ratio"] = 0.0
 
-
-def _is_complete_row(covered_cols: set[int], band_total_cols: int, row_index: int) -> bool:
-    if band_total_cols <= 0:
-        return False
-    return len(covered_cols) >= _get_completion_threshold(band_total_cols, row_index)
-
-
-def _has_last_underline(
-    line_underline_ids: list[int],
-    layout_id: int,
-    page_number: int,
-    line_id: int,
-    underline_last_map: dict,
-) -> bool:
-    for u in line_underline_ids:
-        last = underline_last_map.get((layout_id, page_number, u))
-        if last is not None and int(line_id) == int(last):
-            return True
-    return False
-
-
-def _flush_group_to_row(
-    group_df: pd.DataFrame,
-    layout_id: int,
-    page_number: int,
-    table_id: int,
-    row_index: int,
-    band_total_cols: int,
-    covered_cols: set[int],
-    records: list,
-    table_cell_id_counter: int,
-    cell_meta: dict,
-    cell_record_idx: dict,
-    row_to_cell_ids: dict,
-    open_rowspan: dict,
-    underline_row_anchor: dict,
-    flush_reason: str,
-) -> tuple[int, dict, dict]:
-    # Extend rowspans for missing columns.
-    for col in range(1, band_total_cols + 1):
-        key_col = (layout_id, page_number, col)
-        if col not in covered_cols:
-            prev = open_rowspan.get(key_col)
-            if prev is not None:
-                records[cell_record_idx[prev]]["rowspan"] += 1
-
-    row_key = (layout_id, page_number, row_index)
-    row_to_cell_ids.setdefault(row_key, [])
-
-    sorted_group = group_df.sort_values(["col_start", "col_end", "line_id", "cell_id"])
-    for (col_start, col_end), sub in sorted_group.groupby(["col_start", "col_end"], sort=True):
-        col_start = int(col_start)
-        col_end   = int(col_end)
-        colspan   = col_end - col_start + 1
-
-        texts = [str(t or "").strip() for t in sub["text"] if str(t or "").strip()]
-        merged_text = " ".join(texts)
-
-        text_raw_lines: list[str] = []
-        for _, sub_line in sub.groupby("line_id", sort=True):
-            parts = [str(t or "").strip() for t in sub_line["text"] if str(t or "").strip()]
-            if parts:
-                text_raw_lines.append(" ".join(parts))
-
-        tcell_id = table_cell_id_counter
-        table_cell_id_counter += 1
-
-        record = {
-            "table_cell_id": tcell_id,
-            "page_number":   page_number,
-            "layout_id":     layout_id,
-            "table_id":      table_id,
-            "row_start":     row_index,
-            "col_start":     col_start,
-            "rowspan":       1,
-            "colspan":       colspan,
-            "text":          merged_text,
-            "text_raw_lines": text_raw_lines,
-            "cell_ids":      sub["cell_id"].tolist(),
-            "line_ids":      sub["line_id"].dropna().drop_duplicates().astype(int).tolist(),
-            "flush_reason":  flush_reason,
-        }
-        records.append(record)
-        rec_idx = len(records) - 1
-        cell_record_idx[tcell_id] = rec_idx
-        cell_meta[tcell_id] = {
-            "layout_id": layout_id,
-            "page_number": page_number,
-            "row_index": row_index,
-            "col_start": col_start,
-            "colspan": colspan,
-        }
-        row_to_cell_ids[row_key].append(tcell_id)
-        for col in range(col_start, col_end + 1):
-            open_rowspan[(layout_id, page_number, col)] = tcell_id
-
-    # Anchor underline IDs on this row.
-    for u in (
-        group_df["shape_id_underline"].dropna().astype(int).unique().tolist()
-        if "shape_id_underline" in group_df.columns else []
-    ):
-        underline_row_anchor.setdefault((layout_id, page_number, u), row_index)
-
-    return table_cell_id_counter, open_rowspan, underline_row_anchor
-
-
-def _try_attach_to_existing_row(
-    df_line: pd.DataFrame,
-    layout_id: int,
-    page_number: int,
-    records: list,
-    cell_meta: dict,
-    cell_record_idx: dict,
-    row_to_cell_ids: dict,
-    underline_row_anchor: dict,
-) -> tuple[bool, set[int]]:
-    if "shape_id_underline" not in df_line.columns:
-        return False, set()
-    underline_ids = (
-        df_line["shape_id_underline"].dropna().astype(int).unique().tolist()
+    metrics["has_large_gap"] = metrics["max_gap"] >= 25.0
+    metrics["is_multi_cell"] = metrics["cell_count"] >= 2
+    metrics["is_strong_multi_cell"] = metrics["cell_count"] >= 3
+    metrics["is_full_span_line"] = (
+        (metrics["cell_count"] == 1)
+        & (metrics["max_colspan"] >= metrics["total_cols"])
     )
-    if not underline_ids:
-        return False, set()
+    metrics["is_prose_candidate"] = metrics["cell_count"] >= 3
+    metrics["is_justified_prose_like"] = (
+        metrics["is_prose_candidate"]
+        & (metrics["digit_ratio"] < 0.15)
+        & (metrics["median_cell_words"] <= 2.0)
+        & (metrics["width_ratio"] >= 0.25)
+        & (metrics["max_gap"] <= 30.0)
+        & (metrics["gap_cv"] <= 0.75)
+    )
 
-    attached_any = False
-    anchor_rows: set[int] = set()
-
-    for u in underline_ids:
-        key_u = (layout_id, page_number, u)
-        if key_u not in underline_row_anchor:
-            continue
-        row_index_anchor = underline_row_anchor[key_u]
-        anchor_rows.add(row_index_anchor)
-        row_key = (layout_id, page_number, row_index_anchor)
-        dest_ids = row_to_cell_ids.get(row_key, [])
-        if not dest_ids:
-            continue
-
-        df_line_u = df_line[df_line["shape_id_underline"].astype("Int64") == u]
-        for _, cell in df_line_u.iterrows():
-            col_start = int(cell["col_start"])
-            chosen_id = next(
-                (cid for cid in dest_ids
-                 if cell_meta[cid]["col_start"] <= col_start
-                 <= cell_meta[cid]["col_start"] + cell_meta[cid]["colspan"] - 1),
-                max(dest_ids, key=lambda cid: int(cell_meta[cid]["col_start"])),
-            )
-            rec = records[cell_record_idx[chosen_id]]
-            txt = str(cell["text"] or "").strip()
-            if txt:
-                rec["text"] = (rec["text"] + " " + txt).strip() if rec["text"] else txt
-            rec["cell_ids"].append(cell["cell_id"])
-            rec["line_ids"].append(int(cell["line_id"]))
-            attached_any = True
-
-    return attached_any, anchor_rows
-
-
-def _attach_pending_to_rows(
-    group_df: pd.DataFrame,
-    layout_id: int,
-    page_number: int,
-    anchor_rows: set[int],
-    records: list,
-    cell_meta: dict,
-    cell_record_idx: dict,
-    row_to_cell_ids: dict,
-) -> None:
-    if group_df.empty or not anchor_rows:
-        return
-    for row_index_anchor in sorted(anchor_rows):
-        row_key  = (layout_id, page_number, row_index_anchor)
-        dest_ids = row_to_cell_ids.get(row_key, [])
-        if not dest_ids:
-            continue
-        for _, cell in group_df.sort_values(["line_id", "col_start", "cell_id"]).iterrows():
-            col_start = int(cell["col_start"])
-            chosen_id = next(
-                (cid for cid in dest_ids
-                 if cell_meta[cid]["col_start"] <= col_start
-                 <= cell_meta[cid]["col_start"] + cell_meta[cid]["colspan"] - 1),
-                max(dest_ids, key=lambda cid: int(cell_meta[cid]["col_start"])),
-            )
-            rec = records[cell_record_idx[chosen_id]]
-            txt = str(cell["text"] or "").strip()
-            if txt:
-                rec["text"] = (rec["text"] + " " + txt).strip() if rec["text"] else txt
-            rec["cell_ids"].append(cell["cell_id"])
-            rec["line_ids"].append(int(cell["line_id"]))
-
-
-def _build_table_cells(df_cells: pd.DataFrame) -> pd.DataFrame:
-    """
-    Assemble table cell records from cells classified as layout_type == "table".
-
-    Groups cells by (layout_id, page_number), then iterates over line_id order,
-    accumulating cells into rows based on column coverage and underline cues.
-    """
-    _EMPTY_COLS = [
-        "table_cell_id", "page_number", "layout_id", "table_id",
-        "row_start", "col_start", "rowspan", "colspan",
-        "text", "text_raw_lines", "cell_ids", "line_ids",
-    ]
-
-    if "layout_type" in df_cells.columns:
-        df_tables = df_cells[df_cells["layout_type"] == "table"].copy()
+    if "table_row_score" in df.columns:
+        metrics["table_row_score"] = line_gb["table_row_score"].first()
     else:
-        df_tables = df_cells.copy()
+        metrics["table_row_score"] = 0.0
 
-    if df_tables.empty:
-        return pd.DataFrame(columns=_EMPTY_COLS)
-
-    if "shape_id_underline" not in df_tables.columns:
-        df_tables["shape_id_underline"] = np.nan
-
-    underline_last_map = _compute_underline_last(df_tables)
-
-    records: list[dict] = []
-    table_cell_id_counter = 1
-    table_id_counter      = 1
-
-    cell_meta:           dict = {}
-    cell_record_idx:     dict = {}
-    row_to_cell_ids:     dict = {}
-    underline_row_anchor: dict = {}
-    open_rowspan:        dict = {}
-
-    for (layout_id, page_number), df_seg in df_tables.groupby(
-        ["layout_id", "page_number"], sort=True
-    ):
-        if df_seg.empty:
-            continue
-
-        df_seg   = df_seg.sort_values(["line_id", "col_start", "cell_id"])
-        table_id = table_id_counter
-        table_id_counter += 1
-
-        row_index = 1
-        open_group_line_ids: list[int] = []
-
-        for line_id in sorted(df_seg["line_id"].dropna().drop_duplicates().tolist()):
-            df_line = df_seg[df_seg["line_id"] == line_id]
-
-            # Try to attach to an already-flushed underlined row.
-            attached, anchor_rows = _try_attach_to_existing_row(
-                df_line=df_line,
-                layout_id=int(layout_id),
-                page_number=int(page_number),
-                records=records,
-                cell_meta=cell_meta,
-                cell_record_idx=cell_record_idx,
-                row_to_cell_ids=row_to_cell_ids,
-                underline_row_anchor=underline_row_anchor,
-            )
-            if attached:
-                if open_group_line_ids:
-                    pending = df_seg[df_seg["line_id"].isin(open_group_line_ids)]
-                    _attach_pending_to_rows(
-                        group_df=pending,
-                        layout_id=int(layout_id),
-                        page_number=int(page_number),
-                        anchor_rows=anchor_rows,
-                        records=records,
-                        cell_meta=cell_meta,
-                        cell_record_idx=cell_record_idx,
-                        row_to_cell_ids=row_to_cell_ids,
-                    )
-                    open_group_line_ids = []
-                continue
-
-            open_group_line_ids.append(int(line_id))
-            group_df = df_seg[df_seg["line_id"].isin(open_group_line_ids)]
-
-            band_total_cols = int(group_df["band_total_cols"].max())
-            covered_cols    = _compute_covered_cols(group_df)
-
-            is_complete = _is_complete_row(covered_cols, band_total_cols, row_index)
-
-            line_underline_ids = (
-                df_line["shape_id_underline"].dropna().astype(int).unique().tolist()
-                if "shape_id_underline" in df_line.columns else []
-            )
-            has_last_u = _has_last_underline(
-                line_underline_ids=line_underline_ids,
-                layout_id=int(layout_id),
-                page_number=int(page_number),
-                line_id=int(line_id),
-                underline_last_map=underline_last_map,
-            )
-
-            flush_reason = (
-                "complete_row" if is_complete
-                else "last_underline" if has_last_u
-                else None
-            )
-
-            if flush_reason is not None:
-                (table_cell_id_counter, open_rowspan, underline_row_anchor) = _flush_group_to_row(
-                    group_df=group_df,
-                    layout_id=int(layout_id),
-                    page_number=int(page_number),
-                    table_id=table_id,
-                    row_index=row_index,
-                    band_total_cols=band_total_cols,
-                    covered_cols=covered_cols,
-                    records=records,
-                    table_cell_id_counter=table_cell_id_counter,
-                    cell_meta=cell_meta,
-                    cell_record_idx=cell_record_idx,
-                    row_to_cell_ids=row_to_cell_ids,
-                    open_rowspan=open_rowspan,
-                    underline_row_anchor=underline_row_anchor,
-                    flush_reason=flush_reason,
-                )
-                row_index += 1
-                open_group_line_ids = []
-
-    if not records:
-        return pd.DataFrame(columns=_EMPTY_COLS)
-
-    return pd.DataFrame.from_records(records)
-
-
-# --- cell roles ---
-
-def _looks_like_numberish(text: str) -> bool:
-    if not text or not text.strip():
-        return False
-    clean = (text.strip()
-             .replace(",", "").replace("$", "").replace("€", "").replace("£", "")
-             .replace("(", "").replace(")", "").replace("%", "").replace(" ", ""))
-    if not clean:
-        return False
-    try:
-        float(clean)
-        return True
-    except ValueError:
-        pass
-    return sum(c.isdigit() for c in text) >= 3
-
-
-def _assign_cell_roles(df_table_cells: pd.DataFrame) -> pd.DataFrame:
-    """
-    Assign role to each table cell:
-        header       first row(s) and any rowspan-extended header rows
-        row_label    col_start == 0 on data rows
-        footnote     sole bottom-row cell starting at col_start == 0 with colspan ≥ 2
-        value_numeric / value_text  all remaining data cells
-    """
-    if df_table_cells.empty:
-        df_table_cells["role"] = pd.Series(dtype=str)
-        return df_table_cells
-
-    df = df_table_cells.copy()
-    df["role"] = None
-
-    year_re = re.compile(r"\b20\d{2}\b")
-    date_re = re.compile(
-        r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+20\d{2}\b|"
-        r"\b\d{1,2}-(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-\d{2,4}\b",
-        re.IGNORECASE,
+    token_df = df[["line_id", "col_start", "col_end"]].copy()
+    token_df["_pattern_token"] = (
+        token_df["col_start"].astype("int32").astype(str)
+        + ":"
+        + token_df["col_end"].astype("int32").astype(str)
     )
-    unit_phrases = {
-        "in thousands", "in millions", "in billions",
-        "except per share", "per share", "percentage", "(%)",
-        "year ended", "years ended", "months ended", "month ended",
-        "quarters ended", "quarter ended", "total", "actual", "adjusted",
-        "number", "shares", "amount", "value",
-    }
+    metrics["row_pattern"] = token_df.groupby("line_id", sort=False)["_pattern_token"].agg("|".join)
 
-    for (table_id, page_number, layout_id), tbl in df.groupby(
-        ["table_id", "page_number", "layout_id"], sort=False
-    ):
-        rows = sorted(tbl["row_start"].unique())
-        if not rows:
-            continue
-        max_row = max(rows)
+    return metrics
 
-        # Header detection
-        header_rows: set[int] = {rows[0]}
-        for _, cell in tbl[tbl["row_start"] == rows[0]].iterrows():
-            for offset in range(1, int(cell["rowspan"])):
-                spanned = rows[0] + offset
-                if spanned in rows:
-                    header_rows.add(spanned)
 
-        for r in rows[1:min(6, len(rows))]:
-            if r in header_rows:
-                continue
-            row_cells = tbl[tbl["row_start"] == r]
-            texts_lower = [str(c["text"] or "").strip().lower() for _, c in row_cells.iterrows()]
-            combined = " ".join(texts_lower)
-            if any(
-                _looks_like_numberish(t) and not year_re.search(t)
-                for t in texts_lower if t
-            ):
-                break
-            if year_re.search(combined) or date_re.search(combined):
-                header_rows.add(r)
-                continue
-            if any(phrase in combined for phrase in unit_phrases):
-                header_rows.add(r)
-                continue
-            break
+def _compute_band_grid_metrics(
+    df_cells: pd.DataFrame,
+    line_metrics: pd.DataFrame,
+) -> pd.DataFrame:
+    """Aggregate precomputed line metrics into one KPI row per horizontal band."""
+    if df_cells.empty or line_metrics.empty:
+        return pd.DataFrame()
 
-        # Footnote detection (sole bottom-row cell at col 0 with colspan ≥ 2)
-        bottom_cells = tbl[tbl["row_start"] == max_row]
-        is_footnote_row = (
-            len(bottom_cells) == 1
-            and int(bottom_cells.iloc[0]["col_start"]) == 0
-            and int(bottom_cells.iloc[0]["colspan"]) >= 2
+    band_gb = line_metrics.groupby("horizontal_band_id", sort=False)
+    band = band_gb.agg(
+        total_lines=("cell_count", "size"),
+        max_cell_count=("cell_count", "max"),
+        total_cols=("total_cols", "max"),
+        multi_cell_lines=("is_multi_cell", "sum"),
+        strong_multi_cell_lines=("is_strong_multi_cell", "sum"),
+        large_gap_lines=("has_large_gap", "sum"),
+        prose_candidate_lines=("is_prose_candidate", "sum"),
+        justified_prose_lines=("is_justified_prose_like", "sum"),
+        full_span_lines=("is_full_span_line", "sum"),
+        mean_table_row_score=("table_row_score", "mean"),
+    )
+
+    cell_gb = df_cells.groupby("horizontal_band_id", sort=False)
+    cell_counts = cell_gb.size().rename("total_cells")
+    atomic_counts = (
+        df_cells["colspan"].astype(int).eq(1)
+        .groupby(df_cells["horizontal_band_id"], sort=False)
+        .sum()
+        .rename("atomic_cells")
+    )
+    band = band.join([cell_counts, atomic_counts]).fillna({
+        "total_cells": 0,
+        "atomic_cells": 0,
+    })
+
+    atomic = df_cells[df_cells["colspan"].astype(int).eq(1)]
+    if atomic.empty:
+        reused_cols = pd.Series(0, index=band.index, name="reused_cols")
+    else:
+        col_line_counts = (
+            atomic.groupby(["horizontal_band_id", "col_start"], sort=False)["line_id"]
+            .nunique()
         )
+        reused_cols = (
+            col_line_counts.ge(2)
+            .groupby(level=0, sort=False)
+            .sum()
+            .rename("reused_cols")
+        )
+    band = band.join(reused_cols).fillna({"reused_cols": 0})
 
-        for idx, cell in tbl.iterrows():
-            r = int(cell["row_start"])
-            if r in header_rows:
-                df.at[idx, "role"] = "header"
-            elif is_footnote_row and r == max_row:
-                df.at[idx, "role"] = "footnote"
-            elif int(cell["col_start"]) == 0:
-                df.at[idx, "role"] = "row_label"
-            else:
-                df.at[idx, "role"] = (
-                    "value_numeric"
-                    if _looks_like_numberish(str(cell["text"] or ""))
-                    else "value_text"
-                )
+    pattern_counts = (
+        line_metrics.groupby(["horizontal_band_id", "row_pattern"], sort=False)
+        .size()
+    )
+    row_pattern_max = (
+        pattern_counts.groupby(level=0, sort=False)
+        .max()
+        .rename("row_pattern_max")
+    )
+    band = band.join(row_pattern_max).fillna({"row_pattern_max": 0})
 
-    return df
+    band["multi_cell_line_ratio"] = (
+        band["multi_cell_lines"] / band["total_lines"].replace(0, np.nan)
+    ).fillna(0.0)
+    band["strong_multi_cell_line_ratio"] = (
+        band["strong_multi_cell_lines"] / band["total_lines"].replace(0, np.nan)
+    ).fillna(0.0)
+    band["atomic_cell_ratio"] = (
+        band["atomic_cells"] / band["total_cells"].replace(0, np.nan)
+    ).fillna(0.0)
+    band["column_reuse"] = (
+        band["reused_cols"] / band["total_cols"].replace(0, np.nan)
+    ).fillna(0.0)
+    band["full_span_line_ratio"] = (
+        band["full_span_lines"] / band["total_lines"].replace(0, np.nan)
+    ).fillna(0.0)
+    band["row_pattern_reuse"] = (
+        band["row_pattern_max"] / band["total_lines"].replace(0, np.nan)
+    ).fillna(0.0)
+    band["large_gap_ratio"] = (
+        band["large_gap_lines"] / band["multi_cell_lines"].replace(0, np.nan)
+    ).fillna(0.0)
+    band["justified_prose_ratio"] = (
+        band["justified_prose_lines"]
+        / band["prose_candidate_lines"].replace(0, np.nan)
+    ).fillna(0.0)
+
+    return band
+
+
+def _classify_bands(
+    df_lines: pd.DataFrame,
+    df_cells: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Classify every horizontal_band_id as "table" or "text" using the inferred grid.
+
+    The key distinction is whether the grid is reused across lines. Justified
+    prose can create many cells, but it usually creates weak columns, one-off row
+    patterns, short word fragments, and many full-row paragraph-like splits.
+    """
+    result_cells = _assign_column_layout(df_cells)
+
+    result_cells["layout_id"] = result_cells["horizontal_band_id"]
+    result_cells["layout_type"] = "text"
+    if "block_role" not in result_cells.columns:
+        result_cells["block_role"] = pd.NA
+
+    result_lines = df_lines.copy()
+    result_lines["layout_id"] = result_lines["horizontal_band_id"]
+    result_lines["layout_type"] = "text"
+
+    if result_cells.empty:
+        return result_lines, result_cells
+
+    line_metrics = _compute_line_grid_metrics(result_cells, result_lines)
+    band_metrics = _compute_band_grid_metrics(result_cells, line_metrics)
+
+    if band_metrics.empty:
+        return result_lines, result_cells
+
+    eligible = (
+        (band_metrics["max_cell_count"] > 1)
+        & (band_metrics["multi_cell_lines"] >= 2)
+        & (band_metrics["total_cols"] > 1)
+    )
+
+    score = pd.Series(0.0, index=band_metrics.index)
+    score += np.where(band_metrics["total_cols"] >= 3, 2.0, 0.0)
+    score += np.where(band_metrics["column_reuse"] >= 0.45, 2.0, 0.0)
+    score += np.where(band_metrics["atomic_cell_ratio"] >= 0.55, 1.5, 0.0)
+    score += np.where(band_metrics["multi_cell_line_ratio"] >= 0.25, 1.5, 0.0)
+    score += np.where(band_metrics["strong_multi_cell_line_ratio"] >= 0.15, 1.0, 0.0)
+    score += np.where(band_metrics["large_gap_ratio"] >= 0.40, 1.0, 0.0)
+    score += np.where(band_metrics["row_pattern_reuse"] >= 0.35, 1.0, 0.0)
+    score += np.where(band_metrics["mean_table_row_score"] >= 1.5, 1.0, 0.0)
+
+    score -= np.where(
+        (band_metrics["full_span_line_ratio"] >= 0.60)
+        & (band_metrics["atomic_cell_ratio"] < 0.45),
+        2.0,
+        0.0,
+    )
+
+    strong_prose_penalty = (
+        (band_metrics["justified_prose_ratio"] >= 0.60)
+        & (band_metrics["large_gap_ratio"] < 0.25)
+        & (band_metrics["mean_table_row_score"] < 1.5)
+    )
+    weak_prose_penalty = (
+        (band_metrics["justified_prose_ratio"] >= 0.60)
+        & ~strong_prose_penalty
+    )
+    score -= np.where(strong_prose_penalty, 8.0, 0.0)
+    score -= np.where(weak_prose_penalty, 3.0, 0.0)
+    score = score.where(eligible, 0.0)
+
+    band_types = pd.Series(
+        np.where(eligible & (score >= 3.0), "table", "text"),
+        index=band_metrics.index,
+    )
+    band_scores = score
+
+    result_cells["layout_type"] = result_cells["horizontal_band_id"].map(band_types).fillna("text")
+    result_cells["band_table_score"] = result_cells["horizontal_band_id"].map(band_scores).fillna(0.0)
+    result_cells.loc[result_cells["layout_type"] == "table", "block_role"] = "table"
+
+    result_lines["layout_type"] = result_lines["horizontal_band_id"].map(band_types).fillna("text")
+    result_lines["band_table_score"] = result_lines["horizontal_band_id"].map(band_scores).fillna(0.0)
+
+    return result_lines, result_cells
+
+
+
+
 
 
 # ============================================================
@@ -989,19 +490,16 @@ def build_tables(
         x_left, x_right, y_top, y_bottom, text.
 
     df_words : pd.DataFrame | None
-        One row per word, with line_id (from step_07_cell_builder output).
-        Used for word-gap features in the table-row scorer.
-        If None or missing line_id, gap features default to 0.
+        Reserved for later table-cell assembly/scoring stages.
 
     Returns
     -------
     df_lines : pd.DataFrame
-        With added columns: table_row_score, ratio features,
-        layout_id, layout_type.
+        With added columns: layout_id, layout_type, band_table_score.
 
     df_cells : pd.DataFrame
-        With added columns: table_row_score, col_start, col_end, colspan,
-        band_total_cols, layout_id, average_table_score, layout_type, block_role.
+        With added columns: col_start, col_end, colspan, band_total_cols,
+        layout_id, layout_type, block_role, band_table_score.
 
     df_table_cells : pd.DataFrame
         One row per assembled table cell.  Contains: table_cell_id, page_number,
@@ -1016,58 +514,14 @@ def build_tables(
         ])
         return df_lines.copy(), df_cells.copy(), empty_tcells
 
-    # Step 1 — score
-    df_lines, df_cells = _score_lines(df_lines, df_cells, df_words)
+    # Step 1/2 — infer grid, then classify each horizontal band.
+    df_lines, df_cells = _classify_bands(df_lines, df_cells)
 
-    # Step 2 — column grid
-    df_cells = _assign_column_layout(df_cells)
+    # Table-cell assembly will come after the revised band classifier.
+    empty_tcells = pd.DataFrame(columns=[
+        "table_cell_id", "page_number", "layout_id", "table_id",
+        "row_start", "col_start", "rowspan", "colspan",
+        "text", "text_raw_lines", "cell_ids", "line_ids", "role",
+    ])
 
-    # Step 3 — merge bands → layout_id
-    band_mapping = _find_mergeable_bands(df_cells)
-    df_cells["layout_id"] = df_cells["horizontal_band_id"].map(band_mapping)
-
-    # Step 4 — classify
-    df_cells = _add_average_table_score(df_cells)
-    df_cells = _classify_layout_types(df_cells)
-
-    # Propagate layout_id and layout_type to df_lines.
-    line_layout = (
-        df_cells.groupby("line_id")[["layout_id", "layout_type"]]
-        .first()
-        .reset_index()
-    )
-    df_lines = df_lines.merge(line_layout, on="line_id", how="left")
-    df_lines.loc[df_lines["layout_type"] == "table", "block_role"] = "table"
-
-    # Step 5 — build table cells
-    df_table_cells = _build_table_cells(df_cells)
-
-    if not df_table_cells.empty:
-        df_table_cells = _assign_cell_roles(df_table_cells)
-
-        # Propagate table_id to df_lines via line_ids (explode list → line_id mapping).
-        line_table_map = (
-            df_table_cells[["table_id", "line_ids"]]
-            .explode("line_ids")
-            .rename(columns={"line_ids": "line_id"})
-            .dropna(subset=["line_id"])
-            .drop_duplicates("line_id")
-        )
-        line_table_map["line_id"] = line_table_map["line_id"].astype(df_lines["line_id"].dtype)
-        df_lines = df_lines.merge(line_table_map, on="line_id", how="left")
-
-        cell_table_map = (
-            df_table_cells[["table_id", "cell_ids"]]
-            .explode("cell_ids")
-            .rename(columns={"cell_ids": "cell_id"})
-            .dropna(subset=["cell_id"])
-            .drop_duplicates("cell_id")
-        )
-        cell_table_map["cell_id"] = cell_table_map["cell_id"].astype(df_cells["cell_id"].dtype)
-        df_cells = df_cells.merge(cell_table_map, on="cell_id", how="left")
-    else:
-        df_table_cells["role"] = pd.Series(dtype=str)
-        df_lines["table_id"] = pd.NA
-        df_cells["table_id"] = pd.NA
-
-    return df_lines, df_cells, df_table_cells
+    return df_lines, df_cells#, empty_tcells

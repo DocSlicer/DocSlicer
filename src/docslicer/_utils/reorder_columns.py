@@ -56,6 +56,7 @@ MASTER_COLUMN_ORDER: List[str] = [
     "page_number",
     "page_label",
     "document_region",
+    "section_id", # Only for .docx
     
     # ===== 2. IDs and hierarchy =====
     
@@ -67,11 +68,13 @@ MASTER_COLUMN_ORDER: List[str] = [
     "raw_shape_id",
     "shape_id",
     "link_id",
+    "run_id",
         # -- Processed in HTML and PDF
     "gutter_id",
     "gutter_candidate_id",
     "cell_id",
     "line_id",
+    "paragraph_id",
         # -- Processed in Shared
     "block_id",
     "chunk_index",
@@ -90,9 +93,9 @@ MASTER_COLUMN_ORDER: List[str] = [
     "block_role",
     
     # Table IDs
-    "table_cell_id",
     "table_id",
     "table_row_id",
+    "table_cell_id",
     "table_header_flag",
 
     "row_start",
