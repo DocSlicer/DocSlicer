@@ -15,7 +15,10 @@ from docslicer._utils.hierarchical_aggregator import (
 
 def _create_line_text(df: pd.DataFrame) -> dict:
     """
-    Create text for each line by sorting boxes by x_left and joining with spaces.
+    Create text for each line by sorting boxes by x_left.
+
+    Non-table lines are joined with spaces. Table lines are joined with pipes so
+    downstream shared stages see a row-shaped representation.
     
     Returns:
         Dict mapping line_id -> text string
@@ -24,20 +27,32 @@ def _create_line_text(df: pd.DataFrame) -> dict:
         return {}
 
     # Operate on the full DataFrame at once instead of per-group
-    working = df[["line_id", "x_left", "text"]].copy()
+    cols = ["line_id", "x_left", "text"]
+    if "table_id" in df.columns:
+        cols.append("table_id")
+    working = df[cols].copy()
     working = working[working["text"].notna()]
     working["text"] = working["text"].astype(str).str.strip()
     working = working[working["text"] != ""]
 
-    # Single global sort, then one groupby+join
     working = working.sort_values(["line_id", "x_left"])
-    return working.groupby("line_id", sort=False)["text"].agg(" ".join).to_dict()
+
+    if "table_id" not in working.columns:
+        return working.groupby("line_id", sort=False)["text"].agg(" ".join).to_dict()
+
+    text_map = {}
+    for line_id, group in working.groupby("line_id", sort=False):
+        table_id = group["table_id"].iloc[0]
+        has_table = pd.notna(table_id) and str(table_id).strip() != ""
+        sep = " | " if has_table else " "
+        text_map[line_id] = sep.join(group["text"].tolist())
+    return text_map
 
 
 def _remove_single_row_tables(df: pd.DataFrame) -> pd.DataFrame:
     """
     Remove table_id and table_row_id for tables with only 1 row, then reindex remaining tables.
-    Also adds block_role = "table" for remaining tables (preserving existing values).
+    Also adds block_type = "table" for remaining tables (preserving existing values).
     
     Args:
         df: DataFrame with table_id and table_row_id columns
@@ -74,12 +89,12 @@ def _remove_single_row_tables(df: pd.DataFrame) -> pd.DataFrame:
         table_id_map = {old_id: new_id for new_id, old_id in enumerate(remaining_tables, start=1)}
         df["table_id"] = df["table_id"].map(lambda x: table_id_map.get(x) if pd.notna(x) else None)
 
-    # Add block_role = "table" for remaining tables (preserve existing values)
-    if "block_role" not in df.columns:
-        df["block_role"] = None
+    # Add block_type = "table" for remaining tables (preserve existing values)
+    if "block_type" not in df.columns:
+        df["block_type"] = None
     has_table = df["table_id"].notna()
-    no_existing_role = df["block_role"].isna()
-    df.loc[has_table & no_existing_role, "block_role"] = "table"
+    no_existing_role = df["block_type"].isna()
+    df.loc[has_table & no_existing_role, "block_type"] = "table"
     
     return df
 

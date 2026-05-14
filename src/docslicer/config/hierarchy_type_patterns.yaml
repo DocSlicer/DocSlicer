@@ -177,14 +177,14 @@ hierarchy_rules:
   # Numbered headings
   # =========================
 
-  - hierarchy_type: numbered_section        # Example: "10.2 Revenue", "1. Introduction" -- excludes years like 1920, 2020, etc.
+  - hierarchy_type: numbered_heading        # Example: "10.2 Revenue", "1. Introduction" -- excludes years like 1920, 2020, etc.
     applies_to_profiles: [generic, finance, technical, academic, legal, government]
     patterns:
       #- regex: '^(?!\s*(19|20)\d{2}\b)\s*\d+(?:\.\d+)*\.?'
       - regex: '^(?!\s*(19|20)\d{2}\b)\s*\d+(?:\.\d+)*(?:\.(?=\s+["\u201C\u2018\[]?(?-i:[A-Z]))|(?=\s+["\u201C\u2018\[]?(?-i:[A-Z])))' # stricter version with lookahead, either followed by a dot or a capital letter, optionally preceded by an opening quote or bracket
         flags: 'i'
 
-  - hierarchy_type: roman_numbered_section         # Example: "II. Background"
+  - hierarchy_type: roman_numbered_heading         # Example: "II. Background"
     applies_to_profiles: [finance, generic, technical, academic, legal]
     patterns:
       #- regex: '^\s*[ivxlcdm]+\.'
@@ -195,14 +195,14 @@ hierarchy_rules:
   # Alpha-numbered headings
   # =========================
 
-  - hierarchy_type: alpha_dotted_numbered_section   # Example: "A.1 Tasks", "A1.2.3 Overview"
+  - hierarchy_type: alpha_dotted_numbered_heading   # Example: "A.1 Tasks", "A1.2.3 Overview"
     applies_to_profiles: [finance, generic, technical, academic, legal]
     patterns:
       #- regex: '^\s*[A-Za-z]\.?\d+(?:\.\d+)*'
       - regex: '^\s*[A-Za-z]\.?\d+(?:\.\d+)*\.?(?=\.\s+|[A-Z])'
         flags: 'i'
 
-  - hierarchy_type: alpha_numbered_section         # Example: "A Additional", "A. Additional"
+  - hierarchy_type: alpha_numbered_heading         # Example: "A Additional", "A. Additional"
     applies_to_profiles: [finance, generic, technical, academic, legal]
     patterns:
       #- regex: '^\s*[A-Za-z]\.?\s+'

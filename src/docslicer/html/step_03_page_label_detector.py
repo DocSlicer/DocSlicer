@@ -174,7 +174,7 @@ def assign_page_labels(
     5. Convert to validated PageLabel and PageLabelGroup objects
     6. Add page_label columns to DataFrame
     7. Post-processing:
-       - Set block_role = "page_label" for labeled rows
+       - Set block_type = "page_label" for labeled rows
        - Propagate page_label upward (first label until <hr>, others until prior label)
        - Infer page_number if all rows had page_number == 1
 
@@ -204,7 +204,7 @@ def assign_page_labels(
           Always present:
             - page_label        : validated label propagated upward (or None)
             - page_label_type   : "arabic", "roman", "alpha_numeric", etc. (or None)
-            - block_role        : "page_label" for label rows; existing values preserved
+            - block_type        : "page_label" for label rows; existing values preserved
             - page_number       : updated in-place if originally all 1s
 
           Only when debug=True:
@@ -266,11 +266,11 @@ def assign_page_labels(
     
     # ===== POST-PROCESSING STEPS ===== #
     
-    # Step 1: Add block_role column (only if it doesn't exist, then update page label rows)
-    if "block_role" not in out.columns:
-        out["block_role"] = None
+    # Step 1: Add block_type column (only if it doesn't exist, then update page label rows)
+    if "block_type" not in out.columns:
+        out["block_type"] = None
     # Only update rows with page labels, preserve existing values
-    out.loc[out["page_label"].notna(), "block_role"] = "page_label"
+    out.loc[out["page_label"].notna(), "block_type"] = "page_label"
     
     # Step 2: Fill page_label upwards with propagation rules
     out = _propagate_page_labels_upward(out)

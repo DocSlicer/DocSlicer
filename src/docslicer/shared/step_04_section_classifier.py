@@ -2,16 +2,16 @@
 Document region assignment for parsed document DataFrames.
 
 Each row in the input DataFrame represents one text line from a document.
-This module assigns a ``document_region`` value to every row, classifying
+This module assigns a ``section`` value to every row, classifying
 it as one of: ``toc``, ``exhibits``, ``coverpage``, ``last_page``,
 ``body``, ``front_matter``, ``back_matter``, ``annex``, ``financials``,
 or ``schedules``.
 
 Assignment runs in four passes, each of which only fills rows whose
-``document_region`` is still null:
+``section`` is still null:
 
-1. **Block-role pass** — rows with a known ``block_role`` (``toc``,
-   ``toc_header``, ``exhibit``, ``exhibit_header``) are assigned directly.
+1. **Block-role pass** — rows with a known ``block_type`` (``toc``,
+   ``toc_heading``, ``exhibit``, ``exhibit_heading``) are assigned directly.
 
 2. **Coverpage pass** — the leading pages of the document are examined
    using four detection strategies tried in order (first match wins):
@@ -34,7 +34,7 @@ Assignment runs in four passes, each of which only fills rows whose
    alpha-prefixed → annex/financials/schedules, etc.).
 
 Required column: ``page_number`` (int-coercible).
-Optional columns improve accuracy: ``block_role``, ``page_label``,
+Optional columns improve accuracy: ``block_type``, ``page_label``,
 ``page_label_type``, ``page_label_value``, ``text``, ``text_align``,
 ``char_count``, ``background_non_stroking_color``.
 """
@@ -46,7 +46,7 @@ import pandas as pd
 import re
 
 
-DocRegionType = Literal[
+SectionType = Literal[
     "toc",
     "exhibits",
     "coverpage",
@@ -61,44 +61,44 @@ DocRegionType = Literal[
 
 
 # ================================================================================
-# STEP 1: Assign document_region from block_role
+# STEP 1: Assign section from block_type
 # ================================================================================
 
-_BLOCK_ROLE_TO_DOC_REGION = {
+_BLOCK_TYPE_TO_SECTION = {
     "toc": "toc",
-    "toc_header": "toc",
-    "exhibit": "exhibits",
-    "exhibit_header": "exhibits",
+    "toc_heading": "toc",
+    "exhibits": "exhibits",
+    "exhibit_heading": "exhibits",
 }
 
 
-def assign_doc_region_from_block_role(df: pd.DataFrame) -> pd.DataFrame:
+def classify_sections_from_block_type(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Assign ``document_region`` for rows whose ``block_role`` maps to a known
-    region.  Rows with an already-set ``document_region`` are left untouched.
+    Assign ``section`` for rows whose ``block_type`` maps to a known
+    region.  Rows with an already-set ``section`` are left untouched.
 
-    Optional columns: ``block_role``, ``document_region``.
+    Optional columns: ``block_type``, ``section``.
     """
     if df.empty:
         out = df.copy()
-        if "document_region" not in out.columns:
-            out["document_region"] = pd.Series(dtype=object)
+        if "section" not in out.columns:
+            out["section"] = pd.Series(dtype=object)
         return out
 
-    if "block_role" not in df.columns:
+    if "block_type" not in df.columns:
         out = df.copy()
-        if "document_region" not in out.columns:
-            out["document_region"] = pd.Series(index=out.index, dtype=object)
+        if "section" not in out.columns:
+            out["section"] = pd.Series(index=out.index, dtype=object)
         return out
 
     out = df.copy()
 
-    if "document_region" not in out.columns:
-        out["document_region"] = pd.Series(index=out.index, dtype=object)
+    if "section" not in out.columns:
+        out["section"] = pd.Series(index=out.index, dtype=object)
 
-    br = out["block_role"].astype(str).str.strip().str.lower()
-    mapped = br.map(_BLOCK_ROLE_TO_DOC_REGION)
-    out["document_region"] = out["document_region"].where(out["document_region"].notna(), mapped)
+    br = out["block_type"].astype(str).str.strip().str.lower()
+    mapped = br.map(_BLOCK_TYPE_TO_SECTION)
+    out["section"] = out["section"].where(out["section"].notna(), mapped)
 
     return out
 
@@ -147,9 +147,9 @@ def _is_blank_str_series(s: pd.Series) -> pd.Series:
     return ss.isna() | (ss.str.strip() == "")
 
 
-def _ensure_document_region(out: pd.DataFrame) -> None:
-    if "document_region" not in out.columns:
-        out["document_region"] = pd.Series(index=out.index, dtype=object)
+def _ensure_section(out: pd.DataFrame) -> None:
+    if "section" not in out.columns:
+        out["section"] = pd.Series(index=out.index, dtype=object)
 
 
 def _pages_mask(out: pd.DataFrame, pages: set[int]) -> pd.Series:
@@ -160,7 +160,7 @@ def _assign_coverpage_on_pages(out: pd.DataFrame, pages: set[int]) -> None:
     if not pages:
         return
     m = _pages_mask(out, pages)
-    out.loc[m & out["document_region"].isna(), "document_region"] = "coverpage"
+    out.loc[m & out["section"].isna(), "section"] = "coverpage"
 
 
 def _detect_coverpage_scenario_1(out: pd.DataFrame) -> set[int]:
@@ -196,11 +196,11 @@ def _detect_coverpage_scenario_2(out: pd.DataFrame) -> set[int]:
     Returns all pages before the first TOC page, capped at
     ``_MAX_PAGES_COVERPAGE``.
     """
-    if "document_region" not in out.columns:
+    if "section" not in out.columns:
         return set()
 
     pn = out["page_number"].astype(int)
-    is_toc_line = _norm_str_series(out["document_region"]).eq("toc")
+    is_toc_line = _norm_str_series(out["section"]).eq("toc")
     toc_pages = pn[is_toc_line].unique()
     if toc_pages.size == 0:
         return set()
@@ -240,8 +240,8 @@ def _detect_coverpage_scenario_3(out: pd.DataFrame) -> set[int]:
     """
     pn = out["page_number"].astype(int)
 
-    if "document_region" in out.columns:
-        is_toc_line = _norm_str_series(out["document_region"]).eq("toc")
+    if "section" in out.columns:
+        is_toc_line = _norm_str_series(out["section"]).eq("toc")
         if bool(((pn <= _MAX_TOC_DISTANCE) & is_toc_line).any()):
             return set()
 
@@ -373,24 +373,24 @@ def _detect_coverpage_scenario_4(
 
 def assign_coverpage(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Assign ``document_region = 'coverpage'`` to leading pages of the document.
+    Assign ``section = 'coverpage'`` to leading pages of the document.
 
     Tries four detection strategies in order; the first that identifies at
     least one page is used and the rest are skipped.  Existing non-null
-    ``document_region`` values are never overwritten.
+    ``section`` values are never overwritten.
 
     Requires: ``page_number``.
     """
     if df.empty:
         out = df.copy()
-        _ensure_document_region(out)
+        _ensure_section(out)
         return out
 
     if "page_number" not in df.columns:
         raise KeyError("assign_coverpage: missing required column: 'page_number'")
 
     out = df.copy()
-    _ensure_document_region(out)
+    _ensure_section(out)
 
     for detect in (
         _detect_coverpage_scenario_1,
@@ -496,8 +496,8 @@ def _detect_last_page_scenario_2(out: pd.DataFrame) -> int | None:
             per_page_blank_all = lbl_blank.groupby(pn).all()
 
             if bool(per_page_blank_all.any()):
-                if "document_region" in out.columns:
-                    is_cover = _norm_str_series(out["document_region"]).eq("coverpage")
+                if "section" in out.columns:
+                    is_cover = _norm_str_series(out["section"]).eq("coverpage")
                     cover_pages = set(pn[is_cover].unique().tolist())
                 else:
                     cover_pages = set()
@@ -549,24 +549,24 @@ def _detect_last_page_scenario_2(out: pd.DataFrame) -> int | None:
 
 def assign_last_page(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Assign ``document_region = 'last_page'`` to the final page of the
+    Assign ``section = 'last_page'`` to the final page of the
     document when it matches a known closing-page pattern.
 
     At most one page (the highest ``page_number``) can receive this region.
-    Existing non-null ``document_region`` values are never overwritten.
+    Existing non-null ``section`` values are never overwritten.
 
     Requires: ``page_number``.
     """
     if df.empty:
         out = df.copy()
-        _ensure_document_region(out)
+        _ensure_section(out)
         return out
 
     if "page_number" not in df.columns:
         raise KeyError("assign_last_page: missing required column: 'page_number'")
 
     out = df.copy()
-    _ensure_document_region(out)
+    _ensure_section(out)
 
     lp = _detect_last_page_scenario_1(out) or _detect_last_page_scenario_2(out)
 
@@ -574,7 +574,7 @@ def assign_last_page(df: pd.DataFrame) -> pd.DataFrame:
         return out
 
     pn = out["page_number"].astype(int)
-    out.loc[pn.eq(lp) & out["document_region"].isna(), "document_region"] = "last_page"
+    out.loc[pn.eq(lp) & out["section"].isna(), "section"] = "last_page"
     return out
 
 
@@ -634,7 +634,7 @@ def _build_page_index_df(out: pd.DataFrame) -> pd.DataFrame:
     else:
         page["page_label_value"] = None
 
-    dr = _norm_str_series(out["document_region"]) if "document_region" in out.columns else pd.Series([], dtype="string")
+    dr = _norm_str_series(out["section"]) if "section" in out.columns else pd.Series([], dtype="string")
     page["has_coverpage"] = dr.eq("coverpage").groupby(pn).any().reindex(page.index, fill_value=False)
     page["has_toc"] = dr.eq("toc").groupby(pn).any().reindex(page.index, fill_value=False)
 
@@ -671,7 +671,7 @@ def _contiguous_runs(pages: list[int]) -> list[tuple[int, int, int]]:
 
 def _assign_per_page_regions(page: pd.DataFrame) -> dict[int, str]:
     """
-    Derive a proposed ``document_region`` for each page based on label type.
+    Derive a proposed ``section`` for each page based on label type.
 
     Uses ``page.at[p, col]`` for scalar lookups because ``page`` is indexed
     by ``page_number`` (an Index, not a Series).
@@ -816,26 +816,26 @@ def _assign_per_page_regions(page: pd.DataFrame) -> dict[int, str]:
     return proposed
 
 
-def assign_doc_region_from_page_labels(df: pd.DataFrame) -> pd.DataFrame:
+def classify_sections_from_page_labels(df: pd.DataFrame) -> pd.DataFrame:
     """
     Assign standard regions (``body``, ``front_matter``, ``back_matter``,
     ``annex``, ``financials``, ``schedules``) based on ``page_label``,
     ``page_label_type``, and ``page_label_value``.
 
-    Existing non-null ``document_region`` values are never overwritten.
+    Existing non-null ``section`` values are never overwritten.
 
     Requires: ``page_number``.
     """
     if df.empty:
         out = df.copy()
-        _ensure_document_region(out)
+        _ensure_section(out)
         return out
 
     if "page_number" not in df.columns:
-        raise KeyError("assign_doc_region_from_page_labels: missing required column: 'page_number'")
+        raise KeyError("classify_sections_from_page_labels: missing required column: 'page_number'")
 
     out = df.copy()
-    _ensure_document_region(out)
+    _ensure_section(out)
 
     page = _build_page_index_df(out)
     per_page_region = _assign_per_page_regions(page)
@@ -844,14 +844,14 @@ def assign_doc_region_from_page_labels(df: pd.DataFrame) -> pd.DataFrame:
         return out
 
     pn = out["page_number"].astype(int)
-    dr_isna = out["document_region"].isna()
+    dr_isna = out["section"].isna()
 
     for region in _STD_REGIONS:
         pages_for_region = {p for p, r in per_page_region.items() if r == region}
         if not pages_for_region:
             continue
         m = pn.isin(pages_for_region)
-        out.loc[m & dr_isna, "document_region"] = region
+        out.loc[m & dr_isna, "section"] = region
 
     return out
 
@@ -860,18 +860,18 @@ def assign_doc_region_from_page_labels(df: pd.DataFrame) -> pd.DataFrame:
 # Public API
 # ================================================================================
 
-def assign_doc_region(df: pd.DataFrame) -> pd.DataFrame:
+def classify_sections(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Assign a ``document_region`` to every row in *df*.
+    Assign a ``section`` to every row in *df*.
 
     This is the main entry point.  It runs the four assignment passes in
-    order and returns a copy of *df* with the ``document_region`` column
+    order and returns a copy of *df* with the ``section`` column
     populated.  Existing non-null values are preserved throughout.
 
     Passes
     ------
-    1. ``assign_doc_region_from_block_role`` — maps ``block_role`` values
-       ``toc``, ``toc_header``, ``exhibit``, and ``exhibit_header`` to
+    1. ``classify_sections_from_block_type`` — maps ``block_type`` values
+       ``toc``, ``toc_heading``, ``exhibit``, and ``exhibit_heading`` to
        ``toc`` / ``exhibits``.
 
     2. ``assign_coverpage`` — detects the leading cover page(s) using up to
@@ -881,7 +881,7 @@ def assign_doc_region(df: pd.DataFrame) -> pd.DataFrame:
     3. ``assign_last_page`` — detects a standalone closing page using blank
        labels or low-density / contact-info signals.
 
-    4. ``assign_doc_region_from_page_labels`` — classifies the remaining
+    4. ``classify_sections_from_page_labels`` — classifies the remaining
        pages as ``body``, ``front_matter``, ``back_matter``, ``annex``,
        ``financials``, or ``schedules`` based on page label type and value.
 
@@ -895,11 +895,11 @@ def assign_doc_region(df: pd.DataFrame) -> pd.DataFrame:
     Returns
     -------
     pd.DataFrame
-        A copy of *df* with ``document_region`` filled where detectable.
+        A copy of *df* with ``section`` filled where detectable.
         Rows that could not be classified are left as ``NaN``.
     """
-    df = assign_doc_region_from_block_role(df)
+    df = classify_sections_from_block_type(df)
     df = assign_coverpage(df)
     df = assign_last_page(df)
-    df = assign_doc_region_from_page_labels(df)
+    df = classify_sections_from_page_labels(df)
     return df

@@ -340,7 +340,7 @@ def clean_boxes(
        preserving ``<br>``-split boxes as separate entries.
     5. **DOM ordering** – reassign ``box_id`` in reading order: regular content sorted by
        ``structure_tag_id``; ``<hr>`` and ``<img>`` elements inserted by ``y_top`` position.
-    6. **Block role** – populate ``block_role`` for structural elements (``"hr"``, ``"image"``).
+    6. **Block role** – populate ``block_type`` for structural elements (``"hr"``, ``"image"``).
 
     Args:
         df_boxes: Raw box DataFrame as produced by the box extractor step.
@@ -398,10 +398,10 @@ def clean_boxes(
 
         df_clean["box_id"] = range(1, len(df_clean) + 1)  # 1-based
 
-    # 6) Assign block_role for structural element types
+    # 6) Assign block_type for structural element types
     if "structure_tag" in df_clean.columns:
-        df_clean["block_role"] = None
-        df_clean.loc[df_clean["structure_tag"] == "hr", "block_role"] = "hr"
-        df_clean.loc[df_clean["structure_tag"] == "img", "block_role"] = "image"
+        df_clean["block_type"] = None
+        df_clean.loc[df_clean["structure_tag"] == "hr", "block_type"] = "hr"
+        df_clean.loc[df_clean["structure_tag"] == "img", "block_type"] = "image"
 
     return df_clean

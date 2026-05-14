@@ -205,7 +205,7 @@ def extract_language_from_text(df_lines: pd.DataFrame) -> Optional[str]:
     Uses first 10,000 characters, filtering out table content.
 
     Args:
-        df_lines: DataFrame with 'text' and optionally 'block_role' columns
+        df_lines: DataFrame with 'text' and optionally 'block_type' columns
 
     Returns:
         Detected language code (e.g., "en") or None
@@ -214,9 +214,9 @@ def extract_language_from_text(df_lines: pd.DataFrame) -> Optional[str]:
         if df_lines.empty or 'text' not in df_lines.columns:
             return None
 
-        # Filter out table content if block_role column exists
-        if 'block_role' in df_lines.columns:
-            text_lines = df_lines[df_lines['block_role'] != 'table'].copy()
+        # Filter out table content if block_type column exists
+        if 'block_type' in df_lines.columns:
+            text_lines = df_lines[df_lines['block_type'] != 'table'].copy()
         else:
             text_lines = df_lines.copy()
 

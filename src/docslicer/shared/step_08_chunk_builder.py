@@ -38,10 +38,10 @@ _MIN_CHUNK_CHARS_MIN = 100
 _MIN_CHUNK_CHARS_MAX = 1000
 
 # Block roles that should be removed from chunk content
-_NOISE_BLOCK_ROLES= {"hr", "page_label", "image", "suppressed_repeated_heading", "navigation", "watermark"}
+_NOISE_BLOCK_TYPES= {"hr", "page_label", "image", "suppressed_repeated_heading", "navigation", "watermark"}
 
 # Block roles that should be treated as headings (for chunk_heading)
-_HEADING_BLOCK_ROLES = {"heading", "toc_header", "exhibit_header"}
+_HEADING_BLOCK_TYPES = {"heading", "toc_heading", "exhibit_heading"}
 
 
 # =======================================================================================================================
@@ -108,8 +108,8 @@ def _prepare_blocks_df(blocks_df: pd.DataFrame) -> pd.DataFrame:
         df['active_heading_id'] = ''
     
     # Remove noise blocks
-    if 'block_role' in df.columns:
-        df = df[~df['block_role'].isin(_NOISE_BLOCK_ROLES)].reset_index(drop=True)
+    if 'block_type' in df.columns:
+        df = df[~df['block_type'].isin(_NOISE_BLOCK_TYPES)].reset_index(drop=True)
     
     return df
 
@@ -624,8 +624,8 @@ def _assign_chunk_indices(
     for active_hid, g_indices in df.groupby("active_heading_id", sort=False).groups.items():
         g = df.loc[g_indices].copy()
 
-        block_roles = g.get("block_role", pd.Series([""] * len(g), index=g.index)).astype("string").str.strip().str.lower()
-        heading_mask = block_roles.isin(_HEADING_BLOCK_ROLES)
+        block_types = g.get("block_type", pd.Series([""] * len(g), index=g.index)).astype("string").str.strip().str.lower()
+        heading_mask = block_types.isin(_HEADING_BLOCK_TYPES)
 
         heading_indices = g.index[heading_mask].tolist()
         content_indices = g.index[~heading_mask].tolist()
@@ -707,9 +707,9 @@ def _join_chunk_text(blocks_with_chunk_index: pd.DataFrame, chunks_df: pd.DataFr
     heading_metadata = {}
     if "active_heading_id" in blocks_with_chunk_index.columns:
         for active_hid, g in blocks_with_chunk_index.groupby("active_heading_id", sort=False):
-            # Treat heading, toc_header, and exhibit_header as heading blocks
-            block_roles = g.get("block_role", pd.Series([""] * len(g))).astype("string").str.strip().str.lower()
-            heading_mask = block_roles.isin(_HEADING_BLOCK_ROLES)
+            # Treat heading, toc_heading, and exhibit_heading as heading blocks
+            block_types = g.get("block_type", pd.Series([""] * len(g))).astype("string").str.strip().str.lower()
+            heading_mask = block_types.isin(_HEADING_BLOCK_TYPES)
             
             metadata = {"chunk_heading": ""}
             
@@ -750,8 +750,8 @@ def _join_chunk_text(blocks_with_chunk_index: pd.DataFrame, chunks_df: pd.DataFr
         active_hid = group["active_heading_id"].iloc[0] if "active_heading_id" in group.columns else ""
         
         # Get heading text - first try from heading block in this chunk
-        block_roles = group.get("block_role", pd.Series([""] * len(group))).astype("string").str.strip().str.lower()
-        heading_mask = block_roles.isin(_HEADING_BLOCK_ROLES)
+        block_types = group.get("block_type", pd.Series([""] * len(group))).astype("string").str.strip().str.lower()
+        heading_mask = block_types.isin(_HEADING_BLOCK_TYPES)
         
         heading_text = ""
         if heading_mask.any():
@@ -792,11 +792,11 @@ def _join_chunk_text(blocks_with_chunk_index: pd.DataFrame, chunks_df: pd.DataFr
     
     # Check if each chunk contains at least one table block
     def _check_contains_table(blocks: pd.DataFrame) -> bool:
-        """Check if any block in the chunk has block_role = 'table'."""
-        if blocks.empty or "block_role" not in blocks.columns:
+        """Check if any block in the chunk has block_type = 'table'."""
+        if blocks.empty or "block_type" not in blocks.columns:
             return False
-        block_roles = blocks["block_role"].astype("string").str.strip().str.lower()
-        return (block_roles == "table").any()
+        block_types = blocks["block_type"].astype("string").str.strip().str.lower()
+        return (block_types == "table").any()
     
     contains_table_df = (
         blocks_with_chunk_index.groupby("chunk_index", sort=False, observed=True)
@@ -1075,7 +1075,7 @@ def _aggregate_merged_chunks_fields(group: pd.DataFrame) -> pd.Series:
     # Build aggregation spec for chunks
     # Include all standard fields that might be present in chunks
     agg_spec = build_standard_agg_spec(
-        identity_cols=['page_number', 'document_region', 'page_label', 'page_label_type', 'page_label_value'],
+        identity_cols=['page_number', 'section', 'page_label', 'page_label_type', 'page_label_value'],
         include_hierarchy=True,
         include_geometry=True,
         include_style=True,

@@ -962,7 +962,6 @@ def _append_run_row(
             field_state["field_id"] = counters.field_id
             field_state["phase"] = "begin"
             field_state["field_type"] = None
-            field_state["is_toc_field"] = False
         elif text == "separate":
             field_state["phase"] = "result"
         elif text == "end":
@@ -972,7 +971,6 @@ def _append_run_row(
         parsed_type = _field_type(text)
         if parsed_type:
             field_state["field_type"] = parsed_type
-            field_state["is_toc_field"] = parsed_type == "TOC"
         if field_state.get("phase") in {None, "begin"}:
             field_state["phase"] = "instr"
 
@@ -1046,7 +1044,8 @@ def _append_run_row(
             "field_id": field_state.get("field_id"),
             "field_type": field_state.get("field_type"),
             "field_phase": field_state.get("phase"),
-            "is_toc_field": bool(field_state.get("is_toc_field")),
+            "has_link": bool(hyperlink_id or p_props.get("bookmark_ids")),
+            "link_type": "external" if hyperlink_url else ("internal" if hyperlink_id or p_props.get("bookmark_ids") else None),
             "is_deleted_revision": any(a.tag == f"{W}del" for a in ancestors),
             "is_inserted_revision": any(a.tag == f"{W}ins" for a in ancestors),
             "num_id": p_props.get("num_id"),
@@ -1122,7 +1121,8 @@ def _append_section_break_row(
             "field_id": None,
             "field_type": None,
             "field_phase": None,
-            "is_toc_field": False,
+            "has_link": bool(p_props.get("bookmark_ids")),
+            "link_type": "internal" if p_props.get("bookmark_ids") else None,
             "is_deleted_revision": False,
             "is_inserted_revision": False,
             "num_id": p_props.get("num_id"),

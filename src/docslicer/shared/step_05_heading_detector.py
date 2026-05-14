@@ -30,7 +30,7 @@ import re
 # Pre-filter forbidden heading line formats (text that will never be a heading)
 # ================================================================================
 
-_FORBIDDEN_BLOCK_ROLES = {"table", "image", "hr", "page_label", "navigation", "toc", "exhibits"}
+_FORBIDDEN_BLOCK_TYPES = {"table", "image", "hr", "page_label", "navigation", "toc", "exhibits"}
 
 _FORBIDDEN_SUBSTRINGS = {
     # signature indicators
@@ -63,7 +63,7 @@ def _pre_filter_lines(lines_df: pd.DataFrame) -> pd.DataFrame:
     Prefilter lines BEFORE heading_score.
 
     Excludes:
-    (1) rows where block_role is in _FORBIDDEN_BLOCK_ROLES
+    (1) rows where block_type is in _FORBIDDEN_BLOCK_TYPES
     (2) rows where text starts with any token in _FORBIDDEN_START_TEXT (case-insensitive, after lstrip)
     (3) rows where text is fully parenthesized: (...), [...], {...}
     (4) rows where text contains any substring in _FORBIDDEN_SUBSTRINGS (case-insensitive)
@@ -82,9 +82,9 @@ def _pre_filter_lines(lines_df: pd.DataFrame) -> pd.DataFrame:
     keep = pd.Series(True, index=df.index, dtype=bool)
 
     # (1) forbidden block roles
-    if "block_role" in df.columns:
-        br = df["block_role"].astype("string").str.strip().str.lower()
-        keep &= ~br.isin(_FORBIDDEN_BLOCK_ROLES)
+    if "block_type" in df.columns:
+        br = df["block_type"].astype("string").str.strip().str.lower()
+        keep &= ~br.isin(_FORBIDDEN_BLOCK_TYPES)
 
     # (2) forbidden start tokens
     # normalize tokens to lowercase for comparison
@@ -122,14 +122,14 @@ def _detect_marker_candidates(
     """
     Adds hierarchy marker detection columns:
       - hierarchy_marker : str | None   (the matched prefix text)
-      - hierarchy_type   : str | None   (e.g. numbered_section, note, ...)
+      - hierarchy_type   : str | None   (e.g. numbered_heading, note, ...)
 
     Detection logic:
     - For EACH row, test patterns in order; longest match wins
     - Only matches at START of text
 
     max_numbered_value:
-      Rejects numbered_section matches where any dotted component exceeds this
+      Rejects numbered_heading matches where any dotted component exceeds this
       value (e.g. 50 blocks "502 Lexington Av" from being a section marker).
     Roman numerals are restricted to i/v/x characters only (values 1-39);
       anything using l/c/d/m is rejected as too large to be a real heading.
@@ -172,14 +172,14 @@ def _detect_marker_candidates(
             marker = m.group(0).rstrip('. \t')
 
             # Value-range guards
-            if h_type == "numbered_section":
+            if h_type == "numbered_heading":
                 parts = [p for p in marker.replace(' ', '').split('.') if p]
                 try:
                     if any(int(p) > max_numbered_value for p in parts):
                         continue
                 except ValueError:
                     pass
-            elif h_type == "roman_numbered_section":
+            elif h_type == "roman_numbered_heading":
                 roman_str = marker.rstrip('. \t')
                 if not re.fullmatch(r'[ivxIVX]+', roman_str):
                     continue
@@ -282,9 +282,9 @@ def _correct_paren_type_by_series(lines_df: pd.DataFrame) -> pd.DataFrame:
     if not target_mask.any():
         return out
 
-    if "block_role" in out.columns:
-        br = out["block_role"].astype("string").str.strip().str.lower()
-        target_mask &= ~br.isin(_FORBIDDEN_BLOCK_ROLES)
+    if "block_type" in out.columns:
+        br = out["block_type"].astype("string").str.strip().str.lower()
+        target_mask &= ~br.isin(_FORBIDDEN_BLOCK_TYPES)
 
     cand = out[target_mask].copy()
     if "line_id" in cand.columns:
@@ -689,18 +689,18 @@ def _add_heading_decision(
 ) -> pd.DataFrame:
     """
     Final heading decision:
-    - If heading_score > threshold AND block_role is not already set:
-        - set block_role = "heading"
+    - If heading_score > threshold AND block_type is not already set:
+        - set block_type = "heading"
         - set heading_type = hierarchy_type if present else default_heading_type
     - Otherwise:
-        - preserve existing block_role (e.g., toc_header, page_label, etc.)
+        - preserve existing block_type (e.g., toc_heading, page_label, etc.)
         - heading_type is set for all rows passing threshold (regardless of existing role)
 
-    This ensures that special roles like toc_header are preserved while still
+    This ensures that special roles like toc_heading are preserved while still
     getting their heading_type populated based on their hierarchy detection.
 
     Adds/updates:
-      - block_role (string) - only for unassigned rows
+      - block_type (string) - only for unassigned rows
       - heading_type (string) - for all rows passing threshold
     """
     out = lines_df.copy()
@@ -708,9 +708,9 @@ def _add_heading_decision(
     if "heading_type" not in out.columns:
         out["heading_type"] = pd.NA
 
-    # Ensure block_role exists
-    if "block_role" not in out.columns:
-        out["block_role"] = pd.NA
+    # Ensure block_type exists
+    if "block_type" not in out.columns:
+        out["block_type"] = pd.NA
 
     # Need heading_score to decide; if missing, no-op
     if "heading_score" not in out.columns:
@@ -719,14 +719,14 @@ def _add_heading_decision(
     hs = pd.to_numeric(out["heading_score"], errors="coerce").fillna(-1e9)
     is_heading = hs >= float(heading_score_threshold)
 
-    # Set block_role ONLY for winners that don't already have a role
-    # Preserve existing roles like toc_header, page_label, etc.
-    existing_role = out["block_role"].astype("string").str.strip()
+    # Set block_type ONLY for winners that don't already have a role
+    # Preserve existing roles like toc_heading, page_label, etc.
+    existing_role = out["block_type"].astype("string").str.strip()
     no_role_yet = existing_role.isna() | (existing_role == "") | (existing_role == "nan")
     
     # Only assign "heading" to rows that pass threshold AND don't have a role yet
     should_assign_heading = is_heading & no_role_yet
-    out.loc[should_assign_heading, "block_role"] = "heading"
+    out.loc[should_assign_heading, "block_type"] = "heading"
 
     # Pick heading_type from hierarchy_type if present, else default
     if "hierarchy_type" in out.columns:
@@ -744,7 +744,7 @@ def _add_heading_decision(
 # Numbered section group analysis
 # ================================================================================
 
-_NUMBERED_HIERARCHY_TYPES = {"numbered_section", "roman_numbered_section"}
+_NUMBERED_HIERARCHY_TYPES = {"numbered_heading", "roman_numbered_heading"}
 
 
 def _parse_numbered_value(marker: str) -> tuple | None:
@@ -815,22 +815,22 @@ def _is_valid_numbered_continuation(prev: tuple, curr: tuple, max_jump: int = 20
     return all(curr[i] == 1 for i in range(div + 1, len(curr)))
 
 
-def _assign_numbered_section_groups(lines_df: pd.DataFrame) -> pd.DataFrame:
+def _assign_numbered_heading_groups(lines_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Analyses rows with hierarchy_type in {numbered_section, roman_numbered_section}.
+    Analyses rows with hierarchy_type in {numbered_heading, roman_numbered_heading}.
 
     1. Parses each hierarchy_marker into an int tuple (e.g. '8.1' → (8, 1)).
     2. Groups sequential rows into logical series ordered by line_id.
        A new group starts whenever the transition is not a valid continuation.
        Singleton rows (no valid neighbour on either side) are left ungrouped.
     3. Within each (group, depth-level), if at least one row already has
-       block_role = 'heading', every other non-special row at the same depth
+       block_type = 'heading', every other non-special row at the same depth
        is promoted to 'hybrid_heading_paragraph'.
 
     Adds:
-      numbered_section_group  (Int64, nullable — null means stray/ungrouped)
+      numbered_heading_group  (Int64, nullable — null means stray/ungrouped)
     Updates:
-      block_role  — may set 'hybrid_heading_paragraph'
+      block_type  — may set 'hybrid_heading_paragraph'
     """
     out = lines_df.copy()
 
@@ -840,12 +840,12 @@ def _assign_numbered_section_groups(lines_df: pd.DataFrame) -> pd.DataFrame:
            .isin(_NUMBERED_HIERARCHY_TYPES)
     )
     if not target_mask.any():
-        out["numbered_section_group"] = pd.NA
+        out["numbered_heading_group"] = pd.NA
         return out
 
-    if "block_role" in out.columns:
-        br = out["block_role"].astype("string").str.strip().str.lower()
-        target_mask &= ~br.isin(_FORBIDDEN_BLOCK_ROLES)
+    if "block_type" in out.columns:
+        br = out["block_type"].astype("string").str.strip().str.lower()
+        target_mask &= ~br.isin(_FORBIDDEN_BLOCK_TYPES)
 
     cand = out[target_mask].copy()
     if "line_id" in cand.columns:
@@ -912,8 +912,8 @@ def _assign_numbered_section_groups(lines_df: pd.DataFrame) -> pd.DataFrame:
         .astype("Int64")
     )
 
-    out["numbered_section_group"] = pd.NA
-    out.loc[cand.index, "numbered_section_group"] = final_group
+    out["numbered_heading_group"] = pd.NA
+    out.loc[cand.index, "numbered_heading_group"] = final_group
 
     # ---- Promote to hybrid_heading_paragraph ----
     depth_series = values.apply(lambda t: len(t) if t is not None else pd.NA)
@@ -922,23 +922,23 @@ def _assign_numbered_section_groups(lines_df: pd.DataFrame) -> pd.DataFrame:
 
     if (
         not working.empty
-        and "block_role" in working.columns
+        and "block_type" in working.columns
         and "heading_score" in working.columns
     ):
         working = working.copy()
-        working["_is_heading"] = working["block_role"].fillna("").astype(str) == "heading"
+        working["_is_heading"] = working["block_type"].fillna("").astype(str) == "heading"
 
         grp_depth_has_heading = (
             working.groupby(["_grp", "_depth"])["_is_heading"]
             .transform("any")
         )
 
-        _PRESERVE_ROLES = {"heading", "toc_header", "page_label"}
+        _PRESERVE_ROLES = {"heading", "toc_heading", "page_label"}
         promote_mask = grp_depth_has_heading & (
-            ~working["block_role"].fillna("").astype(str).isin(_PRESERVE_ROLES)
+            ~working["block_type"].fillna("").astype(str).isin(_PRESERVE_ROLES)
         )
         promoted_idx = working[promote_mask].index
-        out.loc[promoted_idx, "block_role"] = "hybrid_heading_paragraph"
+        out.loc[promoted_idx, "block_type"] = "hybrid_heading_paragraph"
 
         if "heading_type" not in out.columns:
             out["heading_type"] = pd.NA
@@ -956,7 +956,7 @@ def _extract_hybrid_heading_texts(
     max_search: int = 100,
 ) -> pd.DataFrame:
     """
-    For rows with block_role == 'hybrid_heading_paragraph', extracts the heading
+    For rows with block_type == 'hybrid_heading_paragraph', extracts the heading
     portion from text by finding the first sentence-ending delimiter after the
     hierarchy_marker, searching within max_search characters of body text.
 
@@ -969,7 +969,7 @@ def _extract_hybrid_heading_texts(
     out["hybrid_heading_text"] = pd.NA
 
     mask = (
-        out.get("block_role", pd.Series(dtype="object"))
+        out.get("block_type", pd.Series(dtype="object"))
            .fillna("").astype(str)
            .eq("hybrid_heading_paragraph")
     )
@@ -1009,7 +1009,7 @@ def _extract_hybrid_heading_texts(
 # ================================================================================
 
 _FINGERPRINT_COLS = [
-    "document_region",
+    "section",
     "heading_type",
     "font_size_ratio",
     "is_bold",
@@ -1029,7 +1029,7 @@ _SPECIAL_HEADING_TYPES = {
     "item", "part", "note", "annex", "article", "section", "proposal",
     "section_abbreviated", "schedule", "title", "subpart", "chapter",
     "amendment", "rule", "figure", "table", "appendix", "exhibit",
-    "numbered_section", "roman_numbered_section"
+    "numbered_heading", "roman_numbered_heading"
 }
 
 # All single_parens_*_alpha variants are one continuous series (a→z→aa→zz…)
@@ -1089,11 +1089,11 @@ def _add_heading_fingerprints_and_ids(lines_df: pd.DataFrame) -> pd.DataFrame:
     if "heading_fp_id" not in out.columns:
         out["heading_fp_id"] = pd.NA
 
-    if "block_role" not in out.columns:
+    if "block_type" not in out.columns:
         return out
 
-    br = out["block_role"].astype("string")
-    is_heading = br.str.strip().str.lower().isin({"heading", "toc_header", "exhibit_header", "hybrid_heading_paragraph"}).fillna(False).astype(bool)
+    br = out["block_type"].astype("string")
+    is_heading = br.str.strip().str.lower().isin({"heading", "toc_heading", "exhibit_heading", "hybrid_heading_paragraph"}).fillna(False).astype(bool)
 
     if not is_heading.any():
         return out
@@ -1137,13 +1137,13 @@ def _add_heading_fingerprints_and_ids(lines_df: pd.DataFrame) -> pd.DataFrame:
         best_match_id = None
         best_match_diff = None
         for prev in seen:
-            if prev["doc_region"] != fp.get("doc_region"):
+            if prev["section"] != fp.get("section"):
                 continue
             if prev["heading_type_norm"] != ht_norm_l:
                 continue
             diffs = sum(
                 1 for k in _FINGERPRINT_COLS
-                if k not in {"doc_region", "heading_type"} and prev["fp"].get(k) != fp.get(k)
+                if k not in {"section", "heading_type"} and prev["fp"].get(k) != fp.get(k)
             )
             if diffs <= max_diff:
                 if best_match_diff is None or diffs < best_match_diff:
@@ -1159,7 +1159,7 @@ def _add_heading_fingerprints_and_ids(lines_df: pd.DataFrame) -> pd.DataFrame:
         out.at[i, "heading_fingerprint"] = fp
         out.at[i, "heading_hash"] = h
         out.at[i, "heading_fp_id"] = int(assigned_id)
-        seen.append({"heading_fp_id": int(assigned_id), "doc_region": fp.get("doc_region"), "heading_type_norm": ht_norm_l, "fp": fp})
+        seen.append({"heading_fp_id": int(assigned_id), "section": fp.get("section"), "heading_type_norm": ht_norm_l, "fp": fp})
 
     return out
 
@@ -1181,7 +1181,7 @@ def _suppress_headings(df: pd.DataFrame) -> pd.DataFrame:
     """
     out = df.copy()
 
-    if "block_role" not in out.columns:
+    if "block_type" not in out.columns:
         return out
 
     def _is_heading_mask(x):
@@ -1190,13 +1190,13 @@ def _suppress_headings(df: pd.DataFrame) -> pd.DataFrame:
     def _suppress_rows(mask):
         if mask is None or not mask.any():
             return
-        out.loc[mask, "block_role"] = np.nan
+        out.loc[mask, "block_type"] = np.nan
         for c in _SUPPRESS_BLANK_COLS:
             if c in out.columns:
                 out.loc[mask, c] = np.nan
 
     # (1) Repeated headings
-    is_heading = _is_heading_mask(out["block_role"])
+    is_heading = _is_heading_mask(out["block_type"])
     if "heading_fp_id" in out.columns and "text" in out.columns and is_heading.any():
         fp = out.loc[is_heading, "heading_fp_id"]
         txt = out.loc[is_heading, "text"].astype("string").fillna("").str.strip()
@@ -1211,19 +1211,19 @@ def _suppress_headings(df: pd.DataFrame) -> pd.DataFrame:
             suppress_mask = pd.Series(False, index=out.index)
             suppress_mask.loc[pair_df.index] = bad_mask
             if suppress_mask.any():
-                out.loc[suppress_mask, "block_role"] = "suppressed_repeated_heading"
+                out.loc[suppress_mask, "block_type"] = "suppressed_repeated_heading"
                 for c in _SUPPRESS_BLANK_COLS:
                     if c in out.columns:
                         out.loc[suppress_mask, c] = np.nan
 
     # (2) Coverpage / page-1 cluster
-    is_heading = _is_heading_mask(out["block_role"])
+    is_heading = _is_heading_mask(out["block_type"])
     if is_heading.any():
-        has_coverpage = ("document_region" in out.columns
-                         and out.loc[is_heading, "document_region"].astype("string")
+        has_coverpage = ("section" in out.columns
+                         and out.loc[is_heading, "section"].astype("string")
                          .str.strip().str.lower().eq("coverpage").any())
         if has_coverpage:
-            scope_mask = out["document_region"].astype("string").fillna("").str.strip().str.lower().eq("coverpage")
+            scope_mask = out["section"].astype("string").fillna("").str.strip().str.lower().eq("coverpage")
         elif "page_number" in out.columns:
             scope_mask = out["page_number"].eq(out["page_number"].min())
         else:
@@ -1257,13 +1257,13 @@ def _suppress_headings(df: pd.DataFrame) -> pd.DataFrame:
 # Finalize block roles
 # ================================================================================
 
-def _finalize_block_roles(df: pd.DataFrame) -> pd.DataFrame:
-    """Set all blank/NaN block_role values to 'paragraph'."""
+def _finalize_block_types(df: pd.DataFrame) -> pd.DataFrame:
+    """Set all blank/NaN block_type values to 'paragraph'."""
     out = df.copy()
-    if "block_role" in out.columns:
-        blank_mask = out["block_role"].isna() | (out["block_role"].astype("string").str.strip() == "")
+    if "block_type" in out.columns:
+        blank_mask = out["block_type"].isna() | (out["block_type"].astype("string").str.strip() == "")
         if blank_mask.any():
-            out.loc[blank_mask, "block_role"] = "paragraph"
+            out.loc[blank_mask, "block_type"] = "paragraph"
     return out
 
 
@@ -1290,8 +1290,8 @@ def detect_headings(
     9. Finalize block roles (fill blanks → 'paragraph')
 
     Returns lines_df with columns added:
-      hierarchy_marker, hierarchy_type, heading_score, block_role, heading_type,
-      numbered_section_group, hybrid_heading_text,
+      hierarchy_marker, hierarchy_type, heading_score, block_type, heading_type,
+      numbered_heading_group, hybrid_heading_text,
       heading_fingerprint, heading_hash, heading_fp_id
     """
     out = lines_df.copy()
@@ -1315,11 +1315,11 @@ def detect_headings(
 
     out = _apply_contextual_score_adjustments(out)
     out = _add_heading_decision(out)
-    out = _assign_numbered_section_groups(out)
+    out = _assign_numbered_heading_groups(out)
     out = _extract_hybrid_heading_texts(out)
     out = _add_heading_fingerprints_and_ids(out)
     out = _suppress_headings(out)
-    out = _finalize_block_roles(out)
+    out = _finalize_block_types(out)
 
     return out
 

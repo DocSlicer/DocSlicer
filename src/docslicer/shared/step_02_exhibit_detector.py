@@ -103,7 +103,7 @@ class ExhibitSegment:
     n_candidates: int
     candidate_ratio: float
     max_consecutive_candidates: int
-    has_exhibit_header_nearby: bool
+    has_exhibit_heading_nearby: bool
     has_exhibit_number_header: bool
     has_other_segment_above: bool
     n_links: int
@@ -190,7 +190,7 @@ def _safe_str_or_none(x: Any) -> Optional[str]:
 # STEP 1: Exhibit Header Candidates
 # ==========================================
 
-def _identify_exhibit_header_candidates(
+def _identify_exhibit_heading_candidates(
     df: pd.DataFrame,
     exhibit_config: ExhibitPatternConfig,
     *,
@@ -199,11 +199,11 @@ def _identify_exhibit_header_candidates(
     """
     Tag rows that look like exhibit section headers.
 
-    Adds ``exhibit_header_candidate`` (pattern name or ``pd.NA``).
+    Adds ``exhibit_heading_candidate`` (pattern name or ``pd.NA``).
     Examples of matching text: ``"Item 15. Exhibits"``, ``"EXHIBIT INDEX"``.
     """
     out = df.copy()
-    out["exhibit_header_candidate"] = pd.NA
+    out["exhibit_heading_candidate"] = pd.NA
 
     if "text" not in out.columns:
         return out
@@ -214,7 +214,7 @@ def _identify_exhibit_header_candidates(
             continue
         for pattern in exhibit_config.header_patterns:
             if pattern.compiled.match(txt):
-                out.loc[idx, "exhibit_header_candidate"] = pattern.name
+                out.loc[idx, "exhibit_heading_candidate"] = pattern.name
                 break  # First match wins
 
     return out
@@ -391,20 +391,20 @@ def _calculate_max_consecutive(
     return max_run
 
 
-def _check_exhibit_header_nearby(
+def _check_exhibit_heading_nearby(
     df_sorted: pd.DataFrame,
     start_line_id: int,
     lookback: int,
 ) -> Tuple[bool, List[int]]:
     """Return ``(has_header, header_line_ids)`` for the *lookback* rows before *start_line_id*."""
-    if "exhibit_header_candidate" not in df_sorted.columns:
+    if "exhibit_heading_candidate" not in df_sorted.columns:
         return False, []
 
     before = df_sorted[df_sorted["line_id"] < start_line_id].tail(lookback)
     header_line_ids = [
         int(row["line_id"])
         for _, row in before.iterrows()
-        if pd.notna(row.get("exhibit_header_candidate"))
+        if pd.notna(row.get("exhibit_heading_candidate"))
     ]
     return bool(header_line_ids), header_line_ids
 
@@ -551,7 +551,7 @@ def _build_exhibit_segments(
             n_rows = len(all_line_ids)
             n_candidates = len(candidate_line_ids)
 
-            has_header, header_line_ids = _check_exhibit_header_nearby(
+            has_header, header_line_ids = _check_exhibit_heading_nearby(
                 df_sorted, start_line_id, header_lookback
             )
             if has_header:
@@ -576,7 +576,7 @@ def _build_exhibit_segments(
                 max_consecutive_candidates=_calculate_max_consecutive(
                     all_line_ids, candidate_line_ids
                 ),
-                has_exhibit_header_nearby=has_header,
+                has_exhibit_heading_nearby=has_header,
                 has_exhibit_number_header=table_id in exhibit_number_header_tables,
                 has_other_segment_above=has_above,
                 n_links=n_links,
@@ -621,7 +621,7 @@ def _build_exhibit_segments(
                 if "has_link" in df_sorted.columns else 0
             )
 
-            has_header, header_line_ids = _check_exhibit_header_nearby(
+            has_header, header_line_ids = _check_exhibit_heading_nearby(
                 df_sorted, start_line_id, header_lookback
             )
             if has_header:
@@ -641,7 +641,7 @@ def _build_exhibit_segments(
                 max_consecutive_candidates=_calculate_max_consecutive(
                     segment_line_ids, candidate_line_ids
                 ),
-                has_exhibit_header_nearby=has_header,
+                has_exhibit_heading_nearby=has_header,
                 has_exhibit_number_header=False,
                 has_other_segment_above=has_above,
                 n_links=n_links,
@@ -704,7 +704,7 @@ def _score_exhibit_segments(
 
     **Confidence scoring components:**
 
-    - ``has_exhibit_header_nearby``: +1
+    - ``has_exhibit_heading_nearby``: +1
     - ``has_exhibit_number_header``: +1
     - ``has_other_segment_above`` (continuation): +1
     - Links: ``links_weight_per_link`` per link, capped at ``links_score_cap``
@@ -733,10 +733,10 @@ def _score_exhibit_segments(
         disqualification_reason = None
 
         root = _find_root_segment(segment, segments_by_id)
-        root_has_header = root.has_exhibit_header_nearby
+        root_has_header = root.has_exhibit_heading_nearby
 
         if require_header_in_chain:
-            if not segment.has_exhibit_header_nearby and not segment.has_other_segment_above:
+            if not segment.has_exhibit_heading_nearby and not segment.has_other_segment_above:
                 is_disqualified = True
                 disqualification_reason = "No header nearby and not part of a chain"
             elif segment.has_other_segment_above and not root_has_header:
@@ -746,7 +746,7 @@ def _score_exhibit_segments(
                 )
 
         # --- Confidence scoring (computed even for disqualified segments) ---
-        header_nearby_score = 1.0 if segment.has_exhibit_header_nearby else 0.0
+        header_nearby_score = 1.0 if segment.has_exhibit_heading_nearby else 0.0
         number_header_score = 1.0 if segment.has_exhibit_number_header else 0.0
         segment_above_score = 1.0 if segment.has_other_segment_above else 0.0
         links_score = min(segment.n_links * links_weight_per_link, links_score_cap)
@@ -869,7 +869,7 @@ def print_exhibit_segments(
         else:
             print("  Type: UNKNOWN")
 
-        if seg.has_exhibit_header_nearby:
+        if seg.has_exhibit_heading_nearby:
             print(f"  Has exhibit header nearby (lines: {seg.nearby_header_line_ids})")
         if seg.has_exhibit_number_header:
             print("  Has exhibit number header")
@@ -945,17 +945,17 @@ def detect_and_mark_exhibits(
     Run the complete exhibit detection pipeline and annotate the DataFrame.
 
     Expects columns: ``text``, ``line_id``, ``has_link``, ``table_id``,
-    ``block_role`` (optional — rows classified as ``'toc'`` or ``'toc_header'``
+    ``block_type`` (optional — rows classified as ``'toc'`` or ``'toc_heading'``
     are skipped).
 
     Pipeline steps:
 
-    1. Skip rows already classified as ``'toc'`` or ``'toc_header'``.
+    1. Skip rows already classified as ``'toc'`` or ``'toc_heading'``.
     2. Identify exhibit section header candidates.
     3. Identify exhibit row candidates.
     4. Cluster candidates into :class:`ExhibitSegment` objects.
     5. Score and filter segments.
-    6. Write ``block_role = 'exhibit'`` or ``'exhibit_header'`` for accepted rows.
+    6. Write ``block_type = 'exhibit'`` or ``'exhibit_heading'`` for accepted rows.
 
     Args:
         df: Input DataFrame.
@@ -971,24 +971,24 @@ def detect_and_mark_exhibits(
             output and prints segment details to stdout (default: ``False``).
 
     Returns:
-        DataFrame with ``block_role`` set to ``'exhibit'`` or
-        ``'exhibit_header'`` for detected rows.  When ``debug=True``, also
-        includes ``exhibit_header_candidate``, ``exhibit_row_candidate``,
+        DataFrame with ``block_type`` set to ``'exhibit'`` or
+        ``'exhibit_heading'`` for detected rows.  When ``debug=True``, also
+        includes ``exhibit_heading_candidate``, ``exhibit_row_candidate``,
         ``exhibit_number``, and ``pattern_strength`` columns.
     """
     # STEP 0: Skip rows already classified as TOC
-    if "block_role" in df.columns:
-        df_work = df[~df["block_role"].isin(["toc", "toc_header"])].copy()
+    if "block_type" in df.columns:
+        df_work = df[~df["block_type"].isin(["toc", "toc_heading"])].copy()
     else:
         df_work = df.copy()
 
     if df_work.empty:
-        if "block_role" not in df.columns:
-            df["block_role"] = pd.NA
+        if "block_type" not in df.columns:
+            df["block_type"] = pd.NA
         return df
 
     # STEP 1: Header candidates
-    df_work = _identify_exhibit_header_candidates(df_work, exhibit_config)
+    df_work = _identify_exhibit_heading_candidates(df_work, exhibit_config)
 
     # STEP 2: Row candidates
     df_work, candidates = _add_exhibit_row_candidates(
@@ -1017,15 +1017,15 @@ def detect_and_mark_exhibits(
         print_exhibit_segments(segments, df=df_work, scores=scores)
 
     # STEP 6: Annotate accepted segments
-    if "block_role" not in df.columns:
-        df["block_role"] = pd.NA
+    if "block_type" not in df.columns:
+        df["block_type"] = pd.NA
 
     for score_obj in accepted:
         seg = score_obj.segment
         for hid in seg.nearby_header_line_ids:
-            df.loc[df["line_id"] == hid, "block_role"] = "exhibit_header"
+            df.loc[df["line_id"] == hid, "block_type"] = "exhibit_heading"
         mask = (df["line_id"] >= seg.start_line_id) & (df["line_id"] <= seg.end_line_id)
-        df.loc[mask, "block_role"] = "exhibit"
+        df.loc[mask, "block_type"] = "exhibits"
 
     # STEP 7: Fill gaps between the chain root's header and the last segment
     if accepted:
@@ -1038,26 +1038,26 @@ def detect_and_mark_exhibits(
             root_seg = chain_segs[0]
             last_seg = chain_segs[-1]
 
-            if not (root_seg.has_exhibit_header_nearby and root_seg.nearby_header_line_ids):
+            if not (root_seg.has_exhibit_heading_nearby and root_seg.nearby_header_line_ids):
                 continue
 
             earliest_header = min(root_seg.nearby_header_line_ids)
             header_set = set(root_seg.nearby_header_line_ids)
             in_range = (df["line_id"] >= earliest_header) & (df["line_id"] <= last_seg.end_line_id)
 
-            df.loc[in_range & df["line_id"].isin(header_set), "block_role"] = "exhibit_header"
+            df.loc[in_range & df["line_id"].isin(header_set), "block_type"] = "exhibit_heading"
             df.loc[
                 in_range
                 & ~df["line_id"].isin(header_set)
-                & (df["block_role"].isna() | df["block_role"].isin(["exhibit", "exhibit_header"])),
-                "block_role",
-            ] = "exhibit"
+                & (df["block_type"].isna() | df["block_type"].isin(["exhibits", "exhibit_heading"])),
+                "block_type",
+            ] = "exhibits"
 
     # STEP 8: Merge debug columns back into the original DataFrame
     if debug:
         debug_cols = [
             c for c in [
-                "exhibit_header_candidate", "exhibit_row_candidate",
+                "exhibit_heading_candidate", "exhibit_row_candidate",
                 "exhibit_number", "pattern_strength",
             ]
             if c in df_work.columns

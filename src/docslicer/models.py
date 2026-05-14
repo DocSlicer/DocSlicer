@@ -71,7 +71,7 @@ class PageContext(TypedDict, total=False):
     page_height: float
     page_number: int
     page_label: str
-    doc_region: str
+    section: str
 
 
 class DocumentIdentity(TypedDict, total=False):
@@ -186,7 +186,7 @@ class BlockSchema(DocumentIdentity, ContentBase):
     block_id: int
     line_ids: List[int]
     page_label: str
-    doc_region: str
+    section: str
 
     # Block-specific geometry
     top_first: float  # y_top of first line
@@ -212,7 +212,7 @@ class BlockSchema(DocumentIdentity, ContentBase):
     digit_ratio: float
 
     # Classification
-    block_role: Literal["page_label", "toc", "exhibit", "hr", "image",
+    block_type: Literal["page_label", "toc", "exhibits", "hr", "image",
                         "table", "heading", "paragraph", "signature_block"]
     heading_score: float
 
@@ -384,14 +384,14 @@ def show_schema_inheritance() -> None:
 # TYPE ALIASES (shared across package)
 # ==========================================
 
-BlockRoleType = Literal[
-    "page_label", "toc", "exhibit", "hr", "image",
+BlockType = Literal[
+    "page_label", "toc", "exhibits", "hr", "image",
     "table", "heading", "paragraph", "signature_block"
 ]
 
 ShapeType = Literal["line", "rect", "curve"]
 Orientation = Literal["horizontal", "vertical", "unknown"]
-DocRegion = Literal["coverpage", "body", "last_page"]
+SectionType = Literal["coverpage", "body", "last_page"]
 TextAlign = Literal["left", "center", "right", "justify"]
 
 

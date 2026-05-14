@@ -761,7 +761,7 @@ def pick_pdf_page_label_winners_and_validate(
     restart_curr_max: int = 5,          # and next label is "small"
     restart_support_lookahead: int = 2, # require support in next N pages if fp does not change
     out_final_col: str = "page_label",
-    out_block_role_col: str = "block_role",
+    out_block_type_col: str = "block_type",
     out_role_value: str = "page_label",
     out_series_id_col: str = "page_label_series_id",
 ) -> pd.DataFrame:
@@ -779,7 +779,7 @@ def pick_pdf_page_label_winners_and_validate(
 
     Effects:
       - Writes out_final_col only on the chosen candidate row for each page
-      - Sets out_block_role_col = out_role_value for chosen candidate rows
+      - Sets out_block_type_col = out_role_value for chosen candidate rows
       - Writes out_series_id_col on chosen rows (segment id for restarts)
       - Leaves other rows untouched (except clearing existing out_final_col on non-chosen candidates)
 
@@ -797,8 +797,8 @@ def pick_pdf_page_label_winners_and_validate(
 
     if out_final_col not in out.columns:
         out[out_final_col] = None
-    if out_block_role_col not in out.columns:
-        out[out_block_role_col] = None
+    if out_block_type_col not in out.columns:
+        out[out_block_type_col] = None
     if out_series_id_col not in out.columns:
         out[out_series_id_col] = None
 
@@ -806,7 +806,7 @@ def pick_pdf_page_label_winners_and_validate(
     # Only clear where there is a candidate token to avoid nuking other uses of these cols.
     cand_any = out[token_col].notna() & (out[token_col].astype(str).str.len() > 0)
     out.loc[cand_any, out_final_col] = None
-    # Don't clear block_role globally; only set it on winners.
+    # Don't clear block_type globally; only set it on winners.
 
     # --- Build per-page candidate lists ---
     pages_raw = pd.to_numeric(out[page_col], errors="coerce")
@@ -1095,7 +1095,7 @@ def pick_pdf_page_label_winners_and_validate(
 
         # mark final label on the chosen row
         out.at[st.row_idx, out_final_col] = st.token
-        out.at[st.row_idx, out_block_role_col] = out_role_value
+        out.at[st.row_idx, out_block_type_col] = out_role_value
         out.at[st.row_idx, out_series_id_col] = series_id
 
     out = out.drop(columns=["_page_int__"], errors="ignore")
@@ -1113,9 +1113,9 @@ def drop_unreliable_prefix_labels(
     value_col: str = "page_label_value",
     min_run_len: int = 3,             # require at least 4 consecutive +1 steps
     max_offset_abs: int = 20,         # optional: disallow absurd offsets like page 2 -> label 11 (offset +9)
-    clear_block_role: bool = True,
-    block_role_col: str = "block_role",
-    block_role_value: str = "page_label",
+    clear_block_type: bool = True,
+    block_type_col: str = "block_type",
+    block_type_value: str = "page_label",
 ) -> pd.DataFrame:
     """
     Finds the earliest contiguous +1 run of (page -> label_value) of length >= min_run_len,
@@ -1185,8 +1185,8 @@ def drop_unreliable_prefix_labels(
     out.loc[mask_prefix_pages, label_col] = None
 
     # Also clear role markers if you want
-    if clear_block_role and block_role_col in out.columns:
-        out.loc[mask_prefix_pages & (out[block_role_col] == block_role_value), block_role_col] = None
+    if clear_block_type and block_type_col in out.columns:
+        out.loc[mask_prefix_pages & (out[block_type_col] == block_type_value), block_type_col] = None
 
     return out
 

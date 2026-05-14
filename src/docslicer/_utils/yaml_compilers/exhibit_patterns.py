@@ -228,7 +228,7 @@ def load_and_compile_exhibit_patterns(yaml_obj: Dict[str, Any]) -> ExhibitPatter
         return cached
 
     row_raw = yaml_obj.get("exhibit_row_patterns", []) or []
-    header_raw = yaml_obj.get("exhibit_header_patterns", []) or []
+    header_raw = yaml_obj.get("exhibit_heading_patterns", []) or []
     anti_raw = yaml_obj.get("exhibit_row_anti_patterns", []) or []
 
     # Augment row patterns with footnote marker variations

@@ -97,7 +97,7 @@ def _build_chunks(df_chunks: pd.DataFrame) -> list[Chunk]:
             text=str(row.get("text", "")),
             page_number=int(row.get("page_number", 0)),
             page_label=page_label,
-            document_region=str(row.get("document_region", "")),
+            section=str(row.get("section", "")),
             chunk_index=int(row.get("chunk_index", 0)),
             char_count=int(row.get("embed_char_count", 0)),
             heading=heading,
@@ -122,8 +122,8 @@ def _build_blocks(df_blocks: pd.DataFrame) -> list[Block]:
             text=str(row.get("text", "")),
             page_number=int(row.get("page_number", 0)),
             page_label=page_label,
-            role=str(row.get("block_role", "")),
-            document_region=str(row.get("document_region", "")),
+            role=str(row.get("block_type", "")),
+            section=str(row.get("section", "")),
             chunk_id=None,  # block→chunk link not available without re-running chunk assignment
             char_count=int(row.get("embed_char_count", 0)),
             bbox=_bbox(row),
@@ -201,8 +201,8 @@ def _build_result(
     # Apply region filter if requested
     if config.regions:
         allowed = set(config.regions)
-        chunks = [c for c in chunks if c.document_region in allowed]
-        blocks = [b for b in blocks if b.document_region in allowed]
+        chunks = [c for c in chunks if c.section in allowed]
+        blocks = [b for b in blocks if b.section in allowed]
 
     pipeline_steps: dict[str, pd.DataFrame] = {}
     if config.debug:

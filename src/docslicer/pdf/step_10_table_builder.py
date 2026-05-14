@@ -391,8 +391,8 @@ def _classify_bands(
 
     result_cells["layout_id"] = result_cells["horizontal_band_id"]
     result_cells["layout_type"] = "text"
-    if "block_role" not in result_cells.columns:
-        result_cells["block_role"] = pd.NA
+    if "block_type" not in result_cells.columns:
+        result_cells["block_type"] = pd.NA
 
     result_lines = df_lines.copy()
     result_lines["layout_id"] = result_lines["horizontal_band_id"]
@@ -451,7 +451,7 @@ def _classify_bands(
 
     result_cells["layout_type"] = result_cells["horizontal_band_id"].map(band_types).fillna("text")
     result_cells["band_table_score"] = result_cells["horizontal_band_id"].map(band_scores).fillna(0.0)
-    result_cells.loc[result_cells["layout_type"] == "table", "block_role"] = "table"
+    result_cells.loc[result_cells["layout_type"] == "table", "block_type"] = "table"
 
     result_lines["layout_type"] = result_lines["horizontal_band_id"].map(band_types).fillna("text")
     result_lines["band_table_score"] = result_lines["horizontal_band_id"].map(band_scores).fillna(0.0)
@@ -499,7 +499,7 @@ def build_tables(
 
     df_cells : pd.DataFrame
         With added columns: col_start, col_end, colspan, band_total_cols,
-        layout_id, layout_type, block_role, band_table_score.
+        layout_id, layout_type, block_type, band_table_score.
 
     df_table_cells : pd.DataFrame
         One row per assembled table cell.  Contains: table_cell_id, page_number,

@@ -24,8 +24,18 @@ TOC_HEADER_PATTERNS = [
     re.compile(r'^(?:\s*index\b.*|.*\bindex\s*)$', re.IGNORECASE),
 ]
 
-# dot leaders = "." repeated, allowing whitespace between dots
-_DOT_LEADERS_RE = re.compile(r"\.(?:\s*\.){2,}")
+# dot leaders = repeated visual leader glyphs, allowing whitespace between glyphs
+_DOT_LEADER_CHARS = r".…⋯∙·•‧"
+_DOT_LEADERS_RE = re.compile(rf"[{re.escape(_DOT_LEADER_CHARS)}](?:\s*[{re.escape(_DOT_LEADER_CHARS)}]){{2,}}")
+
+_HIDDEN_BLOCK_TYPES = frozenset({
+    "toc",
+    "toc_heading",
+    "heading",
+    "image",
+    "hr",
+    "page_label",
+})
 
 
 # =========================
@@ -64,10 +74,26 @@ def _safe_int(x: Any) -> Optional[int]:
 
 
 def _safe_str_or_none(x: Any) -> Optional[str]:
-    if x is None or (isinstance(x, float) and pd.isna(x)):
+    if x is None:
         return None
+    try:
+        if bool(pd.isna(x)):
+            return None
+    except (TypeError, ValueError):
+        pass
     s = str(x).strip()
     return s or None
+
+
+def _is_hidden_block_type(value: Any) -> bool:
+    s = _safe_str_or_none(value)
+    return bool(s and s.lower() in _HIDDEN_BLOCK_TYPES)
+
+
+def _hidden_block_type_mask(df: pd.DataFrame) -> pd.Series:
+    if "block_type" not in df.columns:
+        return pd.Series(False, index=df.index, dtype=bool)
+    return df["block_type"].map(_is_hidden_block_type).astype(bool)
 
 
 # =========================
@@ -92,6 +118,8 @@ class TocRowCandidate:
     height: Optional[float]
     font_size_px: Optional[float]
     text_align: Optional[str]
+    non_stroking_color: Optional[str]
+    paragraph_style_id: Optional[str]
     page_number: Optional[int]
 
 
@@ -126,6 +154,45 @@ class LayoutFingerprint:
 
 
 @dataclass(frozen=True)
+class DocxStyleFingerprint:
+    """Fallback fingerprint for DOCX rows that do not have x-position data."""
+    font_size_px: float
+    text_align: Optional[str]
+    non_stroking_color: Optional[str]
+    paragraph_style_id: Optional[str]
+
+    @classmethod
+    def from_candidate(cls, candidate: TocRowCandidate) -> Optional['DocxStyleFingerprint']:
+        """Create a fingerprint from DOCX paragraph/style fields."""
+        if candidate.left is not None or candidate.font_size_px is None:
+            return None
+        if (
+            candidate.text_align is None and
+            candidate.non_stroking_color is None and
+            candidate.paragraph_style_id is None
+        ):
+            return None
+        return cls(
+            font_size_px=candidate.font_size_px,
+            text_align=candidate.text_align,
+            non_stroking_color=candidate.non_stroking_color,
+            paragraph_style_id=candidate.paragraph_style_id,
+        )
+
+    def matches(self, other: 'DocxStyleFingerprint',
+                left_tolerance: float = 5.0,
+                height_tolerance: float = 2.0,
+                font_tolerance: float = 0.5) -> bool:
+        """Check if another DOCX style fingerprint matches."""
+        return (
+            abs(self.font_size_px - other.font_size_px) <= font_tolerance and
+            self.text_align == other.text_align and
+            self.non_stroking_color == other.non_stroking_color and
+            self.paragraph_style_id == other.paragraph_style_id
+        )
+
+
+@dataclass(frozen=True)
 class TocSegment:
     """
     A small, localized cluster of candidate rows.
@@ -138,14 +205,14 @@ class TocSegment:
     n_candidates: int
     candidate_ratio: float
     max_consecutive_candidates: int  # Longest run of consecutive candidate rows
-    has_toc_header_nearby: bool
+    has_toc_heading_nearby: bool
     has_page_header: bool
     n_links: int         # Number of rows in this segment with hyperlinks
     n_dot_leaders: int   # Number of rows in this segment with dot leaders (......)
     nearby_header_line_ids: List[int]
     # Primary clustering signal (mutually exclusive in practice)
     table_id: Optional[str]                   # Non-null if this is a table-based segment
-    fingerprint: Optional[LayoutFingerprint]  # Non-null if layout-based segment
+    fingerprint: Optional[Any]                # Non-null if fingerprint-based segment
 
     @property
     def is_table_based(self) -> bool:
@@ -201,16 +268,16 @@ def _remove_toc_pointers(df: pd.DataFrame) -> pd.DataFrame:
 # STEP 1: Build TOC Header Candidate Column
 # ==========================================
 
-def _identify_toc_header_candidates(df: pd.DataFrame) -> pd.DataFrame:
+def _identify_toc_heading_candidates(df: pd.DataFrame) -> pd.DataFrame:
     """
     Identify TOC header candidates (e.g., "Table of Contents", "Index").
 
-    Adds column `toc_header_candidate`:
+    Adds column `toc_heading_candidate`:
     - TRUE where text matches any TOC header pattern and length <= 80
     - NA elsewhere
     """
     out = df.copy()
-    out["toc_header_candidate"] = pd.NA
+    out["toc_heading_candidate"] = pd.NA
 
     if "text" not in out.columns:
         return out
@@ -222,8 +289,9 @@ def _identify_toc_header_candidates(df: pd.DataFrame) -> pd.DataFrame:
         mask |= text.str.match(pattern, na=False)
 
     mask &= text.str.len().fillna(81) <= 80
+    mask &= ~_hidden_block_type_mask(out)
 
-    out.loc[mask, "toc_header_candidate"] = True
+    out.loc[mask, "toc_heading_candidate"] = True
     return out
 
 
@@ -333,10 +401,14 @@ def _add_toc_row_candidates(
         return out, []
 
     texts = out["text"].astype(str)
+    hidden_mask = _hidden_block_type_mask(out)
     candidates: List[TocRowCandidate] = []
 
     # Row candidates (iterate once; keeps logic clear and debuggable)
     for idx, raw_text in texts.items():
+        if bool(hidden_mask.at[idx]):
+            continue
+
         text = (raw_text or "").strip()
         if not text or len(text) > max_chars:
             continue
@@ -388,6 +460,8 @@ def _add_toc_row_candidates(
                 height=_safe_float(out.at[idx, "height"]) if "height" in out.columns else None,
                 font_size_px=_safe_float(out.at[idx, "font_size"]) if "font_size" in out.columns else None,
                 text_align=_safe_str_or_none(out.at[idx, "text_align"]) if "text_align" in out.columns else None,
+                non_stroking_color=_safe_str_or_none(out.at[idx, "non_stroking_color"]) if "non_stroking_color" in out.columns else None,
+                paragraph_style_id=_safe_str_or_none(out.at[idx, "paragraph_style_id"]) if "paragraph_style_id" in out.columns else None,
                 page_number=_safe_int(out.at[idx, "page_number"]) if "page_number" in out.columns else None,
             )
         )
@@ -446,7 +520,7 @@ def _calculate_max_consecutive(sorted_line_ids: List[int], candidate_set: Set[in
     return max_run
 
 
-def _check_toc_header_nearby(
+def _check_toc_heading_nearby(
     df_sorted: pd.DataFrame,
     start_line_id: int,
     lookback: int,
@@ -457,37 +531,54 @@ def _check_toc_header_nearby(
     Returns:
         Tuple of (has_header: bool, header_line_ids: List[int])
     """
-    if "toc_header_candidate" not in df_sorted.columns:
+    if "toc_heading_candidate" not in df_sorted.columns:
         return False, []
 
     before_rows = df_sorted[df_sorted["line_id"] < start_line_id].tail(lookback)
     if before_rows.empty:
         return False, []
 
-    header_rows = before_rows[before_rows["toc_header_candidate"].notna()]
+    header_rows = before_rows[before_rows["toc_heading_candidate"].notna()]
     header_line_ids = [int(x) for x in header_rows["line_id"].tolist()]
     return len(header_line_ids) > 0, header_line_ids
 
 
-def _get_row_fingerprint(row: pd.Series) -> Optional[LayoutFingerprint]:
-    """Extract a LayoutFingerprint from a DataFrame row.
+def _get_row_fingerprint(row: pd.Series) -> Optional[Any]:
+    """Extract a positional or DOCX style fingerprint from a DataFrame row.
 
     Used during segment expansion to check layout continuity of non-candidate rows.
     """
+    if _is_hidden_block_type(row.get("block_type")):
+        return None
+
     left = _safe_float(row.get("x_left"))
     height = _safe_float(row.get("height"))
     font_size_px = _safe_float(row.get("font_size"))
 
-    if left is None or font_size_px is None:
+    if font_size_px is None:
         return None
 
-    return LayoutFingerprint(left=left, height=height or 0.0, font_size_px=font_size_px)
+    if left is not None:
+        return LayoutFingerprint(left=left, height=height or 0.0, font_size_px=font_size_px)
+
+    text_align = _safe_str_or_none(row.get("text_align"))
+    non_stroking_color = _safe_str_or_none(row.get("non_stroking_color"))
+    paragraph_style_id = _safe_str_or_none(row.get("paragraph_style_id"))
+    if text_align is None and non_stroking_color is None and paragraph_style_id is None:
+        return None
+
+    return DocxStyleFingerprint(
+        font_size_px=font_size_px,
+        text_align=text_align,
+        non_stroking_color=non_stroking_color,
+        paragraph_style_id=paragraph_style_id,
+    )
 
 
 def _expand_segment_by_fingerprint(
     df_sorted: pd.DataFrame,
     seed_line_id: int,
-    target_fingerprint: LayoutFingerprint,
+    target_fingerprint: Any,
     line_id_to_idx: Dict[int, int],
     left_tolerance: float,
     height_tolerance: float,
@@ -588,7 +679,7 @@ def _build_toc_segments(
                 n_candidates = len(candidate_line_ids)
 
                 max_consecutive = _calculate_max_consecutive(all_line_ids, candidate_line_ids)
-                has_toc_header, header_line_ids = _check_toc_header_nearby(
+                has_toc_heading, header_line_ids = _check_toc_heading_nearby(
                     df_sorted, start_line_id, header_lookback
                 )
 
@@ -603,7 +694,7 @@ def _build_toc_segments(
                     n_candidates=n_candidates,
                     candidate_ratio=n_candidates / n_rows if n_rows > 0 else 0.0,
                     max_consecutive_candidates=max_consecutive,
-                    has_toc_header_nearby=has_toc_header,
+                    has_toc_heading_nearby=has_toc_heading,
                     has_page_header=table_id in page_header_tables,
                     n_links=n_links,
                     n_dot_leaders=n_dot_leaders,
@@ -622,7 +713,10 @@ def _build_toc_segments(
             if candidate_obj is None:
                 continue
 
-            fingerprint = LayoutFingerprint.from_candidate(candidate_obj)
+            fingerprint = (
+                LayoutFingerprint.from_candidate(candidate_obj) or
+                DocxStyleFingerprint.from_candidate(candidate_obj)
+            )
             if fingerprint is None:
                 continue
 
@@ -642,7 +736,7 @@ def _build_toc_segments(
             n_candidates = len(candidate_line_ids)
 
             max_consecutive = _calculate_max_consecutive(segment_line_ids, candidate_line_ids)
-            has_toc_header, header_line_ids = _check_toc_header_nearby(
+            has_toc_heading, header_line_ids = _check_toc_heading_nearby(
                 df_sorted, start_line_id, header_lookback
             )
 
@@ -667,7 +761,7 @@ def _build_toc_segments(
                 n_candidates=n_candidates,
                 candidate_ratio=n_candidates / n_rows if n_rows > 0 else 0.0,
                 max_consecutive_candidates=max_consecutive,
-                has_toc_header_nearby=has_toc_header,
+                has_toc_heading_nearby=has_toc_heading,
                 has_page_header=False,
                 n_links=n_links,
                 n_dot_leaders=n_dot_leaders,
@@ -707,6 +801,8 @@ def _score_and_filter_toc_segments(
     LINKS_SCORE_CAP             = 2.0
     CONSECUTIVE_WEIGHT          = 0.2
     CONSECUTIVE_CAP             = 1.5
+    LONG_CONSECUTIVE_MIN        = 10
+    LONG_CONSECUTIVE_BONUS      = 0.2
     RATIO_WEIGHT                = 1.0
     DOT_LEADERS_WEIGHT          = 0.2
     DOT_LEADERS_CAP             = 1.0
@@ -743,10 +839,12 @@ def _score_and_filter_toc_segments(
             continue
 
         # === SCORING ===
-        header_score      = HAS_TOC_HEADER_WEIGHT if segment.has_toc_header_nearby else 0.0
+        header_score      = HAS_TOC_HEADER_WEIGHT if segment.has_toc_heading_nearby else 0.0
         page_header_score = HAS_PAGE_HEADER_WEIGHT if segment.has_page_header else 0.0
         links_score       = min(segment.n_links * LINKS_WEIGHT_PER_LINK, LINKS_SCORE_CAP)
         consecutive_score = min(segment.max_consecutive_candidates * CONSECUTIVE_WEIGHT, CONSECUTIVE_CAP)
+        if segment.max_consecutive_candidates >= LONG_CONSECUTIVE_MIN:
+            consecutive_score += LONG_CONSECUTIVE_BONUS
         ratio_score       = segment.candidate_ratio * RATIO_WEIGHT
         dot_leaders_score = min(segment.n_dot_leaders * DOT_LEADERS_WEIGHT, DOT_LEADERS_CAP)
 
@@ -797,23 +895,23 @@ def _close_toc_gaps(df: pd.DataFrame, *, max_gap: int = 3) -> pd.DataFrame:
     Close gaps between TOC-related rows for better continuity.
 
     Two gap-closing operations:
-    1. Fill gaps between toc_header and toc (mark as toc_header)
+    1. Fill gaps between toc_heading and toc (mark as toc_heading)
     2. Fill small gaps between toc segments (mark as toc, max `max_gap` rows)
 
     Both operations overwrite existing "table" rows in the gap, in addition to NA rows.
     This handles TOCs where the table parser produced many small per-section tables that
     individually fail the min_rows filter but sit between accepted toc segments.
     """
-    if df.empty or "block_role" not in df.columns or "line_id" not in df.columns:
+    if df.empty or "block_type" not in df.columns or "line_id" not in df.columns:
         return df
 
     out = df.copy().sort_values("line_id").reset_index(drop=True)
 
-    # === OPERATION 1: Close gaps between toc_header and toc ===
-    toc_header_indices = out[out["block_role"] == "toc_header"].index.tolist()
-    toc_indices = out[out["block_role"] == "toc"].index.tolist()
+    # === OPERATION 1: Close gaps between toc_heading and toc ===
+    toc_heading_indices = out[out["block_type"] == "toc_heading"].index.tolist()
+    toc_indices = out[out["block_type"] == "toc"].index.tolist()
 
-    for header_idx in toc_header_indices:
+    for header_idx in toc_heading_indices:
         header_line_id = out.at[header_idx, "line_id"]
         next_toc = [idx for idx in toc_indices if out.at[idx, "line_id"] > header_line_id]
 
@@ -822,12 +920,12 @@ def _close_toc_gaps(df: pd.DataFrame, *, max_gap: int = 3) -> pd.DataFrame:
             gap_mask = (
                 (out["line_id"] > header_line_id) &
                 (out["line_id"] < next_toc_line_id) &
-                (out["block_role"].isna() | (out["block_role"] == "table"))
+                (out["block_type"].isna() | (out["block_type"] == "table"))
             )
-            out.loc[gap_mask, "block_role"] = "toc_header"
+            out.loc[gap_mask, "block_type"] = "toc_heading"
 
     # === OPERATION 2: Close small gaps between toc segments ===
-    toc_indices = out[out["block_role"] == "toc"].index.tolist()
+    toc_indices = out[out["block_type"] == "toc"].index.tolist()
     if not toc_indices:
         return out
 
@@ -855,9 +953,9 @@ def _close_toc_gaps(df: pd.DataFrame, *, max_gap: int = 3) -> pd.DataFrame:
             gap_mask = (
                 (out["line_id"] > seg1_end_line_id) &
                 (out["line_id"] < seg2_start_line_id) &
-                (out["block_role"].isna() | (out["block_role"] == "table"))
+                (out["block_type"].isna() | (out["block_type"] == "table"))
             )
-            out.loc[gap_mask, "block_role"] = "toc"
+            out.loc[gap_mask, "block_type"] = "toc"
 
     return out
 
@@ -886,8 +984,8 @@ def detect_and_annotate_tocs(
     3. Identify row candidates and build TocRowCandidate objects
     4. Build TocSegment objects
     5. Score and filter segments
-    6. Annotate winning rows with block_role = 'toc' or 'toc_header'
-    7. Close gaps between toc_header/toc and between toc segments
+    6. Annotate winning rows with block_type = 'toc' or 'toc_heading'
+    7. Close gaps between toc_heading/toc and between toc segments
 
     Args:
         df: Input DataFrame (expects columns: text, has_link, line_id)
@@ -906,12 +1004,12 @@ def detect_and_annotate_tocs(
             include_debug_cols: Keep toc_* intermediate columns in output (default: False)
 
     Returns:
-        DataFrame with block_role column added:
+        DataFrame with block_type column added:
         - 'toc' for TOC entry rows
-        - 'toc_header' for header rows (e.g. "Table of Contents" title)
+        - 'toc_heading' for header rows (e.g. "Table of Contents" title)
     """
     df = _remove_toc_pointers(df)
-    df = _identify_toc_header_candidates(df)
+    df = _identify_toc_heading_candidates(df)
     df, candidates = _add_toc_row_candidates(df, page_label_config, include_debug_cols=include_debug_cols)
     segments = _build_toc_segments(df, candidates)
     scores = _score_and_filter_toc_segments(
@@ -922,24 +1020,29 @@ def detect_and_annotate_tocs(
         min_score_threshold=min_score_threshold,
     )
 
-    if "block_role" not in df.columns:
-        df["block_role"] = pd.NA
+    if "block_type" not in df.columns:
+        df["block_type"] = pd.NA
 
     for score_obj in scores:
         if score_obj.accepted:
             seg = score_obj.segment
 
             for header_line_id in seg.nearby_header_line_ids:
-                df.loc[df["line_id"] == header_line_id, "block_role"] = "toc_header"
+                header_mask = (
+                    (df["line_id"] == header_line_id) &
+                    ~_hidden_block_type_mask(df)
+                )
+                df.loc[header_mask, "block_type"] = "toc_heading"
 
             mask = (df["line_id"] >= seg.start_line_id) & (df["line_id"] <= seg.end_line_id)
-            df.loc[mask, "block_role"] = "toc"
+            mask &= ~_hidden_block_type_mask(df)
+            df.loc[mask, "block_type"] = "toc"
 
     df = _close_toc_gaps(df, max_gap=max_gap)
 
     if not include_debug_cols:
         debug_cols = [
-            "toc_header_candidate",
+            "toc_heading_candidate",
             "toc_row_candidate",
             "toc_page_label_token",
             "toc_page_label_type",

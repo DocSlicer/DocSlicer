@@ -133,6 +133,7 @@ def export_debug(df: pd.DataFrame, drop_none: bool = False) -> pd.DataFrame:
     if "text" in df.columns:
         df["text"] = (
             df["text"]
+            .fillna("")
             .astype(str)
             .apply(lambda s: "'" + s if s.startswith(("+", "-", "=")) else s)
         )
@@ -208,6 +209,7 @@ def export_production(
     if "text" in df.columns:
         df["text"] = (
             df["text"]
+            .fillna("")
             .astype(str)
             .apply(lambda s: "'" + s if s.startswith(("+", "-", "=")) else s)
         )

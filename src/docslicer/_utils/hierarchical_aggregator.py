@@ -184,8 +184,8 @@ def build_standard_agg_spec(
     
     Args:
         identity_cols: Identity columns to keep (using "first"). 
-                      Default: ["doc_name", "page_number", "layout_id", "layout_type", "block_role",
-                                "document_region", "page_*"]
+                      Default: ["doc_name", "page_number", "layout_id", "layout_type", "block_type",
+                                "section", "page_*"]
         include_geometry: Include x/y bounding box aggregation
         include_counts: Include char/alpha/digit/token count aggregation
         include_style: Include font/color style aggregation
@@ -214,8 +214,8 @@ def build_standard_agg_spec(
             "page_label_value",
             "layout_id",
             "layout_type",
-            "block_role",
-            "document_region",
+            "block_type",
+            "section",
             # PDF-pipeline columns (harmless no-ops on other pipelines)
             "reading_column",
             "gutter_id_left",
@@ -234,7 +234,7 @@ def build_standard_agg_spec(
     # Hierarchy (heading structure from step_04_hierarchy_assigner)
     if include_hierarchy:
         spec.update({
-            "document_region": "first",
+            "section": "first",
             "heading_id": "first",
             "parent_heading_id": "first",
             "heading_level": "first",

@@ -55,7 +55,7 @@ MASTER_COLUMN_ORDER: List[str] = [
     # ===== 1. Document/Page identifiers =====
     "page_number",
     "page_label",
-    "document_region",
+    "section",
     "section_id", # Only for .docx
     
     # ===== 2. IDs and hierarchy =====
@@ -90,7 +90,7 @@ MASTER_COLUMN_ORDER: List[str] = [
     # Layout IDs
     "layout_id",
     "layout_type",
-    "block_role",
+    "block_type",
     
     # Table IDs
     "table_id",

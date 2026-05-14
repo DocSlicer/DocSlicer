@@ -1,8 +1,9 @@
 """
 DOCX run → paragraph aggregator.
 
-Filters text runs and merges them by paragraph_id, producing one row per logical
-paragraph with concatenated text and character-count-weighted style.
+Filters text/image runs and merges them by paragraph_id, producing one row per
+logical paragraph with concatenated text and character-count-weighted style.
+Header and footer parts are excluded so they don't pollute paragraph merging.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ from docslicer._utils.hierarchical_aggregator import (
     aggregate_hierarchical,
     build_standard_agg_spec,
 )
+
 
 # Identity columns that are constant across all runs in a paragraph.
 # text_orientation is intentionally excluded — include_style=True picks it up
@@ -73,30 +75,45 @@ def build_paragraphs(run_df: pd.DataFrame) -> pd.DataFrame:
     """
     Aggregate run-level rows into paragraph-level rows.
 
-    Keeps only ``run_type == "text"`` runs, then groups by ``paragraph_id``.
-    Text is joined in document order (no separator). Style is weighted by
-    character count; bold/italic/underlined ratios are recomputed from sums.
+    Keeps ``run_type`` in ``{"text", "image_ref"}`` runs, groups by
+    ``paragraph_id``. Header/footer parts are excluded before processing.
+    Style is weighted by character count; bold/italic/underlined ratios are
+    recomputed from sums. A ``block_type`` column is derived post-aggregation.
 
     Args:
-        run_df: Output of ``extract_runs``.
+        run_df: Output of ``extract_runs`` (after ``_inline_footnotes``).
 
     Returns:
-        One row per paragraph that contained at least one text run.
+        One row per paragraph that contained at least one text or image run.
     """
     if run_df.empty:
         return pd.DataFrame()
 
-    text_runs = run_df[run_df["run_type"] == "text"].copy()
-    if text_runs.empty:
+    # Exclude header and footer parts — they are not body content and should
+    # not be merged into the paragraph sequence.
+    if "header_footer_type" in run_df.columns:
+        run_df = run_df[~run_df["header_footer_type"].isin({"header", "footer"})]
+
+    if run_df.empty:
         return pd.DataFrame()
+
+    content_runs = run_df[run_df["run_type"].isin({"text", "image_ref"})].copy()
+    if content_runs.empty:
+        return pd.DataFrame()
+
+    # Track which paragraphs contain at least one image before aggregation.
+    para_has_image = set(
+        content_runs.loc[content_runs["run_type"] == "image_ref", "paragraph_id"]
+    )
 
     # char_count / alpha_count unlock ALPHA_WEIGHTED_STYLE fast path and correct
     # bold/italic/underlined ratio recomputation inside aggregate_hierarchical.
-    text_runs["char_count"] = text_runs["text"].fillna("").str.len()
-    text_runs["alpha_count"] = text_runs["text"].fillna("").str.count(r"[a-zA-Z]")
+    # image_ref rows contribute 0 chars so they don't distort style weighting.
+    content_runs["char_count"] = content_runs["text"].fillna("").str.len()
+    content_runs["alpha_count"] = content_runs["text"].fillna("").str.count(r"[a-zA-Z]")
 
-    # Pre-compute paragraph text from the full run_df so tabs between text runs
-    # produce a space separator (text_runs alone has already lost the tab rows).
+    # Pre-compute paragraph text from the filtered run_df (headers/footers
+    # already removed) so tabs between text runs produce a space separator.
     para_text = _paragraph_text(run_df)
 
     agg_spec = build_standard_agg_spec(
@@ -105,13 +122,12 @@ def build_paragraphs(run_df: pd.DataFrame) -> pd.DataFrame:
         include_hierarchy=False,
         include_style=True,    # font_size, font_name, non_stroking_color, text_orientation
         include_counts=True,   # char_count/alpha_count summed; _bold/_italic/_underlined_char_est
-        include_metadata=False,
+        include_metadata=True,
         include_table=False,
         extra_first=["style_id", "style_name"],
         extra_agg={
             # paragraph-level flags that should OR across runs
             "section_break_after": "max",
-            "is_toc_field": "max",
             "is_deleted_revision": "max",
             "is_inserted_revision": "max",
             # a paragraph can span multiple hyperlinks
@@ -126,7 +142,7 @@ def build_paragraphs(run_df: pd.DataFrame) -> pd.DataFrame:
     )
 
     para_df = aggregate_hierarchical(
-        df=text_runs,
+        df=content_runs,
         group_col="paragraph_id",
         agg_spec=agg_spec,
         rename_count_col={"run_id": "run_count"},
@@ -134,5 +150,13 @@ def build_paragraphs(run_df: pd.DataFrame) -> pd.DataFrame:
     )
 
     para_df["text"] = para_df["paragraph_id"].map(para_text)
+
+    # Derive block_type: image → paragraphs with at least one image_ref run;
+    # table → paragraphs inside a table (table_id not null); table takes priority.
+    para_df["block_type"] = None
+    if para_has_image:
+        para_df.loc[para_df["paragraph_id"].isin(para_has_image), "block_type"] = "image"
+    if "table_id" in para_df.columns:
+        para_df.loc[para_df["table_id"].notna(), "block_type"] = "table"
 
     return para_df

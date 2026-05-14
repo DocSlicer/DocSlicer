@@ -44,7 +44,7 @@ def _assign_block_ids(df: pd.DataFrame) -> pd.DataFrame:
     
     Block splitting strategy:
       1. ALWAYS split when:
-         - block_role changes
+         - block_type changes
          - layout_id changes
          - page_number changes (safety)
          - col_start changes (text_multicol only - each column becomes separate block)
@@ -52,12 +52,12 @@ def _assign_block_ids(df: pd.DataFrame) -> pd.DataFrame:
       
       2. CONDITIONALLY split for paragraph blocks in text layouts:
          a) Style property changes WITHIN same layout_id:
-            - Applies to: block_role == "paragraph" in text_singlecol/text_multicol layouts
+            - Applies to: block_type == "paragraph" in text_singlecol/text_multicol layouts
             - Properties tracked: font_size_ratio, non_stroking_color, is_bold, is_italic
             - Trigger: Any style property changes
          
          b) Indentation increases:
-            - Applies to: block_role == "paragraph" in text_singlecol/text_multicol layouts
+            - Applies to: block_type == "paragraph" in text_singlecol/text_multicol layouts
             - Group by: layout_id + col_start (each column treated separately)
             - Eligibility: group must have >10 lines
             - Trigger: x_left increases by ≥10pt (ONLY increases, not decreases)
@@ -85,10 +85,10 @@ def _assign_block_ids(df: pd.DataFrame) -> pd.DataFrame:
     eligible_for_indent_split = pd.Series(False, index=df.index)
     
     # Check if required columns exist
-    if "layout_type" in df.columns and "col_start" in df.columns and "block_role" in df.columns:
+    if "layout_type" in df.columns and "col_start" in df.columns and "block_type" in df.columns:
         # Filter to text layouts with paragraph role only
         is_text_layout = df["layout_type"].isin(["text_singlecol", "text_multicol"])
-        is_paragraph = df["block_role"] == "paragraph"
+        is_paragraph = df["block_type"] == "paragraph"
         
         if is_text_layout.any() and is_paragraph.any():
             # Create a grouping key: layout_id + col_start
@@ -142,7 +142,7 @@ def _assign_block_ids(df: pd.DataFrame) -> pd.DataFrame:
     # -------------------------------------------------------------------------
     # Combine all conditions that trigger a new block
     
-    prev_block_role = df["block_role"].shift(1)
+    prev_block_type = df["block_type"].shift(1)
     prev_page = df["page_number"].shift(1)
     prev_layout = df["layout_id"].shift(1)
     
@@ -164,8 +164,8 @@ def _assign_block_ids(df: pd.DataFrame) -> pd.DataFrame:
     
     # Only apply to paragraph blocks in text layouts
     is_eligible = pd.Series(False, index=df.index)
-    if "block_role" in df.columns and "layout_type" in df.columns:
-        is_paragraph = df["block_role"] == "paragraph"
+    if "block_type" in df.columns and "layout_type" in df.columns:
+        is_paragraph = df["block_type"] == "paragraph"
         is_text_layout = df["layout_type"].isin(["text_singlecol", "text_multicol"])
         is_eligible = is_paragraph & is_text_layout
     
@@ -187,9 +187,9 @@ def _assign_block_ids(df: pd.DataFrame) -> pd.DataFrame:
     
     # Split when heading_id changes between consecutive heading lines
     heading_id_change = pd.Series(False, index=df.index)
-    if "heading_id" in df.columns and "block_role" in df.columns:
-        is_heading = df["block_role"] == "heading"
-        prev_is_heading = prev_block_role == "heading"
+    if "heading_id" in df.columns and "block_type" in df.columns:
+        is_heading = df["block_type"] == "heading"
+        prev_is_heading = prev_block_type == "heading"
         prev_heading_id = df["heading_id"].shift(1)
         
         # Split when both current and previous are headings, but heading_id changes
@@ -200,7 +200,7 @@ def _assign_block_ids(df: pd.DataFrame) -> pd.DataFrame:
         )
     
     is_new_block = (
-        df["block_role"].ne(prev_block_role) |  # Role change
+        df["block_type"].ne(prev_block_type) |  # Role change
         df["layout_id"].ne(prev_layout) |        # Layout change
         df["page_number"].ne(prev_page) |        # Page change
         col_start_change |                        # Column change (text_multicol only)
@@ -606,7 +606,7 @@ def _compute_line_separator(df_with_block_ids: pd.DataFrame) -> pd.DataFrame:
     Note: Lines with table_id are skipped as they use table rendering logic.
     
     Separator rules (applied per line):
-      1. If block_role is "toc" or "exhibits" (and no table_id): newline
+      1. If block_type is "toc" or "exhibits" (and no table_id): newline
       2. If text starts with a bullet token: newline
       3. If hierarchy_marker is non-blank: newline
       4. Default: space
@@ -627,8 +627,8 @@ def _compute_line_separator(df_with_block_ids: pd.DataFrame) -> pd.DataFrame:
         has_table_id = table_id_s.notna() & table_id_s.str.strip().ne("")
     
     # Rule 1: TOC and exhibits always use newlines (if not part of a table)
-    if "block_role" in df_with_block_ids.columns:
-        is_toc_or_exhibits = df_with_block_ids["block_role"].isin(["toc", "exhibits"])
+    if "block_type" in df_with_block_ids.columns:
+        is_toc_or_exhibits = df_with_block_ids["block_type"].isin(["toc", "exhibits"])
         is_toc_or_exhibits_non_table = is_toc_or_exhibits & ~has_table_id
         df_with_block_ids.loc[is_toc_or_exhibits_non_table, "_join_sep"] = "\n"
     
@@ -691,7 +691,7 @@ def _join_text(
     
     Text joining strategies:
       1. Blocks with table_id (including table, toc, exhibits): Use table rendering
-      2. block_role = "toc" or "exhibits" (without table_id): Join with newlines
+      2. block_type = "toc" or "exhibits" (without table_id): Join with newlines
       3. Lines with bullet tokens or hierarchy markers: Join with newlines
       4. Default: Join with spaces
     
@@ -713,19 +713,19 @@ def _join_text(
     # STEP 2: BUILD TEXT PER BLOCK
     # -------------------------------------------------------------------------
     def _build_block_text(lines: pd.DataFrame) -> str:
-        """Build text for one block based on block_role and table_id."""
+        """Build text for one block based on block_type and table_id."""
         if lines.empty:
             return ""
         
-        # Get block_role and table_id (all lines in a block share the same values)
-        block_role = lines["block_role"].iloc[0] if "block_role" in lines.columns else None
+        # Get block_type and table_id (all lines in a block share the same values)
+        block_type = lines["block_type"].iloc[0] if "block_type" in lines.columns else None
         table_id = lines["table_id"].iloc[0] if "table_id" in lines.columns else None
         
         # Check if this block has a table
         has_table = table_id is not None and str(table_id).strip() != ""
         
         # Strategy 1: Blocks with tables (table, toc, exhibits)
-        if block_role == "table" or (block_role in ["toc", "exhibits"] and has_table):
+        if block_type == "table" or (block_type in ["toc", "exhibits"] and has_table):
             return _generate_table_block(
                 table_id,
                 lines,

@@ -3,7 +3,7 @@ step_06_hierarchy_builder.py
 
 Builds the document heading hierarchy from annotated lines_df.
 
-Receives lines_df from step_05 (which already has block_role, heading_fp_id, etc.)
+Receives lines_df from step_05 (which already has block_type, heading_fp_id, etc.)
 and produces the heading tree:
   - heading_weight_static / heading_weight_dynamic
   - heading_id
@@ -40,15 +40,15 @@ HEADING_TYPE_RANK = {
     "table": 5, "figure": 5,
 }
 
-# block_role values treated as headings throughout this module
-_HEADING_ROLES = {"heading", "toc_header", "exhibit_header", "hybrid_heading_paragraph"}
+# block_type values treated as headings throughout this module
+_HEADING_ROLES = {"heading", "toc_heading", "exhibit_heading", "hybrid_heading_paragraph"}
 
 # heading types whose hierarchy is determined by their own numeric depth
 NUMBERED_HEADING_TYPES = {
-    "numbered_section",
-    "roman_numbered_section",
-    "alpha_dotted_numbered_section",
-    "alpha_numbered_section",
+    "numbered_heading",
+    "roman_numbered_heading",
+    "alpha_dotted_numbered_heading",
+    "alpha_numbered_heading",
 }
 
 _RE_NUMERIC_PREFIX = re.compile(r'^\s*(\d+(?:\.\d+)*)')
@@ -61,7 +61,7 @@ def _numeric_depth(text: str, heading_type: str) -> int:
     Examples: "1." -> 1,  "1.2." -> 2,  "10.2 Revenue" -> 2,  "1.2.3" -> 3
     Roman and plain-alpha types are always depth 1 (they don't nest by number).
     """
-    if heading_type in ("roman_numbered_section", "alpha_numbered_section"):
+    if heading_type in ("roman_numbered_heading", "alpha_numbered_heading"):
         return 1
     m = _RE_NUMERIC_PREFIX.match(text)
     if m:
@@ -81,10 +81,10 @@ def _add_heading_weights(df: pd.DataFrame) -> pd.DataFrame:
     out["heading_weight_static"] = np.nan
     out["heading_weight_dynamic"] = np.nan
 
-    if "block_role" not in out.columns:
+    if "block_type" not in out.columns:
         return out
 
-    is_heading = out["block_role"].astype("string").str.strip().str.lower().isin(_HEADING_ROLES).fillna(False)
+    is_heading = out["block_type"].astype("string").str.strip().str.lower().isin(_HEADING_ROLES).fillna(False)
     if not is_heading.any():
         return out
 
@@ -100,8 +100,8 @@ def _add_heading_weights(df: pd.DataFrame) -> pd.DataFrame:
     out.loc[is_heading, "heading_weight_static"] = static.loc[is_heading].astype("float32")
 
     # Dynamic score (relative to previous heading within same region)
-    region_key = (out["document_region"].astype("string").fillna("")
-                  if "document_region" in out.columns
+    region_key = (out["section"].astype("string").fillna("")
+                  if "section" in out.columns
                   else pd.Series("", index=out.index, dtype="string"))
     idx = out.index[is_heading]
     groups = region_key.loc[idx]
@@ -138,11 +138,11 @@ def _assign_heading_id(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     out["heading_id"] = pd.Series([pd.NA] * len(out), index=out.index, dtype="Int64")
 
-    if "block_role" not in out.columns:
+    if "block_type" not in out.columns:
         return out
 
     is_heading = (
-        out["block_role"].astype("string").str.strip().str.lower()
+        out["block_type"].astype("string").str.strip().str.lower()
         .isin(_HEADING_ROLES).fillna(False)
     )
     if not is_heading.any():
@@ -207,7 +207,7 @@ def _assign_heading_id(df: pd.DataFrame) -> pd.DataFrame:
 def _infer_heading_hierarchy(df: pd.DataFrame) -> pd.DataFrame:
     """
     Adds parent_heading_id, parent_heading_text, and heading_level to heading rows.
-    Processes block_role in {heading, toc_header, exhibit_header}.
+    Processes block_type in {heading, toc_heading, exhibit_heading}.
     Assumes df is already in reading order.
     """
     out = df.copy()
@@ -218,19 +218,19 @@ def _infer_heading_hierarchy(df: pd.DataFrame) -> pd.DataFrame:
     if "parent_heading_text" not in out.columns:
         out["parent_heading_text"] = pd.Series([pd.NA] * len(out), index=out.index, dtype="string")
 
-    if "block_role" not in out.columns or "heading_id" not in out.columns:
+    if "block_type" not in out.columns or "heading_id" not in out.columns:
         return out
 
     heading_mask = (
-        out["block_role"].astype("string").str.strip().str.lower()
+        out["block_type"].astype("string").str.strip().str.lower()
         .isin(_HEADING_ROLES).fillna(False)
     ) & out["heading_id"].notna()
 
     if not heading_mask.any():
         return out
 
-    region = (out["document_region"].astype("string").fillna("")
-              if "document_region" in out.columns
+    region = (out["section"].astype("string").fillna("")
+              if "section" in out.columns
               else pd.Series("", index=out.index, dtype="string"))
 
     def sf(v) -> float:
@@ -259,8 +259,8 @@ def _infer_heading_hierarchy(df: pd.DataFrame) -> pd.DataFrame:
                                  if "heading_type" in first.index and pd.notna(first["heading_type"])
                                  else "free_form"),
                 "end_line_id": last.get("line_id") if "line_id" in last.index else None,
-                "block_role": (str(first["block_role"]).strip().lower()
-                               if "block_role" in first.index and pd.notna(first["block_role"])
+                "block_type": (str(first["block_type"]).strip().lower()
+                               if "block_type" in first.index and pd.notna(first["block_type"])
                                else ""),
                 "numeric_depth": _numeric_depth(
                     str(first["text"]) if "text" in first.index and pd.notna(first["text"]) else "",
@@ -290,7 +290,7 @@ def _infer_heading_hierarchy(df: pd.DataFrame) -> pd.DataFrame:
                     out.at[idx, "heading_level"] = 1
                 path_stack.append({"heading_id": curr_heading_id, "fp": curr_fp, "text": curr_text,
                                    "level": 1, "static_weight": curr_static, "heading_type": curr_type,
-                                   "end_line_id": curr_line_id, "block_role": heading["block_role"],
+                                   "end_line_id": curr_line_id, "block_type": heading["block_type"],
                                    "numeric_depth": curr_nd})
                 continue
 
@@ -310,7 +310,7 @@ def _infer_heading_hierarchy(df: pd.DataFrame) -> pd.DataFrame:
                         decision = "numbered_pop"
                 else:
                     decision = "sibling"
-            elif (prior.get("block_role") == "heading"
+            elif (prior.get("block_type") == "heading"
                   and curr_line_id is not None and prior["end_line_id"] is not None
                   and pd.notna(curr_line_id) and pd.notna(prior["end_line_id"])
                   and curr_line_id == prior["end_line_id"] + 1):
@@ -330,7 +330,7 @@ def _infer_heading_hierarchy(df: pd.DataFrame) -> pd.DataFrame:
             def _node(level):
                 return {"heading_id": curr_heading_id, "fp": curr_fp, "text": curr_text,
                         "level": level, "static_weight": curr_static, "heading_type": curr_type,
-                        "end_line_id": curr_line_id, "block_role": heading["block_role"],
+                        "end_line_id": curr_line_id, "block_type": heading["block_type"],
                         "numeric_depth": curr_nd}
 
             def _set(indices, pid, ptxt, level):

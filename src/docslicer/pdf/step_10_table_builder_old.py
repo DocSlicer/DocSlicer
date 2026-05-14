@@ -473,9 +473,9 @@ def _classify_layout_types(df_cells: pd.DataFrame) -> pd.DataFrame:
 
     result["layout_type"] = result["layout_id"].map(layout_types)
 
-    if "block_role" not in result.columns:
-        result["block_role"] = pd.NA
-    result.loc[result["layout_type"] == "table", "block_role"] = "table"
+    if "block_type" not in result.columns:
+        result["block_type"] = pd.NA
+    result.loc[result["layout_type"] == "table", "block_type"] = "table"
 
     return result
 
@@ -1001,7 +1001,7 @@ def build_tables(
 
     df_cells : pd.DataFrame
         With added columns: table_row_score, col_start, col_end, colspan,
-        band_total_cols, layout_id, average_table_score, layout_type, block_role.
+        band_total_cols, layout_id, average_table_score, layout_type, block_type.
 
     df_table_cells : pd.DataFrame
         One row per assembled table cell.  Contains: table_cell_id, page_number,
@@ -1037,7 +1037,7 @@ def build_tables(
         .reset_index()
     )
     df_lines = df_lines.merge(line_layout, on="line_id", how="left")
-    df_lines.loc[df_lines["layout_type"] == "table", "block_role"] = "table"
+    df_lines.loc[df_lines["layout_type"] == "table", "block_type"] = "table"
 
     # Step 5 — build table cells
     df_table_cells = _build_table_cells(df_cells)

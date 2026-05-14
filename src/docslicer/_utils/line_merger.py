@@ -17,8 +17,8 @@ YAlignment = Literal["top", "center", "bottom"]
 
 @dataclass(frozen=True)
 class LineMergerConfig:
-    # Do not merge rows with these block_roles (case-insensitive)
-    blocked_block_roles: tuple[str, ...] = ("image", "hr")
+    # Do not merge rows with these block_types (case-insensitive)
+    blocked_block_types: tuple[str, ...] = ("image", "hr")
 
     # Vertical tolerances (points)
     TOL_BASE: float = 5.0          # default tolerance on selected y key
@@ -68,17 +68,17 @@ def assign_line_id(
     page_arr = out["page_number"].to_numpy()
 
     has_table_row_id = "table_row_id" in out.columns
-    has_block_role   = "block_role"   in out.columns
+    has_block_type   = "block_type"   in out.columns
 
     table_row_arr = out["table_row_id"].to_numpy() if has_table_row_id else None
-    block_role_arr = out["block_role"].to_numpy()  if has_block_role   else None
+    block_type_arr = out["block_type"].to_numpy()  if has_block_type   else None
 
     # Pre-compute blocked mask if needed
-    if has_block_role:
+    if has_block_type:
         blocked_arr = np.zeros(len(out), dtype=bool)
-        for i, role in enumerate(block_role_arr):
+        for i, role in enumerate(block_type_arr):
             if role is not None and not (isinstance(role, float) and np.isnan(role)):
-                if str(role).strip().lower() in config.blocked_block_roles:
+                if str(role).strip().lower() in config.blocked_block_types:
                     blocked_arr[i] = True
     else:
         blocked_arr = None

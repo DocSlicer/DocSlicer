@@ -30,7 +30,7 @@ class Chunk:
     chunk_index: int
     page_number: int
     page_label: str | None                           # e.g. "A-6", "iv" — distinct from page_number
-    document_region: str                             # body | toc | exhibit | header | footer | coverpage
+    section: str                                     # body | toc | exhibit | header | footer | coverpage
     heading: str | None                              # active heading text for this chunk
     path: list[str]                                  # full heading path from root, e.g. ["## Section 1", "### 1.1"]
     text: str
@@ -50,7 +50,7 @@ class Block:
     role: str                                        # paragraph | heading | table | toc | exhibits | navigation | …
     page_number: int
     page_label: str | None                           # e.g. "A-6", "iv" — distinct from page_number
-    document_region: str                             # body | toc | exhibit | header | footer | coverpage
+    section: str                                     # body | toc | exhibit | header | footer | coverpage
     text: str
     chunk_id: str | None                             # which chunk this block belongs to
     char_count: int
