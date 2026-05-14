@@ -212,8 +212,8 @@ class BlockSchema(DocumentIdentity, ContentBase):
     digit_ratio: float
 
     # Classification
-    block_type: Literal["page_label", "toc", "exhibits", "hr", "image",
-                        "table", "heading", "paragraph", "signature_block"]
+    block_type: Literal["page_label", "toc", "toc_heading", "exhibits", "exhibit_heading", "hr", "image",
+                        "table", "heading", "paragraph"]
     heading_score: float
 
     # Optional metadata
@@ -386,7 +386,7 @@ def show_schema_inheritance() -> None:
 
 BlockType = Literal[
     "page_label", "toc", "exhibits", "hr", "image",
-    "table", "heading", "paragraph", "signature_block"
+    "table", "heading", "paragraph"
 ]
 
 ShapeType = Literal["line", "rect", "curve"]

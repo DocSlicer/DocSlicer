@@ -453,8 +453,24 @@
   // WeakMaps to store assigned IDs for tables and rows
   const tableIds = new WeakMap();
   const rowIds = new WeakMap();
+  const rowCellCounts = new WeakMap();
+  const cellIndexes = new WeakMap();
   let tableCounter = 1;
   let rowCounter = 1;
+
+  const isTableCellTag = (tag) => tag === "TD" || tag === "TH";
+
+  const ensureRowCellInfo = (rowEl) => {
+    if (rowCellCounts.has(rowEl)) return;
+
+    let index = 0;
+    for (const child of rowEl.children) {
+      const tag = child.tagName ? child.tagName.toUpperCase() : "";
+      if (!isTableCellTag(tag)) continue;
+      cellIndexes.set(child, index++);
+    }
+    rowCellCounts.set(rowEl, index);
+  };
   
   // Helper to find table and row IDs
   const findTableContext = (node) => {
@@ -462,12 +478,20 @@
     let tableId = NaN;
     let tableRowId = NaN;
     let tableHeaderFlag = false;
+    let tableCellIndex = NaN;
+    let tableRowCellCount = NaN;
     let foundTable = null;
     let foundRow = null;
+    let foundCell = null;
     
     while (parent) {
       const tag = parent.tagName ? parent.tagName.toUpperCase() : "";
       
+      // Find cell first (closest)
+      if (!foundCell && isTableCellTag(tag)) {
+        foundCell = parent;
+      }
+
       // Check if inside a TH tag
       if (!tableHeaderFlag && tag === "TH") {
         tableHeaderFlag = true;
@@ -480,6 +504,11 @@
           rowIds.set(parent, rowCounter++);
         }
         tableRowId = rowIds.get(parent);
+        ensureRowCellInfo(parent);
+        tableRowCellCount = rowCellCounts.get(parent);
+        if (foundCell && cellIndexes.has(foundCell)) {
+          tableCellIndex = cellIndexes.get(foundCell);
+        }
       }
       
       // Find table
@@ -495,7 +524,7 @@
       parent = parent.parentElement;
     }
     
-    return { tableId, tableRowId, tableHeaderFlag };
+    return { tableId, tableRowId, tableHeaderFlag, tableCellIndex, tableRowCellCount };
   };
 
   // =========================
@@ -687,6 +716,8 @@
       table_id: tableContext.tableId,
       table_row_id: tableContext.tableRowId,
       table_header_flag: tableContext.tableHeaderFlag,
+      table_cell_index: tableContext.tableCellIndex,
+      table_row_cell_count: tableContext.tableRowCellCount,
       page_number: pageContext.page_number,
       page_width: pageContext.page_width,
       page_height: pageContext.page_height,
@@ -773,6 +804,8 @@
       table_id: tableContext.tableId,
       table_row_id: tableContext.tableRowId,
       table_header_flag: tableContext.tableHeaderFlag,
+      table_cell_index: tableContext.tableCellIndex,
+      table_row_cell_count: tableContext.tableRowCellCount,
       page_number: pageContext.page_number,
       page_width: pageContext.page_width,
       page_height: pageContext.page_height,
@@ -924,6 +957,8 @@
             table_id: tableContext.tableId,
             table_row_id: tableContext.tableRowId,
             table_header_flag: tableContext.tableHeaderFlag,
+            table_cell_index: tableContext.tableCellIndex,
+            table_row_cell_count: tableContext.tableRowCellCount,
             page_number: pageContext.page_number,
             page_width: pageContext.page_width,
             page_height: pageContext.page_height,
@@ -1169,14 +1204,24 @@
     const allHrs = root.querySelectorAll("hr");
     for (const hr of allHrs) {
       if (processedHrs.has(hr)) continue;
-      
+
       const hrBox = extractHrBox(hr, boxIdObj);
       if (hrBox) {
         hrBox.structure_tag_id = structureTagId++;
         boxes.push(hrBox);
       }
     }
-    
+
+    // Annotate every <table> element with its assigned JS table_id so that
+    // Python can look up tables by attribute rather than relying on document-
+    // order indexing (which diverges from JS assignment order for nested tables).
+    const allTables = root.querySelectorAll("table");
+    for (const tbl of allTables) {
+      if (tableIds.has(tbl)) {
+        tbl.setAttribute("data-docslicer-table-id", tableIds.get(tbl));
+      }
+    }
+
     return boxes;
   };
 

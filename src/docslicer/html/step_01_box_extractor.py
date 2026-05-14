@@ -91,11 +91,14 @@ def extract_boxes_with_playwright(
             html { scrollbar-width: none; }
         """)
         
-        # Get the rendered HTML
-        rendered_html = page.content()
-
-        # Run extraction once after the initial load state.
+        # Run extraction. The JS also annotates every <table> with
+        # data-docslicer-table-id so Python can look up tables by their JS
+        # table_id rather than by document-order position (which diverges for
+        # nested tables). Capture rendered_html AFTER so annotations are present.
         boxes = page.evaluate(js_code)
+
+        # Get the rendered HTML (includes data-docslicer-table-id attributes)
+        rendered_html = page.content()
 
         # Some sites render meaningful content after DOMContentLoaded but before
         # becoming visually stable. Keep the fast path by default, then retry once

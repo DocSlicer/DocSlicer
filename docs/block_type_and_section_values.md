@@ -1,0 +1,46 @@
+# Block Type and Section Values
+
+## `block_type`
+
+Classification of a block's content role. Set progressively through the shared pipeline — later steps fill nulls left by earlier ones.
+
+| Value | Set by | Description |
+|---|---|---|
+| `page_label` | `pdf/step_08_page_label_detector`, `html/step_03_page_label_detector` | Running page number or label (e.g. "Page 1", "A-6") |
+| `hr` | `html/step_02_box_cleaner` | Horizontal rule / divider element |
+| `image` | `html/step_02_box_cleaner` | Image or figure block |
+| `table` | `pdf/step_10_table_builder`, `html/step_04_line_builder` | Tabular data |
+| `toc` | `shared/step_01_toc_detector` | Table of contents entry line |
+| `toc_heading` | `shared/step_01_toc_detector` | Heading line of the TOC section (e.g. "Table of Contents") |
+| `exhibits` | `shared/step_02_exhibit_detector` | Exhibit body content |
+| `exhibit_heading` | `shared/step_02_exhibit_detector` | Heading line of an exhibit (e.g. "Exhibit A") |
+| `navigation` | `shared/step_03_navigation_detector` | Repeated header/footer navigation text |
+| `heading` | `shared/step_05_heading_detector` | Structural heading |
+| `hybrid_heading_paragraph` | `shared/step_05_heading_detector` | Heading that also contains body text inline |
+| `suppressed_repeated_heading` | `shared/step_05_heading_detector` | Heading suppressed because it repeats across pages |
+| `paragraph` | `shared/step_05_heading_detector` | Default body text (fallback when no other type matches) |
+| `watermark` | _(reserved)_ | Watermark / background text overlay |
+| `signature_block` | _(reserved)_ | Signature block at end of legal document |
+
+**Noise types** (stripped before chunking): `hr`, `page_label`, `image`, `suppressed_repeated_heading`, `navigation`, `watermark`
+
+**Heading types** (treated as hierarchy anchors): `heading`, `toc_heading`, `exhibit_heading`, `hybrid_heading_paragraph`
+
+---
+
+## `section`
+
+Document-zone classification of a page. Set in `shared/step_04_section_classifier.py` in four passes.
+
+| Value | Detection method | Description |
+|---|---|---|
+| `coverpage` | Blank page labels / TOC anchor / layout scoring / SEC heuristics | Leading cover page(s) before body content |
+| `toc` | Inherited from `block_type` (`toc`, `toc_heading`) | Pages containing the table of contents |
+| `exhibits` | Inherited from `block_type` (`exhibits`, `exhibit_heading`) | Pages containing exhibit content |
+| `front_matter` | Roman page labels before body; blank pages before first TOC | Preface, foreword, executive summary |
+| `body` | Longest contiguous run of arabic-numbered pages | Main document body |
+| `back_matter` | Roman page labels after body; trailing blank-labeled pages | Appendices using roman numbering |
+| `annex` | Alpha-prefixed page labels (e.g. "A-1", "B-3") | Annexes (general) |
+| `financials` | Alpha-prefixed labels with prefix `F` (e.g. "F-1") | Financial statement annexes |
+| `schedules` | Alpha-prefixed labels with prefix `S` (e.g. "S-1") | Schedule annexes |
+| `last_page` | Blank label / low density / contact info signals | Standalone closing page (contact, disclaimer, colophon) |

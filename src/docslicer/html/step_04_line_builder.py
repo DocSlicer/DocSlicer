@@ -1,5 +1,6 @@
 # step_04_line_merger.py
 
+import re
 import pandas as pd
 
 from docslicer._utils.line_merger import assign_line_id, LineMergerConfig
@@ -49,53 +50,111 @@ def _create_line_text(df: pd.DataFrame) -> dict:
     return text_map
 
 
+_STARTS_WITH_NUMBER_OR_PARENS = re.compile(r'^(\d|\([a-zA-Z0-9]+\)|[•◦▪▸·‣⁃●○►▶◆◇□■])')
+
+
 def _remove_single_row_tables(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Remove table_id and table_row_id for tables with only 1 row, then reindex remaining tables.
-    Also adds block_type = "table" for remaining tables (preserving existing values).
-    
-    Args:
-        df: DataFrame with table_id and table_row_id columns
-        
-    Returns:
-        DataFrame with single-row tables removed and remaining tables reindexed
+    Process single-row tables: merge or remove them.
+
+    Consecutive runs of >=5 single-row tables with equal table_row_cell_count where
+    <=10% of rows start with a digit or a parenthesised token like (1)/(i)/(a) are
+    merged into one multi-row table with sequential table_row_ids. All other
+    single-row tables are removed (table_id/table_row_id cleared).
+
+    Remaining tables are reindexed sequentially and marked block_type="table".
     """
     if df is None or df.empty:
         return df
-    
+
     if "table_id" not in df.columns or "table_row_id" not in df.columns:
         return df
-    
+
     df = df.copy()
-    
-    # Identify tables with only 1 unique table_row_id
+    df["original_table_id"] = df["table_id"]
+    df["original_table_row_id"] = df["table_row_id"]
+
+    # --- 1. Identify single-row tables ---
     tables_with_rows = (
         df[df["table_id"].notna()]
         .groupby("table_id")["table_row_id"]
         .nunique()
     )
-    single_row_tables = set(tables_with_rows[tables_with_rows == 1].index)
-    
-    # Remove table_id and table_row_id for single-row tables
-    is_single_row_table = df["table_id"].isin(single_row_tables)
-    df.loc[is_single_row_table, "table_id"] = None
-    df.loc[is_single_row_table, "table_row_id"] = None
-    
-    # Reindex remaining table_ids (1-based sequential)
-    remaining_tables = df[df["table_id"].notna()]["table_id"].unique()
-    if len(remaining_tables):
-        # Sort to maintain order
-        remaining_tables = sorted(remaining_tables)
-        table_id_map = {old_id: new_id for new_id, old_id in enumerate(remaining_tables, start=1)}
-        df["table_id"] = df["table_id"].map(lambda x: table_id_map.get(x) if pd.notna(x) else None)
+    single_row_ids = set(tables_with_rows[tables_with_rows == 1].index)
+    is_single = df["table_id"].isin(single_row_ids)
 
-    # Add block_type = "table" for remaining tables (preserve existing values)
+    # --- 2. Build consecutive-run groups (breaks on non-single or cell-count change) ---
+    has_cell_count = "table_row_cell_count" in df.columns
+    cc_vals = (
+        df["table_row_cell_count"].fillna(-1).astype(str).values
+        if has_cell_count
+        else ["same"] * len(df)
+    )
+    is_single_arr = is_single.values
+    group_arr = [None] * len(df)
+    current_group = 0
+
+    for i in range(len(df)):
+        if not is_single_arr[i]:
+            continue
+        if i == 0 or not is_single_arr[i - 1] or cc_vals[i] != cc_vals[i - 1]:
+            current_group += 1
+        group_arr[i] = current_group
+
+    df["_srg"] = group_arr
+
+    # --- 3. Decide merge vs remove per group ---
+    merge_groups: set = set()
+    remove_groups: set = set()
+
+    for gid, grp in df[df["_srg"].notna()].groupby("_srg"):
+        if len(grp) >= 5:
+            texts = grp["text"].fillna("").astype(str)
+            n_flagged = texts.apply(
+                lambda t: bool(_STARTS_WITH_NUMBER_OR_PARENS.match(t.strip()))
+            ).sum()
+            if n_flagged / len(texts) <= 0.10:
+                merge_groups.add(gid)
+                continue
+        remove_groups.add(gid)
+
+    # --- 4. Remove ---
+    to_remove = df["_srg"].isin(remove_groups)
+    df.loc[to_remove, "table_id"] = None
+    df.loc[to_remove, "table_row_id"] = None
+    if "text" in df.columns:
+        df.loc[to_remove, "text"] = df.loc[to_remove, "text"].str.replace(" | ", " ", regex=False)
+
+    # --- 5. Merge ---
+    if merge_groups:
+        existing_max = df["table_id"].max()
+        next_tid = int(existing_max) + 1 if pd.notna(existing_max) else 1
+
+        for gid in sorted(merge_groups):
+            mask = df["_srg"] == gid
+            indices = df[mask].index
+            df.loc[mask, "table_id"] = next_tid
+            for row_num, idx in enumerate(indices, start=1):
+                df.loc[idx, "table_row_id"] = row_num
+            next_tid += 1
+
+    df = df.drop(columns=["_srg"])
+
+    # --- 6. Reindex table_ids by first appearance ---
+    if df["table_id"].notna().any():
+        seen: dict = {}
+        for tid in df.loc[df["table_id"].notna(), "table_id"]:
+            if tid not in seen:
+                seen[tid] = len(seen) + 1
+        df["table_id"] = df["table_id"].map(lambda x: seen.get(x) if pd.notna(x) else None)
+
+    # --- 7. Mark block_type = "table" ---
     if "block_type" not in df.columns:
         df["block_type"] = None
     has_table = df["table_id"].notna()
-    no_existing_role = df["block_type"].isna()
-    df.loc[has_table & no_existing_role, "block_type"] = "table"
-    
+    no_existing_type = df["block_type"].isna()
+    df.loc[has_table & no_existing_type, "block_type"] = "table"
+
     return df
 
 

@@ -314,6 +314,8 @@ def build_standard_agg_spec(
             "table_id": "first",
             "table_row_id": "first", # Needed for Line Merger
             "table_header_flag": "first",
+            "table_cell_index": "first",
+            "table_row_cell_count": "first",
 
             "row_start": "first",
             "col_start": "first",

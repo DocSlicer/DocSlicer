@@ -27,7 +27,7 @@ from .step_01_box_extractor import extract_boxes_with_playwright
 from .step_02_box_cleaner import clean_boxes
 from .step_03_page_label_detector import assign_page_labels
 from .step_04_line_builder import merge_boxes_to_lines
-from .step_05_table_extractor import extract_tables_from_html
+from .step_05_table_extractor import extract_table_cells
 
 # Config loaders
 from .._utils.yaml_loader import load_yamls
@@ -88,7 +88,7 @@ def run_pipeline(
         #        box extractor will page.goto(source_url) for full JS rendering
 
     # ============================================================
-    # STAGE: PARSING (Steps 01-04)
+    # STAGE: PARSING (Steps 01-03)
     # ============================================================
     if on_stage:
         on_stage("parsing")
@@ -132,33 +132,6 @@ def run_pipeline(
         discovered_metadata.setdefault("is_password_protected", False)
         discovered_metadata.setdefault("has_ocr", False)
 
-    # Step 04 - Table Extraction
-    df_table_cells = extract_tables_from_html(
-        rendered_html,
-        min_rows=2,
-        page_number=0,
-        remove_single_row_tables=True,
-    )
-
-    # Map page labels to tables
-    if df_table_cells is not None and not df_table_cells.empty and not df_boxes.empty:
-        if "page_number" in df_boxes.columns and "page_label" in df_boxes.columns:
-            page_info = df_boxes[["page_number", "page_label"]].drop_duplicates().sort_values("page_number")
-            if not page_info.empty:
-                unique_table_ids = sorted(df_table_cells["table_id"].unique())
-                table_page_mapping = []
-                for i, table_id in enumerate(unique_table_ids):
-                    page_idx = min(i, len(page_info) - 1)
-                    table_page_mapping.append({
-                        "table_id": table_id,
-                        "page_number_mapped": page_info.iloc[page_idx]["page_number"],
-                        "page_label": page_info.iloc[page_idx]["page_label"],
-                    })
-                table_page_mapping_df = pd.DataFrame(table_page_mapping)
-                df_table_cells = df_table_cells.merge(table_page_mapping_df, on="table_id", how="left")
-                df_table_cells["page_number"] = df_table_cells["page_number_mapped"]
-                df_table_cells = df_table_cells.drop(columns=["page_number_mapped"])
-
     # Convert pixels to points (96 px = 72 pt)
     PX_TO_PT = 0.75
     geometry_cols = ["x_left", "x_right", "y_top", "y_bottom", "width", "height", "font_size"]
@@ -167,13 +140,20 @@ def run_pipeline(
             df_boxes[col] = df_boxes[col] * PX_TO_PT
 
     # ============================================================
-    # STAGE: HIERARCHY (Step 05)
+    # STAGE: HIERARCHY (Steps 04-05)
     # ============================================================
     if on_stage:
         on_stage("hierarchy")
 
-    # Step 05 - Line Merger (boxes → lines)
+    # Step 04 - Line Builder (boxes → lines); must run before table extractor
+    # so that the final reindexed table_id values are available for ID matching.
     df_lines = merge_boxes_to_lines(df_boxes, remove_single_row_tables=True)
+
+    # Step 05 - Table Extractor (uses df_lines.original_table_id for table_id sync)
+    df_table_cells = extract_table_cells(
+        df_lines=df_lines,
+        rendered_html=rendered_html,
+    )
 
     try:
         add_document_information(discovered_metadata, html_content=rendered_html, df_lines=df_lines)
@@ -192,8 +172,9 @@ def run_pipeline(
     discovered_metadata["is_password_protected"] = False
     discovered_metadata["has_ocr"] = False
 
-
-    if df_table_cells is not None and df_table_cells.empty:
+    if df_table_cells is not None and not isinstance(df_table_cells, pd.DataFrame):
+        df_table_cells = None
+    elif df_table_cells is not None and df_table_cells.empty:
         df_table_cells = None
 
     return discovered_metadata, df_lines, df_table_cells

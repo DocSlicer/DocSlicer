@@ -1023,6 +1023,26 @@ def detect_and_annotate_tocs(
     if "block_type" not in df.columns:
         df["block_type"] = pd.NA
 
+    # Write per-row segment debug columns before annotating block_type so that
+    # the mask covers the unmodified rows (no hidden-block interference).
+    if include_debug_cols:
+        df["toc_segment_id"]       = pd.NA
+        df["toc_seg_type"]         = pd.NA  # "table" or "fingerprint"
+        df["toc_seg_score"]        = pd.NA
+        df["toc_seg_passed"]       = pd.NA
+        df["toc_seg_accepted"]     = pd.NA
+        df["toc_seg_max_consec"]   = pd.NA
+
+        for score_obj in scores:
+            seg = score_obj.segment
+            mask = (df["line_id"] >= seg.start_line_id) & (df["line_id"] <= seg.end_line_id)
+            df.loc[mask, "toc_segment_id"]     = seg.segment_id
+            df.loc[mask, "toc_seg_type"]       = "table" if seg.is_table_based else "fingerprint"
+            df.loc[mask, "toc_seg_score"]      = round(score_obj.total_score, 2)
+            df.loc[mask, "toc_seg_passed"]     = score_obj.passed_filters
+            df.loc[mask, "toc_seg_accepted"]   = score_obj.accepted
+            df.loc[mask, "toc_seg_max_consec"] = seg.max_consecutive_candidates
+
     for score_obj in scores:
         if score_obj.accepted:
             seg = score_obj.segment
@@ -1049,5 +1069,4 @@ def detect_and_annotate_tocs(
             "toc_has_dot_leaders",
         ]
         df = df.drop(columns=[col for col in debug_cols if col in df.columns])
-
     return df

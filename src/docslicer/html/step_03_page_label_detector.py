@@ -1668,51 +1668,103 @@ def _convert_sequences_to_groups(
 #  Sequencing Pipeline Orchestrator
 # =========================
 
+def _passes_global_quality_gate(sequences: List[CandidateSequence], doc_char_len: int) -> bool:
+    """
+    Return False if the winning sequences do not meet document-scale quality thresholds.
+
+    Both criteria must pass, or all detection is discarded:
+
+    1. **Five-consecutive requirement**: at least one winning sequence must have
+       length >= 5.  A document where no run of five sequential page labels was
+       found is not reliably paginated enough to trust any label, including lone
+       singletons.
+
+    2. **Minimum label count**: for long documents the total number of detected
+       labels must be proportional to the implied page count:
+
+           minimum_labels = floor(doc_char_len * 0.90 / 5000)
+
+       For a 350 000-char document this yields 63; if fewer than 63 labels are
+       found across all winning sequences the detection is considered too sparse
+       and is rejected in full.  The minimum is 0 for documents shorter than
+       ~5 556 chars, so very short files are never penalised.
+
+    Args:
+        sequences: Winning (non-overlapping) CandidateSequence objects.
+        doc_char_len: Total character length of the document text.
+
+    Returns:
+        True if detection should be kept, False if all sequences should be discarded.
+    """
+    if not sequences:
+        return False
+
+    # Criterion 1: need at least one run of 5 consecutive labels.
+    if not any(seq.length >= 5 for seq in sequences):
+        return False
+
+    # Criterion 2: total labels must meet the doc-length-scaled minimum.
+    minimum_labels = int(doc_char_len * 0.90) // 5000
+    if minimum_labels > 0:
+        total_labels = sum(seq.length for seq in sequences)
+        if total_labels < minimum_labels:
+            return False
+
+    return True
+
+
 def _detect_page_label_sequence(
     df: pd.DataFrame,
     page_label_config
 ) -> Tuple[List[PageLabel], List[PageLabelGroup]]:
     """
     Internal function to detect page label sequences.
-    
+
     Pipeline:
     1. Build candidates from filtered tokens
     2. Build candidate sequences
     3. Select winning sequences (non-overlapping)
+    3a. Apply global quality gate — reject all if thresholds not met
     4. Convert to PageLabel and PageLabelGroup objects
-    
+
     Args:
         df: DataFrame with page_label_token, formatting columns, wrapper flags
         page_label_config: Compiled pattern config
-        
+
     Returns:
         Tuple of (page_labels, page_label_groups)
     """
     # Step 1: Build candidates from the DataFrame
     candidates = _build_candidates_from_df(df, page_label_config)
-    
+
     if not candidates:
         return [], []
-    
+
     # Step 2: Build candidate sequences
     sequences = _build_candidate_sequences(candidates)
-    
+
     if not sequences:
         return [], []
-    
+
     # Step 3: Select winning (non-overlapping) sequences
     winning_sequences = _select_winning_sequences(sequences)
-    
+
     if not winning_sequences:
         return [], []
-    
+
+    # Step 3a: Global quality gate — discard all detection if the document does
+    # not have enough evidence to trust the result in totality.
+    doc_char_len = int(df["text"].fillna("").astype(str).str.len().sum())
+    if not _passes_global_quality_gate(winning_sequences, doc_char_len):
+        return [], []
+
     # Step 4: Convert to PageLabel and PageLabelGroup objects
     # Need to pass df for alignment detection
     candidates_map = {c.box_id: c for c in candidates}
     page_labels, page_label_groups = _convert_sequences_to_groups(
         winning_sequences, df, candidates_map
     )
-    
+
     return page_labels, page_label_groups
 
 # ---------------------------------------------------------------------------- PART 3: Post-Processing ---------------------------------------------------------------------------- #
