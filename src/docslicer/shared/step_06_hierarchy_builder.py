@@ -31,14 +31,18 @@ STATIC_WEIGHTS = {
 }
 
 # heading type rank (lower = stronger / higher in hierarchy)
-HEADING_TYPE_RANK = {
-    "centered_upper": 0, "exhibit": 0,
-    "part": 1,
-    "item": 2, "appendix": 2, "annex": 2, "subpart": 2,
-    "note": 3,
-    "free_form": 4,
-    "table": 5, "figure": 5,
+_HEADING_TYPE_RANK_TIERS = {
+    0: ["title", "centered_upper", "exhibit", "volume", "appendix", "annex", "schedule", "attachment"],
+    1: ["subtitle"],
+    2: ["chapter", "part"], # Chapter sometimes higher, sometimes lower than part
+    3: ["subchapter", "subpart", "item"],
+    4: ["note", "section", "proposal"],
+    5: ["subsection", "section_symbol", "section_abbreviated"],
+    6: ["article", "rule"],
+    7: ["free_form"],
+    8: ["table", "figure"],
 }
+HEADING_TYPE_RANK = {t: rank for rank, types in _HEADING_TYPE_RANK_TIERS.items() for t in types}
 
 # block_type values treated as headings throughout this module
 _HEADING_ROLES = {"heading", "toc_heading", "exhibit_heading", "hybrid_heading_paragraph"}

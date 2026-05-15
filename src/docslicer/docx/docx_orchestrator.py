@@ -9,6 +9,7 @@ import pandas as pd
 
 from .step_01_package_reader import DocxPackage, read_docx_package
 from .step_02_run_extractor import extract_runs
+from .._utils.config import load_compiled_page_label_config
 from .step_03_table_cell_builder import build_table_cells
 from .step_04_paragraph_builder import build_paragraphs
 from .step_05_line_builder import build_lines
@@ -31,10 +32,12 @@ def run_pipeline(
         df_lines: Shared-compatible line DataFrame.
     """
     package = read_docx_package(source)
+    page_label_config = load_compiled_page_label_config()
     run_df = extract_runs(
         package,
         include_headers_footers=include_headers_footers,
         include_notes_comments=include_notes_comments,
+        page_label_config=page_label_config,
     )
     df_table_cells = build_table_cells(
         package,

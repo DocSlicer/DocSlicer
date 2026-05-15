@@ -194,12 +194,12 @@ MASTER_COLUMN_ORDER: List[str] = [
     # ===== 6. Calculated features =====
     # Counts
     "char_count",
-    "alpha_count",
+    "alpha_word_count",
     "digit_count",
     "uppercase_count",
     "word_count",
     "alpha_token_count",
-    "capitalized_token_count",
+    "capitalized_word_count",
     
     # Ratios
     "bold_ratio",

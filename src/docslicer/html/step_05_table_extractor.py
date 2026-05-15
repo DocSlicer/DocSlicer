@@ -30,6 +30,7 @@ import re
 import warnings
 from typing import NamedTuple, Optional
 
+import numpy as np
 import pandas as pd
 from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 
@@ -202,43 +203,57 @@ def _remove_blank_rows(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
 
-    rows_to_remove: set[int] = set()
-    all_rows = sorted(df["row_start"].unique())
+    row_start_arr = df["row_start"].values
+    rowspan_arr = df["rowspan"].values
 
+    # Rows that contain at least one non-blank cell
+    rows_with_text: set[int] = set(
+        df.loc[df["text"].str.strip() != "", "row_start"].unique().tolist()
+    )
+
+    all_rows = sorted(set(row_start_arr.tolist()))
+    row_ends = row_start_arr + rowspan_arr - 1  # inclusive end per cell
+
+    rows_to_remove: set[int] = set()
     for r in all_rows:
-        origin_cells = df[df["row_start"] == r]
-        if origin_cells.empty:
+        if r in rows_with_text:
             continue
-        if origin_cells["text"].str.strip().ne("").any():
+        # Keep if any prior cell spans into this row
+        if np.any((row_start_arr < r) & (row_ends >= r)):
             continue
-        # Check that no cell from a previous row spans into r
-        spans_into = (
-            (df["row_start"] < r) & (df["row_start"] + df["rowspan"] > r)
-        ).any()
-        if not spans_into:
-            rows_to_remove.add(r)
+        rows_to_remove.add(r)
 
     if not rows_to_remove:
         return df
 
-    df = df[~df["row_start"].isin(rows_to_remove)].copy()
+    keep = ~np.isin(row_start_arr, list(rows_to_remove))
+    df = df[keep].copy()
+    if df.empty:
+        return df.reset_index(drop=True)
 
-    # Re-index row_start and adjust rowspans
-    surviving = sorted(set(df["row_start"].unique()))
-    row_remap = {old: new for new, old in enumerate(surviving)}
+    rs = df["row_start"].values
+    rsp = df["rowspan"].values
 
-    def _new_rowspan(row):
-        r0 = row["row_start"]
-        r_end = r0 + row["rowspan"] - 1
-        new_r0 = row_remap[r0]
-        # Count surviving rows in [r0, r_end]
-        new_span = sum(1 for r in range(r0, r_end + 1) if r not in rows_to_remove)
-        return pd.Series({"row_start": new_r0, "rowspan": max(1, new_span)})
+    # Build a lookup array for remapping old row indices to new contiguous ones
+    surviving = sorted(set(rs.tolist()))
+    row_remap = np.full(surviving[-1] + 1, -1, dtype=np.int64)
+    for new_idx, old_idx in enumerate(surviving):
+        row_remap[old_idx] = new_idx
 
-    adjusted = df.apply(_new_rowspan, axis=1)
-    df["row_start"] = adjusted["row_start"]
-    df["rowspan"] = adjusted["rowspan"]
+    # Cumulative-sum trick: surviving[i] = 1 for kept rows, 0 for removed.
+    # new_span = sum of kept flags in [r0, r_end].
+    max_row_end = int((rs + rsp - 1).max())
+    kept_flags = np.ones(max_row_end + 2, dtype=np.int64)
+    for r in rows_to_remove:
+        if r <= max_row_end:
+            kept_flags[r] = 0
+    cumkept = np.concatenate([[0], np.cumsum(kept_flags)])
 
+    r_end = np.minimum(rs + rsp - 1, max_row_end)
+    new_rowspans = np.maximum(1, cumkept[r_end + 1] - cumkept[rs])
+
+    df["row_start"] = row_remap[rs]
+    df["rowspan"] = new_rowspans
     return df.reset_index(drop=True)
 
 
@@ -246,16 +261,42 @@ def _remove_blank_rows(df: pd.DataFrame) -> pd.DataFrame:
 # Column normalization
 # ---------------------------------------------------------------------------
 
+def _profile_single_col(df: pd.DataFrame, col: int) -> dict:
+    """Profile one column: all_blank / currency_only / lparen_only / rparen_only."""
+    standalone = df[(df["col_start"] == col) & (df["colspan"] == 1)]
+    texts = standalone.loc[standalone["text"].str.strip() != "", "text"].tolist()
+    if not texts:
+        return dict(all_blank=True, currency_only=False, lparen_only=False, rparen_only=False)
+    return dict(
+        all_blank=False,
+        currency_only=all(_is_currency(t) for t in texts),
+        lparen_only=all(_is_lparen(t) for t in texts),
+        rparen_only=all(_is_rparen_like(t) for t in texts),
+    )
+
+
 def _profile_columns(df: pd.DataFrame) -> dict[int, dict]:
     """Profile each column: all_blank / currency_only / lparen_only / rparen_only."""
+    all_cols: list[int] = sorted(df["col_start"].unique().tolist())
+    standalone = df[df["colspan"] == 1]
+
+    if standalone.empty:
+        return {c: dict(all_blank=True, currency_only=False, lparen_only=False, rparen_only=False)
+                for c in all_cols}
+
+    # Compute nonblank texts grouped by column in one pass
+    nonblank = standalone[standalone["text"].str.strip() != ""]
+    nb_by_col: dict[int, list[str]] = {}
+    if not nonblank.empty:
+        for col_val, grp in nonblank.groupby("col_start"):
+            nb_by_col[int(col_val)] = grp["text"].tolist()
+
     profiles: dict[int, dict] = {}
-    for col in sorted(df["col_start"].unique()):
-        standalone = df[(df["col_start"] == col) & (df["colspan"] == 1)]
-        nonblank = standalone[standalone["text"].str.strip() != ""]
-        if nonblank.empty:
+    for col in all_cols:
+        texts = nb_by_col.get(col, [])
+        if not texts:
             profiles[col] = dict(all_blank=True, currency_only=False, lparen_only=False, rparen_only=False)
         else:
-            texts = nonblank["text"].tolist()
             profiles[col] = dict(
                 all_blank=False,
                 currency_only=all(_is_currency(t) for t in texts),
@@ -263,6 +304,18 @@ def _profile_columns(df: pd.DataFrame) -> dict[int, dict]:
                 rparen_only=all(_is_rparen_like(t) for t in texts),
             )
     return profiles
+
+
+def _shift_remove_profiles(profiles: dict[int, dict], removed_col: int) -> dict[int, dict]:
+    """Return updated profiles after removing `removed_col`, shifting keys > removed_col left."""
+    result: dict[int, dict] = {}
+    for c, p in profiles.items():
+        if c < removed_col:
+            result[c] = p
+        elif c > removed_col:
+            result[c - 1] = p
+        # c == removed_col is dropped
+    return result
 
 
 def _find_next_data_col(profiles: dict[int, dict], from_col: int, direction: int) -> Optional[int]:
@@ -279,23 +332,32 @@ def _find_next_data_col(profiles: dict[int, dict], from_col: int, direction: int
 
 def _merge_col_text(df: pd.DataFrame, src_col: int, tgt_col: int, prefix: bool) -> pd.DataFrame:
     """Prepend (prefix=True) or append the text of standalone src_col cells into tgt_col cells."""
+    src_mask = (df["col_start"] == src_col) & (df["colspan"] == 1)
+    src_cells = df[src_mask]
+    src_cells = src_cells[src_cells["text"].str.strip() != ""]
+    if src_cells.empty:
+        return df
+
     df = df.copy()
-    src_cells = df[(df["col_start"] == src_col) & (df["colspan"] == 1) & (df["text"].str.strip() != "")]
+    col_start = df["col_start"].values
+    colspan = df["colspan"].values
+    row_start = df["row_start"].values
+    rowspan = df["rowspan"].values
+    text = df["text"].to_numpy(dtype=object)
 
     for _, src in src_cells.iterrows():
-        r = src["row_start"]
-        tgt_mask = (
-            (df["col_start"] <= tgt_col)
-            & (df["col_start"] + df["colspan"] > tgt_col)
-            & (df["row_start"] <= r)
-            & (df["row_start"] + df["rowspan"] > r)
-        )
-        if tgt_mask.any():
-            if prefix:
-                df.loc[tgt_mask, "text"] = src["text"] + df.loc[tgt_mask, "text"]
-            else:
-                df.loc[tgt_mask, "text"] = df.loc[tgt_mask, "text"] + src["text"]
+        r = int(src["row_start"])
+        src_txt = src["text"]
+        tgt_idx = np.where(
+            (col_start <= tgt_col)
+            & (col_start + colspan > tgt_col)
+            & (row_start <= r)
+            & (row_start + rowspan > r)
+        )[0]
+        for i in tgt_idx:
+            text[i] = (src_txt + text[i]) if prefix else (text[i] + src_txt)
 
+    df["text"] = text
     return df
 
 
@@ -306,79 +368,91 @@ def _remove_col(df: pd.DataFrame, col: int) -> pd.DataFrame:
     - cells spanning through col get colspan - 1
     - cells starting after col get col_start - 1
     """
-    df = df.copy()
+    keep = ~((df["col_start"] == col) & (df["colspan"] == 1))
+    df = df[keep].copy()
+    if df.empty:
+        return df.reset_index(drop=True)
 
-    # Drop standalone cells at col
-    standalone = (df["col_start"] == col) & (df["colspan"] == 1)
-    df = df[~standalone].copy()
+    col_start = df["col_start"].values.copy()
+    colspan = df["colspan"].values.copy()
 
-    # Cells spanning through col: reduce colspan
-    covers = (df["col_start"] <= col) & (df["col_start"] + df["colspan"] > col)
-    df.loc[covers, "colspan"] -= 1
+    covers = (col_start <= col) & (col_start + colspan > col)
+    colspan[covers] -= 1
+    col_start[col_start > col] -= 1
 
-    # Cells starting strictly after col: shift left
-    df.loc[df["col_start"] > col, "col_start"] -= 1
-
+    df["col_start"] = col_start
+    df["colspan"] = colspan
     return df.reset_index(drop=True)
 
 
 def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     """Iteratively merge currency/paren columns and remove blank spacer columns."""
+    # Profile once; maintain incrementally to avoid re-scanning the DataFrame each iteration.
+    profiles = _profile_columns(df)
+
     while True:
-        profiles = _profile_columns(df)
+        cols = sorted(profiles.keys())
         changed = False
 
         # Currency → merge into right neighbor
-        for col, p in sorted(profiles.items()):
-            if not p["currency_only"]:
+        for col in cols:
+            if not profiles[col]["currency_only"]:
                 continue
             tgt = _find_next_data_col(profiles, col, direction=1)
             if tgt is None:
                 continue
             df = _merge_col_text(df, col, tgt, prefix=True)
             df = _remove_col(df, col)
+            new_tgt = tgt - 1 if tgt > col else tgt
+            profiles = _shift_remove_profiles(profiles, col)
+            profiles[new_tgt] = _profile_single_col(df, new_tgt)
             changed = True
             break
         if changed:
             continue
 
         # Left paren → merge into right neighbor
-        for col, p in sorted(profiles.items()):
-            if not p["lparen_only"]:
+        for col in cols:
+            if not profiles[col]["lparen_only"]:
                 continue
             tgt = _find_next_data_col(profiles, col, direction=1)
             if tgt is None:
                 continue
             df = _merge_col_text(df, col, tgt, prefix=True)
             df = _remove_col(df, col)
+            new_tgt = tgt - 1 if tgt > col else tgt
+            profiles = _shift_remove_profiles(profiles, col)
+            profiles[new_tgt] = _profile_single_col(df, new_tgt)
             changed = True
             break
         if changed:
             continue
 
         # Right paren → merge into left neighbor
-        for col, p in sorted(profiles.items()):
-            if not p["rparen_only"]:
+        for col in cols:
+            if not profiles[col]["rparen_only"]:
                 continue
             tgt = _find_next_data_col(profiles, col, direction=-1)
             if tgt is None:
                 continue
             df = _merge_col_text(df, col, tgt, prefix=False)
             df = _remove_col(df, col)
+            # tgt < col (direction=-1), so tgt index is unchanged after removing col
+            profiles = _shift_remove_profiles(profiles, col)
+            profiles[tgt] = _profile_single_col(df, tgt)
             changed = True
             break
         if changed:
             continue
 
-        # Blank spacers → remove
-        for col, p in sorted(profiles.items()):
-            if not p["all_blank"]:
-                continue
-            df = _remove_col(df, col)
-            changed = True
-            break
-        if changed:
-            continue
+        # Blank spacers — remove all at once right-to-left (preserves lower indices).
+        # Blank removal never changes cell text so no new currency/paren cols can appear.
+        blank_cols = sorted([c for c, p in profiles.items() if p["all_blank"]], reverse=True)
+        if blank_cols:
+            for col in blank_cols:
+                df = _remove_col(df, col)
+                profiles = _shift_remove_profiles(profiles, col)
+            break  # stable: blank removal can't create new special columns
 
         break  # stable
 
@@ -489,7 +563,6 @@ def _combine_table_parts(parts: list[pd.DataFrame]) -> pd.DataFrame:
 def extract_table_cells(
     df_lines: pd.DataFrame,
     rendered_html: str,
-    df_boxes: pd.DataFrame = None,
 ) -> Optional[pd.DataFrame]:
     """
     Extract and normalize HTML tables into a cell-level DataFrame whose

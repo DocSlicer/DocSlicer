@@ -97,6 +97,60 @@ class Table:
 
 
 @dataclass
+class HierarchyNode:
+    heading_id: int
+    text: str
+    level: int
+    heading_type: str
+    page_number: int | None
+    page_label: str | None
+    chunk_ids: list[str]
+    children: list[HierarchyNode]
+
+    def to_dict(self, minimal: bool = False) -> dict:
+        if minimal:
+            d: dict = {"text": self.text}
+            if self.children:
+                d["children"] = [c.to_dict(minimal=True) for c in self.children]
+            return d
+        return asdict(self)
+
+
+@dataclass
+class HierarchyTree:
+    roots: list[HierarchyNode]
+
+    def __iter__(self):
+        return iter(self.roots)
+
+    def __len__(self) -> int:
+        return len(self.roots)
+
+    def flatten(self) -> list[HierarchyNode]:
+        result: list[HierarchyNode] = []
+        def _visit(node: HierarchyNode) -> None:
+            result.append(node)
+            for child in node.children:
+                _visit(child)
+        for root in self.roots:
+            _visit(root)
+        return result
+
+    def to_dict(self, minimal: bool = False) -> list[dict]:
+        return [r.to_dict(minimal=minimal) for r in self.roots]
+
+    def to_outline(self) -> str:
+        lines: list[str] = []
+        def _visit(node: HierarchyNode, depth: int) -> None:
+            lines.append("  " * depth + "- " + node.text)
+            for child in node.children:
+                _visit(child, depth + 1)
+        for root in self.roots:
+            _visit(root, 0)
+        return "\n".join(lines)
+
+
+@dataclass
 class DocMetadata:
     title: str | None
     author: str | None
@@ -130,6 +184,7 @@ class ParseResult:
     blocks: list[Block]
     tables: list[Table]
     metadata: DocMetadata
+    hierarchy: HierarchyTree = field(default_factory=lambda: HierarchyTree(roots=[]))
     pipeline_steps: dict[str, "pd.DataFrame"] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
@@ -140,6 +195,7 @@ class ParseResult:
             "chunks": [c.to_dict() for c in self.chunks],
             "blocks": [b.to_dict() for b in self.blocks],
             "tables": [t.to_dict() for t in self.tables],
+            "hierarchy": self.hierarchy.to_dict(),
         }
 
 

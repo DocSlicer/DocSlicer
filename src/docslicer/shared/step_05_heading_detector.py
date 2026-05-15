@@ -551,6 +551,8 @@ def _add_heading_score(lines_df: pd.DataFrame) -> pd.DataFrame:
 
     # --- capitalized_token_ratio
     cap_ratio = _safe_div(out.get("capitalized_word_count"), out.get("word_count"), fill=0.0)
+    if len(cap_ratio) == 0:
+        cap_ratio = pd.Series(0.0, index=out.index, dtype="float64")
     score += np.where(cap_ratio > 0.75, 0.5, 0.0)
 
     # --- styles

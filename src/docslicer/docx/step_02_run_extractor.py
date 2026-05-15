@@ -17,6 +17,8 @@ import pandas as pd
 from lxml import etree
 
 from .step_01_package_reader import DocxPackage
+from .._utils.yaml_compilers.page_label_patterns import PageLabelPatternConfig
+from .._utils.text_utils import add_calculated_text_features
 
 
 NS = {
@@ -699,13 +701,25 @@ def _format_number_value(value: int, fmt: str | None) -> str:
     return str(value)
 
 
-def _add_page_labels_from_sections(run_df: pd.DataFrame, package: DocxPackage) -> pd.DataFrame:
+def _classify_page_label(label: str, config: PageLabelPatternConfig) -> str:
+    for p in config.patterns:
+        if p.compiled.fullmatch(label):
+            return p.name
+    return "unknown"
+
+
+def _add_page_labels_from_sections(
+    run_df: pd.DataFrame,
+    package: DocxPackage,
+    page_label_config: PageLabelPatternConfig | None = None,
+) -> pd.DataFrame:
     if run_df.empty or "section_id" not in run_df.columns or "page_number" not in run_df.columns:
         return run_df
 
     section_infos = _collect_section_infos(package)
     out = run_df.copy()
     out["page_label"] = None
+    out["page_label_type"] = None
     out["page_label_format"] = None
     out["page_label_footer_part"] = None
     out["page_label_footer_type"] = None
@@ -774,10 +788,13 @@ def _add_page_labels_from_sections(run_df: pd.DataFrame, package: DocxPackage) -
             page_number - section_first_page
         )
 
-        out.at[idx, "page_label"] = _format_page_label(
+        label = _format_page_label(
             label_number,
             info.page_number_format if info is not None else None,
         )
+        out.at[idx, "page_label"] = label
+        if page_label_config is not None:
+            out.at[idx, "page_label_type"] = _classify_page_label(label, page_label_config)
         out.at[idx, "page_label_source"] = "section_footer_page_field"
 
     return out
@@ -1427,6 +1444,7 @@ def extract_runs(
     package: DocxPackage,
     include_headers_footers: bool = True,
     include_notes_comments: bool = True,
+    page_label_config: PageLabelPatternConfig | None = None,
 ) -> pd.DataFrame:
     """
     Extract run-level content from a DOCX package.
@@ -1435,6 +1453,7 @@ def extract_runs(
         package: Parsed DOCX package.
         include_headers_footers: Include word/header*.xml and word/footer*.xml.
         include_notes_comments: Include footnotes, endnotes, and comments.
+        page_label_config: Compiled page label patterns; when provided, populates page_label_type.
 
     Returns:
         DataFrame with one row per text/control/image/field run event.
@@ -1478,7 +1497,7 @@ def extract_runs(
     run_df = pd.DataFrame(rows)
     if not run_df.empty:
         run_df["page_number"] = _assign_page_numbers(run_df)
-        run_df = _add_page_labels_from_sections(run_df, package)
+        run_df = _add_page_labels_from_sections(run_df, package, page_label_config)
         run_df = _inline_footnotes(run_df)
         if "text_orientation" in run_df.columns:
             run_df["text_orientation"] = run_df["text_orientation"].fillna("LTR")
@@ -1488,5 +1507,6 @@ def extract_runs(
             run_df["non_stroking_color"] = run_df["non_stroking_color"].fillna("#000000")
         leading_cols = [col for col in ("page_number", "page_label") if col in run_df.columns]
         run_df = run_df[leading_cols + [col for col in run_df.columns if col not in leading_cols]]
+        run_df = add_calculated_text_features(run_df)
 
     return run_df

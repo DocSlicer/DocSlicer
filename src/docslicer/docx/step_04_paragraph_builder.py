@@ -24,6 +24,7 @@ from docslicer._utils.hierarchical_aggregator import (
 _PARA_IDENTITY_COLS = [
     "page_number",
     "page_label",
+    "page_label_type",
     "page_width",
     "page_height",
     "section_id",

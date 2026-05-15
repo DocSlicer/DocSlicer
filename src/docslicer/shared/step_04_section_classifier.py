@@ -691,10 +691,14 @@ def _assign_per_page_regions(page: pd.DataFrame) -> dict[int, str]:
     has_cover = page["has_coverpage"].fillna(False).astype(bool)
     has_toc = page["has_toc"].fillna(False).astype(bool)
 
-    # When no page labels exist at all, every non-special page is body.
+    # When no page labels exist at all, every non-coverpage page is body.
+    # has_toc is intentionally excluded: toc rows already carry section="toc" from
+    # pass 1, so the dr_isna mask in classify_sections_from_page_labels protects
+    # them. Without this, a single-page document whose only page has a TOC would
+    # get no body assignment at all.
     if not bool((~label_blank).any()):
         for p in pages:
-            if not bool(has_cover.at[p]) and not bool(has_toc.at[p]):
+            if not bool(has_cover.at[p]):
                 proposed[p] = "body"
         return proposed
 

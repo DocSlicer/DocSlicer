@@ -11,12 +11,13 @@ except Exception:
     __version__ = "0.1.0"
 
 from ._config import ParseConfig
-from ._result import ParseResult, Chunk, Block, Table, TableCell, DocMetadata, BBox
+from ._result import ParseResult, Chunk, Block, Table, TableCell, DocMetadata, BBox, HierarchyNode, HierarchyTree
 from ._orchestrator import _run_pipeline
 
 __all__ = [
     "parse_pdf",
     "parse_html",
+    "parse_docx",
     "parse_document",
     "ParseConfig",
     "ParseResult",
@@ -26,6 +27,8 @@ __all__ = [
     "TableCell",
     "DocMetadata",
     "BBox",
+    "HierarchyNode",
+    "HierarchyTree",
 ]
 
 _Source = Union[str, Path, bytes, io.IOBase]
@@ -78,6 +81,35 @@ def parse_pdf(
     )
     content = _load_bytes(source)
     return _run_pipeline(content, "pdf", source_url=None, config=config)
+
+
+def parse_docx(
+    source: _Source,
+    max_chunk_size: int = 3200,
+    optimal_chunk_size: int = 1500,
+    extract_tables: bool = True,
+    regions: list[str] | None = None,
+    debug: bool = False,
+) -> ParseResult:
+    """Parse a DOCX document and return a ParseResult.
+
+    Args:
+        source: DOCX file path, raw bytes, or file-like object.
+        max_chunk_size: Maximum characters per chunk (default 3200).
+        optimal_chunk_size: Target characters per chunk (default 1500).
+        extract_tables: Include table extraction (default True).
+        regions: Filter output to these regions only.
+        debug: Populate result.pipeline_steps with intermediate DataFrames.
+    """
+    config = ParseConfig(
+        max_chunk_size=max_chunk_size,
+        optimal_chunk_size=optimal_chunk_size,
+        extract_tables=extract_tables,
+        regions=regions,
+        debug=debug,
+    )
+    content = _load_bytes(source)
+    return _run_pipeline(content, "docx", source_url=None, config=config)
 
 
 def parse_html(
@@ -151,6 +183,8 @@ def parse_document(
         suffix = path.suffix.lower()
         if suffix == ".pdf":
             return parse_pdf(path, **kwargs)
+        if suffix == ".docx":
+            return parse_docx(path, **kwargs)
         if suffix in (".html", ".htm", ".xhtml"):
             return parse_html(path, source_url=source_url, **kwargs)
         # Unknown extension: peek at magic bytes
