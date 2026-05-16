@@ -36,7 +36,7 @@ _PARA_IDENTITY_COLS = [
     "table_row_id",
     "table_cell_id",
     "nested_table_depth",
-    "num_id",
+    "list_num_id",
     "list_level",
     "list_label",
     "outline_level",

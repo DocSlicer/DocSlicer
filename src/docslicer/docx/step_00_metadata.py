@@ -6,9 +6,8 @@ from typing import Any
 
 from .step_01_package_reader import DocxPackage
 
-_DC   = "http://purl.org/dc/elements/1.1/"
-_CP   = "http://schemas.openxmlformats.org/package/2006/metadata/core-properties"
-_APP  = "http://schemas.openxmlformats.org/officeDocument/2006/extended-properties"
+_DC = "http://purl.org/dc/elements/1.1/"
+_APP = "http://schemas.openxmlformats.org/officeDocument/2006/extended-properties"
 
 
 def _text(root, tag_ns: str, tag_local: str) -> str | None:

@@ -21,6 +21,10 @@ from .._utils.yaml_compilers.page_label_patterns import PageLabelPatternConfig
 from .._utils.text_utils import add_calculated_text_features
 
 
+# ---------------------------------------------------------------------------
+# Module-level constants
+# ---------------------------------------------------------------------------
+
 NS = {
     "w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
     "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
@@ -38,6 +42,11 @@ _CONTENT_PARTS = (
     ("word/endnotes.xml", "endnote"),
     ("word/comments.xml", "comment"),
 )
+
+
+# ---------------------------------------------------------------------------
+# Internal dataclasses
+# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -95,6 +104,11 @@ class _StyleDef:
     p_pr: etree._Element | None
     r_pr: etree._Element | None
     is_default: bool
+
+
+# ---------------------------------------------------------------------------
+# Style and numbering resolvers
+# ---------------------------------------------------------------------------
 
 
 class _StyleResolver:
@@ -261,15 +275,15 @@ class _NumberingResolver:
                 }
 
         for num in numbering_root.findall("w:num", namespaces=NS):
-            num_id = num.get(f"{W}numId")
+            list_num_id = num.get(f"{W}numId")
             abstract_id = _attr(_child(num, "abstractNumId"), "val")
-            if num_id is not None and abstract_id is not None:
-                self.num_to_abstract[num_id] = abstract_id
+            if list_num_id is not None and abstract_id is not None:
+                self.num_to_abstract[list_num_id] = abstract_id
 
-    def next_label(self, num_id: str | None, list_level: str | None) -> str | None:
-        if num_id is None or list_level is None:
+    def next_label(self, list_num_id: str | None, list_level: str | None) -> str | None:
+        if list_num_id is None or list_level is None:
             return None
-        abstract_id = self.num_to_abstract.get(str(num_id))
+        abstract_id = self.num_to_abstract.get(str(list_num_id))
         if abstract_id is None:
             return None
         try:
@@ -277,7 +291,7 @@ class _NumberingResolver:
         except ValueError:
             return None
 
-        counters = self.counters.setdefault(str(num_id), [0] * 9)
+        counters = self.counters.setdefault(str(list_num_id), [0] * 9)
         lvl_def = self.levels.get((abstract_id, ilvl), {})
         start = int(lvl_def.get("start", 1))
         counters[ilvl] = counters[ilvl] + 1 if counters[ilvl] else start
@@ -299,6 +313,11 @@ class _NumberingResolver:
 
         label = re.sub(r"%([1-9])", repl, lvl_text).strip()
         return label or None
+
+
+# ---------------------------------------------------------------------------
+# XML helpers
+# ---------------------------------------------------------------------------
 
 
 def _local_name(elem: etree._Element) -> str:
@@ -391,7 +410,7 @@ def _ratio_from_bool(value: Any) -> float:
 def _extract_p_pr_props(p_pr: etree._Element | None) -> dict[str, Any]:
     p_style = _child(p_pr, "pStyle")
     num_pr = _child(p_pr, "numPr")
-    num_id = _child(num_pr, "numId")
+    list_num_id = _child(num_pr, "numId")
     ilvl = _child(num_pr, "ilvl")
     outline = _child(p_pr, "outlineLvl")
     page_break_before = _child(p_pr, "pageBreakBefore")
@@ -400,7 +419,7 @@ def _extract_p_pr_props(p_pr: etree._Element | None) -> dict[str, Any]:
 
     return _drop_none({
         "paragraph_style_id": _attr(p_style, "val"),
-        "num_id": _attr(num_id, "val"),
+        "list_num_id": _attr(list_num_id, "val"),
         "list_level": _attr(ilvl, "val"),
         "outline_level": _attr(outline, "val"),
         "page_break_before": _bool_val(page_break_before),
@@ -439,6 +458,11 @@ def _paragraph_props(p: etree._Element, style_resolver: _StyleResolver) -> dict[
     p_pr = _child(p, "pPr")
     p_style = _child(p_pr, "pStyle")
     return style_resolver.resolve_paragraph_props(_attr(p_style, "val"), p_pr)
+
+
+# ---------------------------------------------------------------------------
+# Field and section helpers
+# ---------------------------------------------------------------------------
 
 
 def _field_type(instr_text: str | None) -> str | None:
@@ -632,6 +656,11 @@ def _select_footer_part(
     return None, None
 
 
+# ---------------------------------------------------------------------------
+# Number and page label formatting
+# ---------------------------------------------------------------------------
+
+
 def _to_roman(value: int) -> str:
     if value <= 0:
         return str(value)
@@ -671,7 +700,7 @@ def _to_alpha(value: int) -> str:
     return "".join(reversed(chars))
 
 
-def _format_page_label(value: int, fmt: str | None) -> str:
+def _format_value(value: int, fmt: str | None) -> str:
     fmt_norm = (fmt or "decimal").strip()
     if fmt_norm == "lowerRoman":
         return _to_roman(value).lower()
@@ -681,24 +710,19 @@ def _format_page_label(value: int, fmt: str | None) -> str:
         return _to_alpha(value).lower()
     if fmt_norm == "upperLetter":
         return _to_alpha(value)
-    if fmt_norm == "decimalZero":
-        return f"{value:02d}"
     return str(value)
+
+
+def _format_page_label(value: int, fmt: str | None) -> str:
+    if (fmt or "").strip() == "decimalZero":
+        return f"{value:02d}"
+    return _format_value(value, fmt)
 
 
 def _format_number_value(value: int, fmt: str | None) -> str:
-    fmt_norm = (fmt or "decimal").strip()
-    if fmt_norm == "lowerRoman":
-        return _to_roman(value).lower()
-    if fmt_norm == "upperRoman":
-        return _to_roman(value)
-    if fmt_norm == "lowerLetter":
-        return _to_alpha(value).lower()
-    if fmt_norm == "upperLetter":
-        return _to_alpha(value)
-    if fmt_norm == "bullet":
+    if (fmt or "").strip() == "bullet":
         return ""
-    return str(value)
+    return _format_value(value, fmt)
 
 
 def _classify_page_label(label: str, config: PageLabelPatternConfig) -> str:
@@ -839,6 +863,11 @@ def _assign_page_numbers(run_df: pd.DataFrame) -> pd.Series:
     return pd.Series(page_numbers, index=run_df.index, dtype="int64")
 
 
+# ---------------------------------------------------------------------------
+# Content part discovery and run events
+# ---------------------------------------------------------------------------
+
+
 def _part_kind(part_name: str) -> str:
     if "/header" in part_name:
         return "header"
@@ -944,6 +973,11 @@ def _run_events(r: etree._Element) -> list[tuple[str, str, etree._Element | None
             if en_id is not None:
                 events.append(("endnote_reference", en_id, child))
     return events
+
+
+# ---------------------------------------------------------------------------
+# Row builders
+# ---------------------------------------------------------------------------
 
 
 def _append_run_row(
@@ -1065,7 +1099,7 @@ def _append_run_row(
             "link_type": "external" if hyperlink_url else ("internal" if hyperlink_id or p_props.get("bookmark_ids") else None),
             "is_deleted_revision": any(a.tag == f"{W}del" for a in ancestors),
             "is_inserted_revision": any(a.tag == f"{W}ins" for a in ancestors),
-            "num_id": p_props.get("num_id"),
+            "list_num_id": p_props.get("list_num_id"),
             "list_level": p_props.get("list_level"),
             "list_label": list_label,
             "outline_level": p_props.get("outline_level"),
@@ -1142,7 +1176,7 @@ def _append_section_break_row(
             "link_type": "internal" if p_props.get("bookmark_ids") else None,
             "is_deleted_revision": False,
             "is_inserted_revision": False,
-            "num_id": p_props.get("num_id"),
+            "list_num_id": p_props.get("list_num_id"),
             "list_level": p_props.get("list_level"),
             "list_label": p_props.get("list_label"),
             "outline_level": p_props.get("outline_level"),
@@ -1150,6 +1184,11 @@ def _append_section_break_row(
             "event_tag": "sectPr",
         }
     )
+
+
+# ---------------------------------------------------------------------------
+# Document walkers
+# ---------------------------------------------------------------------------
 
 
 def _walk_paragraph(
@@ -1171,10 +1210,10 @@ def _walk_paragraph(
     p_props["bookmark_names"] = bookmark_names
     p_props["section_break_after"] = sect_pr is not None
     p_props["section_break_type"] = _section_break_type(sect_pr)
-    if p_props.get("num_id") is not None and p_props.get("list_level") is None:
+    if p_props.get("list_num_id") is not None and p_props.get("list_level") is None:
         p_props["list_level"] = "0"
     p_props["list_label"] = numbering_resolver.next_label(
-        p_props.get("num_id"),
+        p_props.get("list_num_id"),
         p_props.get("list_level"),
     )
     field_state: dict[str, Any] = {}
@@ -1343,6 +1382,11 @@ def _walk_container(
             )
 
 
+# ---------------------------------------------------------------------------
+# Footnote and endnote inlining
+# ---------------------------------------------------------------------------
+
+
 def _inline_footnotes(run_df: pd.DataFrame) -> pd.DataFrame:
     """
     Reorder footnote and endnote content rows to appear immediately after their
@@ -1400,7 +1444,7 @@ def _inline_footnotes(run_df: pd.DataFrame) -> pd.DataFrame:
 
     has_page_label = "page_label" in df.columns
     has_section_id = "section_id" in df.columns
-    has_page_dims  = "page_width" in df.columns and "page_height" in df.columns
+    has_page_dims = "page_width" in df.columns and "page_height" in df.columns
 
     df["_sort_key"] = df["order_index"].astype(float)
 
@@ -1438,6 +1482,11 @@ def _inline_footnotes(run_df: pd.DataFrame) -> pd.DataFrame:
     df = df.drop(columns=["_sort_key"])
     df["order_index"] = range(1, len(df) + 1)
     return df
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
 
 def extract_runs(

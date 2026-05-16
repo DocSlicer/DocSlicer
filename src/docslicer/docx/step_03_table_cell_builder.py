@@ -27,6 +27,7 @@ from .step_02_run_extractor import (
     _content_part_specs,
     _iter_part_roots,
 )
+from .._utils.table_utils import detect_cell_roles
 
 
 # ---------------------------------------------------------------------------
@@ -390,15 +391,11 @@ def build_table_cells(
             lambda s: s.ffill().bfill()
         )
 
-    # Role: header if w:tblHeader flag, or paragraph style contains "header",
-    # or first row of the table when neither signal is present (fallback).
-    style_is_header = (
-        result["_para_style"].str.lower().str.contains("header", na=False)
-    )
-    result["role"] = "data"
-    result.loc[result["row_start"].eq(0), "role"] = "header"
-    result.loc[style_is_header, "role"] = "header"
-    result.loc[result["_tbl_header"], "role"] = "header"
+    # Fold DOCX-specific header signals into a `th` column for detect_cell_roles.
+    # w:tblHeader and style names containing "header" both count.
+    style_is_header = result["_para_style"].str.lower().str.contains("header", na=False)
+    result["th"] = result["_tbl_header"] | style_is_header
     result = result.drop(columns=["_tbl_header", "_para_style"])
+    result = detect_cell_roles(result, with_row_label=False)
 
     return result[_OUTPUT_COLS].reset_index(drop=True)

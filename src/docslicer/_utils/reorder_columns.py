@@ -57,6 +57,7 @@ MASTER_COLUMN_ORDER: List[str] = [
     "page_label",
     "section",
     "section_id", # Only for .docx
+    "slide_index", # Only for .pptx
     
     # ===== 2. IDs and hierarchy =====
     
@@ -64,11 +65,12 @@ MASTER_COLUMN_ORDER: List[str] = [
         # -- Raw data
     "word_id",
     "box_id",
+    "run_id",
     "image_id",
     "raw_shape_id",
     "shape_id",
     "link_id",
-    "run_id",
+    "chart_id",
         # -- Processed in HTML and PDF
     "gutter_id",
     "gutter_candidate_id",
@@ -147,6 +149,11 @@ MASTER_COLUMN_ORDER: List[str] = [
     "heading_level",
     "parent_heading_id",
 
+    # Lists / outlines
+    "list_num_id",
+    "list_level",
+    "list_label",
+    "outline_level",
     
     # Cell count
     "cell_count",
@@ -194,11 +201,11 @@ MASTER_COLUMN_ORDER: List[str] = [
     # ===== 6. Calculated features =====
     # Counts
     "char_count",
-    "alpha_word_count",
+    "alpha_count",
     "digit_count",
     "uppercase_count",
     "word_count",
-    "alpha_token_count",
+    "alpha_word_count",
     "capitalized_word_count",
     
     # Ratios

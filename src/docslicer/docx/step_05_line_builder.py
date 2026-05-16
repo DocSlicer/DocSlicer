@@ -29,7 +29,7 @@ _DOCX_IDENTITY_COLS = [
     "source_part",
     "source_part_id",
     "text_align",
-    "num_id",
+    "list_num_id",
     "list_level",
     "list_label",
     "outline_level",
@@ -213,9 +213,6 @@ def build_lines(paragraph_df: pd.DataFrame) -> pd.DataFrame:
     lines_df["text"] = lines_df["_line_group_key"].map(line_text_map)
     lines_df.insert(0, "line_id", range(1, len(lines_df) + 1))
     lines_df = lines_df.drop(columns=["_line_group_key"])
-
-    #if "layout_type" not in lines_df.columns:
-     #   lines_df["layout_type"] = "docx"
 
     lines_df = _add_layout_id(lines_df)
     return lines_df
