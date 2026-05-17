@@ -13,7 +13,7 @@ from .step_02_run_extractor import extract_runs
 from .step_03_table_cell_builder import build_table_cells
 from .step_04_paragraph_builder import build_paragraphs
 from .step_05_line_builder import build_lines
-from .step_05_style_prefiller import prefill_block_types
+from .step_06_style_prefiller import prefill_block_types
 
 
 class DocxPipelineResult(NamedTuple):

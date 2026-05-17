@@ -274,130 +274,102 @@ def _attach_representative_spans(
     TOC spans that actually represent the text.
     """
     if words_df.empty or span_df.empty:
-        words_df = words_df.copy()
-        words_df["font_name"] = None
-        words_df["font_size"] = None
-        words_df["non_stroking_color"] = None
-        words_df["stroking_color"] = None
-        words_df["text_orientation"] = None
-        #words_df["debug_span_id"] = None
-        return words_df
+        out = words_df.copy()
+        for col in ("font_name", "font_size", "non_stroking_color", "stroking_color", "text_orientation"):
+            out[col] = None
+        return out
 
-    fontnames: List[Optional[str]] = []
-    font_sizes: List[Optional[float]] = []
-    ns_colors: List[Optional[Any]] = []
-    s_colors: List[Optional[Any]] = []
-    orientations: List[Optional[str]] = []
-    #chosen_span_ids: List[Optional[int]] = []
+    # Word geometry (W,)
+    W_x0 = words_df["x_left"].to_numpy(dtype=np.float64)
+    W_x1 = words_df["x_right"].to_numpy(dtype=np.float64)
+    W_y0 = words_df["y_top"].to_numpy(dtype=np.float64)
+    W_y1 = words_df["y_bottom"].to_numpy(dtype=np.float64)
 
-    # Local arrays for span geometry + style
-    sx0 = span_df["x0"].values
-    sx1 = span_df["x1"].values
-    stop = span_df["top"].values
-    sbot = span_df["bottom"].values
-    scx = span_df["cx"].values
-    scy = span_df["cy"].values
-    s_font = span_df["fontname"].values
-    s_size = span_df["size"].values
-    s_ns = span_df["non_stroking_color"].values
-    s_s = span_df["stroking_color"].values
-    s_dir_x = span_df["dir_x"].values
-    s_dir_y = span_df["dir_y"].values
-    #s_span_id = span_df["span_id"].values
+    # Span geometry and style (S,)
+    S_x0    = span_df["x0"].to_numpy(dtype=np.float64)
+    S_x1    = span_df["x1"].to_numpy(dtype=np.float64)
+    S_y0    = span_df["top"].to_numpy(dtype=np.float64)
+    S_y1    = span_df["bottom"].to_numpy(dtype=np.float64)
+    S_cx    = span_df["cx"].to_numpy(dtype=np.float64)
+    S_cy    = span_df["cy"].to_numpy(dtype=np.float64)
+    S_dir_x = span_df["dir_x"].to_numpy(dtype=np.float64)
+    S_dir_y = span_df["dir_y"].to_numpy(dtype=np.float64)
+    S_font  = span_df["fontname"].to_numpy()
+    S_size  = span_df["size"].to_numpy()
+    S_ns    = span_df["non_stroking_color"].to_numpy()
+    S_sc    = span_df["stroking_color"].to_numpy()
 
-    span_index = span_df.index.to_numpy()
+    # Word metrics (W,)
+    W_cx     = (W_x0 + W_x1) * 0.5
+    W_cy     = (W_y0 + W_y1) * 0.5
+    w_height = np.maximum(W_y1 - W_y0, 1e-6)
+    w_area   = np.maximum(W_x1 - W_x0, 1e-6) * w_height
 
-    for _, w in words_df.iterrows():
-        x_left = float(w["x_left"])
-        x_right = float(w["x_right"])
-        y_top = float(w["y_top"])
-        y_bottom = float(w["y_bottom"])
+    # Intersection mask (W, S)
+    intersects = (
+        (S_x0[np.newaxis, :] <= W_x1[:, np.newaxis] + eps)
+        & (S_x1[np.newaxis, :] >= W_x0[:, np.newaxis] - eps)
+        & (S_y0[np.newaxis, :] <= W_y1[:, np.newaxis] + eps)
+        & (S_y1[np.newaxis, :] >= W_y0[:, np.newaxis] - eps)
+    )
 
-        # word center + size
-        w_cx = (x_left + x_right) / 2.0
-        w_cy = (y_top + y_bottom) / 2.0
-        w_width = max(x_right - x_left, 1e-6)
-        w_height = max(y_bottom - y_top, 1e-6)
-        w_area = w_width * w_height
+    # Intersection area (W, S)
+    inter_area = (
+        np.maximum(0.0, np.minimum(S_x1[np.newaxis, :], W_x1[:, np.newaxis])
+                        - np.maximum(S_x0[np.newaxis, :], W_x0[:, np.newaxis]))
+        * np.maximum(0.0, np.minimum(S_y1[np.newaxis, :], W_y1[:, np.newaxis])
+                          - np.maximum(S_y0[np.newaxis, :], W_y0[:, np.newaxis]))
+    )
 
-        # --- primary: spans whose bbox intersects the word bbox ---
-        mask = (
-            (sx0 <= x_right + eps)
-            & (sx1 >= x_left - eps)
-            & (stop <= y_bottom + eps)
-            & (sbot >= y_top - eps)
-        )
+    # Span-level features, broadcast over words
+    span_h        = S_y1 - S_y0                                              # (S,)
+    height_ok     = span_h[np.newaxis, :] >= 0.7 * w_height[:, np.newaxis]  # (W, S)
+    vertical_flag = np.abs(S_dir_y) > np.abs(S_dir_x)                       # (S,)
 
-        if mask.any():
-            # candidate spans
-            cand_idx = np.where(mask)[0]
+    # Intersection score (W, S); non-intersecting entries → -inf
+    score = np.where(
+        intersects,
+        inter_area / w_area[:, np.newaxis]
+            + 0.5 * height_ok
+            + 0.2 * vertical_flag[np.newaxis, :],
+        -np.inf,
+    )
 
-            # intersection bbox per candidate
-            inter_x0 = np.maximum(sx0[cand_idx], x_left)
-            inter_y0 = np.maximum(stop[cand_idx], y_top)
-            inter_x1 = np.minimum(sx1[cand_idx], x_right)
-            inter_y1 = np.minimum(sbot[cand_idx], y_bottom)
+    # Words that have ≥1 intersecting span with a positive score use intersection
+    # scoring; all others (no intersection or only zero-area touches) fall back to
+    # nearest-centre matching — preserving the original per-word logic exactly.
+    use_intersection = intersects.any(axis=1) & (score > 0).any(axis=1)  # (W,)
 
-            inter_w = np.maximum(0.0, inter_x1 - inter_x0)
-            inter_h = np.maximum(0.0, inter_y1 - inter_y0)
-            inter_area = inter_w * inter_h
+    # Fallback: negative squared distance so argmax gives the nearest span centre
+    dist2 = (
+        (S_cx[np.newaxis, :] - W_cx[:, np.newaxis]) ** 2
+        + (S_cy[np.newaxis, :] - W_cy[:, np.newaxis]) ** 2
+    )
 
-            # how much of the word is covered?
-            area_ratio = inter_area / w_area  # 0..1+
+    final_score = np.where(use_intersection[:, np.newaxis], score, -dist2)
+    best = final_score.argmax(axis=1)  # (W,) — positional indices into span arrays
 
-            # is span height comparable to word height?
-            span_h = sbot[cand_idx] - stop[cand_idx]
-            height_ok = span_h >= 0.7 * w_height  # big spans get a bonus
-
-            # is span vertical-ish?
-            vertical_flag = np.abs(s_dir_y[cand_idx]) > np.abs(s_dir_x[cand_idx])
-
-            # build a simple score:
-            #   - area_ratio is the main signal
-            #   - +0.5 bonus if span is tall enough
-            #   - +0.2 bonus if vertical (for rotated TOC labels)
-            score = area_ratio.copy()
-            score += 0.5 * height_ok.astype(float)
-            score += 0.2 * vertical_flag.astype(float)
-
-            # if everything is zero (e.g. weird geometry), fall back to nearest
-            if (score > 0).any():
-                best_local = score.argmax()
-                idx_abs = span_index[cand_idx[best_local]]
-            else:
-                # fallback to nearest center among all spans
-                dx_all = scx - w_cx
-                dy_all = scy - w_cy
-                dist2_all = dx_all * dx_all + dy_all * dy_all
-                idx_rel = dist2_all.argmin()
-                idx_abs = span_index[idx_rel]
-        else:
-            # --- no intersecting spans: fallback to globally nearest center ---
-            dx_all = scx - w_cx
-            dy_all = scy - w_cy
-            dist2_all = dx_all * dx_all + dy_all * dy_all
-            idx_rel = dist2_all.argmin()
-            idx_abs = span_index[idx_rel]
-
-        # attach style + orientation from the chosen span
-        fontnames.append(s_font[idx_abs])
-        font_sizes.append(s_size[idx_abs])
-        ns_colors.append(s_ns[idx_abs])
-        s_colors.append(s_s[idx_abs])
-
-        dx_span = s_dir_x[idx_abs]
-        dy_span = s_dir_y[idx_abs]
-        orientations.append(_orientation_from_dir(dx_span, dy_span))
-
-        #chosen_span_ids.append(s_span_id[idx_abs])
+    # Vectorised orientation label from direction vectors
+    dx, dy = S_dir_x[best], S_dir_y[best]
+    mostly_horiz = np.abs(dx) >= np.abs(dy)
+    THRESH = 0.5
+    text_orientation = np.select(
+        [
+            mostly_horiz & (dx >= THRESH),
+            mostly_horiz & (dx <= -THRESH),
+            ~mostly_horiz & (dy >= THRESH),
+            ~mostly_horiz & (dy <= -THRESH),
+        ],
+        ["LTR", "RTL", "TTB", "BTT"],
+        default="UNKNOWN",
+    )
 
     out = words_df.copy()
-    out["font_name"] = fontnames
-    out["font_size"] = font_sizes
-    out["non_stroking_color"] = ns_colors
-    out["stroking_color"] = s_colors
-    out["text_orientation"] = orientations
-    #out["debug_span_id"] = chosen_span_ids
+    out["font_name"]          = S_font[best]
+    out["font_size"]          = S_size[best]
+    out["non_stroking_color"] = S_ns[best]
+    out["stroking_color"]     = S_sc[best]
+    out["text_orientation"]   = text_orientation
     return out
 
 

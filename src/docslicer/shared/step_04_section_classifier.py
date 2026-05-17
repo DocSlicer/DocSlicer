@@ -45,19 +45,7 @@ from typing import Literal
 import pandas as pd
 import re
 
-
-SectionType = Literal[
-    "toc",
-    "exhibits",
-    "coverpage",
-    "last_page",
-    "body",
-    "annex",
-    "financials",
-    "schedules",
-    "front_matter",
-    "back_matter",
-]
+from docslicer.constants import SectionType  # noqa: F401  (re-exported for callers)
 
 
 # ================================================================================

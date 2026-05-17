@@ -123,12 +123,13 @@ def export_debug(df: pd.DataFrame, drop_none: bool = False) -> pd.DataFrame:
             # Skip columns that can't be accessed normally
             continue
     
-    # Round all float columns to 2 decimals (keeps ints as ints)
-    # Include all numeric types that could contain float values
-    float_cols = df.select_dtypes(include=['float64', 'float32', 'Float64', 'Float32']).columns
-    if len(float_cols) > 0:
-        df[float_cols] = df[float_cols].round(2)
-    
+    # Round all float columns to 2 decimals (keeps ints as ints).
+    # Use positional indexing to handle DataFrames with duplicate column names.
+    float_dtypes = {'float64', 'float32', 'Float64', 'Float32'}
+    for i, dt in enumerate(df.dtypes):
+        if str(dt) in float_dtypes:
+            df.iloc[:, i] = df.iloc[:, i].round(2)
+
     # Escape Excel-style formulas in text column
     if "text" in df.columns:
         df["text"] = (
@@ -137,7 +138,7 @@ def export_debug(df: pd.DataFrame, drop_none: bool = False) -> pd.DataFrame:
             .astype(str)
             .apply(lambda s: "'" + s if s.startswith(("+", "-", "=")) else s)
         )
-    
+
     return df
 
 
@@ -199,11 +200,12 @@ def export_production(
             # Skip columns that can't be accessed normally
             continue
     
-    # Round all float columns to 2 decimals (keeps ints as ints)
-    # Include all numeric types that could contain float values
-    float_cols = df.select_dtypes(include=['float64', 'float32', 'Float64', 'Float32']).columns
-    if len(float_cols) > 0:
-        df[float_cols] = df[float_cols].round(2)
+    # Round all float columns to 2 decimals (keeps ints as ints).
+    # Use positional indexing to handle DataFrames with duplicate column names.
+    float_dtypes = {'float64', 'float32', 'Float64', 'Float32'}
+    for i, dt in enumerate(df.dtypes):
+        if str(dt) in float_dtypes:
+            df.iloc[:, i] = df.iloc[:, i].round(2)
     
     # Escape Excel-style formulas in text column
     if "text" in df.columns:

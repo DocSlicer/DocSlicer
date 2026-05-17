@@ -18,7 +18,11 @@ class Geometry(TypedDict, total=False):
     width: float
     height: float
     text_align: Optional[Literal["left", "center", "right", "justify"]]  # HTML only
+    x_center: float
+    y_center: float
     top_bucket: Optional[int]
+    center_bucket: Optional[int]
+    bottom_bucket: Optional[int]
 
 
 class Styling(TypedDict, total=False):
@@ -127,7 +131,7 @@ class ShapeSchema(Geometry, Styling, DocumentIdentity):
     fill: bool
     stroke: bool
     paint_op: str
-    orientation: Literal["horizontal", "vertical", "unknown"]
+    shape_orientation: Literal["horizontal", "vertical", "unknown"]
 
 
 class LinkSchema(Geometry, DocumentIdentity):
@@ -164,6 +168,7 @@ class LineSchema(DocumentIdentity, Geometry, Styling, ContentBase, PageContext):
     - PageContext: page_width, page_height, page_number
     """
     line_id: int
+    temp_line_id: int # Temporary line assignment to clean up OCR text (before analysis is done whether the line is text singlecol, multicol or table)
     word_ids: List[int]
 
     # Line-specific scores
@@ -177,39 +182,25 @@ class LineSchema(DocumentIdentity, Geometry, Styling, ContentBase, PageContext):
     capitalized_token_ratio: float
 
 
-class BlockSchema(DocumentIdentity, ContentBase):
-    """
-    Schema for block-level DataFrames.
-
-    Note: Blocks use different geometry naming (left/top_first) for historical reasons.
-    """
+class BlockSchema(DocumentIdentity, Geometry, ContentBase):
+    """Schema for block-level DataFrames."""
     block_id: int
     line_ids: List[int]
     page_label: str
     section: str
 
-    # Block-specific geometry
-    top_first: float  # y_top of first line
-    left: float
-    width: float
-
-    # Block-specific fields
-    font_size_px: float
-    font_size_z: float
+    # Style aggregates
+    font_size: float
     is_bold: int
     is_italic: int
     is_underlined: int
+    bold_ratio: float
+    uppercase_ratio: float
+    digit_ratio: float
     text_align: str
     has_link: int
     has_image: int
-
-    # Calculated features
-    block_len_chars: int
     is_single_line: bool
-    bold_ratio: float
-    has_inline_bold: int
-    uppercase_ratio: float
-    digit_ratio: float
 
     # Classification
     block_type: Literal["page_label", "toc", "toc_heading", "exhibits", "exhibit_heading", "hr", "image",
@@ -221,6 +212,97 @@ class BlockSchema(DocumentIdentity, ContentBase):
     table_ids: List[int]
     links_per_line: Optional[List[List[str]]]
     ixbrl_ids: Optional[List[List[str]]]
+
+
+# --- docx / pptx run level --- #
+
+class _RunProvenance(TypedDict, total=False):
+    """Fields that describe where an XML run sits in the document structure."""
+    run_type: str               # text / tab / image_ref / chart_ref / section_break / …
+    run_index: int              # position within parent paragraph
+    order_index: int            # global sequential position in document
+    source_part: str            # body / footnotes / endnotes / header / footer / …
+    source_part_id: str         # ID of the item within that part
+    header_footer_type: str     # body / header / footer  (docx)
+    nested_table_depth: int     # 0 = top-level, >0 = inside table cell  (docx)
+    page_break_before: bool     # paragraph-level page break flag  (docx)
+    section_break_after: bool   # docx
+    section_break_type: str     # nextPage / continuous / evenPage / oddPage  (docx)
+    bookmark_id: str            # docx
+    bookmark_ids: List[str]     # docx
+    bookmark_names: List[str]   # docx
+    comment_id: str             # docx
+    footnote_id: str            # docx
+    endnote_id: str             # docx
+    placeholder_type: str       # title / body / subtitle / …  (pptx)
+
+
+class _StyleInheritance(TypedDict, total=False):
+    """Style-inheritance chain columns, resolved through the docx style graph."""
+    paragraph_style_id: str
+    paragraph_style_name: str
+    effective_paragraph_style_id: str
+    effective_paragraph_style_name: str
+    character_style_id: str
+    character_style_name: str
+    effective_character_style_id: str
+    effective_character_style_name: str
+
+
+class _ListOutline(TypedDict, total=False):
+    """List and outline-level fields shared by docx and pptx."""
+    list_num_id: str            # docx numbering definition ID
+    list_level: str             # 0-based level within the numbering definition
+    list_label: str             # rendered label: "1.", "a)", "•", …
+    list_type: str              # pptx: bullet / autoNumber / none
+    list_auto_type: str         # pptx: arabicPeriod / romanUC / …
+    list_start_at: int          # pptx: override start value
+    outline_level: int          # 0-based heading depth from style (docx/pptx)
+
+
+class RunSchema(
+    _RunProvenance, _StyleInheritance, _ListOutline,
+    Geometry, Styling, ContentBase, BaseMetadata, PageContext, DocumentIdentity,
+):
+    """
+    Schema for run-level DataFrames produced by docx and pptx extractors.
+
+    A run is the atomic text unit in Office XML — a sequence of characters
+    sharing identical character-level formatting within one paragraph.
+
+    Inherits:
+    - DocumentIdentity: document_name, document_id
+    - PageContext: page_number, page_label, section
+    - Geometry: x_left / x_right / y_top / y_bottom (not always populated)
+    - Styling: font_name, font_size, bold/italic flags, colors, text_align, …
+    - ContentBase: text, char_count, …
+    - BaseMetadata: has_link, link_url, …
+    - _RunProvenance: run_type, order_index, source_part, header_footer_type, …
+    - _StyleInheritance: paragraph_style_id, effective_paragraph_style_id, …
+    - _ListOutline: list_num_id, list_level, list_label, outline_level, …
+    """
+    run_id: int
+    paragraph_id: int
+    section_id: int             # docx
+    slide_index: int            # pptx
+
+
+class ParagraphSchema(
+    _ListOutline, _StyleInheritance,
+    Geometry, Styling, ContentBase, PageContext, DocumentIdentity,
+):
+    """
+    Schema for paragraph-level DataFrames (docx / pptx step_04/05).
+
+    Paragraphs are produced by aggregating runs; one row = one XML <w:p> / <a:p>.
+
+    Inherits:
+    - DocumentIdentity, PageContext, Geometry, Styling, ContentBase
+    - _ListOutline, _StyleInheritance
+    """
+    paragraph_id: int
+    run_count: int              # number of runs aggregated into this paragraph
+    block_type: Optional[str]   # image / table / None (set before line-building)
 
 
 # ==========================================
@@ -330,6 +412,16 @@ def validate_shape_df(df: pd.DataFrame, strict: bool = False) -> pd.DataFrame:
     return SchemaValidator.validate(df, ShapeSchema, strict=strict)
 
 
+def validate_run_df(df: pd.DataFrame, strict: bool = False) -> pd.DataFrame:
+    """Validate run-level DataFrame (docx / pptx)."""
+    return SchemaValidator.validate(df, RunSchema, strict=strict)
+
+
+def validate_paragraph_df(df: pd.DataFrame, strict: bool = False) -> pd.DataFrame:
+    """Validate paragraph-level DataFrame (docx / pptx)."""
+    return SchemaValidator.validate(df, ParagraphSchema, strict=strict)
+
+
 # ==========================================
 # GEOMETRY NORMALIZATION (prevent drift)
 # ==========================================
@@ -373,7 +465,7 @@ def normalize_geometry(df: pd.DataFrame, target_schema: type) -> pd.DataFrame:
 
 def show_schema_inheritance() -> None:
     """Print inheritance for all schemas."""
-    schemas = [WordSchema, LineSchema, CellSchema, BlockSchema, ShapeSchema]
+    schemas = [WordSchema, RunSchema, ParagraphSchema, LineSchema, CellSchema, BlockSchema, ShapeSchema]
     for schema in schemas:
         print(f"\n{'='*60}")
         SchemaValidator.print_schema(schema)
@@ -381,18 +473,26 @@ def show_schema_inheritance() -> None:
 
 
 # ==========================================
-# TYPE ALIASES (shared across package)
+# TYPE ALIASES (re-exported from constants for backwards compatibility)
 # ==========================================
 
-BlockType = Literal[
-    "page_label", "toc", "exhibits", "hr", "image",
-    "table", "heading", "paragraph"
-]
+from .constants import (
+    BlockType,
+    ShapeType,
+    ShapeOrientation,
+    Orientation,
+    SectionType,
+    TextAlign,
+)
 
-ShapeType = Literal["line", "rect", "curve"]
-Orientation = Literal["horizontal", "vertical", "unknown"]
-SectionType = Literal["coverpage", "body", "last_page"]
-TextAlign = Literal["left", "center", "right", "justify"]
+__all__ = [
+    "BlockType",
+    "ShapeType",
+    "ShapeOrientation",
+    "Orientation",
+    "SectionType",
+    "TextAlign",
+]
 
 
 # ==========================================

@@ -1,5 +1,5 @@
 """
-step_06_cell_builder.py
+step_08_cell_builder.py
 
 Words → Cells.
 
@@ -18,8 +18,6 @@ Public API:
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
-
 import numpy as np
 import pandas as pd
 
@@ -33,7 +31,7 @@ from .._utils.text_utils import is_bullet_token
 # ================================================================================
 
 def _interpolate_font_gap(
-    font_size: Optional[float],
+    font_size: float | None,
     gap_at_low: float = 6.0,
     gap_at_high: float = 10.0,
     low_size: float = 10.0,
@@ -55,6 +53,10 @@ _BULLET_MERGE_MAX_GAP   = 30.0   # max gap for bullet → text merge
 _DOLLAR_MERGE_MAX_GAP   = 60.0   # max gap for "$" → number merge
 _SENTENCE_MERGE_MAX_GAP = 10.0   # wider tolerance for justified paragraph text
 
+# Underline detection thresholds
+_UNDERLINE_COVERAGE_THRESHOLD  = 95.0
+_UNDERLINE_SEPARATOR_GAP       = 10.0
+_UNDERLINE_X_OVERLAP_EPS       = 1e-4
 
 # Grammar-glue stopwords for sentence detection
 _STOPWORDS = {
@@ -62,8 +64,7 @@ _STOPWORDS = {
     "into", "among", "including", "that", "which", "who", "whose", "its",
     "is", "are", "was", "were", "be", "been", "being",
 }
-_PUNCT_CHARS  = ".,;:"
-_STRIP_CHARS  = ".,;:()[]{}\"'"
+_STRIP_CHARS = ".,;:()[]{}\"'"
 
 
 # ================================================================================
@@ -75,10 +76,6 @@ def _is_numeric_like(text: str) -> bool:
         return False
     text = str(text).strip()
     return bool(text) and all(ch.isdigit() or ch in ",.()-+% " for ch in text)
-
-
-def _is_bullet_token(text: str) -> bool:
-    return is_bullet_token(text)
 
 
 # ================================================================================
@@ -149,7 +146,101 @@ def is_sentence_like_line(words_df_line: pd.DataFrame) -> tuple[bool, int]:
     if capitalized >= 4 and stop_hits == 0:
         score -= 2
 
+    # Threshold of 4 balances precision/recall across mixed document styles;
+    # combined with the n < 5 guard above, false positives on short numeric rows are rare.
     return score >= 4, score
+
+
+# ================================================================================
+# READING ORDER PRE-SORT
+# ================================================================================
+
+def _sort_reading_order(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Sort words into correct reading order for mixed single/multi-column pages.
+
+    Problem with a naive (page, y_top) sort:
+        A page may have singlecol content, then a 2-col section, then more singlecol.
+        Grouping all col-1 words first, then col-2, pushes col-2 below the trailing
+        singlecol content — violating reading order.
+
+    Solution — compute a zone_y per word, then sort by (zone_y, reading_column, y_top, x_left):
+        • Singlecol words (reading_column=1, no gutter_id_right): zone_y = y_top (their own)
+        • Multicol words: zone_y = min(y_top) of col-1 words that share the same gutter zone
+
+    For 3-column layouts the zone is propagated via the gutter chain:
+        col1 has gutter_id_right=G1 → zone_y[G1] = min y_top of col-1 words
+        col2 has gutter_id_left=G1, gutter_id_right=G2 → zone_y[G2] = zone_y[G1]
+        col3 has gutter_id_left=G2 → gets zone_y[G2] = zone_y[G1]
+    """
+    if df.empty:
+        return df
+
+    has_right = "gutter_id_right" in df.columns
+    has_left  = "gutter_id_left"  in df.columns
+    has_rc    = "reading_column"  in df.columns
+
+    if not has_right or df["gutter_id_right"].isna().all():
+        return df.sort_values(
+            ["page_number", "y_top", "x_left"], kind="mergesort"
+        ).reset_index(drop=True)
+
+    df = df.copy()
+    rc = df["reading_column"].fillna(1).astype(int) if has_rc else pd.Series(1, index=df.index)
+
+    df["_zone_y"] = df["y_top"].astype(float)
+    df["_rc"]     = rc
+
+    for page in df["page_number"].unique():
+        pm = df["page_number"] == page
+
+        col1_gutter_mask = pm & df["gutter_id_right"].notna() & (rc == 1)
+        if not col1_gutter_mask.any():
+            continue
+
+        zone_y: dict = (
+            df.loc[col1_gutter_mask]
+            .groupby("gutter_id_right")["y_top"]
+            .min()
+            .to_dict()
+        )
+
+        # Propagate zone_y through gutter chains for 3+ column layouts.
+        # Reduce to unique (G_left, G_right) pairs — avoids iterating over every word.
+        if has_left:
+            chain_mask = pm & df["gutter_id_left"].notna() & df["gutter_id_right"].notna()
+            if chain_mask.any():
+                chain_pairs = (
+                    df.loc[chain_mask, ["gutter_id_left", "gutter_id_right"]]
+                    .drop_duplicates()
+                )
+                chain_pairs = chain_pairs[chain_pairs["gutter_id_left"].isin(zone_y)]
+                if not chain_pairs.empty:
+                    chain_pairs = chain_pairs.copy()
+                    chain_pairs["_inherited"] = chain_pairs["gutter_id_left"].map(zone_y)
+                    min_inherited = chain_pairs.groupby("gutter_id_right")["_inherited"].min()
+                    for G_right, inherited in min_inherited.items():
+                        zone_y[G_right] = min(inherited, zone_y.get(G_right, inherited))
+
+        for G, zy in zone_y.items():
+            right_mask = pm & (df["gutter_id_right"] == G)
+            if right_mask.any():
+                df.loc[right_mask, "_zone_y"] = zy
+
+            if has_left:
+                left_mask = pm & (df["gutter_id_left"] == G)
+                if left_mask.any():
+                    df.loc[left_mask, "_zone_y"] = zy
+
+    result = (
+        df.sort_values(
+            ["page_number", "_zone_y", "_rc", "y_top", "x_left"],
+            kind="mergesort",
+        )
+        .drop(columns=["_zone_y", "_rc"])
+        .reset_index(drop=True)
+    )
+    return result
 
 
 # ================================================================================
@@ -192,7 +283,7 @@ def _assign_cell_ids(df: pd.DataFrame) -> pd.DataFrame:
 
     # np.frompyfunc vectorises Python callables without a Python-level loop
     bullet_flags  = (
-        np.frompyfunc(_is_bullet_token, 1, 1)(stripped.to_numpy()).astype(bool)
+        np.frompyfunc(is_bullet_token, 1, 1)(stripped.to_numpy()).astype(bool)
         if _BULLET_MERGE_ENABLED else
         np.zeros(len(text_arr), dtype=bool)
     )
@@ -277,6 +368,7 @@ def _assign_cell_ids(df: pd.DataFrame) -> pd.DataFrame:
         for k in range(i, j - 1):
             gap = x_left_arr[k + 1] - x_right_arr[k]
 
+            # Negative gap means bounding boxes overlap — always a cell boundary.
             if gap < 0:
                 next_cell_id += 1
                 current_cell = next_cell_id
@@ -465,7 +557,7 @@ def _add_rect_relationships(
             continue
 
         # argmax gives the index of the first True along axis=1 (first matching rect wins)
-        first_rect_pos  = inside_2d.argmax(axis=1)
+        first_rect_pos   = inside_2d.argmax(axis=1)
         target_cell_idxs = cell_idxs[has_any]
         matched_rects    = page_rects.iloc[first_rect_pos[has_any]]
 
@@ -480,7 +572,7 @@ def _add_rect_relationships(
     return df_cells
 
 
-def add_vertical_line_relationships_to_cells(
+def _add_vertical_line_relationships(
     cells_df: pd.DataFrame,
     shapes_df: pd.DataFrame,
 ) -> pd.DataFrame:
@@ -491,8 +583,8 @@ def add_vertical_line_relationships_to_cells(
       - has_vertical_line: bool
       - shape_id_vertical_line: list[int] | None
     """
-    cells_df["has_vertical_line"]       = False
-    cells_df["shape_id_vertical_line"]  = None
+    cells_df["has_vertical_line"]      = False
+    cells_df["shape_id_vertical_line"] = None
 
     if shapes_df.empty:
         return cells_df
@@ -551,11 +643,6 @@ def add_vertical_line_relationships_to_cells(
 # UNDERLINE RELATIONSHIPS  (inlined from _utils/cell_underline_assessor.py)
 # ================================================================================
 
-_UNDERLINE_COVERAGE_THRESHOLD  = 95.0
-_UNDERLINE_SEPARATOR_GAP       = 10.0
-_UNDERLINE_X_OVERLAP_EPS       = 1e-4
-
-
 def _union_coverage(line_left: float, line_right: float, segments: list[tuple[float, float]]) -> float:
     """Percent of line width covered by the union of segments."""
     line_width = line_right - line_left
@@ -587,11 +674,15 @@ def _union_coverage(line_left: float, line_right: float, segments: list[tuple[fl
     return 100.0 * covered / line_width
 
 
-def _x_overlap_width(cx_l, cx_r, ax_l_arr, ax_r_arr) -> np.ndarray:
+def _x_overlap_width(
+    cx_l: float, cx_r: float,
+    ax_l_arr: np.ndarray, ax_r_arr: np.ndarray,
+) -> np.ndarray:
+    """Width of x-overlap between a candidate cell and each already-assigned segment."""
     return np.minimum(cx_r, ax_r_arr) - np.maximum(cx_l, ax_l_arr)
 
 
-def assign_cell_underlines(
+def _assign_cell_underlines(
     cells_df: pd.DataFrame,
     shapes_df: pd.DataFrame,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -607,10 +698,7 @@ def assign_cell_underlines(
     cells["is_underlined"]      = False
     cells["shape_id_underline"] = pd.Series(pd.NA, index=cells.index, dtype="Int64")
 
-    if "line_role" not in shapes.columns:
-        shapes["line_role"] = pd.NA
-    else:
-        shapes["line_role"] = pd.NA
+    shapes["line_role"] = pd.NA
 
     for col in ["y_top", "y_bottom", "x_left", "x_right"]:
         if col in cells.columns:
@@ -742,106 +830,14 @@ def assign_cell_underlines(
 
 
 # ================================================================================
-# READING ORDER PRE-SORT
-# ================================================================================
-
-def _sort_reading_order(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Sort words into correct reading order for mixed single/multi-column pages.
-
-    Problem with a naive (page, y_top) sort:
-        A page may have singlecol content, then a 2-col section, then more singlecol.
-        Grouping all col-1 words first, then col-2, pushes col-2 below the trailing
-        singlecol content — violating reading order.
-
-    Solution — compute a zone_y per word, then sort by (zone_y, reading_column, y_top, x_left):
-        • Singlecol words (reading_column=1, no gutter_id_right): zone_y = y_top (their own)
-        • Multicol words: zone_y = min(y_top) of col-1 words that share the same gutter zone
-
-    For 3-column layouts the zone is propagated via the gutter chain:
-        col1 has gutter_id_right=G1 → zone_y[G1] = min y_top of col-1 words
-        col2 has gutter_id_left=G1, gutter_id_right=G2 → zone_y[G2] = zone_y[G1]
-        col3 has gutter_id_left=G2 → gets zone_y[G2] = zone_y[G1]
-    """
-    if df.empty:
-        return df
-
-    has_right = "gutter_id_right" in df.columns
-    has_left  = "gutter_id_left"  in df.columns
-    has_rc    = "reading_column"  in df.columns
-
-    if not has_right or df["gutter_id_right"].isna().all():
-        return df.sort_values(
-            ["page_number", "y_top", "x_left"], kind="mergesort"
-        ).reset_index(drop=True)
-
-    df = df.copy()
-    rc = df["reading_column"].fillna(1).astype(int) if has_rc else pd.Series(1, index=df.index)
-
-    df["_zone_y"] = df["y_top"].astype(float)
-    df["_rc"]     = rc
-
-    for page in df["page_number"].unique():
-        pm = df["page_number"] == page
-
-        col1_gutter_mask = pm & df["gutter_id_right"].notna() & (rc == 1)
-        if not col1_gutter_mask.any():
-            continue
-
-        zone_y: dict = (
-            df.loc[col1_gutter_mask]
-            .groupby("gutter_id_right")["y_top"]
-            .min()
-            .to_dict()
-        )
-
-        # Propagate zone_y through gutter chains for 3+ column layouts.
-        # Reduce to unique (G_left, G_right) pairs — avoids iterating over every word.
-        if has_left:
-            chain_mask = pm & df["gutter_id_left"].notna() & df["gutter_id_right"].notna()
-            if chain_mask.any():
-                chain_pairs = (
-                    df.loc[chain_mask, ["gutter_id_left", "gutter_id_right"]]
-                    .drop_duplicates()
-                )
-                chain_pairs = chain_pairs[chain_pairs["gutter_id_left"].isin(zone_y)]
-                if not chain_pairs.empty:
-                    chain_pairs = chain_pairs.copy()
-                    chain_pairs["_inherited"] = chain_pairs["gutter_id_left"].map(zone_y)
-                    min_inherited = chain_pairs.groupby("gutter_id_right")["_inherited"].min()
-                    for G_right, inherited in min_inherited.items():
-                        zone_y[G_right] = min(inherited, zone_y.get(G_right, inherited))
-
-        for G, zy in zone_y.items():
-            right_mask = pm & (df["gutter_id_right"] == G)
-            if right_mask.any():
-                df.loc[right_mask, "_zone_y"] = zy
-
-            if has_left:
-                left_mask = pm & (df["gutter_id_left"] == G)
-                if left_mask.any():
-                    df.loc[left_mask, "_zone_y"] = zy
-
-    result = (
-        df.sort_values(
-            ["page_number", "_zone_y", "_rc", "y_top", "x_left"],
-            kind="mergesort",
-        )
-        .drop(columns=["_zone_y", "_rc"])
-        .reset_index(drop=True)
-    )
-    return result
-
-
-# ================================================================================
 # PUBLIC API
 # ================================================================================
 
 def build_cells(
     df_words: pd.DataFrame,
-    df_shapes: Optional[pd.DataFrame] = None,
-    df_links:  Optional[pd.DataFrame] = None,
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    df_shapes: pd.DataFrame | None = None,
+    df_links:  pd.DataFrame | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Build cell-level DataFrame from word-level input.
 
@@ -849,7 +845,7 @@ def build_cells(
     ----------
     df_words : pd.DataFrame
         Word-level data. Expected columns include reading_column, gutter_id_left,
-        gutter_id_right (from step_05_gutter_extractor) plus standard word fields.
+        gutter_id_right (from step_07_gutter_extractor) plus standard word fields.
     df_shapes : pd.DataFrame, optional
     df_links  : pd.DataFrame, optional
 
@@ -907,11 +903,11 @@ def build_cells(
 
     # --- Step 6: Vertical line relationships ---
     if df_shapes is not None and not df_shapes.empty:
-        add_vertical_line_relationships_to_cells(df_cells, df_shapes)
+        _add_vertical_line_relationships(df_cells, df_shapes)
 
     # --- Step 7: Underline relationships ---
     if df_shapes is not None and not df_shapes.empty:
-        df_cells, df_shapes = assign_cell_underlines(df_cells, df_shapes)
+        df_cells, df_shapes = _assign_cell_underlines(df_cells, df_shapes)
 
     # Recombine LTR + vertical words (vertical words carry no cell/line IDs)
     # Also restore line-number words so df_words_out remains complete for debug.

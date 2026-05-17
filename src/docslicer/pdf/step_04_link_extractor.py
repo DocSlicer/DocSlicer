@@ -1,7 +1,7 @@
 # step_03_link_extractor.py
 
 """
-Step 03 – Raw link extraction (PyMuPDF version)
+Step 04 – Raw link extraction (PyMuPDF version)
 
 Responsibility:
     - Open a PDF with PyMuPDF (fitz)

@@ -378,8 +378,8 @@ def colorize_words_df(
     out["non_stroking_color_hex_raw"] = ink_hex_raw
     out["background_non_stroking_color_hex_raw"] = bg_hex_raw
 
-    out["non_stroking_color_hex"] = ink_hex_norm
-    out["background_non_stroking_color_hex"] = bg_hex_norm
+    out["non_stroking_color"] = ink_hex_norm
+    out["background_non_stroking_color"] = bg_hex_norm
 
     out["ink_coverage"] = ink_cov
 

@@ -1,28 +1,15 @@
 """
-step_05_gutter_extractor.py
+step_07_gutter_detector.py
 """
 
 from __future__ import annotations
 
 import re
 
+import numpy as np
 import pandas as pd
 
 from .._utils.text_utils import is_list_marker
-
-# Numeric value: optional currency prefix, number body (123 / 1,23 / 1.23 / (123)), optional % or currency suffix
-_NUMERIC_VALUE_RE = re.compile(
-    r'^[\$€£¥₹₩₪₫₭₮₯₰₱₲₳₴₵₶₷₸₹₺₻₼₽₾]?\(?\d[\d,\.]*\)?[\$€£¥₹₩₪₫₭₮₯₰₱₲₳₴₵₶₷₸₹₺₻₼₽₾%]?$'
-)
-_DASH_TOKENS = {"-", "–", "—", "−"}
-
-
-def _is_numeric_or_dash(text: object) -> bool:
-    """True if text is a numeric value (possibly with currency/percent) or a dash."""
-    if text is None or (isinstance(text, float) and pd.isna(text)):
-        return False
-    t = str(text).strip()
-    return bool(t) and (t in _DASH_TOKENS or bool(_NUMERIC_VALUE_RE.match(t)))
 
 # =======================================================================================================================
 # CONFIG
@@ -40,6 +27,7 @@ _MIN_INTERNAL_GAPS: int = 3 # how many internal gaps does a gutter_candidate_id 
 _MAX_INTERNAL_GAP_DENSITY: int = 3 # those _MIN_INTERNAL_GAPS need to come from gutter_candidate_id with <= 4 internal gaps, otherwise if those gaps only exist within high density areas, its a table
 _MAX_GUTTER_WINDOW_Y_GAP: float = 30.0  # pt - if the y distance between two consecutive sliding windows exceeds this, kill all active gutters (large vertical gap = new layout region)
 _EDGE_WINDOW_Y_GAP_FACTOR: float = 1.4  # if the first/last window of a gutter_candidate_id is page_left/page_right and its y-distance to the adjacent window exceeds this multiple of the median gap, eject it
+_GUTTER_X_SNAP_EPS: float = 0.5        # pt - epsilon for floating-point x-coordinate comparisons at gutter edges
 
 
 
@@ -88,13 +76,16 @@ def add_sliding_windows(words_df: pd.DataFrame) -> pd.DataFrame:
     # 651, 655, 659 with window=5 would never split (each gap=4) even though
     # 659 > 651+5.  The correct rule requires remembering bucket_start.
     def _new_bucket_flags(y_series: pd.Series) -> pd.Series:
-        flags = pd.Series(False, index=y_series.index)
-        bucket_start = None
-        for idx, y in y_series.items():
-            if bucket_start is None or y > bucket_start + _Y_TOP_SLIDING_WINDOW:
-                bucket_start = y
-                flags[idx] = True
-        return flags
+        y = y_series.to_numpy(dtype=np.float64)
+        flags = np.zeros(len(y), dtype=bool)
+        if len(y):
+            flags[0] = True
+            bucket_start = y[0]
+            for i in range(1, len(y)):
+                if y[i] > bucket_start + _Y_TOP_SLIDING_WINDOW:
+                    flags[i] = True
+                    bucket_start = y[i]
+        return pd.Series(flags, index=y_series.index, dtype=bool)
 
     is_new_bucket = df.groupby("page_number", sort=False, group_keys=False).apply(
         lambda g: _new_bucket_flags(g["y_top"])
@@ -122,7 +113,7 @@ def add_page_x_bounds(words_df: pd.DataFrame) -> pd.DataFrame:
       - x_page_max: per-page max x_right (computed on a filtered subset)
 
     Rules:
-      - Only use rows where text_orientation == "LRT"
+      - Only use rows where text_orientation == "LTR"
       - Exclude the first and last sliding_window_id per page
       - Bounds are: min(x_left), max(x_right) over the remaining rows
       - Broadcast bounds back to all rows in that page
@@ -367,15 +358,15 @@ def build_gutter_candidate_df(words_df: pd.DataFrame) -> pd.DataFrame:
 
     # Calculate internal_gap_density per (page_number, sliding_window_id)
     # This counts how many "internal_gap" candidates exist in each sliding window
-    internal_gap_counts = (
+    _density = (
         gutters[gutters["candidate_type"] == "internal_gap"]
         .groupby(["page_number", "sliding_window_id"], sort=False)
         .size()
+        .rename("internal_gap_density")
+        .reset_index()
     )
-    gutters["internal_gap_density"] = (
-        gutters.set_index(["page_number", "sliding_window_id"])
-        .index.map(lambda idx: internal_gap_counts.get(idx, 0))
-    )
+    gutters = gutters.merge(_density, on=["page_number", "sliding_window_id"], how="left")
+    gutters["internal_gap_density"] = gutters["internal_gap_density"].fillna(0).astype(int)
 
     return gutters[
         [
@@ -460,169 +451,160 @@ def cluster_gutter_candidates(
         raise ValueError(f"Missing required columns: {sorted(missing)}")
     
     df = gutters_df.copy()
-    
-    # Sort by page_number, then sliding_window_id, then by x position
     df = df.sort_values(
         ["page_number", "sliding_window_id", "gutter_x_left", "gutter_x_right"],
         kind="mergesort"
     ).reset_index(drop=True)
-    
-    # Initialize output columns (lists)
-    gutter_candidate_ids = []
-    gutter_candidate_shapes = []
-    
-    # Track active gutters per page
-    # Key: gutter_id, Value: (x_left, x_right)
-    next_gutter_id = 1
-    
-    # Prepare horizontal lines data for checking between windows (if available)
-    horizontal_lines = None
+
+    # Pre-extract numpy arrays — avoids repeated DataFrame column access in the hot loop
+    arr_x_left = df["gutter_x_left"].values
+    arr_x_right = df["gutter_x_right"].values
+
+    # Build window-id → y-value map without iterrows
+    if "sliding_window" in df.columns:
+        sliding_window_y_map = dict(zip(
+            df["sliding_window_id"].values, df["sliding_window"].values
+        ))
+    else:
+        sliding_window_y_map = {}
+
+    # Pre-group rows by (page, window) so inner loops never do boolean DataFrame masking
+    page_win_map: dict = {}
+    for (page_num, win_id), idxs in sorted(
+        df.groupby(["page_number", "sliding_window_id"], sort=True).groups.items()
+    ):
+        page_win_map.setdefault(page_num, []).append((win_id, idxs.to_numpy()))
+
+    # Pre-group horizontal lines by page for O(1) per-window lookup
+    page_h_lines: dict = {}
     if shapes_df is not None and not shapes_df.empty:
-        if all(col in shapes_df.columns for col in ["shape_orientation", "shape_type", "page_number", "x_left", "x_right", "y_top"]):
-            horizontal_lines = shapes_df[
+        required_cols = {"shape_orientation", "shape_type", "page_number", "x_left", "x_right", "y_top"}
+        if required_cols.issubset(shapes_df.columns):
+            h_lines = shapes_df[
                 (shapes_df["shape_orientation"].astype(str).str.lower() == "horizontal") &
                 (shapes_df["shape_type"].astype(str).str.lower() == "line")
-            ].copy()
-    
-    # Get sliding window y values mapping (window_id -> y value) if available
-    sliding_window_y_map = {}
-    if "sliding_window" in df.columns:
-        for _, row in df[["sliding_window_id", "sliding_window"]].drop_duplicates().iterrows():
-            sliding_window_y_map[row["sliding_window_id"]] = row["sliding_window"]
-    
-    # Process page by page
-    for page_num in df["page_number"].unique():
-        page_mask = df["page_number"] == page_num
-        page_df = df[page_mask].copy()
-        
-        # Track active gutters for this page
-        active_gutters = {}  # {gutter_id: (x_left, x_right)}
+            ]
+            for pn, grp in h_lines.groupby("page_number", sort=False):
+                page_h_lines[pn] = (
+                    grp["x_left"].values,
+                    grp["x_right"].values,
+                    grp["y_top"].values,
+                )
+
+    n_rows = len(df)
+    gutter_candidate_ids: list = [None] * n_rows
+    gutter_candidate_shapes: list = [None] * n_rows
+    next_gutter_id = 1
+
+    for page_num, win_list in page_win_map.items():
+        active_gutters: dict = {}  # {gutter_id: (x_left, x_right)}
         prev_window_id = None
-        
-        # Get sorted window IDs for this page
-        window_ids = sorted(page_df["sliding_window_id"].unique())
-        
-        # Process each sliding window in order
-        for window_idx, window_id in enumerate(window_ids):
-            # Kill all active gutters on a gap in window IDs or a large y jump
+        n_wins = len(win_list)
+
+        for win_pos, (window_id, win_idxs) in enumerate(win_list):
+            # Kill all active gutters on a window-ID gap or a large y jump
             if prev_window_id is not None:
                 if window_id != prev_window_id + 1:
                     active_gutters.clear()
                 else:
                     prev_y = sliding_window_y_map.get(prev_window_id)
                     curr_y = sliding_window_y_map.get(window_id)
-                    if prev_y is not None and curr_y is not None and (curr_y - prev_y) > _MAX_GUTTER_WINDOW_Y_GAP:
+                    if (
+                        prev_y is not None and curr_y is not None
+                        and (curr_y - prev_y) > _MAX_GUTTER_WINDOW_Y_GAP
+                    ):
                         active_gutters.clear()
-            
-            window_mask = page_df["sliding_window_id"] == window_id
-            window_rows = page_df[window_mask]
-            
+
+            node_lefts = arr_x_left[win_idxs]
+            node_rights = arr_x_right[win_idxs]
+
             # Gutter-centric best-path matching:
             # Each active gutter picks the single node with the largest overlap
             # (>= _MIN_GUTTER_CANDIDATE_OVERLAP), preventing marginal touches from
             # stealing a gutter_candidate_id away from a better-matching node.
             # A node can still be claimed by multiple gutters (if multiple gutters
             # each independently chose it as their best match).
+            gutter_best: dict = {}
+            if active_gutters:
+                gids_list = list(active_gutters.keys())
+                g_lefts = np.array([active_gutters[g][0] for g in gids_list])
+                g_rights = np.array([active_gutters[g][1] for g in gids_list])
 
-            # Step 1: for each active gutter, find its best node
-            gutter_best = {}  # {gutter_id: (node_idx, int_left, int_right)}
-            for gutter_id, (g_left, g_right) in active_gutters.items():
-                best_idx = None
-                best_overlap = 0.0
-                best_int_left = best_int_right = None
-                for idx, row in window_rows.iterrows():
-                    int_left = max(row["gutter_x_left"], g_left)
-                    int_right = min(row["gutter_x_right"], g_right)
-                    overlap = int_right - int_left
-                    if overlap >= _MIN_GUTTER_CANDIDATE_OVERLAP and overlap > best_overlap:
-                        best_overlap = overlap
-                        best_idx = idx
-                        best_int_left, best_int_right = int_left, int_right
-                if best_idx is not None:
-                    gutter_best[gutter_id] = (best_idx, best_int_left, best_int_right)
+                # Vectorized overlap matrix: shape (n_gutters, n_nodes)
+                int_lefts = np.maximum(g_lefts[:, None], node_lefts[None, :])
+                int_rights = np.minimum(g_rights[:, None], node_rights[None, :])
+                overlaps = int_rights - int_lefts
+                valid = overlaps >= _MIN_GUTTER_CANDIDATE_OVERLAP
 
-            # Step 2: invert — for each node, collect the gutters that chose it
-            node_claimed_by = {}  # {node_idx: [(gutter_id, int_left, int_right)]}
-            for gutter_id, (node_idx, int_left, int_right) in gutter_best.items():
-                node_claimed_by.setdefault(node_idx, []).append((gutter_id, int_left, int_right))
+                best_node_local = np.argmax(np.where(valid, overlaps, -np.inf), axis=1)
+                has_match = valid[np.arange(len(gids_list)), best_node_local]
 
-            # Step 3: build per-node output; unclaimed nodes start a new gutter
-            matched_gutters = {}
-            for idx, row in window_rows.iterrows():
-                node_x_left = row["gutter_x_left"]
-                node_x_right = row["gutter_x_right"]
-                claims = node_claimed_by.get(idx, [])
+                for i, gid in enumerate(gids_list):
+                    if has_match[i]:
+                        ni = int(best_node_local[i])
+                        gutter_best[gid] = (
+                            int(win_idxs[ni]),
+                            float(int_lefts[i, ni]),
+                            float(int_rights[i, ni]),
+                        )
+
+            # Invert: node df-index → list of (gutter_id, int_left, int_right)
+            node_claimed_by: dict = {}
+            for gid, (df_idx, il, ir) in gutter_best.items():
+                node_claimed_by.setdefault(df_idx, []).append((gid, il, ir))
+
+            matched_gutters: dict = {}
+            for local_i, df_idx in enumerate(win_idxs):
+                df_idx = int(df_idx)
+                node_x_left = float(node_lefts[local_i])
+                node_x_right = float(node_rights[local_i])
+                claims = node_claimed_by.get(df_idx, [])
                 if claims:
-                    candidate_gutter_ids = [g for g, _, _ in claims]
-                    candidate_gutter_shapes = [f"[{l:.2f}, {r:.2f}]" for _, l, r in claims]
-                    for gutter_id, int_left, int_right in claims:
-                        matched_gutters[gutter_id] = (int_left, int_right)
+                    out_ids = [g for g, _, _ in claims]
+                    out_shapes = [f"[{l:.2f}, {r:.2f}]" for _, l, r in claims]
+                    for gid, il, ir in claims:
+                        matched_gutters[gid] = (il, ir)
                 else:
                     new_id = next_gutter_id
                     next_gutter_id += 1
-                    candidate_gutter_ids = [new_id]
-                    candidate_gutter_shapes = [f"[{node_x_left:.2f}, {node_x_right:.2f}]"]
+                    out_ids = [new_id]
+                    out_shapes = [f"[{node_x_left:.2f}, {node_x_right:.2f}]"]
                     matched_gutters[new_id] = (node_x_left, node_x_right)
-                gutter_candidate_ids.append(candidate_gutter_ids)
-                gutter_candidate_shapes.append(candidate_gutter_shapes)
-            
-            # Update active_gutters: keep only matched gutters, remove too-narrow ones
-            new_active_gutters = {}
-            for gutter_id, (new_left, new_right) in matched_gutters.items():
-                width = new_right - new_left
-                if width >= _MIN_GAP_WIDTH:
-                    new_active_gutters[gutter_id] = (new_left, new_right)
-                # else: gutter dies (too narrow)
-            
-            active_gutters = new_active_gutters
-            
-            # Check for horizontal lines between current and next sliding window
-            # If a horizontal line crosses a gutter's x bounds, kill that gutter
-            if horizontal_lines is not None and not horizontal_lines.empty and window_idx < len(window_ids) - 1:
-                next_window_id = window_ids[window_idx + 1]
-                
-                # Get y values for current and next window
-                current_y = sliding_window_y_map.get(window_id)
-                next_y = sliding_window_y_map.get(next_window_id)
-                
-                if current_y is not None and next_y is not None:
-                    # Get horizontal lines on this page between current and next window
-                    page_lines = horizontal_lines[
-                        (horizontal_lines["page_number"] == page_num) &
-                        (horizontal_lines["y_top"] > current_y) &
-                        (horizontal_lines["y_top"] < next_y)
-                    ]
-                    
-                    if not page_lines.empty:
-                        # Check each active gutter against these lines
-                        gutters_to_kill = []
-                        for gutter_id, (g_left, g_right) in active_gutters.items():
-                            for _, line in page_lines.iterrows():
-                                line_x_left = line["x_left"]
-                                line_x_right = line["x_right"]
-                                
-                                # Check if line overlaps with gutter's x bounds by at least
-                                # _MIN_GUTTER_CANDIDATE_OVERLAP (marginal touches do not kill)
-                                overlap_left = max(line_x_left, g_left)
-                                overlap_right = min(line_x_right, g_right)
+                gutter_candidate_ids[df_idx] = out_ids
+                gutter_candidate_shapes[df_idx] = out_shapes
 
-                                if overlap_right - overlap_left >= _MIN_GUTTER_LINE_KILL_OVERLAP:
-                                    # Horizontal line crosses this gutter - kill it
-                                    gutters_to_kill.append(gutter_id)
-                                    break
-                        
-                        # Remove gutters killed by horizontal lines
-                        for gutter_id in gutters_to_kill:
-                            if gutter_id in active_gutters:
-                                del active_gutters[gutter_id]
-            
-            # Update for next iteration
+            # Drop gutters that became too narrow
+            active_gutters = {
+                gid: bounds
+                for gid, bounds in matched_gutters.items()
+                if bounds[1] - bounds[0] >= _MIN_GAP_WIDTH
+            }
+
+            # Vectorized horizontal-line kill check for the gap before the next window
+            if active_gutters and win_pos < n_wins - 1 and page_num in page_h_lines:
+                next_win_id = win_list[win_pos + 1][0]
+                current_y = sliding_window_y_map.get(window_id)
+                next_y = sliding_window_y_map.get(next_win_id)
+                if current_y is not None and next_y is not None:
+                    lx, rx, ly = page_h_lines[page_num]
+                    between = (ly > current_y) & (ly < next_y)
+                    if between.any():
+                        lx_b, rx_b = lx[between], rx[between]
+                        gids_list = list(active_gutters.keys())
+                        g_lefts = np.array([active_gutters[g][0] for g in gids_list])
+                        g_rights = np.array([active_gutters[g][1] for g in gids_list])
+                        # (n_gutters, n_lines) overlap
+                        ol = np.maximum(g_lefts[:, None], lx_b[None, :])
+                        or_ = np.minimum(g_rights[:, None], rx_b[None, :])
+                        kill = (or_ - ol >= _MIN_GUTTER_LINE_KILL_OVERLAP).any(axis=1)
+                        for i, gid in enumerate(gids_list):
+                            if kill[i]:
+                                del active_gutters[gid]
+
             prev_window_id = window_id
-    
-    # Add the new columns to the dataframe
+
     df["gutter_candidate_id"] = gutter_candidate_ids
     df["gutter_candidate_shape"] = gutter_candidate_shapes
-    
     return df
 
 
@@ -647,66 +629,65 @@ def eject_outlier_edge_windows(candidates_df: pd.DataFrame) -> pd.DataFrame:
     if candidates_df is None or candidates_df.empty:
         return candidates_df
 
-    import numpy as np
-
     df = candidates_df.copy().reset_index(drop=True)
     df["_orig_idx"] = df.index
 
-    # Explode to one row per scalar gutter_candidate_id for analysis
+    # Explode and pre-sort once — avoids per-group sort_values inside the loop
     exploded = (
         df[["_orig_idx", "gutter_candidate_id", "sliding_window", "candidate_type"]]
         .explode("gutter_candidate_id")
         .dropna(subset=["gutter_candidate_id"])
+        .sort_values(["gutter_candidate_id", "sliding_window"])
+        .reset_index(drop=True)
     )
 
-    to_eject: set[tuple] = set()  # (orig_idx, gutter_candidate_id)
+    orig_idxs = exploded["_orig_idx"].values
+    gids = exploded["gutter_candidate_id"].values
+    y_vals_all = exploded["sliding_window"].values.astype(float)
+    ctypes = exploded["candidate_type"].values
 
-    for gid, grp in exploded.groupby("gutter_candidate_id", sort=False):
-        grp = grp.sort_values("sliding_window").reset_index(drop=True)
-        n = len(grp)
-        if n < 3:
+    # np.unique on the pre-sorted gids gives group boundaries without per-group sorting
+    unique_gids, group_starts = np.unique(gids, return_index=True)
+    group_ends = np.append(group_starts[1:], len(gids))
+
+    to_eject_by_row: dict = {}  # {orig_idx: set of gutter_ids to remove}
+
+    for i, gid in enumerate(unique_gids):
+        s, e = int(group_starts[i]), int(group_ends[i])
+        if e - s < 3:
             continue  # need at least 2 gaps for a meaningful median
 
-        y_vals = grp["sliding_window"].to_numpy(dtype=float)
-        gaps = y_vals[1:] - y_vals[:-1]
-        median_gap = float(np.median(gaps))
+        y = y_vals_all[s:e]
+        median_gap = float(np.median(y[1:] - y[:-1]))
         if median_gap <= 0:
             continue
 
         threshold = _EDGE_WINDOW_Y_GAP_FACTOR * median_gap
 
-        # First window
-        if grp.iloc[0]["candidate_type"] in ("page_left", "page_right"):
-            if (y_vals[1] - y_vals[0]) > threshold:
-                to_eject.add((int(grp.iloc[0]["_orig_idx"]), gid))
+        if ctypes[s] in ("page_left", "page_right") and (y[1] - y[0]) > threshold:
+            to_eject_by_row.setdefault(int(orig_idxs[s]), set()).add(gid)
 
-        # Last window
-        if grp.iloc[-1]["candidate_type"] in ("page_left", "page_right"):
-            if (y_vals[-1] - y_vals[-2]) > threshold:
-                to_eject.add((int(grp.iloc[-1]["_orig_idx"]), gid))
+        if ctypes[e - 1] in ("page_left", "page_right") and (y[-1] - y[-2]) > threshold:
+            to_eject_by_row.setdefault(int(orig_idxs[e - 1]), set()).add(gid)
 
-    if not to_eject:
+    if not to_eject_by_row:
         return candidates_df
 
-    # Remove ejected (orig_idx, gutter_id) pairs from the list columns
-    def _filter_row(row):
-        orig_idx = row["_orig_idx"]
-        ids = row["gutter_candidate_id"]
-        shapes = row["gutter_candidate_shape"]
-        new_ids, new_shapes = [], []
-        for gid, gshape in zip(ids, shapes):
-            if (orig_idx, gid) not in to_eject:
-                new_ids.append(gid)
-                new_shapes.append(gshape)
-        return new_ids, new_shapes
-
-    filtered = df.apply(_filter_row, axis=1)
-    df["gutter_candidate_id"] = [r[0] for r in filtered]
-    df["gutter_candidate_shape"] = [r[1] for r in filtered]
+    # Update only the affected rows (typically far fewer than total row count)
     df = df.drop(columns=["_orig_idx"])
+    rows_to_drop = []
+    for orig_idx, gids_to_remove in to_eject_by_row.items():
+        old_ids = df.at[orig_idx, "gutter_candidate_id"]
+        old_shapes = df.at[orig_idx, "gutter_candidate_shape"]
+        new_ids = [g for g in old_ids if g not in gids_to_remove]
+        new_shapes = [sh for g, sh in zip(old_ids, old_shapes) if g not in gids_to_remove]
+        df.at[orig_idx, "gutter_candidate_id"] = new_ids
+        df.at[orig_idx, "gutter_candidate_shape"] = new_shapes
+        if not new_ids:
+            rows_to_drop.append(orig_idx)
 
-    # Drop rows whose ID list became empty
-    df = df[df["gutter_candidate_id"].apply(len) > 0].reset_index(drop=True)
+    if rows_to_drop:
+        df = df.drop(index=rows_to_drop).reset_index(drop=True)
     return df
 
 
@@ -780,29 +761,11 @@ def promote_gutter_candidates_to_gutters(gutters_df: pd.DataFrame, words_df: pd.
     
     df = gutters_df.copy()
     
-    # Explode the list columns to create one row per gutter_candidate_id
-    # Each row had lists of gutter_candidate_id and gutter_candidate_shape
-    # We need to expand them so each ID gets its own row
-    exploded_rows = []
-    
-    for idx, row in df.iterrows():
-        gutter_ids = row["gutter_candidate_id"]
-        gutter_shapes = row["gutter_candidate_shape"]
-        
-        # Handle cases where it might not be a list
-        if not isinstance(gutter_ids, list):
-            gutter_ids = [gutter_ids]
-        if not isinstance(gutter_shapes, list):
-            gutter_shapes = [gutter_shapes]
-        
-        # Create a row for each gutter_id
-        for gid, gshape in zip(gutter_ids, gutter_shapes):
-            new_row = row.copy()
-            new_row["gutter_candidate_id"] = gid
-            new_row["gutter_candidate_shape"] = gshape
-            exploded_rows.append(new_row)
-    
-    if not exploded_rows:
+    # Explode list columns so each gutter_candidate_id gets its own row
+    df = df.explode(["gutter_candidate_id", "gutter_candidate_shape"])
+    df = df.dropna(subset=["gutter_candidate_id"]).reset_index(drop=True)
+
+    if df.empty:
         return pd.DataFrame(
             columns=[
                 "page_number", "gutter_candidate_id",
@@ -811,8 +774,6 @@ def promote_gutter_candidates_to_gutters(gutters_df: pd.DataFrame, words_df: pd.
                 "gutter_width", "gutter_height",
             ]
         )
-    
-    df = pd.DataFrame(exploded_rows).reset_index(drop=True)
     
     # Group by gutter_candidate_id to calculate metrics
     grouped = df.groupby("gutter_candidate_id", sort=False)
@@ -895,15 +856,6 @@ def promote_gutter_candidates_to_gutters(gutters_df: pd.DataFrame, words_df: pd.
     # Filter to only valid gutters
     valid_df = df[df["gutter_candidate_id"].isin(valid_ids)].copy()
     
-    # Helper to parse gutter_candidate_shape
-    def parse_shape(shape_str):
-        """Extract x_left and x_right from shape string like '[76.69, 114.25]'"""
-        try:
-            values = shape_str.strip('[]').split(',')
-            return float(values[0].strip()), float(values[1].strip())
-        except:
-            return None, None
-    
     # Aggregate to gutter level (one row per gutter_candidate_id)
     gutter_level = valid_df.groupby(["page_number", "gutter_candidate_id"], sort=False).agg(
         gutter_y_top=("sliding_window", "min"),
@@ -912,38 +864,34 @@ def promote_gutter_candidates_to_gutters(gutters_df: pd.DataFrame, words_df: pd.
     ).reset_index()
     
     # Calculate gutter_y_bottom using max y_bottom of words in last sliding window
-    if words_df is not None and not words_df.empty and "y_bottom" in words_df.columns:
-        # For each gutter, find the max y_bottom of words in the last sliding window
-        gutter_bottoms = []
-        for _, gutter in gutter_level.iterrows():
-            page_num = gutter["page_number"]
-            last_sliding_window = gutter["gutter_y_bottom_sliding"]
-            
-            # Find words in this page and sliding window
-            words_in_window = words_df[
-                (words_df["page_number"] == page_num) &
-                (words_df["sliding_window"] == last_sliding_window)
-            ]
-            
-            if not words_in_window.empty and "y_bottom" in words_in_window.columns:
-                max_y_bottom = words_in_window["y_bottom"].max()
-                gutter_bottoms.append(max_y_bottom)
-            else:
-                # Fallback to sliding_window value if no words found
-                gutter_bottoms.append(last_sliding_window)
-        
-        gutter_level["gutter_y_bottom"] = gutter_bottoms
+    if (
+        words_df is not None
+        and not words_df.empty
+        and "y_bottom" in words_df.columns
+        and "sliding_window" in words_df.columns
+    ):
+        _window_max_y = (
+            words_df.groupby(["page_number", "sliding_window"], sort=False)["y_bottom"]
+            .max()
+            .reset_index()
+            .rename(columns={"sliding_window": "gutter_y_bottom_sliding", "y_bottom": "gutter_y_bottom"})
+        )
+        gutter_level = gutter_level.merge(
+            _window_max_y, on=["page_number", "gutter_y_bottom_sliding"], how="left"
+        )
+        gutter_level["gutter_y_bottom"] = gutter_level["gutter_y_bottom"].fillna(
+            gutter_level["gutter_y_bottom_sliding"]
+        )
     else:
-        # Fallback to sliding_window value if words_df not provided
         gutter_level["gutter_y_bottom"] = gutter_level["gutter_y_bottom_sliding"]
     
     # Drop the temporary sliding window column
     gutter_level = gutter_level.drop(columns=["gutter_y_bottom_sliding"])
     
-    # Parse the final shape to get x bounds
-    gutter_level[["gutter_x_left", "gutter_x_right"]] = gutter_level["final_shape"].apply(
-        lambda s: pd.Series(parse_shape(s))
-    )
+    # Parse the final shape "[x_left, x_right]" to get x bounds — vectorized string ops
+    _parts = gutter_level["final_shape"].str.strip("[]").str.split(",", expand=True)
+    gutter_level["gutter_x_left"] = pd.to_numeric(_parts[0].str.strip(), errors="coerce")
+    gutter_level["gutter_x_right"] = pd.to_numeric(_parts[1].str.strip(), errors="coerce")
     
     # Drop the temporary final_shape column
     gutter_level = gutter_level.drop(columns=["final_shape"])
@@ -963,6 +911,21 @@ def promote_gutter_candidates_to_gutters(gutters_df: pd.DataFrame, words_df: pd.
 # Reject gutters whose left or right side fails content checks
 # ------------------------------
 
+# Numeric value: optional currency prefix, number body (123 / 1,23 / 1.23 / (123)), optional % or currency suffix
+_NUMERIC_VALUE_RE = re.compile(
+    r'^[\$€£¥₹₩₪₫₭₮₯₰₱₲₳₴₵₶₷₸₹₺₻₼₽₾]?\(?\d[\d,\.]*\)?[\$€£¥₹₩₪₫₭₮₯₰₱₲₳₴₵₶₷₸₹₺₻₼₽₾%]?$'
+)
+_DASH_TOKENS = {"-", "–", "—", "−"}
+
+
+def _is_numeric_or_dash(text: object) -> bool:
+    """True if text is a numeric value (possibly with currency/percent) or a dash."""
+    if text is None or (isinstance(text, float) and pd.isna(text)):
+        return False
+    t = str(text).strip()
+    return bool(t) and (t in _DASH_TOKENS or bool(_NUMERIC_VALUE_RE.match(t)))
+
+
 def reject_non_content_gutters(
     gutters_df: pd.DataFrame,
     candidates_df: pd.DataFrame,
@@ -974,7 +937,7 @@ def reject_non_content_gutters(
     either the left or the right side:
 
     1. All words are list/bullet markers  (e.g. "1.", "(a)", "•").
-    2. All words are short  (< 10 characters each).
+    2. All words are short  (< 7 characters each).
     3. All words are numeric values or dashes  (123, 1,23, 1.23, (123), $5, 12%,
        or dash variants).
     4. All words are identical  (e.g. the same date/label repeated on every row).
@@ -1122,43 +1085,35 @@ def filter_gutters_by_horizontal_lines(
         df["intersecting_horizontal_line_ids"] = [[] for _ in range(len(df))]
         return df
     
-    # For each gutter, collect intersecting shape_ids
+    # Pre-group lines by page to avoid repeated full-df boolean masks in the loop
+    page_lines_map = {
+        pn: grp for pn, grp in horizontal_lines.groupby("page_number", sort=False)
+    }
+
+    # For each gutter, collect intersecting shape_ids (vectorized inner check)
     intersecting_ids_list = []
-    
     for _, gutter in df.iterrows():
-        page_num = gutter["page_number"]
-        g_y_min = gutter["gutter_y_top"]
-        g_y_max = gutter["gutter_y_bottom"]
+        page_lines = page_lines_map.get(gutter["page_number"])
+        if page_lines is None or page_lines.empty:
+            intersecting_ids_list.append([])
+            continue
+
+        g_y_min = gutter["gutter_y_top"] - y_padding
+        g_y_max = gutter["gutter_y_bottom"] + y_padding
         g_x_left = gutter["gutter_x_left"]
         g_x_right = gutter["gutter_x_right"]
-        
-        # Apply y_padding to expand the vertical range
-        g_y_min_padded = g_y_min - y_padding
-        g_y_max_padded = g_y_max + y_padding
-        
-        # Get horizontal lines on the same page
-        page_lines = horizontal_lines[horizontal_lines["page_number"] == page_num]
-        
-        intersecting_shape_ids = []
-        
-        for _, line in page_lines.iterrows():
-            line_y = line["y_top"]
-            line_x_left = line["x_left"]
-            line_x_right = line["x_right"]
-            
-            # Check if line's y is within gutter's vertical span (with padding)
-            if g_y_min_padded <= line_y <= g_y_max_padded:
-                # Check if line's x range overlaps with gutter's x range
-                overlap_x_left = max(line_x_left, g_x_left)
-                overlap_x_right = min(line_x_right, g_x_right)
-                overlap_width = overlap_x_right - overlap_x_left
-                
-                # Require at least 10pt of overlap
-                if overlap_width >= min_x_overlap:
-                    # Significant intersection detected!
-                    intersecting_shape_ids.append(line["shape_id"])
-        
-        intersecting_ids_list.append(intersecting_shape_ids)
+
+        in_y = (page_lines["y_top"].values >= g_y_min) & (page_lines["y_top"].values <= g_y_max)
+        if not in_y.any():
+            intersecting_ids_list.append([])
+            continue
+
+        x_overlap = (
+            np.minimum(page_lines["x_right"].values, g_x_right)
+            - np.maximum(page_lines["x_left"].values, g_x_left)
+        )
+        hit = in_y & (x_overlap >= min_x_overlap)
+        intersecting_ids_list.append(page_lines["shape_id"].values[hit].tolist())
     
     # Add the column with intersecting shape_ids
     df["intersecting_horizontal_line_ids"] = intersecting_ids_list
@@ -1268,8 +1223,7 @@ def merge_gutters_onto_words(df_words: pd.DataFrame, df_gutters: pd.DataFrame) -
         # --- gutter_id_left: gutter whose right edge is at or left of the word ---
         # Small epsilon guards against floating-point display equality failing (e.g.
         # gutter_x_right=264.5799... vs x_left=264.5800... comparing as unequal)
-        _EPS = 0.5
-        left = cross[cross["gutter_x_right"] <= cross["x_left"] + _EPS].copy()
+        left = cross[cross["gutter_x_right"] <= cross["x_left"] + _GUTTER_X_SNAP_EPS].copy()
         if not left.empty:
             # nearest = largest gutter_x_right per word
             best_left = (
@@ -1284,7 +1238,7 @@ def merge_gutters_onto_words(df_words: pd.DataFrame, df_gutters: pd.DataFrame) -
             df_words.loc[left_count.index, "reading_column"] = left_count.values + 1
 
         # --- gutter_id_right: gutter whose left edge is at or right of the word ---
-        right = cross[cross["gutter_x_left"] >= cross["x_right"] - _EPS].copy()
+        right = cross[cross["gutter_x_left"] >= cross["x_right"] - _GUTTER_X_SNAP_EPS].copy()
         if not right.empty:
             # nearest = smallest gutter_x_left per word
             best_right = (
@@ -1301,26 +1255,30 @@ def merge_gutters_onto_words(df_words: pd.DataFrame, df_gutters: pd.DataFrame) -
 # Public API
 # =======================================================================================================================
 
-def detect_and_annotate_gutters(df_words: pd.DataFrame, df_shapes: pd.DataFrame) -> pd.DataFrame:
+def detect_and_annotate_gutters(df_words: pd.DataFrame, df_shapes: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     Detect vertical gutters in the document.
     A gutter is a vertical area without text or shapes that separates (part of) a page into two or more columns.
     """
+    _empty = pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
     if df_words is None or df_words.empty:
-        return pd.DataFrame()
+        return _empty
+
+    if "text_orientation" not in df_words.columns:
+        raise ValueError("df_words must contain a 'text_orientation' column")
 
     # Exclude line numbers — they are not part of the text layout and must not
     # influence gutter detection
     if "line_number_flag" in df_words.columns:
-        df_words = df_words[df_words["line_number_flag"] != True].copy()
+        df_words = df_words[df_words["line_number_flag"].ne(True)].copy()
         if df_words.empty:
-            return pd.DataFrame()
+            return _empty
 
     # Filter to only LTR (left-to-right) text orientation
-    if "text_orientation" in df_words.columns:
-        df_words = df_words[df_words["text_orientation"] == "LTR"].copy()
-        if df_words.empty:
-            return pd.DataFrame()
+    df_words = df_words[df_words["text_orientation"] == "LTR"].copy()
+    if df_words.empty:
+        return _empty
 
     # 1) Add sliding windows
     df_words = add_sliding_windows(df_words)
@@ -1328,28 +1286,28 @@ def detect_and_annotate_gutters(df_words: pd.DataFrame, df_shapes: pd.DataFrame)
     # 2) Add page x bounds
     df_words = add_page_x_bounds(df_words)
 
-    # 3) Add gutter candidates
+    # 3) Build gutter candidates
     df_gutter_candidates = build_gutter_candidate_df(df_words)
-    
-    # 3.5) Cluster gutter candidates into persistent gutters
+
+    # 4) Cluster candidates into persistent gutter tracks
     df_gutter_candidates = cluster_gutter_candidates(df_gutter_candidates, df_shapes, df_words)
 
-    # 3.6) Eject page_left/page_right edge windows that are outliers in y-distance
+    # 5) Eject page_left/page_right edge windows that are outliers in y-distance
     df_gutter_candidates = eject_outlier_edge_windows(df_gutter_candidates)
 
-    # 4) Promote gutter candidates to actual gutters
+    # 6) Promote gutter candidates to actual gutters
     df_gutters = promote_gutter_candidates_to_gutters(df_gutter_candidates, df_words)
 
-    # 4.1) Reject gutters whose left or right side looks like non-content (markers, short, numeric, or repeated)
+    # 7) Reject gutters whose left or right side looks like non-content (markers, short, numeric, or repeated)
     df_gutters = reject_non_content_gutters(df_gutters, df_gutter_candidates, df_words)
 
-    # 4.5) Annotate gutters with intersecting horizontal line shape_ids
+    # 8) Annotate gutters with intersecting horizontal line shape_ids
     df_gutters = filter_gutters_by_horizontal_lines(df_gutters, df_shapes)
-    
-    # 4.6) Filter gutters with no intersecting lines and assign gutter_id
+
+    # 9) Filter out gutters crossed by a horizontal line and assign final gutter_id
     df_gutters = filter_and_assign_gutter_ids(df_gutters)
 
-    # 5) Merge gutters onto words
+    # 10) Merge gutters onto words
     df_words = merge_gutters_onto_words(df_words, df_gutters)
 
     return df_words, df_gutter_candidates, df_gutters

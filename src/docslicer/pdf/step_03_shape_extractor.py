@@ -1,5 +1,5 @@
 """
-Step 02 – Raw shape extraction (PyMuPDF version)
+Step 03 – Raw shape extraction (PyMuPDF version)
 
 Responsibility:
     - Open a PDF with PyMuPDF (fitz)

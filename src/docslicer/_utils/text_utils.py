@@ -72,14 +72,35 @@ def is_list_marker(text: object) -> bool:
 ITALIC_RE = re.compile(r"(italic|ital|oblique|slanted|cursive|skew|obl)", re.I)
 BOLD_RE   = re.compile(r"(bold|black|semi[- ]?bold|demi|medium|heavy|extra|ultra)", re.I)
 
-FONT_SUBSET_PREFIX      = re.compile(r"^[A-Z]{6}\+")
+FONT_SUBSET_PREFIX = re.compile(r"^[A-Z]{6}\+")
+FONT_DIGIT_SUFFIX  = re.compile(r"\+\d+$")
+
+# Each atom is a full or abbreviated style word; longer alternatives come first so
+# the engine doesn't greedily consume a short prefix (e.g. "Ital" before "Italic").
+# The `+` quantifier allows compound suffixes like -BoldItalic or -LightObl.
+_STYLE_ATOMS = "|".join([
+    "Italic", "Ital",
+    "Oblique", "Obl",
+    "Regular", "Regu", "Reg",
+    "Bold", "Bd",
+    "Light",
+    "Medium", "Medi", "Med",
+    "Heavy", "Hvy",
+    "Black", "Blk",
+    "Condensed", "Cond",
+    "Extended", "Ext",
+    "Narrow", "Nr",
+    "Thin", "Demi", "Semi", "Ultra", "Extra",
+    "Book", "Normal", "Plain", "Roman",
+    "Upright", "Wide",
+    "It",  # short for Italic; must follow longer Ital/Italic entries
+])
 HYPHENATED_STYLE_SUFFIX = re.compile(
-    r"[-_](bold|italic|oblique|regular|light|medium|heavy|black|thin|"
-    r"demi|semi|extra|ultra|book|normal|plain)$",
+    r"[-_](?:" + _STYLE_ATOMS + r")+$",
     re.I,
 )
 POSTSCRIPT_SUFFIX = re.compile(
-    r"(mt|ps|psmt|ms|tt|std|pro|cyr|ce|baltic|greek|tur|"
+    r"(psmt|mt|ps|ms|tt|std|pro|cyr|ce|baltic|greek|tur|"
     r"hebrew|arabic|vietnamese|eot|woff|ttf)$",
     re.I,
 )
@@ -97,6 +118,7 @@ def _extract_font_family(font_name: str) -> str:
     if not font_name:
         return ""
     family = FONT_SUBSET_PREFIX.sub("", font_name)
+    family = FONT_DIGIT_SUFFIX.sub("", family)
     prev_family = ""
     while prev_family != family:
         prev_family = family
@@ -135,14 +157,20 @@ def add_calculated_text_features(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
 
     # ---- Font features ----
+    # Compute regex once per unique font name, then broadcast via map.
+    # A typical document has O(10) distinct fonts but O(10_000) words.
     if "font_name" in out.columns:
         font_name = out["font_name"].fillna("").astype(str)
+        unique_fonts = font_name.unique()
         if "font_family" not in out.columns:
-            out["font_family"] = font_name.apply(_extract_font_family)
+            _fm = {f: _extract_font_family(f) for f in unique_fonts}
+            out["font_family"] = font_name.map(_fm)
         if "bold_ratio" not in out.columns:
-            out["bold_ratio"] = font_name.apply(lambda f: 1.0 if BOLD_RE.search(f) else 0.0)
+            _bm = {f: 1.0 if BOLD_RE.search(f) else 0.0 for f in unique_fonts}
+            out["bold_ratio"] = font_name.map(_bm)
         if "italic_ratio" not in out.columns:
-            out["italic_ratio"] = font_name.apply(lambda f: 1.0 if ITALIC_RE.search(f) else 0.0)
+            _im = {f: 1.0 if ITALIC_RE.search(f) else 0.0 for f in unique_fonts}
+            out["italic_ratio"] = font_name.map(_im)
 
     # ---- Text features ----
     if "text" in out.columns:
@@ -150,16 +178,16 @@ def add_calculated_text_features(df: pd.DataFrame) -> pd.DataFrame:
         if "char_count" not in out.columns:
             out["char_count"] = text.str.len()
         if "alpha_count" not in out.columns:
-            out["alpha_count"] = text.apply(lambda s: sum(ch.isalpha() for ch in s))
+            out["alpha_count"] = text.str.count(r'[^\W\d_]')
         if "digit_count" not in out.columns:
-            out["digit_count"] = text.apply(lambda s: sum(ch.isdigit() for ch in s))
+            out["digit_count"] = text.str.count(r'\d')
         if "uppercase_count" not in out.columns:
-            out["uppercase_count"] = text.apply(lambda s: sum(ch.isupper() for ch in s))
+            out["uppercase_count"] = text.str.count(r'[A-Z]')
         if "word_count" not in out.columns:
-            out["word_count"] = text.apply(lambda s: len(s.split()))
+            out["word_count"] = text.str.split().str.len().fillna(0).astype(int)
         if "alpha_word_count" not in out.columns:
             out["alpha_word_count"] = text.apply(
-                lambda s: sum(1 for w in s.split() if any(ch.isalpha() for ch in w))
+                lambda s: sum(1 for w in s.split() if any(map(str.isalpha, w)))
             )
         if "capitalized_word_count" not in out.columns:
             out["capitalized_word_count"] = text.apply(

@@ -26,7 +26,11 @@ _BULLET_TOKENS: Set[str] = {
     "*",    # asterisk
     "o",    # lowercase o (open bullet)
     "e",    # lowercase e (OCR of open bullet)
+    "s",    # lowercase s (OCR of open bullet)
+    "a",    # lowercase a (OCR of open bullet)
     "]",    # right bracket
+    "=\u201c",
+    "=\"",
 }
 
 _BULLET = "•"

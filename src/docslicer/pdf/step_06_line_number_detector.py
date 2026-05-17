@@ -1,5 +1,5 @@
 """
-step_05_line_number_detector.py
+step_06_line_number_detector.py
 
 Detects margin line numbers in structured documents (legal, technical, etc.).
 
@@ -88,16 +88,17 @@ def detect_line_numbers(df_words: pd.DataFrame) -> pd.DataFrame:
 def _detect_page_line_numbers(page_df: pd.DataFrame) -> list[int]:
     """Return word_ids identified as line numbers on this page."""
 
-    # Per line_id: pick the leftmost word
-    candidates = (
-        page_df.groupby("line_id", group_keys=False)
-        .apply(lambda g: g.loc[g["x_left"].idxmin()])
-        .reset_index(drop=True)
-    )
+    # Per line_id: pick the leftmost word — idxmin is C-level, no apply overhead
+    idx = page_df.groupby("line_id")["x_left"].idxmin()
+    candidates = page_df.loc[idx].reset_index(drop=True)
 
-    # Keep only narrow, positive-integer tokens
+    # Vectorised positive-integer check (replaces row-wise _is_positive_integer)
+    text_str = candidates["text"].astype(str).str.strip()
+    is_pos_int = text_str.str.fullmatch(r"\d+", na=False) & (
+        pd.to_numeric(text_str, errors="coerce").fillna(0) > 0
+    )
     candidates = candidates[
-        candidates["text"].apply(_is_positive_integer)
+        is_pos_int
         & ((candidates["x_right"] - candidates["x_left"]) <= _MAX_NUMBER_WIDTH)
     ].copy()
 
@@ -119,13 +120,6 @@ def _detect_page_line_numbers(page_df: pd.DataFrame) -> list[int]:
             flagged_ids.extend(cluster["word_id"].tolist())
 
     return flagged_ids
-
-
-def _is_positive_integer(text) -> bool:
-    try:
-        return int(str(text).strip()) > 0
-    except (ValueError, TypeError):
-        return False
 
 
 def _is_monotonically_increasing(nums: list[int]) -> bool:

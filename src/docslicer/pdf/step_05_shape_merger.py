@@ -1,4 +1,4 @@
-# step_04_shape_merger.py
+# step_05_shape_merger.py
 
 from __future__ import annotations
 
@@ -132,28 +132,43 @@ def _make_horizontal_candidate_groups(
     groups: List[CandidateGroup] = []
     group_id = start_group_id
 
-    horiz = df[df["raw_orientation"].isin(["horizontal", "square"])].copy()
+    horiz = df[df["raw_orientation"].isin(["horizontal", "square"])]
 
     for page, page_df in horiz.groupby("page_number"):
-        remaining = page_df.sort_values("raw_shape_id").copy()
+        page_df = page_df.sort_values("raw_shape_id")
 
-        while len(remaining):
-            anchor = remaining.iloc[0]
+        ids     = page_df["raw_shape_id"].to_numpy(dtype=np.int64)
+        y_top   = page_df["y_top"].to_numpy(dtype=np.float64)
+        y_bot   = page_df["y_bottom"].to_numpy(dtype=np.float64)
+        x_left  = page_df["x_left"].to_numpy(dtype=np.float64)
+        x_right = page_df["x_right"].to_numpy(dtype=np.float64)
+
+        used = np.zeros(len(ids), dtype=bool)
+
+        while True:
+            remaining_idx = np.where(~used)[0]
+            if len(remaining_idx) == 0:
+                break
+            i = remaining_idx[0]
+
             mask = (
-                (remaining["y_top"]    - anchor["y_top"]).abs()    <= _GAP_TOL_PX
-            ) & (
-                (remaining["y_bottom"] - anchor["y_bottom"]).abs() <= _GAP_TOL_PX
+                ~used
+                & (np.abs(y_top - y_top[i]) <= _GAP_TOL_PX)
+                & (np.abs(y_bot  - y_bot[i])  <= _GAP_TOL_PX)
             )
-            band_df = remaining[mask]
-            group = CandidateGroup.from_shapes_df(
+            used |= mask
+
+            groups.append(CandidateGroup(
                 group_id=group_id,
-                page_number=page,
-                shape_orientation="horizontal",
-                shapes_df=band_df,
-            )
-            groups.append(group)
+                page_number=int(page),
+                raw_shape_ids=ids[mask].tolist(),
+                group_orientation="horizontal",
+                x_left=float(x_left[mask].min()),
+                x_right=float(x_right[mask].max()),
+                y_top=float(y_top[mask].min()),
+                y_bottom=float(y_bot[mask].max()),
+            ))
             group_id += 1
-            remaining = remaining[~remaining["raw_shape_id"].isin(group.raw_shape_ids)]
 
     return groups, group_id
 
@@ -201,25 +216,40 @@ def _make_vertical_candidate_groups(
     group_id = start_group_id
 
     for page, page_df in vertical_df.groupby("page_number"):
-        remaining = page_df.sort_values("raw_shape_id").copy()
+        page_df = page_df.sort_values("raw_shape_id")
 
-        while len(remaining):
-            anchor = remaining.iloc[0]
+        ids     = page_df["raw_shape_id"].to_numpy(dtype=np.int64)
+        x_left  = page_df["x_left"].to_numpy(dtype=np.float64)
+        x_right = page_df["x_right"].to_numpy(dtype=np.float64)
+        y_top   = page_df["y_top"].to_numpy(dtype=np.float64)
+        y_bot   = page_df["y_bottom"].to_numpy(dtype=np.float64)
+
+        used = np.zeros(len(ids), dtype=bool)
+
+        while True:
+            remaining_idx = np.where(~used)[0]
+            if len(remaining_idx) == 0:
+                break
+            i = remaining_idx[0]
+
             mask = (
-                (remaining["x_left"]  - anchor["x_left"]).abs()  <= _GAP_TOL_PX
-            ) & (
-                (remaining["x_right"] - anchor["x_right"]).abs() <= _GAP_TOL_PX
+                ~used
+                & (np.abs(x_left  - x_left[i])  <= _GAP_TOL_PX)
+                & (np.abs(x_right - x_right[i]) <= _GAP_TOL_PX)
             )
-            band_df = remaining[mask]
-            group = CandidateGroup.from_shapes_df(
+            used |= mask
+
+            groups.append(CandidateGroup(
                 group_id=group_id,
-                page_number=page,
-                shape_orientation="vertical",
-                shapes_df=band_df,
-            )
-            groups.append(group)
+                page_number=int(page),
+                raw_shape_ids=ids[mask].tolist(),
+                group_orientation="vertical",
+                x_left=float(x_left[mask].min()),
+                x_right=float(x_right[mask].max()),
+                y_top=float(y_top[mask].min()),
+                y_bottom=float(y_bot[mask].max()),
+            ))
             group_id += 1
-            remaining = remaining[~remaining["raw_shape_id"].isin(group.raw_shape_ids)]
 
     return groups, group_id
 
@@ -229,7 +259,7 @@ def _make_vertical_candidate_groups(
 # ==============================
 
 def _build_shape_record(
-    df: pd.DataFrame,
+    indexed_df: pd.DataFrame,
     group: CandidateGroup,
     raw_shape_ids: List[int],
     shape_id: int,
@@ -237,8 +267,9 @@ def _build_shape_record(
     """
     Build a merged shape record from a run of raw shape IDs.
     Geometry is the union bbox; drawing metadata is taken from the first shape.
+    indexed_df must be indexed by raw_shape_id.
     """
-    sub = df[df["raw_shape_id"].isin(raw_shape_ids)].sort_values("raw_shape_id")
+    sub = indexed_df.loc[sorted(raw_shape_ids)]
     rep = sub.iloc[0]
 
     x_left   = float(sub["x_left"].min())
@@ -304,7 +335,7 @@ def _build_shape_record(
 
 
 def _split_candidate_group(
-    df: pd.DataFrame,
+    indexed_df: pd.DataFrame,
     group: CandidateGroup,
     *,
     start_id: int,
@@ -315,22 +346,35 @@ def _split_candidate_group(
     """
     Split a CandidateGroup into one or more shape records by chaining segments
     within _CHAIN_TOL_PX of each other along the primary axis.
+    indexed_df must be indexed by raw_shape_id.
     """
-    sub = df[df["raw_shape_id"].isin(group.raw_shape_ids)].sort_values(sort_col)
+    sub = indexed_df.loc[group.raw_shape_ids].sort_values(sort_col)
+
+    n = len(sub)
+    if n == 0:
+        return []
+
+    raw_ids     = sub.index.to_numpy(dtype=np.int64)
+    x_left_arr  = sub["x_left"].to_numpy(dtype=np.float64)
+    x_right_arr = sub["x_right"].to_numpy(dtype=np.float64)
+    y_top_arr   = sub["y_top"].to_numpy(dtype=np.float64)
+    y_bot_arr   = sub["y_bottom"].to_numpy(dtype=np.float64)
+    gap_ref_arr = sub[gap_ref_col].to_numpy(dtype=np.float64)
+    use_x_right = gap_to_col == "x_right"
 
     records: List[Dict[str, Any]] = []
     current_ids: List[int] = []
-    current_x0 = current_x1 = current_top = current_bottom = None
+    current_x0 = current_x1 = current_top = current_bottom = 0.0
     prev_gap_to: float | None = None
     next_id = start_id
 
-    for _, row in sub.iterrows():
-        sid       = int(row["raw_shape_id"])
-        sx0       = float(row["x_left"])
-        sx1       = float(row["x_right"])
-        sy_top    = float(row["y_top"])
-        sy_bottom = float(row["y_bottom"])
-        gap_ref   = float(row[gap_ref_col])
+    for i in range(n):
+        sid       = int(raw_ids[i])
+        sx0       = x_left_arr[i]
+        sx1       = x_right_arr[i]
+        sy_top    = y_top_arr[i]
+        sy_bottom = y_bot_arr[i]
+        gap_ref   = gap_ref_arr[i]
 
         if prev_gap_to is None:
             current_ids    = [sid]
@@ -340,12 +384,12 @@ def _split_candidate_group(
             current_bottom = sy_bottom
         elif gap_ref - prev_gap_to <= _CHAIN_TOL_PX:
             current_ids.append(sid)
-            current_x0     = min(current_x0, sx0)
-            current_x1     = max(current_x1, sx1)
-            current_top    = min(current_top, sy_top)
-            current_bottom = max(current_bottom, sy_bottom)
+            if sx0 < current_x0: current_x0 = sx0
+            if sx1 > current_x1: current_x1 = sx1
+            if sy_top < current_top: current_top = sy_top
+            if sy_bottom > current_bottom: current_bottom = sy_bottom
         else:
-            records.append(_build_shape_record(df, group, current_ids, next_id))
+            records.append(_build_shape_record(indexed_df, group, current_ids, next_id))
             next_id        += 1
             current_ids    = [sid]
             current_x0     = sx0
@@ -354,34 +398,34 @@ def _split_candidate_group(
             current_bottom = sy_bottom
 
         # Track the trailing edge of the current run (not just the current shape)
-        prev_gap_to = current_x1 if gap_to_col == "x_right" else current_bottom
+        prev_gap_to = current_x1 if use_x_right else current_bottom
 
     if current_ids:
-        records.append(_build_shape_record(df, group, current_ids, next_id))
+        records.append(_build_shape_record(indexed_df, group, current_ids, next_id))
 
     return records
 
 
 def _shapes_from_horizontal_group(
-    df: pd.DataFrame,
+    indexed_df: pd.DataFrame,
     group: CandidateGroup,
     *,
     start_id: int = 1,
 ) -> List[Dict[str, Any]]:
     return _split_candidate_group(
-        df, group, start_id=start_id,
+        indexed_df, group, start_id=start_id,
         sort_col="x_left", gap_ref_col="x_left", gap_to_col="x_right",
     )
 
 
 def _shapes_from_vertical_group(
-    df: pd.DataFrame,
+    indexed_df: pd.DataFrame,
     group: CandidateGroup,
     *,
     start_id: int = 1,
 ) -> List[Dict[str, Any]]:
     return _split_candidate_group(
-        df, group, start_id=start_id,
+        indexed_df, group, start_id=start_id,
         sort_col="y_top", gap_ref_col="y_top", gap_to_col="y_bottom",
     )
 
@@ -402,7 +446,8 @@ def _run_merge(df: pd.DataFrame) -> pd.DataFrame:
     next_shape_id = 1
 
     for page_number in sorted(df["page_number"].unique()):
-        page_df = df[df["page_number"] == page_number].copy()
+        page_df = df[df["page_number"] == page_number]
+        indexed_page_df = page_df.set_index("raw_shape_id")
 
         # Horizontal pass
         h_groups, next_group_id = _make_horizontal_candidate_groups(
@@ -410,7 +455,7 @@ def _run_merge(df: pd.DataFrame) -> pd.DataFrame:
         )
         page_shapes: List[Dict[str, Any]] = []
         for g in h_groups:
-            shapes = _shapes_from_horizontal_group(page_df, g, start_id=next_shape_id)
+            shapes = _shapes_from_horizontal_group(indexed_page_df, g, start_id=next_shape_id)
             page_shapes.extend(shapes)
             next_shape_id += len(shapes)
 
@@ -419,7 +464,7 @@ def _run_merge(df: pd.DataFrame) -> pd.DataFrame:
             page_df, page_shapes, start_group_id=next_group_id
         )
         for g in v_groups:
-            shapes = _shapes_from_vertical_group(page_df, g, start_id=next_shape_id)
+            shapes = _shapes_from_vertical_group(indexed_page_df, g, start_id=next_shape_id)
             page_shapes.extend(shapes)
             next_shape_id += len(shapes)
 
