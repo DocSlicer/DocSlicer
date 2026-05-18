@@ -25,6 +25,7 @@ from .._utils.line_merger import assign_line_id
 _MIN_SERIES_LENGTH: int = 3       # minimum candidates to qualify as line numbers
 _X_ALIGN_TOLERANCE: float = 5.0   # pt — max x_left spread within an x-cluster
 _MAX_NUMBER_WIDTH: float = 30.0   # pt — line-number token must be narrow
+_MAX_MISSING_NUMBERS_PER_PAGE: int = 1  # allow at most one skipped line number
 
 
 # =============================================================================
@@ -110,21 +111,43 @@ def _detect_page_line_numbers(page_df: pd.DataFrame) -> list[int]:
     # Sort by reading order (y_top ascending)
     candidates = candidates.sort_values("y_top").reset_index(drop=True)
 
-    # Group into x-aligned clusters, then check each for monotonic increase
+    # Group into x-aligned clusters, then check each for a near-contiguous series.
     flagged_ids: list[int] = []
+    missing_budget = _MAX_MISSING_NUMBERS_PER_PAGE
     for cluster in _cluster_by_x(candidates):
         if len(cluster) < _MIN_SERIES_LENGTH:
             continue
         nums = cluster.sort_values("y_top")["_num"].tolist()
-        if _is_monotonically_increasing(nums):
+        ok, missing_count = _is_line_number_sequence(nums, max_missing=missing_budget)
+        if ok:
             flagged_ids.extend(cluster["word_id"].tolist())
+            missing_budget -= missing_count
 
     return flagged_ids
 
 
-def _is_monotonically_increasing(nums: list[int]) -> bool:
-    """Strictly increasing; gaps are allowed."""
-    return all(b > a for a, b in zip(nums, nums[1:]))
+def _is_line_number_sequence(nums: list[int], *, max_missing: int) -> tuple[bool, int]:
+    """
+    Return whether nums look like margin line numbers and how many numbers are missing.
+
+    Line numbers should be contiguous. To tolerate one missed OCR/tokenization row,
+    the page gets a tiny missing-number budget, e.g. [1, 2, 4, 5] is acceptable
+    with max_missing=1, while TOC/page-label jumps like [2, 12, 14] are not.
+    """
+    if len(nums) < _MIN_SERIES_LENGTH:
+        return False, 0
+
+    missing_count = 0
+    for a, b in zip(nums, nums[1:]):
+        diff = b - a
+        if diff <= 0:
+            return False, missing_count
+
+        missing_count += diff - 1
+        if missing_count > max_missing:
+            return False, missing_count
+
+    return True, missing_count
 
 
 def _cluster_by_x(candidates: pd.DataFrame) -> list[pd.DataFrame]:

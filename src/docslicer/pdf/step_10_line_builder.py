@@ -10,7 +10,7 @@ Pipeline:
     Step 1: Aggregate cells → df_lines
         - Groups cells by line_id
         - Merges text, geometry, style, counts
-        - Aggregates shape_id_vertical_line (union per line)
+        - Aggregates shape_id_vertical_grid_line (union per line)
         - Creates bracketed 'cells' column: "[cell1] [cell2] [cell3]"
 
     Step 2: Assign horizontal bands
@@ -18,6 +18,8 @@ Pipeline:
         - Gutter-aware: right-column lines compute their zone-entry gap
           vs the last singlecol content before the gutter started, not vs
           the end of the parallel left column
+        - Each (gutter_id, reading_column) gets its own independent bands;
+          cells from different sides of a gutter never share a band_id
         - Adds: line_gap, horizontal_band_id, page_gap_thresh to df_lines
 
     Step 3: Merge bands by shared vertical lines
@@ -53,7 +55,7 @@ _MIN_PAGE_GAP_THRESH: float = 3.5
 _FLAG_COLS = [
     "has_link",
     "is_underlined",
-    "has_vertical_line",
+    "has_vertical_grid_line",
 ]
 
 
@@ -139,7 +141,7 @@ def _aggregate_cells_to_lines(df_cells: pd.DataFrame) -> pd.DataFrame:
     bold/italic ratios: char-count-weighted average across cells.
     Style:    most common value across cells.
     Flags:    True if any cell has the flag (max).
-    shape_id_vertical_line: union of all vertical line IDs across cells.
+    shape_id_vertical_grid_line: union of all vertical grid-line IDs across cells.
     """
     df = df_cells.sort_values(["line_id", "x_left", "y_top"], kind="mergesort").copy()
 
@@ -157,8 +159,8 @@ def _aggregate_cells_to_lines(df_cells: pd.DataFrame) -> pd.DataFrame:
         },
         count_col="cell_id",
     )
-    if "shape_id_vertical_line" in df.columns:
-        agg_spec["shape_id_vertical_line"] = _collect_unique_list
+    if "shape_id_vertical_grid_line" in df.columns:
+        agg_spec["shape_id_vertical_grid_line"] = _collect_unique_list
 
     grouped = aggregate_hierarchical(
         df,
@@ -230,12 +232,50 @@ def _assign_horizontal_bands(df_lines: pd.DataFrame) -> pd.DataFrame:
     df["horizontal_band_id"] = 0
     df["page_gap_thresh"]    = 0.0
 
+    # ------------------------------------------------------------------
+    # Precompute sort keys so each gutter zone is fully resolved per
+    # reading column before moving on.  This guarantees horizontal_band_id
+    # is monotonically increasing when the output is sorted by line_id
+    # (which follows reading order: rc=1 before rc=2 within each zone).
+    #
+    #   _gid     — effective gutter_id (left preferred, else right, else NA)
+    #   _rc_key  — 0 for singlecol, reading_column for gutter lines
+    #   _zone_y  — min y_top of the zone (gutter) or y_top (singlecol);
+    #              anchors the zone relative to surrounding singlecol content
+    # ------------------------------------------------------------------
+    if has_gl and has_gr:
+        gid_s = df["gutter_id_left"].where(df["gutter_id_left"].notna(), df["gutter_id_right"])
+    elif has_gl:
+        gid_s = df["gutter_id_left"].copy()
+    elif has_gr:
+        gid_s = df["gutter_id_right"].copy()
+    else:
+        gid_s = pd.Series(pd.NA, index=df.index)
+    df["_gid"] = gid_s
+
+    if has_rc:
+        df["_rc_key"] = df["reading_column"].fillna(1).astype(int)
+    else:
+        df["_rc_key"] = 1
+    df.loc[df["_gid"].isna(), "_rc_key"] = 0  # singlecol sorts before gutter cols
+
+    df["_zone_y"] = df["y_top"].astype(float)
+    gutter_mask = df["_gid"].notna()
+    if gutter_mask.any():
+        df.loc[gutter_mask, "_zone_y"] = (
+            df[gutter_mask]
+            .groupby(["page_number", "_gid"])["y_top"]
+            .transform("min")
+            .astype(float)
+        )
+
     band_counter = 0  # increments globally across pages
 
     for _, page_df in df.groupby("page_number", sort=True):
 
-        # Sort lines top-to-bottom for this page.
-        sorted_idx = page_df.sort_values("y_top").index.tolist()
+        # Sort: singlecol in y_top order; gutter zones grouped by
+        # (zone_y, reading_column, y_top) so rc=1 is fully resolved before rc=2.
+        sorted_idx = page_df.sort_values(["_zone_y", "_rc_key", "y_top"]).index.tolist()
         n = len(sorted_idx)
 
         # Pre-extract arrays — avoids per-row .loc overhead inside the loops.
@@ -252,15 +292,8 @@ def _assign_horizontal_bands(df_lines: pd.DataFrame) -> pd.DataFrame:
         else:
             block_type_arr = np.full(n, "", dtype=object)
 
-        # Build gutter_id array (None = singlecol).
-        gutter_id_arr: list = []
-        for idx in sorted_idx:
-            row = df.loc[idx]
-            gl = row["gutter_id_left"]  if has_gl else None
-            gr = row["gutter_id_right"] if has_gr else None
-            gl = None if _na(gl) else gl
-            gr = None if _na(gr) else gr
-            gutter_id_arr.append(gl if gl is not None else gr)
+        # Build gutter_id array from precomputed _gid (None = singlecol).
+        gutter_id_arr = [None if _na(v) else v for v in df.loc[sorted_idx, "_gid"].tolist()]
 
         # ----------------------------------------------------------------
         # Phase 1 — compute line_gap for each line
@@ -326,17 +359,18 @@ def _assign_horizontal_bands(df_lines: pd.DataFrame) -> pd.DataFrame:
         # Phase 3 — assign horizontal_band_id
         #
         # Rules:
-        #   Singlecol    gap > threshold  → new band
-        #   Gutter, first column of zone  → new band if gap > threshold
-        #   Gutter, second+ column        → join the band started for that zone
-        #   Gutter, within-column cont.   → new band if gap > threshold
+        #   Singlecol                          gap > threshold → new band
+        #   Gutter, first line of (gid, rc)    always new band — each reading
+        #                                       column is independent; cells from
+        #                                       different sides of the gutter must
+        #                                       not share a horizontal_band_id
+        #   Gutter, continuation of (gid, rc)  new band if gap > threshold
         # ----------------------------------------------------------------
         band_ids = np.zeros(n, dtype=int)
 
         current_band      = 0
         current_gutter_id = None
-        zone_band:  dict  = {}   # gutter_id → band_id the zone started on
-        per_col_seen: set = set()
+        zone_band:  dict  = {}   # (gutter_id, rc) → current band_id for that reading column
 
         for i in range(n):
             if block_type_arr[i] == "page_label":
@@ -348,7 +382,6 @@ def _assign_horizontal_bands(df_lines: pd.DataFrame) -> pd.DataFrame:
                 current_band      = 0
                 current_gutter_id = None
                 zone_band.clear()
-                per_col_seen.clear()
                 continue
 
             gid     = gutter_id_arr[i]
@@ -365,23 +398,20 @@ def _assign_horizontal_bands(df_lines: pd.DataFrame) -> pd.DataFrame:
                 if gid != current_gutter_id:
                     current_gutter_id = gid
 
-                if col_key not in per_col_seen:
-                    per_col_seen.add(col_key)
-                    if gid not in zone_band:
-                        # First column entering this zone.
-                        if current_band == 0 or gaps[i] > threshold:
-                            band_counter += 1
-                            current_band  = band_counter
-                        zone_band[gid] = current_band
-                    else:
-                        # Second+ column: join the zone's existing band.
-                        current_band = zone_band[gid]
+                if col_key not in zone_band:
+                    # First line of this (gutter_id, reading_column): always start
+                    # a new independent band so cells from different reading columns
+                    # never share a horizontal_band_id.
+                    band_counter += 1
+                    current_band       = band_counter
+                    zone_band[col_key] = current_band
                 else:
-                    # Within-column continuation: normal gap check.
+                    # Continuation within the same (gutter_id, reading_column).
+                    current_band = zone_band[col_key]
                     if gaps[i] > threshold:
                         band_counter += 1
-                        current_band      = band_counter
-                        zone_band[gid]    = current_band  # zone's band moves forward
+                        current_band       = band_counter
+                        zone_band[col_key] = current_band
 
             band_ids[i] = current_band
 
@@ -393,6 +423,7 @@ def _assign_horizontal_bands(df_lines: pd.DataFrame) -> pd.DataFrame:
         df.loc[sorted_idx, "horizontal_band_id"] = band_ids
         df.loc[sorted_idx, "page_gap_thresh"]    = threshold
 
+    df = df.drop(columns=["_gid", "_rc_key", "_zone_y"], errors="ignore")
     return df
 
 
@@ -410,11 +441,11 @@ def _merge_bands_by_shared_vertical_lines(
     For each page, finds bands that share at least `min_shared_lines`
     vertical line IDs and merges them to use the same band_id (the smallest).
 
-    Requires column: shape_id_vertical_line (list[int] | None per line),
+    Requires column: shape_id_vertical_grid_line (list[int] | None per line),
     horizontal_band_id, page_number.  If the column is absent, returns df
     unchanged.
     """
-    if df_lines.empty or "shape_id_vertical_line" not in df_lines.columns:
+    if df_lines.empty or "shape_id_vertical_grid_line" not in df_lines.columns:
         return df_lines
 
     df = df_lines.copy()
@@ -430,7 +461,7 @@ def _merge_bands_by_shared_vertical_lines(
             if pd.isna(band_id) or band_id < 0:
                 continue
             band_id = int(band_id)
-            vlines  = df.at[idx, "shape_id_vertical_line"]
+            vlines  = df.at[idx, "shape_id_vertical_grid_line"]
             if vlines is None or (isinstance(vlines, float) and pd.isna(vlines)):
                 continue
             if not isinstance(vlines, list):
@@ -508,9 +539,12 @@ def build_lines(
     df_lines = _assign_horizontal_bands(df_lines)
     df_lines = _merge_bands_by_shared_vertical_lines(df_lines)
 
-    # Propagate horizontal_band_id to cells via line_id join.
-    band_map = df_lines.set_index("line_id")["horizontal_band_id"].to_dict()
+    # Propagate horizontal_band_id and cell_count to cells via line_id join.
+    # cell_count (cells per line) is computed once here so downstream steps
+    # (e.g. table builder) can use it without recomputing groupby sizes.
+    line_attrs = df_lines.set_index("line_id")[["horizontal_band_id", "cell_count"]]
     df_cells = df_cells.copy()
-    df_cells["horizontal_band_id"] = df_cells["line_id"].map(band_map)
+    df_cells["horizontal_band_id"] = df_cells["line_id"].map(line_attrs["horizontal_band_id"])
+    df_cells["cell_count"]         = df_cells["line_id"].map(line_attrs["cell_count"])
 
     return df_lines, df_cells

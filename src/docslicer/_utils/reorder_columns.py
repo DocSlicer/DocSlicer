@@ -259,6 +259,7 @@ MASTER_COLUMN_ORDER: List[str] = [
     "page_height",
 
     # Temporary page-label scratch IDs
+    "page_label_series_id",
     "page_label_raw",
     "page_label_candidate",
     "page_label_type",
@@ -289,12 +290,14 @@ MASTER_COLUMN_ORDER: List[str] = [
     "bookmark_names",       # docx  — all bookmark names on paragraph
 
     # Shape overlaps / decorations (pdf)
-    "has_vertical_line",
+    "has_horizontal_grid_line",
+    "has_vertical_grid_line",
+    "shape_id_underline",       # pdf — shape that provides the underline flag
+    "shape_id_horizontal_grid_line",
+    "shape_id_vertical_grid_line",   # pdf — shape that provides the vertical line flag
     "inside_rect_shape",
     "background_non_stroking_color",
     "background_stroking_color",
-    "shape_id_vertical_line",   # pdf — shape that provides the vertical line flag
-    "shape_id_underline",       # pdf — shape that provides the underline flag
     "shape_id_container",       # pdf — shape acting as a bounding rectangle
 
     # ===== 11. HTML DOM provenance =====
@@ -325,6 +328,7 @@ MASTER_COLUMN_ORDER: List[str] = [
     "rowspan",
     "colspan",
     "role",                 # header / data / row_label
+    "band_total_cols",
 
     # ===== 14. Image metadata (pdf) =====
     "image_width",
@@ -370,7 +374,6 @@ MASTER_COLUMN_ORDER: List[str] = [
     # ===== 17. Table-builder analysis (pdf intermediate) =====
     # These columns live on the lines/bands df during table classification
     # and are typically dropped before the final output.
-    "band_total_cols",
     "band_table_score",
     "row_pattern",
     "row_pattern_max",

@@ -7,10 +7,10 @@ Pipeline:
   1. Reading-order pre-sort + assign_line_id (gutter-zone-aware)
   2. Cell ID assignment – gap-based horizontal merging within each line
   3. Cell aggregation  – aggregate_hierarchical (words → cell rows)
-  4. Link relationships     (vectorized)
-  5. Rect relationships     (vectorized)
-  6. Vertical-line relationships (vectorized)
-  7. Cell underlines
+  4. Link relationships             (vectorized)
+  5. Rect relationships             (vectorized)
+  6. Vertical grid-line relationships (vectorized)
+  7. Cell underlines / horizontal grid lines
 
 Public API:
     df_cells, df_words = build_cells(df_words, df_shapes, df_links)
@@ -57,6 +57,11 @@ _SENTENCE_MERGE_MAX_GAP = 10.0   # wider tolerance for justified paragraph text
 _UNDERLINE_COVERAGE_THRESHOLD  = 95.0
 _UNDERLINE_SEPARATOR_GAP       = 10.0
 _UNDERLINE_X_OVERLAP_EPS       = 1e-4
+
+# Horizontal grid-line detection: a line covering >= this fraction of the page
+# content width is always a grid line, regardless of the per-cell 1.5x test.
+_GRID_LINE_PAGE_COVERAGE = 0.98
+_GRID_LINE_PAGE_WIDTH_FLOOR = 400.0  # minimum denominator (pt)
 
 # Grammar-glue stopwords for sentence detection
 _STOPWORDS = {
@@ -580,11 +585,11 @@ def _add_vertical_line_relationships(
     Flag cells whose vertical center falls within any vertical line's y-range.
 
     Adds:
-      - has_vertical_line: bool
-      - shape_id_vertical_line: list[int] | None
+      - has_vertical_grid_line: bool
+      - shape_id_vertical_grid_line: list[int] | None
     """
-    cells_df["has_vertical_line"]      = False
-    cells_df["shape_id_vertical_line"] = None
+    cells_df["has_vertical_grid_line"]      = False
+    cells_df["shape_id_vertical_grid_line"] = None
 
     if shapes_df.empty:
         return cells_df
@@ -632,15 +637,15 @@ def _add_vertical_line_relationships(
             continue
 
         hit_global = cell_idxs[hit_positions]
-        cells_df.loc[hit_global, "has_vertical_line"] = True
+        cells_df.loc[hit_global, "has_vertical_grid_line"] = True
         for gi, li in zip(hit_global, hit_positions):
-            cells_df.at[gi, "shape_id_vertical_line"] = matches_per_cell[li]
+            cells_df.at[gi, "shape_id_vertical_grid_line"] = matches_per_cell[li]
 
     return cells_df
 
 
 # ================================================================================
-# UNDERLINE RELATIONSHIPS  (inlined from _utils/cell_underline_assessor.py)
+# UNDERLINE RELATIONSHIPS
 # ================================================================================
 
 def _union_coverage(line_left: float, line_right: float, segments: list[tuple[float, float]]) -> float:
@@ -687,7 +692,11 @@ def _assign_cell_underlines(
     shapes_df: pd.DataFrame,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Assign underline shapes to cells.
+    Assign underline and horizontal grid-line shapes to cells.
+
+    A horizontal line whose width is <= 1.5x the matched cell width is treated as
+    a text underline (is_underlined / shape_id_underline). A wider line is a table
+    grid line (has_horizontal_grid_line / shape_id_horizontal_grid_line).
 
     cells_df is mutated in-place (no copy).
     shapes_df is copied; the copy is returned with line_role assigned.
@@ -695,8 +704,10 @@ def _assign_cell_underlines(
     cells  = cells_df          # mutate in-place — no copy needed
     shapes = shapes_df.copy()  # shapes IS modified and returned separately
 
-    cells["is_underlined"]      = False
-    cells["shape_id_underline"] = pd.Series(pd.NA, index=cells.index, dtype="Int64")
+    cells["is_underlined"]               = False
+    cells["shape_id_underline"]          = pd.Series(pd.NA, index=cells.index, dtype="Int64")
+    cells["has_horizontal_grid_line"]      = False
+    cells["shape_id_horizontal_grid_line"] = pd.Series(pd.NA, index=cells.index, dtype="Int64")
 
     shapes["line_role"] = pd.NA
 
@@ -731,7 +742,13 @@ def _assign_cell_underlines(
         c_x_r   = cells_page["x_right"].to_numpy()
         c_band  = cells_page["horizontal_band_id"].to_numpy() if "horizontal_band_id" in cells_page.columns else None
 
+        page_content_width = max(
+            _GRID_LINE_PAGE_WIDTH_FLOOR,
+            float(c_x_r.max()) - float(c_x_l.min()),
+        )
+
         id_to_global_idx = dict(zip(c_id, cells_page.index))
+        id_to_arr_idx    = dict(zip(c_id, range(len(c_id))))
 
         for line_idx, line in lines_page.iterrows():
             line_id = int(line["shape_id"])
@@ -818,13 +835,23 @@ def _assign_cell_underlines(
                     if coverage_pct >= _UNDERLINE_COVERAGE_THRESHOLD:
                         break
 
+            line_width         = lx_r - lx_l
+            is_full_width_line = line_width >= _GRID_LINE_PAGE_COVERAGE * page_content_width
             for cid_val in assigned_ids:
-                g_idx = id_to_global_idx.get(cid_val)
-                if g_idx is None:
+                g_idx   = id_to_global_idx.get(cid_val)
+                arr_idx = id_to_arr_idx.get(cid_val)
+                if g_idx is None or arr_idx is None:
                     continue
-                cells.at[g_idx, "is_underlined"] = True
-                if pd.isna(cells.at[g_idx, "shape_id_underline"]):
-                    cells.at[g_idx, "shape_id_underline"] = line_id
+                cell_width   = float(c_x_r[arr_idx] - c_x_l[arr_idx])
+                is_underline = (not is_full_width_line) and (line_width <= 1.5 * cell_width)
+                if is_underline:
+                    cells.at[g_idx, "is_underlined"] = True
+                    if pd.isna(cells.at[g_idx, "shape_id_underline"]):
+                        cells.at[g_idx, "shape_id_underline"] = line_id
+                else:
+                    cells.at[g_idx, "has_horizontal_grid_line"] = True
+                    if pd.isna(cells.at[g_idx, "shape_id_horizontal_grid_line"]):
+                        cells.at[g_idx, "shape_id_horizontal_grid_line"] = line_id
 
     return cells, shapes
 
