@@ -5,6 +5,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from .metadata.schema import DocumentMetadata
+
 try:
     from importlib.metadata import version as _pkg_version
     _SCHEMA_VERSION = _pkg_version("docslicer")
@@ -39,9 +41,13 @@ class Chunk:
     link_url: list[str]                              # unique URLs found in chunk
     ixbrl_ids: list[str]                             # unique iXBRL IDs found in chunk
     table_ids: list[str]                             # table IDs referenced in chunk
+    extra: dict = field(default_factory=dict)        # caller-requested extra fields from the pipeline df
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        d = asdict(self)
+        if not d["ixbrl_ids"]:
+            del d["ixbrl_ids"]
+        return d
 
 
 @dataclass
@@ -58,9 +64,13 @@ class Block:
     link_url: list[str]                              # unique URLs found in block
     ixbrl_ids: list[str]                             # unique iXBRL IDs found in block
     table_ids: list[str]                             # table IDs referenced in block
+    extra: dict = field(default_factory=dict)        # caller-requested extra fields from the pipeline df
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        d = asdict(self)
+        if not d["ixbrl_ids"]:
+            del d["ixbrl_ids"]
+        return d
 
 
 @dataclass
@@ -150,18 +160,59 @@ class HierarchyTree:
         return "\n".join(lines)
 
 
-@dataclass
-class DocMetadata:
-    title: str | None
-    author: str | None
-    page_count: int
-    language: str | None
-    has_ocr: bool
-    source_url: str | None
+def _prettify_table(markdown: str) -> str:
+    """Reformat a markdown table so pipe characters are vertically aligned."""
+    lines = markdown.strip().splitlines()
+    if not lines:
+        return markdown
 
-    def to_dict(self) -> dict:
-        return asdict(self)
+    def _split_row(line: str) -> list[str]:
+        cells = line.strip().split("|")
+        if cells and cells[0].strip() == "":
+            cells = cells[1:]
+        if cells and cells[-1].strip() == "":
+            cells = cells[:-1]
+        return [c.strip() for c in cells]
 
+    def _is_sep(cell: str) -> bool:
+        return bool(cell) and all(c in "-:" for c in cell)
+
+    rows = [_split_row(l) for l in lines if l.strip().startswith("|")]
+    if not rows:
+        return markdown
+
+    n_cols = max(len(r) for r in rows)
+    for row in rows:
+        while len(row) < n_cols:
+            row.append("")
+
+    sep_indices = {i for i, row in enumerate(rows) if all(_is_sep(c) for c in row if c)}
+    col_widths = [3] * n_cols
+    for i, row in enumerate(rows):
+        if i not in sep_indices:
+            for j, cell in enumerate(row):
+                col_widths[j] = max(col_widths[j], len(cell))
+
+    out: list[str] = []
+    for i, row in enumerate(rows):
+        if i in sep_indices:
+            parts = []
+            for j, cell in enumerate(row):
+                w = col_widths[j]
+                lc, rc = cell.startswith(":"), cell.endswith(":") and len(cell) > 1
+                if lc and rc:
+                    parts.append(":" + "-" * (w - 2) + ":")
+                elif lc:
+                    parts.append(":" + "-" * (w - 1))
+                elif rc:
+                    parts.append("-" * (w - 1) + ":")
+                else:
+                    parts.append("-" * w)
+        else:
+            parts = [cell.ljust(col_widths[j]) for j, cell in enumerate(row)]
+        out.append("| " + " | ".join(parts) + " |")
+
+    return "\n".join(out)
 
 
 def _to_parquet(df: "pd.DataFrame", path: Path) -> None:
@@ -183,7 +234,7 @@ class ParseResult:
     chunks: list[Chunk]
     blocks: list[Block]
     tables: list[Table]
-    metadata: DocMetadata
+    metadata: DocumentMetadata
     hierarchy: HierarchyTree = field(default_factory=lambda: HierarchyTree(roots=[]))
     pipeline_steps: dict[str, "pd.DataFrame"] = field(default_factory=dict)
 
@@ -198,7 +249,174 @@ class ParseResult:
             "hierarchy": self.hierarchy.to_dict(),
         }
 
+    def export_to_dict(self) -> dict:
+        return self.to_dict()
 
+    def export_to_markdown(
+        self,
+        include_page_markers: bool = True,
+        include_tables: bool = True,
+        include_headers_footers: bool = False,
+        include_toc: bool = False,
+        prettify: bool = False,
+    ) -> str:
+        """Render the document as Markdown using blocks as the source of truth."""
+        _HEADING_ROLES = {
+            "heading", "toc_heading", "exhibit_heading", "hybrid_heading_paragraph",
+        }
+        _SKIP_ROLES = {"navigation", "suppressed_repeated_heading"}
+        excluded_sections: set[str] = set()
+        if not include_headers_footers:
+            excluded_sections |= {"header", "footer"}
+        if not include_toc:
+            excluded_sections.add("toc")
+
+        level_map: dict[str, int] = {
+            node.text: node.level
+            for node in reversed(self.hierarchy.flatten())
+        }
+        tables_by_id = {t.id: t for t in self.tables}
+
+        parts: list[str] = []
+        prev_page: int | None = None
+
+        for block in self.blocks:
+            if block.section in excluded_sections:
+                continue
+            if block.role in _SKIP_ROLES:
+                continue
+
+            text = block.text.strip()
+
+            if include_page_markers and block.page_number != prev_page:
+                prev_page = block.page_number
+                label = block.page_label or str(block.page_number)
+                parts.append(f"<!-- page {label} -->")
+
+            if block.role in _HEADING_ROLES:
+                level = level_map.get(text, 2)
+                prefix = "#" * max(1, min(6, level))
+                parts.append(f"{prefix} {text}")
+            elif block.role == "table":
+                if include_tables:
+                    table = tables_by_id.get(block.table_ids[0]) if block.table_ids else None
+                    raw = table.markdown if table else text
+                    parts.append(_prettify_table(raw) if prettify else raw)
+            elif text:
+                parts.append(text)
+
+        return "\n\n".join(parts)
+
+    def export_to_text(
+        self,
+        include_tables: bool = True,
+        include_headers_footers: bool = False,
+        include_toc: bool = False,
+    ) -> str:
+        """Render the document as plain text (no Markdown formatting)."""
+        _HEADING_ROLES = {
+            "heading", "toc_heading", "exhibit_heading", "hybrid_heading_paragraph",
+        }
+        _SKIP_ROLES = {"navigation", "suppressed_repeated_heading"}
+        excluded_sections: set[str] = set()
+        if not include_headers_footers:
+            excluded_sections |= {"header", "footer"}
+        if not include_toc:
+            excluded_sections.add("toc")
+
+        tables_by_id = {t.id: t for t in self.tables}
+
+        parts: list[str] = []
+
+        for block in self.blocks:
+            if block.section in excluded_sections:
+                continue
+            if block.role in _SKIP_ROLES:
+                continue
+
+            text = block.text.strip()
+
+            if block.role in _HEADING_ROLES:
+                if text:
+                    parts.append(text)
+            elif block.role == "table":
+                if include_tables:
+                    table = tables_by_id.get(block.table_ids[0]) if block.table_ids else None
+                    parts.append(table.markdown if table else text)
+            elif text:
+                parts.append(text)
+
+        return "\n\n".join(parts)
+
+    def export_tables_csv(self, path: str | Path, encoding: str = "utf-8") -> None:
+        """Save all tables as CSV.
+
+        Each table is preceded by a one-row header (table id + page) and a
+        caption row when present. Rowspan/colspan are expanded by duplicating
+        the cell text into every covered grid position. Tables are separated by
+        two blank rows.
+
+        Pass encoding="utf-8-sig" for Excel-friendly output (adds BOM).
+        """
+        import csv as _csv
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        with path.open("w", newline="", encoding=encoding) as f:
+            writer = _csv.writer(f)
+            for table in self.tables:
+                label = table.page_label or str(table.page_number)
+                writer.writerow([f"Table {table.id} | Page {label}"])
+                if table.caption:
+                    writer.writerow([table.caption])
+
+                if not table.cells:
+                    writer.writerow(["(no cells)"])
+                    writer.writerow([])
+                    writer.writerow([])
+                    continue
+
+                max_rows = max(c.row + c.rowspan for c in table.cells)
+                max_cols = max(c.col + c.colspan for c in table.cells)
+                grid: list[list[str]] = [[""] * max_cols for _ in range(max_rows)]
+
+                for cell in table.cells:
+                    text = cell.text.replace("\n", " ").strip()
+                    for r in range(cell.row, min(cell.row + cell.rowspan, max_rows)):
+                        for c in range(cell.col, min(cell.col + cell.colspan, max_cols)):
+                            grid[r][c] = text
+
+                for row in grid:
+                    writer.writerow(row)
+
+                writer.writerow([])
+                writer.writerow([])
+
+    def export_chunks_csv(self, path: str | Path, encoding: str = "utf-8") -> None:
+        """Save chunks as CSV. Pass encoding="utf-8-sig" for Excel-friendly output (adds BOM)."""
+        import pandas as pd
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame([c.to_dict() for c in self.chunks]).to_csv(path, index=False, encoding=encoding)
+
+    def chunks_to_jsonl(self) -> str:
+        """Return chunks as a newline-delimited JSON string (one chunk per line), no file I/O."""
+        return "\n".join(json.dumps(c.to_dict(), ensure_ascii=False) for c in self.chunks)
+
+    def export_chunks_jsonl(self, path: str | Path) -> None:
+        """Save chunks as newline-delimited JSON (one chunk per line)."""
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as f:
+            for chunk in self.chunks:
+                f.write(json.dumps(chunk.to_dict(), ensure_ascii=False) + "\n")
+
+    def export_chunks_parquet(self, path: str | Path) -> None:
+        """Save chunks as Parquet (falls back to CSV if pyarrow is not installed)."""
+        import pandas as pd
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _to_parquet(pd.DataFrame([c.to_dict() for c in self.chunks]), path)
 
     def chunks_df(self) -> "pd.DataFrame":
         import pandas as pd

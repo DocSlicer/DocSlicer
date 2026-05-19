@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid as _uuid
 from dataclasses import dataclass, field
 
 
@@ -11,6 +12,8 @@ class ParseConfig:
     extract_tables: bool = True
     regions: list[str] | None = None
     debug: bool = False
+    extra_fields: list[str] = field(default_factory=list)
+    run_id: str = field(default_factory=lambda: str(_uuid.uuid4()))
 
 
 DEFAULT_CONFIG = ParseConfig()

@@ -1,16 +1,20 @@
 from __future__ import annotations
 
+import datetime
 import json
 import logging
+import time
+import uuid
 from typing import Literal
 
 import pandas as pd
 
+from .metadata.schema import DocumentMetadata
 from .pdf.pdf_orchestrator import run_pipeline as _run_pdf_pipeline
 from .shared.shared_orchestrator import run_pipeline as _run_shared_pipeline
 from .shared.step_07_block_merger import _format_table_markdown
 from ._config import ParseConfig, DEFAULT_CONFIG
-from ._result import BBox, Block, Chunk, DocMetadata, HierarchyNode, HierarchyTree, ParseResult, Table, TableCell
+from ._result import BBox, Block, Chunk, HierarchyNode, HierarchyTree, ParseResult, Table, TableCell
 
 _log = logging.getLogger(__name__)
 
@@ -19,29 +23,76 @@ _log = logging.getLogger(__name__)
 # Metadata resolution
 # ─────────────────────────────────────────────
 
-def _resolve_metadata(discovered: dict, source_url: str | None) -> DocMetadata:
-    """Resolve author/title from raw discovered_metadata dict and return DocMetadata."""
-    # Author: prefer whichever of author_meta / author_text is longer
-    author_meta = discovered.get("author_meta") or []
-    author_text = discovered.get("author_text") or []
-    author_meta_str = json.dumps(author_meta) if isinstance(author_meta, list) else str(author_meta or "")
-    author_text_str = json.dumps(author_text) if isinstance(author_text, list) else str(author_text or "")
-    author = author_text_str if len(author_text_str) > len(author_meta_str) else author_meta_str
-    author = author or None
-
-    # Title: prefer whichever of title_meta / title_text is longer
+def _resolve_metadata(
+    discovered: dict,
+    source_url: str | None,
+    source_filename: str | None,
+    file_size_bytes: int | None,
+    run_id: str,
+    df_blocks: pd.DataFrame,
+    processing_time: float | None = None,
+) -> DocumentMetadata:
+    # Resolve title: prefer whichever of title_meta / title_text is longer
     title_meta = str(discovered.get("title_meta") or "")
     title_text = str(discovered.get("title_text") or "")
     title = title_text if len(title_text) > len(title_meta) else title_meta
     title = title or None
 
-    return DocMetadata(
+    # Resolve author: prefer whichever of author_meta / author_text is longer
+    author_meta: list[str] = discovered.get("author_meta") or []
+    author_text: list[str] = discovered.get("author_text") or []
+    author_meta_str = json.dumps(author_meta) if isinstance(author_meta, list) else str(author_meta or "")
+    author_text_str = json.dumps(author_text) if isinstance(author_text, list) else str(author_text or "")
+    author_list = author_text if len(author_text_str) > len(author_meta_str) else author_meta
+    author = list(author_list) if author_list else None
+
+    # Compute chars from the final blocks (consistent across all formats)
+    if not df_blocks.empty and "text" in df_blocks.columns:
+        chars = int(df_blocks["text"].str.len().fillna(0).sum())
+    else:
+        chars = discovered.get("chars") or 0
+    chars = chars or None
+
+    processed_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+    content_type = str(discovered.get("content_type") or "unknown").lower()
+
+    return DocumentMetadata(
+        document_id=str(uuid.uuid4()),
+        run_id=run_id,
+        processed_at=processed_at,
+        content_type=content_type,
+        source_filename=source_filename,
+        source_url=source_url,
+        file_size_bytes=file_size_bytes,
+        is_password_protected=bool(discovered.get("is_password_protected", False)),
+        page_count=int(discovered.get("page_count") or 0),
+        page_width=discovered.get("page_width"),
+        page_height=discovered.get("page_height"),
+        page_format=discovered.get("page_format"),
+        has_mixed_page_sizes=bool(discovered.get("has_mixed_page_sizes", False)),
+        has_ocr=bool(discovered.get("has_ocr", False)),
+        needs_ocr=bool(discovered.get("needs_ocr", False)),
+        is_scanned=bool(discovered.get("is_scanned", False)),
+        chars=chars,
+        estimated_tokens=(chars // 4) if chars is not None else None,
         title=title,
         author=author,
-        page_count=int(discovered.get("page_count") or 0),
         language=discovered.get("language"),
-        has_ocr=bool(discovered.get("has_ocr", False)),
-        source_url=source_url,
+        language_confidence=discovered.get("language_confidence"),
+        language_source=discovered.get("language_source"),
+        profile=discovered.get("profile"),
+        document_type=discovered.get("document_type"),
+        parsing_quality_score=discovered.get("parsing_quality_score"),
+        processing_time=processing_time,
+        # Pipeline intermediates (not serialised)
+        author_meta=author_meta or None,
+        author_text=author_text or None,
+        title_meta=discovered.get("title_meta"),
+        title_text=discovered.get("title_text"),
+        language_meta=discovered.get("language_meta"),
+        language_text=discovered.get("language_text"),
+        extra=discovered.get("extra") or {},
     )
 
 
@@ -141,7 +192,19 @@ def _build_hierarchy(df_blocks: pd.DataFrame, df_chunks: pd.DataFrame) -> Hierar
     return HierarchyTree(roots=roots)
 
 
-def _build_chunks(df_chunks: pd.DataFrame) -> list[Chunk]:
+def _extra(row: pd.Series, fields: list[str]) -> dict:
+    out = {}
+    for col in fields:
+        if col not in row.index:
+            out[col] = None
+            continue
+        val = row[col]
+        out[col] = None if (isinstance(val, float) and pd.isna(val)) else val
+    return out
+
+
+def _build_chunks(df_chunks: pd.DataFrame, extra_fields: list[str] | None = None) -> list[Chunk]:
+    _extra_fields = extra_fields or []
     out = []
     for _, row in df_chunks.iterrows():
         raw_path = row.get("chunk_path", "") if "chunk_path" in row.index else ""
@@ -175,12 +238,14 @@ def _build_chunks(df_chunks: pd.DataFrame) -> list[Chunk]:
             bbox=_bbox(row),
             link_url=_str_list(row, "link_url"),
             ixbrl_ids=_str_list(row, "ixbrl_id"),
-            table_ids=_str_list(row, "table_ids"),
+            table_ids=_str_list(row, "table_id"),
+            extra=_extra(row, _extra_fields),
         ))
     return out
 
 
-def _build_blocks(df_blocks: pd.DataFrame) -> list[Block]:
+def _build_blocks(df_blocks: pd.DataFrame, extra_fields: list[str] | None = None) -> list[Block]:
+    _extra_fields = extra_fields or []
     out = []
     for _, row in df_blocks.iterrows():
         raw_label = row.get("page_label") if "page_label" in row.index else None
@@ -198,7 +263,8 @@ def _build_blocks(df_blocks: pd.DataFrame) -> list[Block]:
             bbox=_bbox(row),
             link_url=_str_list(row, "link_url"),
             ixbrl_ids=_str_list(row, "ixbrl_id"),
-            table_ids=_str_list(row, "table_ids"),
+            table_ids=_str_list(row, "table_id"),
+            extra=_extra(row, _extra_fields),
         ))
     return out
 
@@ -260,11 +326,18 @@ def _build_result(
     df_chunks: pd.DataFrame,
     df_table_cells: pd.DataFrame | None,
     source_url: str | None,
+    source_filename: str | None,
+    file_size_bytes: int | None,
+    run_id: str,
     config: ParseConfig,
+    processing_time: float | None = None,
 ) -> ParseResult:
-    metadata = _resolve_metadata(discovered_metadata, source_url)
-    chunks = _build_chunks(df_chunks)
-    blocks = _build_blocks(df_blocks)
+    metadata = _resolve_metadata(
+        discovered_metadata, source_url, source_filename, file_size_bytes, run_id, df_blocks,
+        processing_time=processing_time,
+    )
+    chunks = _build_chunks(df_chunks, config.extra_fields)
+    blocks = _build_blocks(df_blocks, config.extra_fields)
     tables = _build_tables(df_table_cells)
     hierarchy = _build_hierarchy(df_blocks, df_chunks)
 
@@ -297,16 +370,28 @@ def _build_result(
 
 def _run_pipeline(
     content: str | bytes | None,
-    content_type: Literal["html", "pdf", "docx"],
+    content_type: Literal["html", "pdf", "docx", "pptx"],
     source_url: str | None,
     config: ParseConfig,
+    source_filename: str | None = None,
 ) -> ParseResult:
+    _t0 = time.perf_counter()
+
+    # Compute file size before format-specific processing consumes the bytes
+    if isinstance(content, bytes):
+        file_size_bytes: int | None = len(content)
+    elif isinstance(content, str):
+        file_size_bytes = len(content.encode("utf-8"))
+    else:
+        file_size_bytes = None
+
     if content_type == "pdf":
         if not isinstance(content, bytes):
             raise TypeError("PDF content must be bytes")
         discovered_metadata, df_lines, df_table_cells = _run_pdf_pipeline(
             pdf_bytes=content, source_url=source_url
         )
+        discovered_metadata["content_type"] = "pdf"
     elif content_type == "docx":
         if not isinstance(content, bytes):
             raise TypeError("DOCX content must be bytes")
@@ -316,7 +401,25 @@ def _run_pipeline(
         package, run_df, df_table_cells, _, df_lines = _run_docx_pipeline(content)
         discovered_metadata = extract_core_properties(package)
         discovered_metadata["has_ocr"] = False
-        discovered_metadata["content_type"] = "DOCX"
+        discovered_metadata["content_type"] = "docx"
+        if not discovered_metadata["page_count"]:
+            discovered_metadata["page_count"] = (
+                int(run_df["page_number"].max())
+                if not run_df.empty and "page_number" in run_df.columns
+                else 0
+            )
+        add_document_information(discovered_metadata, df_lines=df_lines)
+    elif content_type == "pptx":
+        if not isinstance(content, bytes):
+            raise TypeError("PPTX content must be bytes")
+        from .metadata import add_document_information
+        from .pptx.pptx_orchestrator import run_pipeline as _run_pptx_pipeline
+        from .pptx.step_00_metadata import extract_core_properties
+
+        package, run_df, _, df_table_cells, _, df_lines = _run_pptx_pipeline(content)
+        discovered_metadata = extract_core_properties(package)
+        discovered_metadata["has_ocr"] = False
+        discovered_metadata["content_type"] = "pptx"
         if not discovered_metadata["page_count"]:
             discovered_metadata["page_count"] = (
                 int(run_df["page_number"].max())
@@ -338,8 +441,9 @@ def _run_pipeline(
         discovered_metadata, df_lines, df_table_cells = _run_html_pipeline(
             html=content, source_url=source_url
         )
+        discovered_metadata["content_type"] = "html"
     else:
-        raise ValueError(f"Unsupported content type: {content_type!r}. Use 'pdf' or 'html'.")
+        raise ValueError(f"Unsupported content type: {content_type!r}. Use 'pdf', 'html', 'docx', or 'pptx'.")
 
     if df_lines.empty:
         _log.warning("Pipeline returned empty df_lines, returning empty result")
@@ -347,9 +451,12 @@ def _run_pipeline(
             chunks=[],
             blocks=[],
             tables=[],
-            metadata=DocMetadata(
-                title=None, author=None, page_count=0,
-                language=None, has_ocr=False, source_url=source_url,
+            metadata=DocumentMetadata(
+                run_id=config.run_id,
+                content_type=content_type,
+                source_filename=source_filename,
+                source_url=source_url,
+                file_size_bytes=file_size_bytes,
             ),
         )
 
@@ -359,4 +466,15 @@ def _run_pipeline(
         config=config,
     )
 
-    return _build_result(discovered_metadata, df_blocks, df_chunks, df_table_cells, source_url, config)
+    return _build_result(
+        discovered_metadata,
+        df_blocks,
+        df_chunks,
+        df_table_cells,
+        source_url,
+        source_filename,
+        file_size_bytes,
+        config.run_id,
+        config,
+        processing_time=time.perf_counter() - _t0,
+    )

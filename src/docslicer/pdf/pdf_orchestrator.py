@@ -182,7 +182,7 @@ def run_pipeline(
         df_lines, df_cells = build_lines(df_cells)
 
         # Step 10 - Table Builder
-        df_lines, df_cells, df_table_cells = build_tables(df_lines, df_cells, df_words)
+        df_lines, df_cells, df_table_cells = build_tables(df_lines, df_cells, df_shapes)
 
         # OCR font size estimation (requires layout_id from step 10)
         if discovered_metadata.get("needs_ocr"):

@@ -86,6 +86,12 @@ def run_pipeline(
             source_url = None  # box extractor will use set_content
         # else: non-SEC → keep source_url=source_url, html=None
         #        box extractor will page.goto(source_url) for full JS rendering
+    elif source_url and html is not None:
+        # Caller already fetched/provided HTML but still gave its original URL for
+        # link resolution. Render via set_content, with a <base> tag for relative
+        # URLs, because the box extractor accepts either html or url, not both.
+        html = _inject_base_url(html, source_url)
+        source_url = None
 
     # ============================================================
     # STAGE: PARSING (Steps 01-03)
