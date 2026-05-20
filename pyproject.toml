@@ -63,5 +63,6 @@ where = ["src"]
 docslicer = [
     "config/*.yaml",
     "config/*.csv",
-    "html/js/*.js",
+    "html/*.js",
+    "scraping/*.js",
 ]

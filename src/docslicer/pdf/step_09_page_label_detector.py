@@ -130,6 +130,7 @@ def _parse_value_int(token: str, label_type: str) -> Optional[int]:
     - alpha_numeric -> numeric part
     - alpha_roman -> roman part
     - roman_numeric -> composite roman_prefix*10000 + numeric (keeps order within prefix)
+    - arabic_sub -> major*1000 + minor (e.g. 347/1 → 347001)
     """
     if not token:
         return None
@@ -165,6 +166,12 @@ def _parse_value_int(token: str, label_type: str) -> Optional[int]:
         if rp is None:
             return None
         return rp * 10000 + int(m.group(2))
+
+    if label_type == "arabic_sub":
+        m = re.match(r"^(\d+)/(\d+)$", u)
+        if not m:
+            return None
+        return int(m.group(1)) * 1000 + int(m.group(2))
 
     return None
 
@@ -240,6 +247,9 @@ _HEADING_LIKE_RE = re.compile(r"^\s*\d+(?:\.\d+)*\.\s+\S+")
 # "Page 1 of 19", "2 of 20" — end-anchored, 1-4 digits only.
 # End-anchored to avoid "3 of 10 items"; validated post-match: 0 < N ≤ M.
 _N_OF_M_RE = re.compile(r"\b(\d{1,4})\s+of\s+(\d{1,4})\s*$", re.IGNORECASE)
+
+# Candidate type preference: arabic/arabic_sub beat roman so "L 347/1" → 347/1, not L.
+_TYPE_PRIO: dict[str, int] = {"arabic": 0, "arabic_sub": 0, "alpha_numeric": 1, "roman_numeric": 2, "alpha_roman": 3, "roman": 4}
 
 
 def _try_extract_embedded_label(text: str) -> Optional[str]:
@@ -468,18 +478,26 @@ def mark_pdf_page_label_candidates(
             if not candidates:
                 continue
 
-            # Pick the first candidate that matches a known type (best by extraction order)
+            # Pick the best candidate by type preference, then extraction order.
+            # arabic/arabic_sub > alpha_numeric > roman_numeric > alpha_roman > roman
+            # This prevents a single-letter roman (e.g. "L" from "L 347/1") from
+            # winning over a later arabic_sub token ("347/1").
             chosen = None
+            chosen_prio = 99
             for token_norm, cell_sharing, wrapper in candidates:
                 label_type = _match_page_label_type(token_norm, page_label_config)
                 if label_type == "unknown":
                     continue
 
                 value_int = _parse_value_int(token_norm, label_type)
-                # We still allow None (e.g., weird but regex-matched), but prefer parseable
-                chosen = (token_norm, label_type, value_int, cell_sharing, wrapper)
-                if value_int is not None:
-                    break
+                prio = _TYPE_PRIO.get(label_type, 99)
+                # Accept if: no candidate yet, OR this type is strictly better
+                # (only upgrade; don't downgrade to a worse type for a parseable value)
+                if chosen is None or (prio < chosen_prio and value_int is not None):
+                    chosen = (token_norm, label_type, value_int, cell_sharing, wrapper)
+                    chosen_prio = prio
+                    if label_type in ("arabic", "arabic_sub") and value_int is not None:
+                        break
 
             if chosen is None:
                 continue
@@ -573,8 +591,8 @@ def add_page_label_score(
     # Global (doc-wide) scoring
     # ---------------------------
 
-    # arabic +0.2, roman -0.2
-    score += np.where(c["_t"] == "arabic", 0.2, 0.0)
+    # arabic/arabic_sub +0.2, roman -0.2
+    score += np.where(c["_t"].isin(["arabic", "arabic_sub"]), 0.2, 0.0)
     score += np.where(c["_t"] == "roman", -0.2, 0.0)
 
     # plain +0.2, parens -0.2
@@ -1102,7 +1120,105 @@ def pick_pdf_page_label_winners_and_validate(
     return out
 
 # ================================================================================
-# STEP 2: Drop unreliable prefix labels
+# STEP 2: Post-DP series QC
+# ================================================================================
+
+def qc_pdf_page_label_series(
+    df: pd.DataFrame,
+    *,
+    page_col: str = "page_number",
+    label_col: str = "page_label",
+    value_col: str = "page_label_value",
+    type_col: str = "page_label_type",
+    block_type_col: str = "block_type",
+    series_id_col: str = "page_label_series_id",
+    enforce_unit_step: bool = False,
+) -> pd.DataFrame:
+    """
+    Post-DP quality control that exploits the fact PDF page numbers are always known.
+
+    Scans winner labels in page order, grouped by series_id. Within each series two
+    rules are applied and the first violating page — plus every page after it in that
+    series — is cleared.
+
+    Rule 1 — strict monotonicity (always on):
+        Consecutive labeled pages must have strictly increasing values.
+        Catches (a) the same label repeating on consecutive pages (e.g. "L" forever),
+        and (b) a backward jump that slipped through a blank-page bridge in the DP.
+
+    Rule 2 — unit-step (enforce_unit_step=True, off by default):
+        For consecutive labeled pages at PDF pages P and P+k, the value difference
+        must be exactly k.  This catches forward value gaps (e.g. value jumps from
+        347 to 352 while only one page passed).  Disabled by default because some
+        documents use non-unit page label increments (article numbers, etc.).
+
+    Pages cleared by this function are also stripped of block_type, series_id,
+    value, and type so that the subsequent spread step treats them as unlabeled.
+    """
+    out = df.copy()
+
+    if label_col not in out.columns or series_id_col not in out.columns:
+        return out
+
+    # Work on winner rows only (at most one per page at this stage)
+    winner_mask = out[label_col].notna() & out[series_id_col].notna()
+    if not winner_mask.any():
+        return out
+
+    winners = out.loc[winner_mask, [page_col, label_col, value_col, series_id_col]].copy()
+    winners["_p"] = pd.to_numeric(winners[page_col], errors="coerce")
+    winners["_v"] = pd.to_numeric(winners[value_col], errors="coerce")
+    winners["_sid"] = pd.to_numeric(winners[series_id_col], errors="coerce")
+    winners = winners.dropna(subset=["_p", "_v", "_sid"]).sort_values(["_sid", "_p"])
+
+    if winners.empty:
+        return out
+
+    pages_to_clear: set = set()
+
+    for _, grp in winners.groupby("_sid"):
+        pages = grp["_p"].astype(int).tolist()
+        values = grp["_v"].tolist()
+
+        if len(pages) < 2:
+            continue
+
+        bad_from: Optional[int] = None
+        for i in range(1, len(pages)):
+            p1, v1 = pages[i - 1], values[i - 1]
+            p2, v2 = pages[i], values[i]
+
+            # Rule 1: value must strictly increase
+            if v2 <= v1:
+                bad_from = i
+                break
+
+            # Rule 2 (optional): value increment must equal page increment
+            if enforce_unit_step and (v2 - v1) != (p2 - p1):
+                bad_from = i
+                break
+
+        if bad_from is not None:
+            pages_to_clear.update(pages[bad_from:])
+
+    if not pages_to_clear:
+        return out
+
+    page_int = pd.to_numeric(out[page_col], errors="coerce").fillna(-1).astype(int)
+    bad_mask = page_int.isin(pages_to_clear)
+
+    out.loc[bad_mask, label_col] = None
+    for col in (value_col, type_col, series_id_col):
+        if col in out.columns:
+            out.loc[bad_mask, col] = None
+    if block_type_col in out.columns:
+        out.loc[bad_mask & (out[block_type_col] == "page_label"), block_type_col] = None
+
+    return out
+
+
+# ================================================================================
+# STEP 3: Drop unreliable prefix labels
 # ================================================================================
 
 def drop_unreliable_prefix_labels(
@@ -1250,6 +1366,7 @@ def assign_pdf_page_labels(
     out = mark_pdf_page_label_candidates(df, page_label_config, max_lines_top, max_lines_bottom, max_cells_per_line)
     out = add_page_label_score(out)
     out = pick_pdf_page_label_winners_and_validate(out)
+    out = qc_pdf_page_label_series(out, enforce_unit_step=True)
     out = drop_unreliable_prefix_labels(out)
     out = spread_winner_page_label_across_page(out)
     return out

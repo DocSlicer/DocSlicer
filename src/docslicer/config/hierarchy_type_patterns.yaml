@@ -102,20 +102,17 @@ hierarchy_rules:
   # --- Counter-based headings ---
 
   - hierarchy_type: single_parens_numeric   # Example: "(28) Financial instruments"
-    applies_to_profiles: [finance, legal, government]
     patterns:
       #- regex: '^\s*\(\d+\)'
       - regex: '^\s*\(\d+\)(?!\s*[-]?\d{3}\b)' # exludes US phone numbers
         flags: 'i'
 
   - hierarchy_type: bracketed_numeric   # [1] Introduction"
-    applies_to_profiles: [finance, legal, government]
     patterns:
       - regex: '^\s*\[\d+\]'
         flags: 'i'
 
   - hierarchy_type: single_parens_roman     # Example: "(iv) Termination"
-    applies_to_profiles: [finance, legal, government]
     patterns:
       # Starts with a parenthesized Roman numeral, any valid length
       - regex: '^\s*\(M{0,3}(CM|CD|D?C{0,3})(XC|XL|L?X{0,3})(IX|IV|V?I{0,3})\)'
@@ -124,25 +121,21 @@ hierarchy_rules:
   # --- Alpha-based headings ---
 
   - hierarchy_type: single_parens_single_alpha     # Example: "(a) Exhibits"
-    applies_to_profiles: [finance, legal, government]
     patterns:
       - regex: '^\s*\([A-Za-z]\)'
         flags: 'i'
 
   - hierarchy_type: single_parens_double_alpha     # Example: "(aa) Conditions"
-    applies_to_profiles: [finance, legal, government]
     patterns:
       - regex: '^\s*\([A-Za-z]{2}\)'
         flags: 'i'
 
   - hierarchy_type: single_parens_triple_alpha     # Example: "(ccc) Special Provisions"
-    applies_to_profiles: [finance, legal, government]
     patterns:
       - regex: '^\s*\([A-Za-z]{3}\)'
         flags: 'i'
 
   - hierarchy_type: single_parens_quadruple_alpha  # Example: "(zzzz) Miscellaneous"
-    applies_to_profiles: [finance, legal, government]
     patterns:
       - regex: '^\s*\([A-Za-z]{4}\)'
         flags: 'i'
@@ -150,25 +143,21 @@ hierarchy_rules:
   # --- Multi Layer Parenthetical headings ---
 
   - hierarchy_type: double_parens      # Example: "(a)(1) Definitions"
-    applies_to_profiles: [finance, legal, government]
     patterns:
       - regex: '^\s*\([A-Za-z0-9]+\)\([A-Za-z0-9]+\)'
         flags: 'i'
 
   - hierarchy_type: triple_parens      # Example: "(a)(1)(i) Special Provisions"
-    applies_to_profiles: [finance, legal, government]
     patterns:
       - regex: '^\s*\([A-Za-z0-9]+\)\([A-Za-z0-9]+\)\([A-Za-z0-9]+\)'
         flags: 'i'
 
   - hierarchy_type: quadruple_parens      # Example: "(a)(1)(i)(A) Additional Terms"
-    applies_to_profiles: [finance, legal, government]
     patterns:
       - regex: '^\s*\([A-Za-z0-9]+\)\([A-Za-z0-9]+\)\([A-Za-z0-9]+\)\([A-Za-z0-9]+\)'
         flags: 'i'
 
   - hierarchy_type: quintuple_parens      # Example: "(a)(1)(i)(A)(2) Exceptions"
-    applies_to_profiles: [finance, legal, government]
     patterns:
       - regex: '^\s*\([A-Za-z0-9]+\)\([A-Za-z0-9]+\)\([A-Za-z0-9]+\)\([A-Za-z0-9]+\)\([A-Za-z0-9]+\)'
         flags: 'i'
@@ -177,45 +166,33 @@ hierarchy_rules:
   # Numbered headings
   # =========================
 
-  - hierarchy_type: numbered_heading        # Example: "10.2 Revenue", "1. Introduction" -- excludes years like 1920, 2020, etc.
-    applies_to_profiles: [generic, finance, technical, academic, legal, government]
+  - hierarchy_type: numbered_heading        # Example: "10.2 Revenue", "1. Introduction", "1 - Introduction" -- excludes years like 1920, 2020, etc.
     patterns:
       #- regex: '^(?!\s*(19|20)\d{2}\b)\s*\d+(?:\.\d+)*\.?'
-      - regex: '^(?!\s*(19|20)\d{2}\b)\s*\d+(?:\.\d+)*(?:\.(?=\s+["\u201C\u2018\[]?(?-i:[A-Z]))|(?=\s+["\u201C\u2018\[]?(?-i:[A-Z])))' # stricter version with lookahead, either followed by a dot or a capital letter, optionally preceded by an opening quote or bracket
+      - regex: '^(?!\s*(19|20)\d{2}\b)\s*\d+(?:\.\d+)*(?:\.(?=\s+["\u201C\u2018\[<]?(?-i:[A-Z]))|(?=\s+["\u201C\u2018\[<]?(?-i:[A-Z]))|(?=\s+[-\u2013\u2014]\s+["\u201C\u2018\[<]?(?-i:[A-Z])))' # stricter version with lookahead, either followed by a dot, dash separator, or capital letter, optionally preceded by an opening quote, bracket, or angle bracket
         flags: 'i'
 
-  - hierarchy_type: roman_numbered_heading         # Example: "II. Background"
-    applies_to_profiles: [finance, generic, technical, academic, legal]
+  - hierarchy_type: roman_numbered_heading         # Example: "II. Background", "II - Background"
     patterns:
       #- regex: '^\s*[ivxlcdm]+\.'
-      - regex: '^\s*[ivxlcdm]+(?:\.(?=\s+(?-i:[A-Z]))|(?=\s+(?-i:[A-Z])))'
+      - regex: '^\s*[ivxlcdm]+(?:\.(?=\s+(?-i:[A-Z]))|(?=\s+(?-i:[A-Z]))|(?=\s+[-\u2013\u2014]\s+(?-i:[A-Z])))'
         flags: 'i'
 
   # =========================
-  # Alpha-numbered headings
+  # Alpha headings
   # =========================
 
   - hierarchy_type: alpha_dotted_numbered_heading   # Example: "A.1 Tasks", "A1.2.3 Overview"
-    applies_to_profiles: [finance, generic, technical, academic, legal]
     patterns:
       #- regex: '^\s*[A-Za-z]\.?\d+(?:\.\d+)*'
       - regex: '^\s*[A-Za-z]\.?\d+(?:\.\d+)*\.?(?=\.\s+|[A-Z])'
         flags: 'i'
 
-  - hierarchy_type: alpha_numbered_heading         # Example: "A Additional", "A. Additional"
-    applies_to_profiles: [finance, generic, technical, academic, legal]
+  - hierarchy_type: alpha_numbered_heading         # Example: "A1. Tasks", "A1 Tasks", "A1 - Tasks" - Excludes Q1 to Q4
     patterns:
-      #- regex: '^\s*[A-Za-z]\.?\s+'
-      - regex: '^\s*[A-Za-z]\.?\d+(?:\.\d+)*\.?(?:\.(?=\s+(?-i:[A-Z]))|(?=\s+(?-i:[A-Z])))'
+      - regex: '^\s*(?![Qq][1-4]\b)[A-Za-z]\.?\d+(?:\.\d+)*\.?(?:\.(?=\s+(?-i:[A-Z]))|(?=\s+(?-i:[A-Z]))|(?=\s+[-\u2013\u2014]\s+(?-i:[A-Z])))'
         flags: 'i'
 
-  
-  # =========================
-  # Academic / Technical labels
-  # =========================
-  # DISABLED FOR NOW
-  #- heading_type: academic_label        # Example: "Abstract" / "Methods" / "Results" -- subordinated to other headings
-  #  applies_to_profiles: [academic, technical]
-  #  patterns:
-  #    - regex: '^\s*(abstract|introduction|background|methods?|results?|discussion|conclusion|references)\s*$'
-  #      flags: 'i'
+  - hierarchy_type: alpha_heading                  # Example: "A Additional", "A. Additional", "A - Additional"
+    patterns:
+      - regex: '^\s*(?-i:[A-Z])\.?(?:(?=\s+(?-i:[A-Z]))|(?=\s+[-\u2013\u2014]\s+(?-i:[A-Z])))'

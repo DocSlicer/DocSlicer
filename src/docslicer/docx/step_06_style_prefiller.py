@@ -300,4 +300,8 @@ def prefill_block_types(df: pd.DataFrame) -> pd.DataFrame:
     unsuppressed_heading = fillable_heading & ~out["docx_heading_suppressed"]
     out.loc[unsuppressed_heading, "block_type"] = "heading"
 
+    if "heading_source" not in out.columns:
+        out["heading_source"] = pd.NA
+    out.loc[unsuppressed_heading, "heading_source"] = "docx"
+
     return out

@@ -1,15 +1,29 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 
 # =============================
 # General Networking Defaults
 # =============================
 
+SCRAPING_DIR = Path(__file__).parent
+
 BROWSER_USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/120.0.0.0 Safari/537.36"
+    "Chrome/136.0.0.0 Safari/537.36"
 )
+
+BROWSER_ARGS = [
+    "--disable-http2",
+    "--disable-blink-features=AutomationControlled",
+    "--no-sandbox",
+    "--disable-dev-shm-usage",
+]
+
+STEALTH_INIT_JS_PATH = SCRAPING_DIR / "stealth_init.js"
+COOKIE_CONSENT_JS_PATH = SCRAPING_DIR / "cookie_consent.js"
 
 DEFAULT_HTTP_HEADERS = {
     "User-Agent": BROWSER_USER_AGENT,
@@ -24,7 +38,7 @@ DEFAULT_HTTP_HEADERS = {
     "Pragma": "no-cache",
     "Connection": "keep-alive",
     "Upgrade-Insecure-Requests": "1",
-    "Sec-Ch-Ua": '"Chromium";v="120", "Not_A Brand";v="24"',
+    "Sec-Ch-Ua": '"Chromium";v="136", "Not_A Brand";v="24"',
     "Sec-Ch-Ua-Mobile": "?0",
     "Sec-Ch-Ua-Platform": '"macOS"',
     "Sec-Fetch-Dest": "document",

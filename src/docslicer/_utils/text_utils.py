@@ -70,7 +70,7 @@ def is_list_marker(text: object) -> bool:
 # ==================================================
 
 ITALIC_RE = re.compile(r"(italic|ital|oblique|slanted|cursive|skew|obl)", re.I)
-BOLD_RE   = re.compile(r"(bold|black|semi[- ]?bold|demi|medium|heavy|extra|ultra)", re.I)
+BOLD_RE   = re.compile(r"(bold|black|semi[- ]?bold|demi|medium|medi|heavy|extra|ultra)", re.I)
 
 FONT_SUBSET_PREFIX = re.compile(r"^[A-Z]{6}\+")
 FONT_DIGIT_SUFFIX  = re.compile(r"\+\d+$")

@@ -604,8 +604,8 @@ def _build_page_label_token_inventory(df: pd.DataFrame, page_label_config) -> pd
 
     out = pd.DataFrame(
         {
-            "raw_token": raw_tokens,
-            "normalized_token": norm_tokens,
+            "raw_token": pd.array(raw_tokens, dtype=object),
+            "normalized_token": pd.array(norm_tokens, dtype=object),
             "page_label_type": types,
             "is_token_like": is_like,
             "has_dash_wrapper": has_dash_wrappers,

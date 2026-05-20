@@ -30,7 +30,7 @@ import re
 # Pre-filter forbidden heading line formats (text that will never be a heading)
 # ================================================================================
 
-_FORBIDDEN_BLOCK_TYPES = {"table", "image", "hr", "page_label", "navigation", "toc", "exhibits"}
+_FORBIDDEN_BLOCK_TYPES = {"table", "image", "hr", "page_label", "navigation", "toc", "exhibits", "speaker_notes", "shape", "chart"}
 
 _FORBIDDEN_SUBSTRINGS = {
     # signature indicators
@@ -67,6 +67,7 @@ def _pre_filter_lines(lines_df: pd.DataFrame) -> pd.DataFrame:
     (2) rows where text starts with any token in _FORBIDDEN_START_TEXT (case-insensitive, after lstrip)
     (3) rows where text is fully parenthesized: (...), [...], {...}
     (4) rows where text contains any substring in _FORBIDDEN_SUBSTRINGS (case-insensitive)
+    (5) rows where stripped text is fewer than 3 characters (e.g. decorative large first-letters)
 
     Returns a filtered COPY (subset of rows).
     """
@@ -105,6 +106,12 @@ def _pre_filter_lines(lines_df: pd.DataFrame) -> pd.DataFrame:
         # Check if any forbidden substring appears anywhere in the text
         for substring in forbidden_substrings:
             keep &= ~text_lower.str.contains(re.escape(substring), na=False)
+
+    # (5) minimum 3 characters
+    if "char_count" in df.columns:
+        keep &= _to_float_series(df["char_count"], default=0.0) >= 3
+    else:
+        keep &= text.str.strip().str.len() >= 3
 
     return df.loc[keep].copy()
 
@@ -444,6 +451,52 @@ def _correct_paren_type_by_series(lines_df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _validate_alpha_heading_series(lines_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Validates alpha_heading markers by requiring them to form a consecutive
+    alphabetical series (A→B→C…). A row is valid if at least one adjacent
+    alpha_heading neighbour (by line_id order) has the immediately preceding
+    or following letter. Singletons have hierarchy_type and hierarchy_marker
+    cleared so they fall through as free_form if scored as a heading.
+    """
+    out = lines_df.copy()
+
+    target_mask = (
+        out.get("hierarchy_type", pd.Series(dtype="object"))
+           .fillna("").astype(str)
+           .eq("alpha_heading")
+    )
+    if not target_mask.any():
+        return out
+
+    cand = out[target_mask].copy()
+    if "line_id" in cand.columns:
+        cand = cand.sort_values("line_id")
+
+    def _parse_letter(marker) -> str | None:
+        s = str(marker).strip().rstrip(". \t").strip()
+        return s.upper() if len(s) == 1 and s.isalpha() else None
+
+    letters = cand["hierarchy_marker"].fillna("").apply(_parse_letter)
+    valid_letters = letters.dropna()
+
+    if valid_letters.empty:
+        return out
+
+    letter_vals = valid_letters.apply(ord)
+
+    # A row is valid if the immediately adjacent alpha_heading (prev or next)
+    # has a letter exactly one step away.
+    has_valid_prev = letter_vals.diff() == 1
+    has_valid_next = letter_vals.diff(-1) == -1
+    is_valid = has_valid_prev | has_valid_next
+
+    invalid_idx = valid_letters.index[~is_valid]
+    out.loc[invalid_idx, "hierarchy_type"] = None
+    out.loc[invalid_idx, "hierarchy_marker"] = None
+
+    return out
+
 
 # ================================================================================
 # Core heading scoring function
@@ -529,6 +582,7 @@ def _add_heading_score(lines_df: pd.DataFrame) -> pd.DataFrame:
     [PDF specific]
     - layout_id consists out of only 1 line_id: +1
       (interpreted as: within the same layout_id, the number of rows/lines == 1)
+    - layout_id has 4 or more lines: -0.5
     """
     out = lines_df.copy()
 
@@ -537,23 +591,27 @@ def _add_heading_score(lines_df: pd.DataFrame) -> pd.DataFrame:
 
     # --- font_size_ratio
     fsr = _to_float_series(out.get("font_size_ratio"), default=np.nan).fillna(1.0)
-    score += np.where((fsr >= 1.01) & (fsr < 1.2), 1.0, 0.0)
-    score += np.where((fsr >= 1.2) & (fsr < 1.4), 2.0, 0.0)
-    score += np.where((fsr >= 1.4), 3.0, 0.0)
-    #score += np.where((fsr < 1.0), -0.5, 0.0) # Was -1.0
-    #score += np.where((fsr < 0.8), -3.0, 0.0)
+    c_fsr = pd.Series(0.0, index=out.index, dtype="float64")
+    c_fsr += np.where((fsr >= 1.01) & (fsr < 1.2), 1.0, 0.0)
+    c_fsr += np.where((fsr >= 1.2) & (fsr < 1.4), 2.0, 0.0)
+    c_fsr += np.where((fsr >= 1.4), 3.0, 0.0)
+    c_fsr += np.where((fsr < 0.75), -5.0, 0.0)
+    score += c_fsr
 
     # --- char_count
     cc = _to_float_series(out.get("char_count"), default=np.nan)
-    score += np.where(cc < 50, 0.5, 0.0)
-    score += np.where(cc > 100, -1.0, 0.0)
-    score += np.where(cc > 250, -3.0, 0.0)
+    c_cc = pd.Series(0.0, index=out.index, dtype="float64")
+    c_cc += np.where(cc < 50, 0.5, 0.0)
+    c_cc += np.where(cc > 100, -1.0, 0.0)
+    c_cc += np.where(cc > 250, -3.0, 0.0)
+    score += c_cc
 
     # --- capitalized_token_ratio
     cap_ratio = _safe_div(out.get("capitalized_word_count"), out.get("word_count"), fill=0.0)
     if len(cap_ratio) == 0:
         cap_ratio = pd.Series(0.0, index=out.index, dtype="float64")
-    score += np.where(cap_ratio > 0.75, 0.5, 0.0)
+    c_cap = pd.Series(np.where(cap_ratio > 0.75, 0.5, 0.0), index=out.index, dtype="float64")
+    score += c_cap
 
     # --- styles
     # Note: we must handle missing columns - _to_bool_series returns empty Series if column is None
@@ -561,7 +619,7 @@ def _add_heading_score(lines_df: pd.DataFrame) -> pd.DataFrame:
     is_italic = _to_bool_series(out.get("is_italic"), default=False)
     is_underlined = _to_bool_series(out.get("is_underlined"), default=False)
     is_uppercase = _to_bool_series(out.get("is_uppercase"), default=False)
-    
+
     # _to_bool_series returns an empty Series for missing columns; realign to full index before scoring
     if len(is_bold) == 0:
         is_bold = pd.Series(False, index=out.index, dtype=bool)
@@ -572,18 +630,22 @@ def _add_heading_score(lines_df: pd.DataFrame) -> pd.DataFrame:
     if len(is_uppercase) == 0:
         is_uppercase = pd.Series(False, index=out.index, dtype=bool)
 
-    score += is_bold.astype("float64") * 2.5
-    score += is_italic.astype("float64") * 1.5
-    score += is_underlined.astype("float64") * 1.5
-    score += is_uppercase.astype("float64") * 1.0
+    c_bold = is_bold.astype("float64") * 2.5
+    c_italic = is_italic.astype("float64") * 1.5
+    c_underlined = is_underlined.astype("float64") * 1.5
+    c_uppercase = is_uppercase.astype("float64") * 1.0
+    score += c_bold + c_italic + c_underlined + c_uppercase
 
     # --- text_align = center
+    c_center = pd.Series(0.0, index=out.index, dtype="float64")
     ta = out.get("text_align")
     if ta is not None:
         ta_norm = ta.astype("string").str.strip().str.lower()
-        score += np.where(ta_norm.eq("center"), 1.0, 0.0)
+        c_center = pd.Series(np.where(ta_norm.eq("center"), 1.0, 0.0), index=out.index, dtype="float64")
+    score += c_center
 
     # --- non_stroking_color rarity bonus (+1 if not the prevalent color, excluding basic colors)
+    c_color = pd.Series(0.0, index=out.index, dtype="float64")
     nsc = out.get("non_stroking_color")
     if nsc is not None:
         nsc_norm = (
@@ -615,14 +677,45 @@ def _add_heading_score(lines_df: pd.DataFrame) -> pd.DataFrame:
         # - color != prevalent color
         # - not a basic color
         bonus = (nsc_norm.notna()) & (nsc_norm != prevalent) & (~is_basic)
-        score += bonus.astype("float64") * 1.0
+        c_color = bonus.astype("float64") * 1.0
+    score += c_color
 
     # --- hierarchy_type marker bonus (+0.5 if a structural marker was detected)
+    c_hierarchy = pd.Series(0.0, index=out.index, dtype="float64")
     if "hierarchy_type" in out.columns:
         ht = out["hierarchy_type"].fillna("").astype(str).str.strip()
-        score += (ht != "").astype("float64") * 0.5
+        c_hierarchy = (ht != "").astype("float64") * 0.5
+    score += c_hierarchy
+
+    # --- layout_id density penalty (-0.5 if layout_id has 4+ lines)
+    c_layout_density = pd.Series(0.0, index=out.index, dtype="float64")
+    if "layout_id" in out.columns:
+        layout_sizes = out.groupby("layout_id", sort=False)["layout_id"].transform("count")
+        c_layout_density = pd.Series(np.where(layout_sizes >= 4, -0.5, 0.0), index=out.index, dtype="float64")
+    score += c_layout_density
 
     out["heading_score"] = score
+
+    # --- build per-row debug JSON with each KPI's contribution
+    debug_components = pd.DataFrame({
+        "font_size_ratio": c_fsr,
+        "char_count": c_cc,
+        "cap_ratio": c_cap,
+        "is_bold": c_bold,
+        "is_italic": c_italic,
+        "is_underlined": c_underlined,
+        "is_uppercase": c_uppercase,
+        "text_align_center": c_center,
+        "color_rarity": c_color,
+        "hierarchy_type": c_hierarchy,
+        "layout_density": c_layout_density,
+    }, index=out.index)
+
+    def _row_to_debug_json(row: pd.Series) -> str:
+        return json.dumps({k: round(float(v), 4) for k, v in row.items() if v != 0.0})
+
+    out["heading_score_debug"] = debug_components.apply(_row_to_debug_json, axis=1)
+
     return out
 
 # ================================================================================
@@ -632,47 +725,80 @@ def _add_heading_score(lines_df: pd.DataFrame) -> pd.DataFrame:
 
 def _apply_contextual_score_adjustments(lines_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Neighborhood-aware adjustments applied to heading_score on the full df.
+    Window-based score adjustments applied to heading_score.
 
-    +1  line is the only line in its layout_id block (isolated element)
-    -2  layout_id block has 3+ lines (line lives in a multi-line visual block)
-        OR line is part of a run of 3+ consecutive lines sharing identical styling
-        (only one -2 penalty fires per line, not both)
+    Operates on lines sorted by line_id. For each line, three overlapping 3-line
+    windows are considered (line is first, middle, and last in the window).
+
+    heading_score: -2  the line is part of any window where all 3 consecutive lines share the
+                       same styling key (applied at most once per line)
+    heading_score: +1  no line within 2 positions shares the line's styling key
+                       (ensures the line is alone in every 3-line window it participates in)
     """
     out = lines_df.copy()
 
     if "heading_score" not in out.columns:
         return out
 
-    adj = pd.Series(0.0, index=out.index, dtype="float64")
-    layout_penalized = pd.Series(False, index=out.index)
-
-    # --- layout_id block size signals ---
-    layout_id = out.get("layout_id")
-    if layout_id is not None:
-        grp_size = out.groupby("layout_id")["layout_id"].transform("size")
-        adj += np.where(grp_size == 1, 1.0, 0.0)
-        layout_penalized = grp_size >= 3
-        adj += np.where(layout_penalized, -2.0, 0.0)
-
-    # --- consecutive style-run penalty ---
-    # Build a style key from boolean style flags + bucketed font_size_ratio.
-    # Uses vectorized cumsum-groupby trick: no row loops.
+    # style key: "hierarchy_type|non_stroking_color|is_bold|is_italic|is_underlined|font_family|font_size_ratio"
+    # font_size_ratio is bucketed to 1 decimal place to absorb minor float variation
     style_parts = []
-    for col in ["hierarchy_type", "non_stroking_color", "is_bold", "is_italic", "is_underlined", "is_uppercase"]:
+    for col in ["is_bold", "is_italic", "is_underlined", "font_family"]: #Removed "hierarchy_type" - accidental hits, "non_stroking_color" - already captured by color_rarity, "is_uppercase" - accidental hits
         if col in out.columns:
             style_parts.append(out[col].fillna(False).astype(str))
     if "font_size_ratio" in out.columns:
         style_parts.append(out["font_size_ratio"].fillna(1.0).round(1).astype(str))
 
-    if style_parts:
-        style_key = pd.concat(style_parts, axis=1).agg("|".join, axis=1)
-        run_group = (style_key != style_key.shift()).cumsum()
-        run_len = run_group.map(run_group.value_counts())
-        style_run_penalty = (run_len >= 3) & ~layout_penalized
-        adj += np.where(style_run_penalty, -2.0, 0.0)
+    if not style_parts:
+        return out
 
-    out["heading_score"] = (out["heading_score"] + adj).astype("float64")
+    sort_col = "line_id" if "line_id" in out.columns else None
+    working_idx = out.sort_values(sort_col).index if sort_col else out.index
+
+    style_key = pd.concat(style_parts, axis=1).agg("|".join, axis=1).loc[working_idx]
+
+    same_prev2 = (style_key == style_key.shift(2)).fillna(False)
+    same_prev  = (style_key == style_key.shift(1)).fillna(False)
+    same_next  = (style_key == style_key.shift(-1)).fillna(False)
+    same_next2 = (style_key == style_key.shift(-2)).fillna(False)
+
+    # -2: part of any 3-consecutive same-style window
+    in_penalty_window = (
+        (same_prev & same_prev.shift(1).fillna(False)) |   # window [i-2, i-1, i]
+        (same_prev & same_next) |                           # window [i-1, i, i+1]
+        (same_next & same_next.shift(-1).fillna(False))    # window [i, i+1, i+2]
+    )
+
+    # +2: no line within 2 positions shares the same style key
+    # (ensures the line is alone in every 3-line window it participates in)
+    isolated = ~same_prev2 & ~same_prev & ~same_next & ~same_next2
+
+    penalty_arr = np.asarray(in_penalty_window).ravel().astype(bool)
+    isolated_arr = np.asarray(isolated).ravel().astype(bool)
+    adj = pd.Series(
+        np.where(penalty_arr, -2.0, 0.0) + np.where(isolated_arr, 1.0, 0.0),
+        index=working_idx,
+        dtype="float64",
+    )
+
+    adj_aligned = adj.reindex(out.index).fillna(0.0)
+    out["heading_score"] = (out["heading_score"] + adj_aligned).astype("float64")
+
+    # Append contextual adjustment to debug JSON
+    if "heading_score_debug" in out.columns:
+        def _append_contextual(row: pd.Series) -> str:
+            v = adj_aligned.loc[row.name]
+            if v == 0.0:
+                return row["heading_score_debug"]
+            try:
+                d = json.loads(row["heading_score_debug"])
+            except (ValueError, TypeError):
+                d = {}
+            d["contextual_adjustment"] = round(float(v), 4)
+            return json.dumps(d)
+
+        out["heading_score_debug"] = out.apply(_append_contextual, axis=1)
+
     return out
 
 
@@ -730,6 +856,10 @@ def _add_heading_decision(
     should_assign_heading = is_heading & no_role_yet
     out.loc[should_assign_heading, "block_type"] = "heading"
 
+    if "heading_source" not in out.columns:
+        out["heading_source"] = pd.NA
+    out.loc[should_assign_heading, "heading_source"] = "score"
+
     # Pick heading_type from hierarchy_type if present, else default
     if "hierarchy_type" in out.columns:
         ht = out["hierarchy_type"].astype("string").str.strip()
@@ -737,7 +867,12 @@ def _add_heading_decision(
     else:
         chosen = pd.Series(default_heading_type, index=out.index, dtype="string")
 
-    out.loc[is_heading, "heading_type"] = chosen.loc[is_heading]
+    # Also populate heading_type for rows already marked as heading (e.g. from docx),
+    # regardless of score — scoring is irrelevant when the role is pre-assigned.
+    already_heading = existing_role.str.lower() == "heading"
+    should_set_heading_type = is_heading | already_heading
+
+    out.loc[should_set_heading_type, "heading_type"] = chosen.loc[should_set_heading_type]
 
     return out
 
@@ -1178,8 +1313,11 @@ _SUPPRESS_BLANK_COLS = (
 def _suppress_headings(df: pd.DataFrame) -> pd.DataFrame:
     """
     (1) Suppress repeated headings: same text ≥3× (center) or ≥5× (other) within fp_id.
+        Only applies to free_form headings — headings with an identified hierarchy_type marker are never suppressed.
     (2) Coverpage rule: when 3+ consecutive heading line_ids exist on coverpage/page-1,
         keep only the best one (FORM/SCHEDULE prefix > highest score > lowest line_id).
+    (3) Per-slide rule (pptx): when slide_index is present, keep only the first heading
+        per slide (lowest line_id) and suppress all others on that slide.
     """
     out = df.copy()
 
@@ -1197,9 +1335,25 @@ def _suppress_headings(df: pd.DataFrame) -> pd.DataFrame:
             if c in out.columns:
                 out.loc[mask, c] = np.nan
 
-    # (1) Repeated headings
-    is_heading = _is_heading_mask(out["block_type"])
-    if "heading_fp_id" in out.columns and "text" in out.columns and is_heading.any():
+    # Rows declared as headings by an upstream parser (e.g. docx) are structural facts —
+    # scoring-based suppression does not apply to them.
+    docx_heading = (
+        out.get("heading_source", pd.Series(dtype="object"))
+           .astype("string").str.strip().str.lower()
+           .eq("docx")
+           .fillna(False)
+    )
+
+    # (1) Repeated headings — skipped for pptx (rule 3 handles per-slide suppression)
+    # Only suppress free_form headings; headings with an identified hierarchy_type marker are structural facts.
+    is_free_form = (
+        out.get("heading_type", pd.Series(dtype="object"))
+           .astype("string").str.strip().str.lower()
+           .eq("free_form")
+           .fillna(True)  # treat missing heading_type as free_form (conservative)
+    )
+    is_heading = _is_heading_mask(out["block_type"]) & ~docx_heading & is_free_form
+    if "heading_fp_id" in out.columns and "text" in out.columns and is_heading.any() and "slide_index" not in out.columns:
         fp = out.loc[is_heading, "heading_fp_id"]
         txt = out.loc[is_heading, "text"].astype("string").fillna("").str.strip()
         align = (out.loc[is_heading, "text_align"].astype("string").fillna("").str.strip().str.lower()
@@ -1218,20 +1372,21 @@ def _suppress_headings(df: pd.DataFrame) -> pd.DataFrame:
                     if c in out.columns:
                         out.loc[suppress_mask, c] = np.nan
 
-    # (2) Coverpage / page-1 cluster
-    is_heading = _is_heading_mask(out["block_type"])
-    if is_heading.any():
+    # (2) Coverpage / page-1 cluster — skipped for pptx (rule 3 handles per-slide suppression)
+    # Only suppresses free_form headings; headings with an identified hierarchy_type marker are kept.
+    is_heading = _is_heading_mask(out["block_type"]) & ~docx_heading & is_free_form
+    if is_heading.any() and "slide_index" not in out.columns:
         has_coverpage = ("section" in out.columns
                          and out.loc[is_heading, "section"].astype("string")
                          .str.strip().str.lower().eq("coverpage").any())
         if has_coverpage:
             scope_mask = out["section"].astype("string").fillna("").str.strip().str.lower().eq("coverpage")
-        elif "page_number" in out.columns:
+        elif "page_number" in out.columns and out["page_number"].nunique() >= 3:
             scope_mask = out["page_number"].eq(out["page_number"].min())
         else:
-            scope_mask = pd.Series(True, index=out.index)
+            scope_mask = None
 
-        scope_heading_idx = out.index[is_heading & scope_mask]
+        scope_heading_idx = out.index[is_heading & scope_mask] if scope_mask is not None else pd.Index([])
         if len(scope_heading_idx) >= 3 and "line_id" in out.columns:
             sorted_ids = out.loc[scope_heading_idx, "line_id"].sort_values().values
             has_run = any(sorted_ids[i + 2] - sorted_ids[i] == 2 for i in range(len(sorted_ids) - 2))
@@ -1248,9 +1403,34 @@ def _suppress_headings(df: pd.DataFrame) -> pd.DataFrame:
                     candidates = candidates.loc[hs == hs.max()]
                 best_line_id = pd.to_numeric(candidates["line_id"], errors="coerce").min()
                 keep_idx = candidates.index[pd.to_numeric(candidates["line_id"], errors="coerce") == best_line_id][0]
+                # If the winner heading spans multiple merged lines (same heading_id), keep all of them
+                if "heading_id" in out.columns:
+                    winner_hid = out.loc[keep_idx, "heading_id"]
+                    if pd.notna(winner_hid):
+                        keep_set = out.index[out["heading_id"] == winner_hid]
+                    else:
+                        keep_set = pd.Index([keep_idx])
+                else:
+                    keep_set = pd.Index([keep_idx])
                 suppress_mask = pd.Series(False, index=out.index)
-                suppress_mask.loc[scope_heading_idx.difference([keep_idx])] = True
+                suppress_mask.loc[scope_heading_idx.difference(keep_set)] = True
                 _suppress_rows(suppress_mask)
+
+    # (3) Per-slide rule: keep only the first heading per slide_index
+    # Includes hybrid_heading_paragraph — suppressed ones become paragraph via _finalize_block_types
+    is_heading = _is_heading_mask(out["block_type"])
+    is_hybrid = out["block_type"].astype("string").str.strip().str.lower().eq("hybrid_heading_paragraph").fillna(False)
+    is_any_heading = is_heading | is_hybrid
+    if "slide_index" in out.columns and is_any_heading.any() and "line_id" in out.columns:
+        slide_headings = out.loc[is_any_heading, ["slide_index", "line_id"]].copy()
+        keep_idx = (
+            slide_headings
+            .groupby("slide_index", sort=False)["line_id"]
+            .idxmin()
+        )
+        suppress_mask = pd.Series(False, index=out.index)
+        suppress_mask.loc[slide_headings.index.difference(keep_idx)] = True
+        _suppress_rows(suppress_mask)  # sets block_type to nan → paragraph via _finalize_block_types
 
     return out
 
@@ -1300,20 +1480,25 @@ def detect_headings(
 
     out = _detect_marker_candidates(out, compiled_patterns)
     out = _correct_paren_type_by_series(out)
+    out = _validate_alpha_heading_series(out)
 
     scored_input = _pre_filter_lines(out)
     if "heading_score" not in out.columns:
         out["heading_score"] = 0.0
+    if "heading_score_debug" not in out.columns:
+        out["heading_score_debug"] = "{}"
     if len(scored_input) > 0:
         scored_slice = _add_heading_score(scored_input)
         if "line_id" in out.columns and "line_id" in scored_slice.columns:
-            scored_key = scored_slice.drop_duplicates(subset=["line_id"], keep="first")[["line_id", "heading_score"]]
+            scored_key = scored_slice.drop_duplicates(subset=["line_id"], keep="first")[["line_id", "heading_score", "heading_score_debug"]]
             out = out.merge(scored_key, on="line_id", how="left", suffixes=("", "_scored"))
             out["heading_score"] = out["heading_score_scored"].fillna(out["heading_score"]).astype("float64")
-            out = out.drop(columns=["heading_score_scored"])
+            out["heading_score_debug"] = out["heading_score_debug_scored"].fillna(out["heading_score_debug"])
+            out = out.drop(columns=["heading_score_scored", "heading_score_debug_scored"])
         else:
             idx = scored_slice.index.intersection(out.index)
             out.loc[idx, "heading_score"] = scored_slice.loc[idx, "heading_score"].astype("float64")
+            out.loc[idx, "heading_score_debug"] = scored_slice.loc[idx, "heading_score_debug"]
 
     out = _apply_contextual_score_adjustments(out)
     out = _add_heading_decision(out)

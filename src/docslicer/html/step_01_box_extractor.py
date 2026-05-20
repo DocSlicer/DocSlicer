@@ -6,16 +6,18 @@ from typing import Any, Dict, List
 
 from playwright.sync_api import sync_playwright
 
-# ====== CONFIG ======
-HEADLESS = True  # set False to debug visually
-BROWSER_USER_AGENT = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/120.0.0.0 Safari/537.36"
+from docslicer.scraping.config import (
+    BROWSER_ARGS,
+    BROWSER_USER_AGENT,
+    COOKIE_CONSENT_JS_PATH,
+    STEALTH_INIT_JS_PATH,
 )
 
-# JS lives in document_pipeline/js folder
-PIPELINE_DIR = Path(__file__).parent  # document_pipeline/
+# ====== CONFIG ======
+HEADLESS = True  # set False to debug visually
+
+# JS lives beside this HTML extraction step.
+PIPELINE_DIR = Path(__file__).parent
 EXTRACTOR_JS_PATH = PIPELINE_DIR / "extract_boxes.js"
 
 # ----------------------------
@@ -24,17 +26,15 @@ EXTRACTOR_JS_PATH = PIPELINE_DIR / "extract_boxes.js"
 def extract_boxes_with_playwright(
     html: str,
     source_url: str = None,
+    wait_until: str = "domcontentloaded",
 ) -> tuple[List[Dict[str, Any]], str]:
     """
     Extract boxes from HTML using Playwright + in-page JS extractor.
-    
-    For URLs (when source_url is provided), navigates to the URL to execute
-    client-side JavaScript. For file uploads, sets content directly.
 
     Args:
-        html: HTML content
-        page_label_config: Page label patterns config dict loaded from YAML
-        source_url: Optional URL - if provided, will navigate instead of setting content
+        html: Raw HTML string, or None when source_url is provided.
+        source_url: URL to navigate to, or None when html is provided.
+        wait_until: Playwright navigation wait strategy ("domcontentloaded" or "networkidle").
 
     Returns:
         Tuple of (boxes list, rendered_html string)
@@ -43,6 +43,8 @@ def extract_boxes_with_playwright(
         raise ValueError("Exactly one of 'html' or 'url' must be provided")
     
     js_code = EXTRACTOR_JS_PATH.read_text(encoding="utf-8")
+    cookie_consent_js = COOKIE_CONSENT_JS_PATH.read_text(encoding="utf-8")
+    stealth_init_js = STEALTH_INIT_JS_PATH.read_text(encoding="utf-8")
     #js_code = _inject_is_page_label_token(js_code, page_label_config)
 
     # Use consistent viewport width for coordinate alignment
@@ -50,11 +52,18 @@ def extract_boxes_with_playwright(
     VIEWPORT_HEIGHT = 800
     
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=HEADLESS, args=["--disable-http2"])
+        # Prefer real Chrome (less detectable) and fall back to bundled Chromium.
+        try:
+            browser = p.chromium.launch(headless=HEADLESS, channel="chrome", args=BROWSER_ARGS)
+        except Exception:
+            browser = p.chromium.launch(headless=HEADLESS, args=BROWSER_ARGS)
         context = browser.new_context(
             user_agent=BROWSER_USER_AGENT,
-            viewport={"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT}
+            viewport={"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
+            extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
+            bypass_csp=True,
         )
+        context.add_init_script(stealth_init_js)
         page = context.new_page()
 
         # For URLs: navigate to execute client-side JS (React, etc.)
@@ -62,9 +71,7 @@ def extract_boxes_with_playwright(
         navigated_url = False
         if source_url and source_url.startswith(('http://', 'https://')):
             try:
-                # Navigate and wait for DOM to be loaded
-                # domcontentloaded is more reliable than networkidle for pages with ongoing network activity
-                page.goto(source_url, wait_until="domcontentloaded", timeout=30000)
+                page.goto(source_url, wait_until=wait_until, timeout=60000)
                 navigated_url = True
             except Exception as e:
                 # If we have html as fallback, use it
@@ -81,6 +88,10 @@ def extract_boxes_with_playwright(
         # set_content("load") already guarantees this; goto("domcontentloaded") does not.
         if navigated_url:
             page.evaluate("document.fonts.ready")
+            # Dismiss cookie banners only when they visually block the page.
+            dismissed = page.evaluate(cookie_consent_js)
+            if dismissed:
+                page.wait_for_timeout(600)  # let dismiss animation finish
 
         # Inject CSS reset to ensure consistent margins (removes default body margin)
         # This must be done BEFORE extracting coordinates
@@ -99,16 +110,6 @@ def extract_boxes_with_playwright(
 
         # Get the rendered HTML (includes data-docslicer-table-id attributes)
         rendered_html = page.content()
-
-        # Some sites render meaningful content after DOMContentLoaded but before
-        # becoming visually stable. Keep the fast path by default, then retry once
-        # with networkidle if the first pass found nothing.
-        if navigated_url and not boxes:
-            try:
-                page.wait_for_load_state("networkidle", timeout=10000)
-                boxes = page.evaluate(js_code)
-            except Exception:
-                pass
 
         # Get the actual page height after rendering
         page_height = page.evaluate("document.documentElement.scrollHeight")

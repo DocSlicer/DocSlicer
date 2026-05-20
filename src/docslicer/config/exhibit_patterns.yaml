@@ -66,13 +66,14 @@ exhibit_row_patterns:
 # =========================
 # Exhibit TITLE / HEADER patterns
 # =========================
-exhibit_header_patterns:
+exhibit_heading_patterns:
   # General "Item ... Exhibits ..." – covers:
   # - "Item 21. Exhibits and Financial Statement Schedules."
   # - "Item 15. Financial Statements and Exhibits."
+  # - "Item 9.01 Financial Statements and Exhibits."
   # - "ITEM 36.2. EXHIBITS"
   - name: item_any_exhibits
-    regex: '^\s*item\s+\d+(\.\d+)?[\.\s\-–—:]*\s+.*exhibit[s]?\b'
+    regex: '^\s*item\s+\d+(\.\d+)?[\.\s\-–—:]+.*exhibit[s]?\b'
     flags: 'i'
 
   # EXHIBIT INDEX
@@ -89,4 +90,10 @@ exhibit_header_patterns:
   # e.g. a table cell with only "EXHIBITS" in it.
   - name: exhibits_only
     regex: '^\s*exhibits\s*\.?\s*$'
+    flags: 'i'
+
+  # "(d) Exhibits." – parenthesized letter/number/roman subpart heading
+  # e.g. "(d) Exhibits.", "(1) Exhibits", "(iv) Exhibits."
+  - name: paren_letter_exhibits
+    regex: '^\s*\([a-z0-9]+\)\s+exhibits?\.?\s*$'
     flags: 'i'

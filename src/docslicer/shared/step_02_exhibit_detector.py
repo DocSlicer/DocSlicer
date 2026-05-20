@@ -1,21 +1,21 @@
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Literal, Optional, Set, Tuple
 
+import numpy as np
 import pandas as pd
 
 from .._utils.yaml_compilers.exhibit_patterns import ExhibitPatternConfig
 
 # =========================
-# Config
+# Constants
 # =========================
 
 EXHIBIT_ROW_MAX_CHARS = 500
 
 # =========================
-# Dataclasses
+# Types
 # =========================
 
 ExhibitRowPatternType = Literal[
@@ -30,7 +30,8 @@ ExhibitRowPatternType = Literal[
     "hundred_series_exhibit", "hundred_series_exhibit_with_markers",
 ]
 ExhibitHeaderPatternType = Literal[
-    "item_any_exhibits", "exhibit_index", "index_to_exhibits", "exhibits_only"
+    "item_any_exhibits", "exhibit_index", "index_to_exhibits", "exhibits_only",
+    "paren_letter_exhibits"
 ]
 
 
@@ -44,7 +45,7 @@ class ExhibitRowCandidate:
     table_id: Optional[Any]
 
     # Layout fields (used for fingerprint-based grouping and cross-page merging)
-    left: Optional[float]
+    x_left: Optional[float]
     height: Optional[float]
     font_size: Optional[float]
     text_align: Optional[str]
@@ -54,17 +55,17 @@ class ExhibitRowCandidate:
 @dataclass(frozen=True)
 class LayoutFingerprint:
     """Layout fingerprint for grouping non-table rows by visual similarity."""
-    left: float
+    x_left: float
     height: float
     font_size: float
 
     @classmethod
     def from_candidate(cls, candidate: ExhibitRowCandidate) -> Optional[LayoutFingerprint]:
         """Create a fingerprint from a candidate's layout values."""
-        if candidate.left is None or candidate.font_size is None:
+        if candidate.x_left is None or candidate.font_size is None:
             return None
         return cls(
-            left=candidate.left,
+            x_left=candidate.x_left,
             height=candidate.height or 0.0,
             font_size=candidate.font_size,
         )
@@ -78,7 +79,7 @@ class LayoutFingerprint:
     ) -> bool:
         """Return True if *other* is within tolerance on all three dimensions."""
         return (
-            abs(self.left - other.left) <= left_tolerance
+            abs(self.x_left - other.x_left) <= left_tolerance
             and abs(self.height - other.height) <= height_tolerance
             and abs(self.font_size - other.font_size) <= font_tolerance
         )
@@ -94,7 +95,7 @@ class ExhibitSegment:
 
     - **Table-based**: all rows share the same ``table_id``.
     - **Fingerprint-based**: rows are contiguous and share the same layout
-      fingerprint (left, height, font_size within tolerance).
+      fingerprint (x_left, height, font_size within tolerance).
     """
     segment_id: int
     start_line_id: int
@@ -187,7 +188,7 @@ def _safe_str_or_none(x: Any) -> Optional[str]:
 
 
 # ==========================================
-# STEP 1: Exhibit Header Candidates
+# Exhibit Header Candidates
 # ==========================================
 
 def _identify_exhibit_heading_candidates(
@@ -208,20 +209,24 @@ def _identify_exhibit_heading_candidates(
     if "text" not in out.columns:
         return out
 
-    for idx, raw_text in out["text"].astype(str).items():
-        txt = (raw_text or "").strip()
+    texts = out["text"].astype(str).tolist()
+    results: List[Any] = [pd.NA] * len(texts)
+
+    for i, raw_text in enumerate(texts):
+        txt = raw_text.strip()
         if not txt or len(txt) > max_len:
             continue
         for pattern in exhibit_config.header_patterns:
             if pattern.compiled.match(txt):
-                out.loc[idx, "exhibit_heading_candidate"] = pattern.name
+                results[i] = pattern.name
                 break  # First match wins
 
+    out["exhibit_heading_candidate"] = results
     return out
 
 
 # ==========================================
-# STEP 2: Exhibit Row Candidates
+# Exhibit Row Candidates
 # ==========================================
 
 def _check_exhibit_row_match(
@@ -302,10 +307,25 @@ def _add_exhibit_row_candidates(
     if "text" not in out.columns:
         return out, []
 
+    # Pre-extract columns as lists for O(1) positional access
+    texts = out["text"].astype(str).tolist()
+    line_ids_list   = out["line_id"].tolist()   if "line_id"   in out.columns else list(range(len(out)))
+    has_links_list  = out["has_link"].tolist()  if "has_link"  in out.columns else [None] * len(out)
+    table_ids_list  = out["table_id"].tolist()  if "table_id"  in out.columns else [None] * len(out)
+    x_lefts_list    = out["x_left"].tolist()    if "x_left"    in out.columns else [None] * len(out)
+    heights_list    = out["height"].tolist()    if "height"    in out.columns else [None] * len(out)
+    font_sizes_list = out["font_size"].tolist() if "font_size" in out.columns else [None] * len(out)
+    text_aligns_list= out["text_align"].tolist()if "text_align"in out.columns else [None] * len(out)
+    page_nums_list  = out["page_number"].tolist()if "page_number" in out.columns else [None] * len(out)
+
+    row_candidate_results: List[Any] = [pd.NA] * len(texts)
+    exhibit_number_results: List[Any] = [pd.NA] * len(texts)
+    pattern_strength_results: List[Any] = [pd.NA] * len(texts)
+
     candidates: List[ExhibitRowCandidate] = []
 
-    for idx, raw_text in out["text"].astype(str).items():
-        text = (raw_text or "").strip()
+    for i, raw_text in enumerate(texts):
+        text = raw_text.strip()
         if not text or len(text) > EXHIBIT_ROW_MAX_CHARS:
             continue
 
@@ -322,35 +342,36 @@ def _add_exhibit_row_candidates(
         if matched_name is None:
             continue
 
-        out.loc[idx, "exhibit_row_candidate"] = matched_name
+        row_candidate_results[i] = matched_name
         if include_debug_cols:
-            out.loc[idx, "exhibit_number"] = exhibit_number
-            out.loc[idx, "pattern_strength"] = matched_strength
+            exhibit_number_results[i] = exhibit_number
+            pattern_strength_results[i] = matched_strength
 
         candidates.append(ExhibitRowCandidate(
-            line_id=int(out.at[idx, "line_id"]) if "line_id" in out.columns else idx,
+            line_id=int(line_ids_list[i]),
             exhibit_row_pattern=matched_name,  # type: ignore[arg-type]
             exhibit_number=exhibit_number,
             pattern_strength=matched_strength,
-            has_link=_safe_bool01(out.at[idx, "has_link"]) if "has_link" in out.columns else False,
-            table_id=out.at[idx, "table_id"] if "table_id" in out.columns else None,
-            left=_safe_float(out.at[idx, "x_left"]) if "x_left" in out.columns else None,
-            height=_safe_float(out.at[idx, "height"]) if "height" in out.columns else None,
-            font_size=_safe_float(out.at[idx, "font_size"]) if "font_size" in out.columns else None,
-            text_align=_safe_str_or_none(out.at[idx, "text_align"]) if "text_align" in out.columns else None,
-            page_number=_safe_int(out.at[idx, "page_number"]) if "page_number" in out.columns else None,
+            has_link=_safe_bool01(has_links_list[i]),
+            table_id=table_ids_list[i],
+            x_left=_safe_float(x_lefts_list[i]),
+            height=_safe_float(heights_list[i]),
+            font_size=_safe_float(font_sizes_list[i]),
+            text_align=_safe_str_or_none(text_aligns_list[i]),
+            page_number=_safe_int(page_nums_list[i]),
         ))
+
+    out["exhibit_row_candidate"] = row_candidate_results
+    if include_debug_cols:
+        out["exhibit_number"] = exhibit_number_results
+        out["pattern_strength"] = pattern_strength_results
 
     return out, candidates
 
 
 # ==========================================
-# STEP 3: Build Exhibit Segments
+# Build Exhibit Segments
 # ==========================================
-
-_EXHIBIT_NUMBER_HEADER_RE = re.compile(
-    r"^\s*exhibit\s+(?:number|no\.?)\s*$", re.IGNORECASE
-)
 
 
 def _detect_exhibit_number_header_tables(df: pd.DataFrame) -> Set[Any]:
@@ -362,19 +383,15 @@ def _detect_exhibit_number_header_tables(df: pd.DataFrame) -> Set[Any]:
     if "table_id" not in df.columns or "text" not in df.columns:
         return set()
 
-    result: Set[Any] = set()
-    for table_id, group in df.groupby("table_id"):
-        if pd.isna(table_id):
-            continue
-        first_row = (
-            group.sort_values("line_id").iloc[0]
-            if "line_id" in group.columns
-            else group.iloc[0]
-        )
-        if _EXHIBIT_NUMBER_HEADER_RE.match(str(first_row["text"]).strip()):
-            result.add(table_id)
-
-    return result
+    sort_col = "line_id" if "line_id" in df.columns else None
+    src = df.dropna(subset=["table_id"])
+    if sort_col:
+        src = src.sort_values(sort_col)
+    first_rows = src.drop_duplicates(subset=["table_id"], keep="first")
+    mask = first_rows["text"].astype(str).str.strip().str.match(
+        r"^\s*exhibit\s+(?:number|no\.?)\s*$", case=False
+    )
+    return set(first_rows.loc[mask, "table_id"])
 
 
 def _calculate_max_consecutive(
@@ -392,98 +409,84 @@ def _calculate_max_consecutive(
 
 
 def _check_exhibit_heading_nearby(
-    df_sorted: pd.DataFrame,
-    start_line_id: int,
+    heading_arr: Optional[np.ndarray],
+    line_ids: np.ndarray,
+    start_pos: int,
     lookback: int,
 ) -> Tuple[bool, List[int]]:
-    """Return ``(has_header, header_line_ids)`` for the *lookback* rows before *start_line_id*."""
-    if "exhibit_heading_candidate" not in df_sorted.columns:
+    """Return ``(has_header, header_line_ids)`` scanning *lookback* positions before *start_pos*."""
+    if heading_arr is None or start_pos == 0:
         return False, []
-
-    before = df_sorted[df_sorted["line_id"] < start_line_id].tail(lookback)
+    begin = max(0, start_pos - lookback)
     header_line_ids = [
-        int(row["line_id"])
-        for _, row in before.iterrows()
-        if pd.notna(row.get("exhibit_heading_candidate"))
+        int(line_ids[i])
+        for i in range(begin, start_pos)
+        if isinstance(heading_arr[i], str)
     ]
     return bool(header_line_ids), header_line_ids
 
 
 def _check_other_segment_above(
-    df_sorted: pd.DataFrame,
-    start_line_id: int,
+    line_ids: np.ndarray,
+    start_pos: int,
     processed_segments: List[ExhibitSegment],
     lookback: int,
 ) -> Tuple[bool, int]:
     """
-    Return ``(has_segment_above, segment_id_above)`` for the *lookback* rows
-    before *start_line_id*. ``segment_id_above`` is ``-1`` when none found.
+    Return ``(has_segment_above, segment_id_above)`` scanning *lookback* positions before *start_pos*.
+    ``segment_id_above`` is ``-1`` when none found.
     """
-    if not processed_segments:
+    if not processed_segments or start_pos == 0:
         return False, -1
-
-    before_ids = set(
-        df_sorted[df_sorted["line_id"] < start_line_id]
-        .tail(lookback)["line_id"]
-        .tolist()
-    )
+    begin = max(0, start_pos - lookback)
+    before_ids = {int(line_ids[i]) for i in range(begin, start_pos)}
     if not before_ids:
         return False, -1
-
     for seg in reversed(processed_segments):  # Most recent first
-        if set(range(seg.start_line_id, seg.end_line_id + 1)) & before_ids:
+        if any(seg.start_line_id <= lid <= seg.end_line_id for lid in before_ids):
             return True, seg.segment_id
-
     return False, -1
 
 
-def _get_row_fingerprint(row: pd.Series) -> Optional[LayoutFingerprint]:
-    """Extract a :class:`LayoutFingerprint` from a DataFrame row."""
-    left = _safe_float(row.get("x_left"))
-    font_size = _safe_float(row.get("font_size"))
-    if left is None or font_size is None:
-        return None
-    return LayoutFingerprint(
-        left=left,
-        height=_safe_float(row.get("height")) or 0.0,
-        font_size=font_size,
-    )
-
-
 def _expand_segment_by_fingerprint(
-    df_sorted: pd.DataFrame,
-    seed_line_id: int,
-    target_fingerprint: LayoutFingerprint,
-    line_id_to_idx: Dict[int, int],
+    seed_pos: int,
+    n_rows: int,
+    target: LayoutFingerprint,
+    line_ids: np.ndarray,
+    x_left_arr: np.ndarray,
+    height_arr: np.ndarray,
+    font_size_arr: np.ndarray,
     left_tolerance: float,
     height_tolerance: float,
     font_tolerance: float,
 ) -> List[int]:
     """
-    Expand from *seed_line_id* in both directions, collecting contiguous rows
-    whose layout fingerprint matches *target_fingerprint* within tolerance.
+    Expand from *seed_pos* in both directions, collecting contiguous rows
+    whose layout fingerprint matches *target* within tolerance.
 
     Returns:
         Sorted list of matching line IDs (including the seed).
     """
-    if seed_line_id not in line_id_to_idx:
-        return []
-
-    seed_idx = line_id_to_idx[seed_line_id]
-    collected = {seed_idx}
-
+    collected = {seed_pos}
     for direction in (-1, 1):
-        current = seed_idx + direction
-        while 0 <= current < len(df_sorted):
-            fp = _get_row_fingerprint(df_sorted.iloc[current])
-            if fp is None or not target_fingerprint.matches(
-                fp, left_tolerance, height_tolerance, font_tolerance
+        current = seed_pos + direction
+        while 0 <= current < n_rows:
+            left = x_left_arr[current]
+            font = font_size_arr[current]
+            if np.isnan(left) or np.isnan(font):
+                break
+            h = height_arr[current]
+            if np.isnan(h):
+                h = 0.0
+            if (
+                abs(target.x_left - left) > left_tolerance
+                or abs(target.font_size - font) > font_tolerance
+                or abs(target.height - h) > height_tolerance
             ):
                 break
             collected.add(current)
             current += direction
-
-    return [df_sorted.iloc[i]["line_id"] for i in sorted(collected)]
+    return [int(line_ids[i]) for i in sorted(collected)]
 
 
 def _build_exhibit_segments(
@@ -510,61 +513,95 @@ def _build_exhibit_segments(
         return []
 
     df_sorted = df.sort_values("line_id").reset_index(drop=True)
-    line_id_to_idx: Dict[int, int] = {
-        row["line_id"]: idx for idx, row in df_sorted.iterrows()
-    }
+    n = len(df_sorted)
+
+    # Pre-extract all needed columns as arrays for O(1) positional access
+    line_ids: np.ndarray = df_sorted["line_id"].to_numpy()
+    line_id_to_pos: Dict[int, int] = {int(lid): pos for pos, lid in enumerate(line_ids)}
+
+    heading_arr: Optional[np.ndarray] = (
+        df_sorted["exhibit_heading_candidate"].to_numpy()
+        if "exhibit_heading_candidate" in df_sorted.columns else None
+    )
+    has_link_arr: np.ndarray = (
+        df_sorted["has_link"].map(_safe_bool01).to_numpy()
+        if "has_link" in df_sorted.columns
+        else np.zeros(n, dtype=bool)
+    )
+    table_id_arr: Optional[np.ndarray] = (
+        df_sorted["table_id"].to_numpy() if "table_id" in df_sorted.columns else None
+    )
+    x_left_arr: np.ndarray = (
+        pd.to_numeric(df_sorted["x_left"], errors="coerce").to_numpy()
+        if "x_left" in df_sorted.columns else np.full(n, np.nan)
+    )
+    height_arr: np.ndarray = (
+        pd.to_numeric(df_sorted["height"], errors="coerce").to_numpy()
+        if "height" in df_sorted.columns else np.zeros(n)
+    )
+    font_size_arr: np.ndarray = (
+        pd.to_numeric(df_sorted["font_size"], errors="coerce").to_numpy()
+        if "font_size" in df_sorted.columns else np.full(n, np.nan)
+    )
+
     candidates_by_line_id: Dict[int, ExhibitRowCandidate] = {
         c.line_id: c for c in candidates
     }
-
     exhibit_number_header_tables = _detect_exhibit_number_header_tables(df)
+
+    # Pre-group table row positions by table_id to avoid per-segment boolean filter
+    table_line_ids_by_tid: Dict[Any, List[int]] = {}
+    if table_id_arr is not None:
+        for pos, tid in enumerate(table_id_arr):
+            if tid is not None and not (isinstance(tid, float) and np.isnan(tid)) and str(tid).strip():
+                table_line_ids_by_tid.setdefault(tid, []).append(int(line_ids[pos]))
 
     segments: List[ExhibitSegment] = []
     segment_id_counter = 0
     processed_line_ids: Set[int] = set()
     processed_table_ids: Set[Any] = set()
 
-    for _, row in df_sorted.iterrows():
-        line_id = row["line_id"]
+    for pos in range(n):
+        line_id = int(line_ids[pos])
 
         if line_id in processed_line_ids or line_id not in candidates_by_line_id:
             continue
 
-        table_id = row.get("table_id")
+        table_id = table_id_arr[pos] if table_id_arr is not None else None
         has_table = (
             table_id is not None
-            and not pd.isna(table_id)
+            and not (isinstance(table_id, float) and np.isnan(table_id))
             and str(table_id).strip() != ""
         )
 
         if has_table and table_id not in processed_table_ids:
             # === TABLE-BASED SEGMENT ===
-            table_rows = df_sorted[df_sorted["table_id"] == table_id]
-            if table_rows.empty:
+            all_line_ids = sorted(table_line_ids_by_tid.get(table_id, []))
+            if not all_line_ids:
                 continue
 
-            all_line_ids = sorted(table_rows["line_id"].tolist())
             candidate_line_ids = {lid for lid in all_line_ids if lid in candidates_by_line_id}
-
             start_line_id = all_line_ids[0]
             end_line_id = all_line_ids[-1]
             n_rows = len(all_line_ids)
             n_candidates = len(candidate_line_ids)
 
+            start_pos = line_id_to_pos.get(start_line_id, pos)
             has_header, header_line_ids = _check_exhibit_heading_nearby(
-                df_sorted, start_line_id, header_lookback
+                heading_arr, line_ids, start_pos, header_lookback
             )
             if has_header:
                 has_above, above_id = False, -1
             else:
                 has_above, above_id = _check_other_segment_above(
-                    df_sorted, start_line_id, segments, segment_lookback
+                    line_ids, start_pos, segments, segment_lookback
                 )
 
-            n_links = (
-                int(table_rows["has_link"].apply(_safe_bool01).sum())
-                if "has_link" in table_rows.columns else 0
-            )
+            n_links = int(sum(
+                has_link_arr[line_id_to_pos[lid]]
+                for lid in all_line_ids
+                if lid in line_id_to_pos
+            ))
 
             segments.append(ExhibitSegment(
                 segment_id=segment_id_counter,
@@ -596,7 +633,8 @@ def _build_exhibit_segments(
                 continue
 
             segment_line_ids = _expand_segment_by_fingerprint(
-                df_sorted, line_id, fingerprint, line_id_to_idx,
+                pos, n, fingerprint, line_ids,
+                x_left_arr, height_arr, font_size_arr,
                 left_tolerance, height_tolerance, font_tolerance,
             )
             if not segment_line_ids:
@@ -605,30 +643,26 @@ def _build_exhibit_segments(
             candidate_line_ids = {
                 lid for lid in segment_line_ids if lid in candidates_by_line_id
             }
-
             start_line_id = segment_line_ids[0]
             end_line_id = segment_line_ids[-1]
             n_rows = len(segment_line_ids)
             n_candidates = len(candidate_line_ids)
 
-            # Count all rows in the segment with links (O(1) per row via index)
-            n_links = (
-                sum(
-                    1 for lid in segment_line_ids
-                    if lid in line_id_to_idx
-                    and _safe_bool01(df_sorted.iloc[line_id_to_idx[lid]].get("has_link"))
-                )
-                if "has_link" in df_sorted.columns else 0
-            )
+            n_links = int(sum(
+                has_link_arr[line_id_to_pos[lid]]
+                for lid in segment_line_ids
+                if lid in line_id_to_pos
+            ))
 
+            start_pos = line_id_to_pos.get(start_line_id, pos)
             has_header, header_line_ids = _check_exhibit_heading_nearby(
-                df_sorted, start_line_id, header_lookback
+                heading_arr, line_ids, start_pos, header_lookback
             )
             if has_header:
                 has_above, above_id = False, -1
             else:
                 has_above, above_id = _check_other_segment_above(
-                    df_sorted, start_line_id, segments, segment_lookback
+                    line_ids, start_pos, segments, segment_lookback
                 )
 
             segments.append(ExhibitSegment(
@@ -657,7 +691,7 @@ def _build_exhibit_segments(
 
 
 # ==========================================
-# STEP 4: Score and Filter Segments
+# Score and Filter Segments
 # ==========================================
 
 def _find_root_segment(
@@ -692,7 +726,6 @@ def _score_exhibit_segments(
     weak_first_weight: float = 1.0,
     weak_additional_weight: float = 0.1,
     weak_pattern_cap: float = 1.5,
-    min_score_threshold: float = 2.0,
 ) -> List[ExhibitScore]:
     """
     Score exhibit segments with disqualification and confidence scoring.
@@ -825,8 +858,8 @@ def _filter_accepted_exhibit_segments(
 
 def print_exhibit_segments(
     segments: List[ExhibitSegment],
-    df: pd.DataFrame = None,
-    scores: List[ExhibitScore] = None,
+    df: Optional[pd.DataFrame] = None,
+    scores: Optional[List[ExhibitScore]] = None,
     *,
     show_text: bool = True,
     max_text_len: int = 80,
@@ -864,7 +897,7 @@ def print_exhibit_segments(
             fp = seg.fingerprint
             print(
                 f"  Type: FINGERPRINT "
-                f"(left={fp.left:.1f}, height={fp.height:.1f}, font={fp.font_size:.1f})"
+                f"(x_left={fp.x_left:.1f}, height={fp.height:.1f}, font={fp.font_size:.1f})"
             )
         else:
             print("  Type: UNKNOWN")
@@ -1006,9 +1039,7 @@ def detect_and_mark_exhibits(
     )
 
     # STEP 4: Score
-    scores = _score_exhibit_segments(
-        segments, candidates, min_score_threshold=min_score_threshold,
-    )
+    scores = _score_exhibit_segments(segments, candidates)
 
     # STEP 5: Filter
     accepted = _filter_accepted_exhibit_segments(scores, min_score_threshold)

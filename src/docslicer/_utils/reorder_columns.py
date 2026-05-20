@@ -156,20 +156,22 @@ MASTER_COLUMN_ORDER: List[str] = [
     "cells",
 
     # Heading hierarchy
+    "heading_level",
     "heading_score",
+    "heading_score_debug",
     "hierarchy_marker",
     "hierarchy_type",
     "heading_type",
-    "active_heading_id",
-    "heading_id",
     "heading_fp_id",
     "heading_fingerprint",
+    "active_heading_id",
+    "heading_id",
+    "parent_heading_id",
     "heading_hash",
     "heading_weight_static",
     "heading_weight_dynamic",
     "heading_sequence",
-    "heading_level",
-    "parent_heading_id",
+    
 
     # ===== 5. Geometry =====
     "x_left",

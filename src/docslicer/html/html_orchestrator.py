@@ -103,8 +103,9 @@ def run_pipeline(
     # html XOR source_url must be set (enforced inside extract_boxes_with_playwright)
     # For non-SEC URLs: Playwright navigates directly. If that fails, fall back to
     # fetching bytes via http_fetcher and rendering with set_content.
+    tried_networkidle = False
     try:
-        boxes, rendered_html = extract_boxes_with_playwright(html, source_url)
+        boxes, rendered_html = extract_boxes_with_playwright(html, source_url, wait_until="domcontentloaded")
     except Exception as e:
         if source_url:
             logger.warning(f"Playwright navigation failed for {source_url}, falling back to http_fetcher: {e}")
@@ -117,12 +118,34 @@ def run_pipeline(
     df_boxes = pd.DataFrame(boxes)
     logger.info(f"Step 01 - Box extraction complete, {len(df_boxes)} boxes")
 
+    # Retry with networkidle if domcontentloaded produced no extractable boxes.
+    if df_boxes.empty and source_url:
+        logger.info("No boxes after domcontentloaded extraction — retrying with networkidle")
+        boxes, rendered_html = extract_boxes_with_playwright(html, source_url, wait_until="networkidle")
+        tried_networkidle = True
+        df_boxes = pd.DataFrame(boxes)
+
     if df_boxes.empty:
         logger.warning("Empty DataFrame after box extraction, returning early")
         return {}, df_boxes, None
 
     # Step 02 - Box Cleaning
     df_boxes = clean_boxes(df_boxes, keep_debug_cols=False, dry_run=False)
+
+    # Retry with networkidle if cleaning wiped everything (e.g. only a footer survived domcontentloaded).
+    if df_boxes.empty and source_url and not tried_networkidle:
+        logger.info("No boxes after cleaning — retrying extraction with networkidle")
+        boxes, rendered_html = extract_boxes_with_playwright(html, source_url, wait_until="networkidle")
+        tried_networkidle = True
+        df_boxes = pd.DataFrame(boxes)
+        if df_boxes.empty:
+            logger.warning("Still empty after networkidle retry, returning early")
+            return {}, df_boxes, None
+        df_boxes = clean_boxes(df_boxes, keep_debug_cols=False, dry_run=False)
+
+    if df_boxes.empty:
+        logger.warning("Empty DataFrame after box cleaning, returning early")
+        return {}, df_boxes, None
 
     # Step 03 - Page Labels (runs on boxes — needs box_id)
     df_boxes, page_labels, page_label_groups = assign_page_labels(df_boxes, page_label_config)

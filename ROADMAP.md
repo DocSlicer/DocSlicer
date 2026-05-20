@@ -12,3 +12,8 @@
 
 ### Structured financial markup
 - Evaluate whether additional iXBRL attributes should be surfaced in extracted output
+
+## Heading Hierarchy
+
+### Named headings
+- Add heading detection for other languages

@@ -725,6 +725,34 @@ def _reindex_layout_id_and_add_table_id(
     return df_lines, df_cells
 
 
+def _sync_table_block_type(
+    df_lines: pd.DataFrame,
+    df_cells: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Keep block_type aligned with the final table classification.
+
+    The table classifier may reclassify/eject/merge layouts after the initial
+    layout_type assignment, so write block_type from the final layout_type state.
+    """
+    result_lines = df_lines.copy()
+    result_cells = df_cells.copy()
+
+    for df in (result_lines, result_cells):
+        if "block_type" not in df.columns:
+            df["block_type"] = pd.NA
+        if "layout_type" not in df.columns:
+            continue
+
+        layout_type = df["layout_type"].astype("string").str.strip().str.lower()
+        table_mask = layout_type.eq("table").fillna(False)
+        stale_table_mask = df["block_type"].astype("string").eq("table").fillna(False)
+        df.loc[table_mask, "block_type"] = "table"
+        df.loc[~table_mask & stale_table_mask, "block_type"] = pd.NA
+
+    return result_lines, result_cells
+
+
 # ============================================================
 # STEP 5: Build table structure — rows, rowspan, cell roles
 # ============================================================
@@ -1118,6 +1146,10 @@ def build_tables(
     # Reindex layout_ids to be sequential ordered by stable upstream line_id.
     df_lines, df_cells = _reindex_layout_id_and_add_table_id(df_lines, df_cells)
 
+    ## REMOVE THIS SYNC IN THE FINAL SCRIPT
+
+    # Keep block_type in sync with final layout_type on both lines and cells.
+    df_lines, df_cells = _sync_table_block_type(df_lines, df_cells)
 
     # Step 4c — expand horizontal grid-line assignments for table cells. THIS IS BELOW THE REINDEXING !!! - START OF A NEW METHOD WHERE WE CONVERT LINE INTO TABLE
     # STOP ADDING IT ON TOP OF REINDEXING !!!
