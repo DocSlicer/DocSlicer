@@ -132,7 +132,13 @@ def detect_cell_roles(
         ):
             header_rows.add(r)
         else:
-            break
+            # Include rows where the first cell is blank, likely indicator of a header row
+            col0_cells = row_cells[row_cells["col_start"] == 0]
+            col0_blank = col0_cells.empty or col0_cells["text"].fillna("").str.strip().eq("").all()
+            if col0_blank:
+                header_rows.add(r)
+            else:
+                break
 
     # --- 2. Assign roles ---
     df["role"] = "data"

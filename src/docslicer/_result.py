@@ -149,6 +149,14 @@ class HierarchyTree:
     def to_dict(self, minimal: bool = False) -> list[dict]:
         return [r.to_dict(minimal=minimal) for r in self.roots]
 
+    def save(self, path: str | Path, minimal: bool = False, indent: int = 2) -> None:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_text(json.dumps(self.to_dict(minimal=minimal), indent=indent), encoding="utf-8")
+
+    def save_outline(self, path: str | Path) -> None:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_text(self.to_outline(), encoding="utf-8")
+
     def to_outline(self) -> str:
         lines: list[str] = []
         def _visit(node: HierarchyNode, depth: int) -> None:

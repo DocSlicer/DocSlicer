@@ -43,6 +43,7 @@ warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 # ---------------------------------------------------------------------------
 
 _WS_RE = re.compile(r"\s+")
+_PAREN_INNER_RE = re.compile(r"\(\s+|\s+\)")
 _CURRENCY_TOKENS = frozenset({"$", "€", "£", "¥", "₹", "₽", "₩", "₪", "₺"})
 _LPAREN_CHARS = frozenset({"(", "[", "{"})
 _RPAREN_CHARS = frozenset({")", "]", "}", "%"})
@@ -63,11 +64,15 @@ _OUTPUT_COLS = [
     "role",
     "text",
     "ix",
+    "max_cols",
+    "initial_col_indices",
 ]
 
 
 def _norm_ws(s: str) -> str:
-    return _WS_RE.sub(" ", (s or "").replace("\xa0", " ")).strip()
+    s = _WS_RE.sub(" ", (s or "").replace("\xa0", " ")).strip()
+    s = _PAREN_INNER_RE.sub(lambda m: "(" if m.group()[0] == "(" else ")", s)
+    return s
 
 
 def _is_currency(s: str) -> bool:
@@ -261,202 +266,187 @@ def _remove_blank_rows(df: pd.DataFrame) -> pd.DataFrame:
 # Column normalization
 # ---------------------------------------------------------------------------
 
-def _profile_single_col(df: pd.DataFrame, col: int) -> dict:
-    """Profile one column: all_blank / currency_only / lparen_only / rparen_only."""
-    standalone = df[(df["col_start"] == col) & (df["colspan"] == 1)]
-    texts = standalone.loc[standalone["text"].str.strip() != "", "text"].tolist()
-    if not texts:
-        return dict(all_blank=True, currency_only=False, lparen_only=False, rparen_only=False)
-    return dict(
-        all_blank=False,
-        currency_only=all(_is_currency(t) for t in texts),
-        lparen_only=all(_is_lparen(t) for t in texts),
-        rparen_only=all(_is_rparen_like(t) for t in texts),
-    )
 
-
-def _profile_columns(df: pd.DataFrame) -> dict[int, dict]:
-    """Profile each column: all_blank / currency_only / lparen_only / rparen_only."""
-    all_cols: list[int] = sorted(df["col_start"].unique().tolist())
-    standalone = df[df["colspan"] == 1]
-
-    if standalone.empty:
-        return {c: dict(all_blank=True, currency_only=False, lparen_only=False, rparen_only=False)
-                for c in all_cols}
-
-    # Compute nonblank texts grouped by column in one pass
-    nonblank = standalone[standalone["text"].str.strip() != ""]
-    nb_by_col: dict[int, list[str]] = {}
-    if not nonblank.empty:
-        for col_val, grp in nonblank.groupby("col_start"):
-            nb_by_col[int(col_val)] = grp["text"].tolist()
-
-    profiles: dict[int, dict] = {}
-    for col in all_cols:
-        texts = nb_by_col.get(col, [])
-        if not texts:
-            profiles[col] = dict(all_blank=True, currency_only=False, lparen_only=False, rparen_only=False)
-        else:
-            profiles[col] = dict(
-                all_blank=False,
-                currency_only=all(_is_currency(t) for t in texts),
-                lparen_only=all(_is_lparen(t) for t in texts),
-                rparen_only=all(_is_rparen_like(t) for t in texts),
-            )
-    return profiles
-
-
-def _shift_remove_profiles(profiles: dict[int, dict], removed_col: int) -> dict[int, dict]:
-    """Return updated profiles after removing `removed_col`, shifting keys > removed_col left."""
-    result: dict[int, dict] = {}
-    for c, p in profiles.items():
-        if c < removed_col:
-            result[c] = p
-        elif c > removed_col:
-            result[c - 1] = p
-        # c == removed_col is dropped
-    return result
-
-
-def _find_next_data_col(profiles: dict[int, dict], from_col: int, direction: int) -> Optional[int]:
-    cols = sorted(profiles.keys())
-    candidates = [c for c in cols if (c > from_col if direction > 0 else c < from_col)]
-    if direction < 0:
-        candidates = list(reversed(candidates))
-    for c in candidates:
-        p = profiles[c]
-        if not (p["all_blank"] or p["currency_only"] or p["lparen_only"] or p["rparen_only"]):
-            return c
-    return None
-
-
-def _merge_col_text(df: pd.DataFrame, src_col: int, tgt_col: int, prefix: bool) -> pd.DataFrame:
-    """Prepend (prefix=True) or append the text of standalone src_col cells into tgt_col cells."""
-    src_mask = (df["col_start"] == src_col) & (df["colspan"] == 1)
-    src_cells = df[src_mask]
-    src_cells = src_cells[src_cells["text"].str.strip() != ""]
-    if src_cells.empty:
-        return df
-
+def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Remove blank/paren spacer columns and merge paren values into adjacent cells."""
     df = df.copy()
-    col_start = df["col_start"].values
-    colspan = df["colspan"].values
-    row_start = df["row_start"].values
-    rowspan = df["rowspan"].values
-    text = df["text"].to_numpy(dtype=object)
+    max_cols = int((df["col_start"] + df["colspan"]).max())
+    df["max_cols"] = max_cols
+    df["initial_col_indices"] = [
+        list(range(cs, cs + sp))
+        for cs, sp in zip(df["col_start"].to_numpy(), df["colspan"].to_numpy())
+    ]
 
-    for _, src in src_cells.iterrows():
-        r = int(src["row_start"])
-        src_txt = src["text"]
-        tgt_idx = np.where(
-            (col_start <= tgt_col)
-            & (col_start + colspan > tgt_col)
-            & (row_start <= r)
-            & (row_start + rowspan > r)
-        )[0]
-        for i in tgt_idx:
-            text[i] = (src_txt + text[i]) if prefix else (text[i] + src_txt)
+    # Pre-extract columns as plain Python lists/arrays — avoids per-row Series overhead
+    all_indices_list: list[list[int]] = df["initial_col_indices"].tolist()
+    all_texts: list = df["text"].tolist()
+    all_row_starts: list[int] = df["row_start"].tolist()
+    all_rowspans: list[int] = df["rowspan"].tolist()
+    df_int_idx: list[int] = df.index.tolist()
 
-    df["text"] = text
-    return df
+    # ── Phase 1: classify each column index using only single-index cells ─────
+    # Build texts_by_idx in one pass instead of one .loc per index
+    texts_by_idx: dict[int, list[str]] = {}
+    single_df_int_idx: list[int] = []          # df int indices of single-index cells
+    single_col_idx: list[int] = []              # their column index
 
+    for indices, text, di in zip(all_indices_list, all_texts, df_int_idx):
+        if len(indices) == 1:
+            c = indices[0]
+            t = text if isinstance(text, str) else ""
+            texts_by_idx.setdefault(c, []).append(t)
+            single_df_int_idx.append(di)
+            single_col_idx.append(c)
 
-def _remove_col(df: pd.DataFrame, col: int) -> pd.DataFrame:
-    """
-    Remove column col from the cells DataFrame:
-    - standalone cells at col are dropped
-    - cells spanning through col get colspan - 1
-    - cells starting after col get col_start - 1
-    """
-    keep = ~((df["col_start"] == col) & (df["colspan"] == 1))
-    df = df[keep].copy()
+    index_class: dict[int, str] = {}
+    for idx in range(max_cols):
+        texts = texts_by_idx.get(idx)
+        if texts is None:
+            index_class[idx] = "multi_only"
+            continue
+        non_blank = [t for t in texts if t.strip()]
+        if not non_blank:
+            index_class[idx] = "blank"
+        elif all(_is_rparen_like(t) for t in non_blank):
+            index_class[idx] = "rparen"
+        elif all(_is_lparen(t) or _is_currency(t) for t in non_blank):
+            index_class[idx] = "lparen"
+        else:
+            index_class[idx] = "keep"
+
+    # ── Phase 2: ensure every non-blank multi-index cell retains a keep index ──
+    # Iterate raw lists — no iterrows overhead
+    is_keep: dict[int, bool] = {idx: cls == "keep" for idx, cls in index_class.items()}
+
+    for indices, text in zip(all_indices_list, all_texts):
+        if len(indices) == 1:
+            continue
+        if not isinstance(text, str) or not text.strip():
+            continue  # blank cell — safe to drop; don't promote its indices
+        if not any(is_keep.get(i, False) for i in indices):
+            # Promote only the first index — the others are redundant padding.
+            # Promoting all would inflate colspan for groups where every cell
+            # always co-covers the same set of indices (e.g. a 3-wide label col).
+            first = indices[0]
+            index_class[first] = "keep"
+            is_keep[first] = True
+
+    for idx in range(max_cols):
+        if index_class[idx] == "multi_only":
+            index_class[idx] = "blank"
+
+    # ── Phase 3: paren merge ──────────────────────────────────────────────────
+    keep_sorted = sorted(i for i, cls in index_class.items() if cls == "keep")
+    rparen_idxs = sorted(i for i, cls in index_class.items() if cls == "rparen")
+    lparen_idxs = sorted(i for i, cls in index_class.items() if cls == "lparen")
+
+    if rparen_idxs or lparen_idxs:
+        # O(1) reverse lookup: df label index → position in the extracted lists
+        pos_of: dict[int, int] = {di: i for i, di in enumerate(df_int_idx)}
+
+        # Compute nearest-left / nearest-right keep for each paren col
+        rparen_neighbors: dict[int, int] = {}
+        lparen_neighbors: dict[int, int] = {}
+        needed_keep_cols: set[int] = set()
+
+        for r_idx in rparen_idxs:
+            lk = next((k for k in reversed(keep_sorted) if k < r_idx), None)
+            if lk is not None:
+                rparen_neighbors[r_idx] = lk
+                needed_keep_cols.add(lk)
+
+        for l_idx in lparen_idxs:
+            rk = next((k for k in keep_sorted if k > l_idx), None)
+            if rk is not None:
+                lparen_neighbors[l_idx] = rk
+                needed_keep_cols.add(rk)
+
+        # Build paren cell lookup in one pass: col_idx → [(row_start, text), ...]
+        paren_idx_set = set(rparen_idxs) | set(lparen_idxs)
+        paren_cells: dict[int, list[tuple[int, str]]] = {}
+        for c, di in zip(single_col_idx, single_df_int_idx):
+            if c in paren_idx_set:
+                list_pos = pos_of[di]
+                paren_cells.setdefault(c, []).append((all_row_starts[list_pos], all_texts[list_pos]))
+
+        # Build expanded grid only for needed keep cols (sparse — avoids full O(n*cols) grid)
+        expanded: dict[tuple[int, int], int] = {}
+        for r0, rs, indices, di in zip(all_row_starts, all_rowspans, all_indices_list, df_int_idx):
+            for c in indices:
+                if c in needed_keep_cols:
+                    for r in range(r0, r0 + rs):
+                        expanded[(r, c)] = di
+
+        # Collect text updates in a dict; apply to df in one vectorized assignment
+        text_updates: dict[int, str] = {}
+
+        for r_idx, left_keep in rparen_neighbors.items():
+            for row, ptext in paren_cells.get(r_idx, []):
+                t = ptext if isinstance(ptext, str) else ""
+                if not t.strip():
+                    continue
+                target = expanded.get((row, left_keep))
+                if target is None:
+                    continue
+                cur = text_updates.get(target, all_texts[pos_of[target]])
+                cur = cur if isinstance(cur, str) else ""
+                text_updates[target] = (cur + t).strip() if cur.strip() else t.strip()
+
+        for l_idx, right_keep in lparen_neighbors.items():
+            for row, ltext in paren_cells.get(l_idx, []):
+                t = ltext if isinstance(ltext, str) else ""
+                if not t.strip():
+                    continue
+                target = expanded.get((row, right_keep))
+                if target is None:
+                    continue
+                cur = text_updates.get(target, all_texts[pos_of[target]])
+                cur = cur if isinstance(cur, str) else ""
+                text_updates[target] = (t + cur).strip() if cur.strip() else t.strip()
+
+        if text_updates:
+            df.loc[list(text_updates.keys()), "text"] = list(text_updates.values())
+
+    # ── Phase 4: remap col_start/colspan and drop removed cells ──────────────
+    surviving = sorted(i for i, cls in index_class.items() if cls == "keep")
+    if not surviving:
+        return df.reset_index(drop=True)
+
+    pos = {idx: new_pos for new_pos, idx in enumerate(surviving)}
+    surviving_set = set(surviving)
+
+    # Compute bounds in one list comprehension — no apply() overhead
+    new_col_starts: list[int] = []
+    new_colspans: list[int] = []
+    keep_flags: list[bool] = []
+
+    for indices in all_indices_list:
+        kept = [pos[i] for i in indices if i in surviving_set]
+        if kept:
+            new_col_starts.append(kept[0])
+            new_colspans.append(kept[-1] - kept[0] + 1)
+            keep_flags.append(True)
+        else:
+            new_col_starts.append(0)
+            new_colspans.append(0)
+            keep_flags.append(False)
+
+    keep_arr = np.array(keep_flags)
+    df = df[keep_arr].copy()
+
     if df.empty:
         return df.reset_index(drop=True)
 
-    col_start = df["col_start"].values.copy()
-    colspan = df["colspan"].values.copy()
+    kept_positions = np.where(keep_arr)[0]
+    df["col_start"] = [new_col_starts[i] for i in kept_positions]
+    df["colspan"] = [new_colspans[i] for i in kept_positions]
+    df["max_cols"] = len(surviving)
+    df["initial_col_indices"] = [
+        [pos[i] for i in all_indices_list[i] if i in surviving_set]
+        for i in kept_positions
+    ]
 
-    covers = (col_start <= col) & (col_start + colspan > col)
-    colspan[covers] -= 1
-    col_start[col_start > col] -= 1
-
-    df["col_start"] = col_start
-    df["colspan"] = colspan
     return df.reset_index(drop=True)
-
-
-def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Iteratively merge currency/paren columns and remove blank spacer columns."""
-    # Profile once; maintain incrementally to avoid re-scanning the DataFrame each iteration.
-    profiles = _profile_columns(df)
-
-    while True:
-        cols = sorted(profiles.keys())
-        changed = False
-
-        # Currency → merge into right neighbor
-        for col in cols:
-            if not profiles[col]["currency_only"]:
-                continue
-            tgt = _find_next_data_col(profiles, col, direction=1)
-            if tgt is None:
-                continue
-            df = _merge_col_text(df, col, tgt, prefix=True)
-            df = _remove_col(df, col)
-            new_tgt = tgt - 1 if tgt > col else tgt
-            profiles = _shift_remove_profiles(profiles, col)
-            profiles[new_tgt] = _profile_single_col(df, new_tgt)
-            changed = True
-            break
-        if changed:
-            continue
-
-        # Left paren → merge into right neighbor
-        for col in cols:
-            if not profiles[col]["lparen_only"]:
-                continue
-            tgt = _find_next_data_col(profiles, col, direction=1)
-            if tgt is None:
-                continue
-            df = _merge_col_text(df, col, tgt, prefix=True)
-            df = _remove_col(df, col)
-            new_tgt = tgt - 1 if tgt > col else tgt
-            profiles = _shift_remove_profiles(profiles, col)
-            profiles[new_tgt] = _profile_single_col(df, new_tgt)
-            changed = True
-            break
-        if changed:
-            continue
-
-        # Right paren → merge into left neighbor
-        for col in cols:
-            if not profiles[col]["rparen_only"]:
-                continue
-            tgt = _find_next_data_col(profiles, col, direction=-1)
-            if tgt is None:
-                continue
-            df = _merge_col_text(df, col, tgt, prefix=False)
-            df = _remove_col(df, col)
-            # tgt < col (direction=-1), so tgt index is unchanged after removing col
-            profiles = _shift_remove_profiles(profiles, col)
-            profiles[tgt] = _profile_single_col(df, tgt)
-            changed = True
-            break
-        if changed:
-            continue
-
-        # Blank spacers — remove all at once right-to-left (preserves lower indices).
-        # Blank removal never changes cell text so no new currency/paren cols can appear.
-        blank_cols = sorted([c for c, p in profiles.items() if p["all_blank"]], reverse=True)
-        if blank_cols:
-            for col in blank_cols:
-                df = _remove_col(df, col)
-                profiles = _shift_remove_profiles(profiles, col)
-            break  # stable: blank removal can't create new special columns
-
-        break  # stable
-
-    return df
 
 
 # ---------------------------------------------------------------------------

@@ -40,7 +40,7 @@ _HEADING_TYPE_RANK_TIERS = {
     5: ["subsection", "section_symbol", "section_abbreviated"],
     6: ["article", "rule"],
     7: ["free_form"],
-    8: ["table", "figure"],
+    8: ["table", "figure"], # These are usually captions
 }
 HEADING_TYPE_RANK = {t: rank for rank, types in _HEADING_TYPE_RANK_TIERS.items() for t in types}
 
@@ -53,6 +53,7 @@ NUMBERED_HEADING_TYPES = {
     "roman_numbered_heading",
     "alpha_dotted_numbered_heading",
     "alpha_numbered_heading",
+    # TODO add alpha heading
 }
 
 _RE_NUMERIC_PREFIX = re.compile(r'^\s*(\d+(?:\.\d+)*)')
@@ -136,7 +137,7 @@ def _assign_heading_id(df: pd.DataFrame) -> pd.DataFrame:
     Groups consecutive heading rows that share the same heading_fp_id into a
     single heading_id (multi-line headings). Non-heading rows get NA.
 
-    Numbered-section headings with different numeric prefixes are never merged,
+    Numbered headings with different numeric prefixes are never merged,
     even when consecutive and sharing an fp_id.
     """
     out = df.copy()
@@ -182,7 +183,7 @@ def _assign_heading_id(df: pd.DataFrame) -> pd.DataFrame:
                 np.isfinite(line_vals[j - 1]) and np.isfinite(line_vals[j])
                 and line_vals[j] == line_vals[j - 1] + 1
             ))
-            # Never merge two numbered-section rows that have different numeric prefixes
+            # Never merge two numbered heading rows that have different numeric prefixes
             diff_numbered_prefix = False
             if same_fp and consecutive and ht_vals is not None and text_vals is not None:
                 ht_j = str(ht_vals[j]).strip().lower()

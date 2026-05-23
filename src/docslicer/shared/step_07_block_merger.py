@@ -1,17 +1,21 @@
 """
-step_05_block_merger.py
+step_07_block_merger.py
 
 Merge lines into logical blocks.
 
 Architecture:
-  1. _assign_block_ids() - Decision logic: what constitutes a new block?
-  2. hierarchical_aggregator - Shared aggregation boilerplate
-  3. _join_text() - Text merging strategy (space vs newline)
+  1. _assign_block_ids()      - Decision logic: what constitutes a new block?
+  2. hierarchical_aggregator  - Shared aggregation boilerplate
+  3. _join_text()             - Text merging strategy (space vs newline)
+
+Table formatters:  _format_table_markdown / _format_table_jsonl / _format_table_melted
+Chart formatters:  _format_chart_markdown / _format_chart_melted / _format_chart_jsonl
 """
 
 from __future__ import annotations
 
-import numpy as np
+import json
+
 import pandas as pd
 
 from .._utils.hierarchical_aggregator import (
@@ -240,12 +244,10 @@ def _format_table_markdown(table_df: pd.DataFrame) -> str:
     
     Args:
         table_df: Table cells (must have col_start, row_start, text, role, colspan, rowspan)
-    
+
     Returns:
         Markdown formatted table string
     """
-    import json
-    
     # Ensure required columns exist
     if "row_start" not in table_df.columns:
         # Try to infer from temp_line_ids
@@ -314,96 +316,73 @@ def _format_table_markdown(table_df: pd.DataFrame) -> str:
 def _format_table_jsonl(table_df: pd.DataFrame) -> str:
     """
     Format table as JSONL with one line per data row.
-    
+
     Each row is a JSON object with headers as keys.
     Handles colspan: headers with colspan > 1 apply to multiple value columns
-    
+
     Args:
         table_df: Table cells
-    
+
     Returns:
         JSONL formatted string (one JSON object per line)
     """
-    import json
-    
-    # Ensure row_start exists
-    if "row_start" not in table_df.columns:
-        if "temp_line_ids" in table_df.columns:
-            table_df["row_start"] = table_df["temp_line_ids"].apply(
-                lambda x: x[0] if isinstance(x, list) and len(x) > 0 else 0
-            )
-        else:
-            return "[Table: missing row information]"
-    
-    # Ensure colspan exists
     if "colspan" not in table_df.columns:
+        table_df = table_df.copy()
         table_df["colspan"] = 1
-    
-    # Separate headers and data
-    headers_df = table_df[table_df["role"] == "header"].copy()
+
+    headers_df = table_df[table_df["role"] == "header"]
     data_df = table_df[table_df["role"] != "header"].copy()
-    
+
     if headers_df.empty:
         return "[Table: no headers found]"
-    
-    # Build header map considering colspan
-    # Map: col_index -> list of header texts (one per header row)
-    header_map = {}  # col_index -> [header_row_0_text, header_row_1_text, ...]
-    
-    # Get unique header rows
-    header_rows = sorted(headers_df["row_start"].unique())
-    
-    # Process each header cell
-    for _, header_cell in headers_df.iterrows():
-        col_start = int(header_cell["col_start"])
-        colspan = int(header_cell.get("colspan", 1))
-        row = int(header_cell["row_start"])
-        text = str(header_cell.get("text", "")).strip()
-        
-        # Apply this header to all columns it spans
-        for col_offset in range(colspan):
-            col = col_start + col_offset
-            
-            # Initialize this column's header list if needed
+
+    # Build header keys using numpy arrays (avoids iterrows overhead)
+    header_rows_sorted = sorted(headers_df["row_start"].unique())
+    col_starts = headers_df["col_start"].to_numpy(dtype=int)
+    colspans = headers_df["colspan"].to_numpy(dtype=int)
+    rows_arr = headers_df["row_start"].to_numpy(dtype=int)
+    texts_arr = headers_df["text"].fillna("").astype(str).str.strip().to_numpy()
+
+    header_map: dict[int, dict[int, str]] = {}
+    for col_start, colspan, row, text in zip(col_starts, colspans, rows_arr, texts_arr):
+        for offset in range(colspan):
+            col = col_start + offset
             if col not in header_map:
                 header_map[col] = {}
-            
-            # Store header text for this row level
             header_map[col][row] = text
-    
-    # Build header keys (combine multi-row headers with underscore)
-    header_keys = {}
+
+    header_keys: dict[int, str] = {}
     for col, row_texts in header_map.items():
-        # Build key from all header rows in order
-        key_parts = []
-        for row in header_rows:
-            if row in row_texts and row_texts[row]:
-                key_parts.append(row_texts[row])
-        
-        header_keys[col] = "_".join(key_parts) if key_parts else f"col_{col}"
-    
-    # Build JSON objects per data row
+        parts = [row_texts[r] for r in header_rows_sorted if r in row_texts and row_texts[r]]
+        header_keys[col] = "_".join(parts) if parts else f"col_{col}"
+
+    # Pre-compute stripped text once
+    data_df["_text"] = data_df["text"].fillna("").astype(str).str.strip()
+
     json_lines = []
-    data_rows = sorted(data_df["row_start"].unique())
-    
-    for row in data_rows:
-        row_data = data_df[data_df["row_start"] == row]
+
+    # groupby replaces repeated boolean filtering (data_df[data_df["row_start"] == row])
+    for row, row_data in data_df.groupby("row_start", sort=True):
+        value_cells = row_data[row_data["role"] == "data"]
+
+        if value_cells["_text"].eq("").all():
+            label_cells = row_data[row_data["col_start"] == 0]
+            label = label_cells.iloc[0]["_text"] if not label_cells.empty else ""
+            if label:
+                json_lines.append(json.dumps({"Metric": label}, ensure_ascii=False))
+            continue
+
         row_obj = {}
-        
-        for _, cell in row_data.iterrows():
-            col = int(cell["col_start"])
-            # Get header
+        cols_arr = row_data["col_start"].to_numpy(dtype=int)
+        vals_arr = row_data["_text"].to_numpy()
+        for col, value in zip(cols_arr, vals_arr):
             header = header_keys.get(col, f"col_{col}")
-            
-            # Replace generic "col_0" with "Metric" for column 0
             if col == 0 and header == "col_0":
                 header = "Metric"
-            
-            value = str(cell.get("text", "")).strip()
             row_obj[header] = value
-        
+
         json_lines.append(json.dumps(row_obj, ensure_ascii=False))
-    
+
     return "\n".join(json_lines)
 
 
@@ -414,114 +393,67 @@ def _format_table_jsonl(table_df: pd.DataFrame) -> str:
 def _format_table_melted(table_df: pd.DataFrame) -> str:
     """
     Format table as fully melted with one fact per row.
-    
+
     Each fact is represented as: row_label | header_path | value
     Handles colspan: headers with colspan > 1 apply to multiple value columns
-    
+
     Args:
         table_df: Table cells
-    
+
     Returns:
         Melted format string
     """
-    import json
-    
-    # Ensure row_start exists
-    if "row_start" not in table_df.columns:
-        if "temp_line_ids" in table_df.columns:
-            table_df["row_start"] = table_df["temp_line_ids"].apply(
-                lambda x: x[0] if isinstance(x, list) and len(x) > 0 else 0
-            )
-        else:
-            return "[Table: missing row information]"
-    
-    # Ensure colspan exists
     if "colspan" not in table_df.columns:
+        table_df = table_df.copy()
         table_df["colspan"] = 1
-    
-    # Separate headers, row labels, and values
-    headers_df = table_df[table_df["role"] == "header"].copy()
-    
-    # Build header map considering colspan
-    # Map: col_index -> list of header texts (one per header row)
-    # For headers with colspan > 1, replicate across all covered columns
-    header_map = {}  # col_index -> [header_row_0_text, header_row_1_text, ...]
-    
-    # Get unique header rows
-    header_rows = sorted(headers_df["row_start"].unique())
-    
-    # Process each header cell
-    for _, header_cell in headers_df.iterrows():
-        col_start = int(header_cell["col_start"])
-        colspan = int(header_cell.get("colspan", 1))
-        row = int(header_cell["row_start"])
-        text = str(header_cell.get("text", "")).strip()
-        
-        # Apply this header to all columns it spans
-        for col_offset in range(colspan):
-            col = col_start + col_offset
-            
-            # Initialize this column's header list if needed
+
+    headers_df = table_df[table_df["role"] == "header"]
+    data_df = table_df[table_df["role"] != "header"].copy()
+
+    # Build header paths using numpy arrays (avoids iterrows overhead)
+    header_rows_sorted = sorted(headers_df["row_start"].unique())
+    col_starts = headers_df["col_start"].to_numpy(dtype=int)
+    colspans = headers_df["colspan"].to_numpy(dtype=int)
+    rows_arr = headers_df["row_start"].to_numpy(dtype=int)
+    texts_arr = headers_df["text"].fillna("").astype(str).str.strip().to_numpy()
+
+    header_map: dict[int, dict[int, str]] = {}
+    for col_start, colspan, row, text in zip(col_starts, colspans, rows_arr, texts_arr):
+        for offset in range(colspan):
+            col = col_start + offset
             if col not in header_map:
                 header_map[col] = {}
-            
-            # Store header text for this row level
             header_map[col][row] = text
-    
-    # Build header paths (combine multi-row headers)
-    header_paths = {}
+
+    header_paths: dict[int, str] = {}
     for col, row_texts in header_map.items():
-        # Build path from all header rows in order
-        path_parts = []
-        for row in header_rows:
-            if row in row_texts and row_texts[row]:
-                path_parts.append(row_texts[row])
-        
-        header_paths[col] = " > ".join(path_parts) if path_parts else f"col_{col}"
-    
-    # Process data rows
-    data_df = table_df[table_df["role"] != "header"].copy()
+        parts = [row_texts[r] for r in header_rows_sorted if r in row_texts and row_texts[r]]
+        header_paths[col] = " > ".join(parts) if parts else f"col_{col}"
+
+    # Pre-compute stripped text once to avoid repeated per-cell string ops
+    data_df["_text"] = data_df["text"].fillna("").astype(str).str.strip()
+
     melted_lines = []
-    
-    for row in sorted(data_df["row_start"].unique()):
-        row_data = data_df[data_df["row_start"] == row]
-        
-        # Get row label (first column with role="row_label")
-        row_label_cells = row_data[row_data["role"] == "row_label"]
-        row_label = row_label_cells.iloc[0]["text"] if not row_label_cells.empty else f"row_{row}"
-        
-        # Get value cells
-        value_cells = row_data[row_data["role"].str.startswith("value", na=False)]
-        
-        for _, cell in value_cells.iterrows():
-            col = int(cell["col_start"])
+
+    # groupby replaces repeated boolean filtering (data_df[data_df["row_start"] == row])
+    for row, row_data in data_df.groupby("row_start", sort=True):
+        row_label_rows = row_data[row_data["role"] == "row_label"]
+        row_label = row_label_rows.iloc[0]["_text"] if not row_label_rows.empty else f"row_{row}"
+
+        value_cells = row_data[row_data["role"] == "data"]
+
+        if value_cells["_text"].eq("").all():
+            if row_label.strip():
+                melted_lines.append(row_label)
+            continue
+
+        cols_arr = value_cells["col_start"].to_numpy(dtype=int)
+        vals_arr = value_cells["_text"].to_numpy()
+        for col, value in zip(cols_arr, vals_arr):
             header = header_paths.get(col, f"col_{col}")
-            value = str(cell.get("text", "")).strip()
-            
-            # Format: row_label | header_path | value
             melted_lines.append(f"{row_label} | {header} | {value}")
-    
+
     return "\n".join(melted_lines)
-
-
-# =================================
-# Narrated Format ### TODO ###
-# =================================
-
-def _format_table_narrated(table_df: pd.DataFrame) -> str:
-    """
-    Format table as natural language narration.
-    
-    TODO: Implement intelligent narration based on table structure and content.
-    
-    Args:
-        table_df: Table cells
-    
-    Returns:
-        Narrated description of table
-    """
-    # Placeholder: return markdown for now
-    return _format_table_markdown(table_df)
 
 
 # =================================
@@ -541,7 +473,6 @@ def _generate_table_block(
       - "markdown": Pipe-separated markdown table
       - "jsonl": One JSON line per row with headers
       - "melted": One fact per row (fully melted)
-      - "narrated": Natural language description [TODO]
 
     Args:
         table_id: Unique identifier for the table
@@ -553,27 +484,181 @@ def _generate_table_block(
         Formatted table text
     """
     if table_cells_df is None or table_cells_df.empty:
-        # Fallback if no table cells data available
         return _build_text_from_lines(df_lines)
-    
-    # Filter to cells belonging to this table
+
     table_df = table_cells_df[table_cells_df["table_id"] == table_id].copy() if table_id else table_cells_df.copy()
-    
+
     if table_df.empty:
         return _build_text_from_lines(df_lines)
-    
-    # Route to appropriate formatter
-    if representation == "markdown":
-        return _format_table_markdown(table_df)
-    elif representation == "jsonl":
+
+    if representation == "jsonl":
         return _format_table_jsonl(table_df)
     elif representation == "melted":
         return _format_table_melted(table_df)
-    elif representation == "narrated":
-        return _format_table_narrated(table_df)
     else:
-        # Unknown format: fallback to markdown
         return _format_table_markdown(table_df)
+
+
+# =======================================================================================================================
+# CHART FORMATTERS
+# =======================================================================================================================
+
+def _chart_display_value(row: "pd.Series") -> str:
+    """Return the display value string from a chart data row, or empty string if missing/NaN."""
+    value = row.get("value", "")
+    return str(value).strip() if value is not None and str(value).strip() not in ("", "nan") else ""
+
+
+def _format_chart_markdown(chart_df: pd.DataFrame) -> str:
+    """
+    Format chart data as a markdown table with categories as rows and series as columns.
+
+    Args:
+        chart_df: Chart points dataframe for a single chart
+
+    Returns:
+        Markdown formatted table string
+    """
+    chart_type = str(chart_df["chart_type"].iloc[0]).strip() if "chart_type" in chart_df.columns else ""
+    is_pie = chart_type in {"doughnutChart", "pieChart"}
+
+    sorted_df = chart_df.sort_values(["series_index", "point_index"])
+    series_names = [s for s in dict.fromkeys(sorted_df["series_name"].fillna("").astype(str).str.strip()) if s]
+    categories = [c for c in dict.fromkeys(sorted_df["category"].fillna("").astype(str).str.strip()) if c]
+
+    # Build value lookup: (series, category) -> display value
+    lookup: dict[tuple[str, str], str] = {}
+    for _, row in sorted_df.iterrows():
+        s = str(row.get("series_name", "")).strip()
+        c = str(row.get("category", "")).strip()
+        v = _chart_display_value(row)
+        if is_pie:
+            pct = row.get("percent", "")
+            pct_str = str(pct).strip() if pct is not None and str(pct).strip() not in ("", "nan") else ""
+            if pct_str and pct_str != v:
+                v = f"{v} ({pct_str})"
+        lookup[(s, c)] = v
+
+    header = "| Category | " + " | ".join(series_names) + " |"
+    separator = "| --- |" + " --- |" * len(series_names)
+    rows = []
+    for cat in categories:
+        cells = [lookup.get((s, cat), "") for s in series_names]
+        rows.append(f"| {cat} | " + " | ".join(cells) + " |")
+
+    return "\n".join([header, separator] + rows)
+
+
+def _format_chart_melted(chart_df: pd.DataFrame) -> str:
+    """
+    Format chart data as melted rows: one "series | category | value" line per data point.
+
+    Args:
+        chart_df: Chart points dataframe for a single chart
+
+    Returns:
+        Melted format string
+    """
+    chart_type = str(chart_df["chart_type"].iloc[0]).strip() if "chart_type" in chart_df.columns else ""
+    is_pie = chart_type in {"doughnutChart", "pieChart"}
+
+    lines = []
+    for _, row in chart_df.sort_values(["series_index", "point_index"]).iterrows():
+        series = str(row.get("series_name", "")).strip()
+        category = str(row.get("category", "")).strip()
+        value = _chart_display_value(row)
+
+        if is_pie:
+            pct = row.get("percent", "")
+            pct_str = str(pct).strip() if pct is not None and str(pct).strip() not in ("", "nan") else ""
+            if pct_str and pct_str != value:
+                value = f"{value} ({pct_str})"
+
+        lines.append(f"{series} | {category} | {value}")
+
+    return "\n".join(lines)
+
+
+def _format_chart_jsonl(chart_df: pd.DataFrame) -> str:
+    """
+    Format chart data as JSONL with one JSON object per series, keyed by category.
+
+    Args:
+        chart_df: Chart points dataframe for a single chart
+
+    Returns:
+        JSONL formatted string (one JSON object per line)
+    """
+    chart_type = str(chart_df["chart_type"].iloc[0]).strip() if "chart_type" in chart_df.columns else ""
+    is_pie = chart_type in {"doughnutChart", "pieChart"}
+
+    json_lines = []
+    sorted_df = chart_df.copy()
+    sorted_df["series_name"] = sorted_df["series_name"].fillna("").astype(str).str.strip()
+    sorted_df = sorted_df.sort_values(["series_index", "point_index"])
+    for series_name, group in sorted_df.groupby("series_name", sort=False):
+        row_obj = {"Series": str(series_name).strip()}
+        for _, row in group.iterrows():
+            category = str(row.get("category", "")).strip()
+            value = _chart_display_value(row)
+            if is_pie:
+                pct = row.get("percent", "")
+                pct_str = str(pct).strip() if pct is not None and str(pct).strip() not in ("", "nan") else ""
+                if pct_str and pct_str != value:
+                    value = f"{value} ({pct_str})"
+            row_obj[category] = value
+        json_lines.append(json.dumps(row_obj, ensure_ascii=False))
+
+    return "\n".join(json_lines)
+
+
+def _generate_chart_block(
+    chart_id: str,
+    df_lines: pd.DataFrame,
+    chart_points_df: pd.DataFrame,
+    representation: str = "jsonl",
+) -> str:
+    """
+    Generate appropriate representation of a chart block.
+
+    Formats:
+      - "markdown": Category-vs-series markdown table
+      - "melted": One fact per row (series | category | value)
+      - "jsonl": One JSON object per series (default)
+
+    Args:
+        chart_id: Unique identifier for the chart
+        df_lines: Lines belonging to this chart block
+        chart_points_df: Full chart points dataframe (filtered to this chart)
+        representation: Format to use for chart output
+
+    Returns:
+        Formatted chart text
+    """
+    if chart_points_df is None or chart_points_df.empty:
+        return _build_text_from_lines(df_lines)
+
+    chart_df = chart_points_df[chart_points_df["chart_id"] == chart_id].copy()
+    if chart_df.empty:
+        return _build_text_from_lines(df_lines)
+
+    parts = []
+
+    # Chart title if present
+    if "chart_title" in chart_df.columns:
+        raw = chart_df["chart_title"].iloc[0]
+        title = str(raw).strip() if raw is not None else ""
+        if title and title.lower() not in ("nan", "none", ""):
+            parts.append(title)
+
+    if representation == "markdown":
+        parts.append(_format_chart_markdown(chart_df))
+    elif representation == "melted":
+        parts.append(_format_chart_melted(chart_df))
+    else:
+        parts.append(_format_chart_jsonl(chart_df))
+
+    return "\n".join(parts)
 
 
 # =======================================================================================================================
@@ -619,31 +704,26 @@ def _compute_line_separator(df_with_block_ids: pd.DataFrame) -> pd.DataFrame:
     """
     # Initialize with default separator (space)
     df_with_block_ids["_join_sep"] = " "
-    
+
     # Skip lines that belong to tables (handled by table rendering)
-    has_table_id = False
+    has_table_id = pd.Series(False, index=df_with_block_ids.index)
     if "table_id" in df_with_block_ids.columns:
-        table_id_s = df_with_block_ids["table_id"].astype("string")
-        has_table_id = table_id_s.notna() & table_id_s.str.strip().ne("")
-    
+        has_table_id = df_with_block_ids["table_id"].fillna("").astype(str).str.strip().ne("")
+
     # Rule 1: TOC and exhibits always use newlines (if not part of a table)
     if "block_type" in df_with_block_ids.columns:
         is_toc_or_exhibits = df_with_block_ids["block_type"].isin(["toc", "exhibits"])
-        is_toc_or_exhibits_non_table = is_toc_or_exhibits & ~has_table_id
-        df_with_block_ids.loc[is_toc_or_exhibits_non_table, "_join_sep"] = "\n"
-    
+        df_with_block_ids.loc[is_toc_or_exhibits & ~has_table_id, "_join_sep"] = "\n"
+
     # Rule 2: Lines starting with bullet tokens use newlines (if not part of a table)
-    text_s = df_with_block_ids["text"].astype("string").fillna("")
-    is_bullet_start = text_s.map(lambda x: _starts_with_any_token(str(x), _BULLET_TOKENS))
-    is_bullet_start_non_table = is_bullet_start & ~has_table_id
-    df_with_block_ids.loc[is_bullet_start_non_table, "_join_sep"] = "\n"
-    
+    text_s = df_with_block_ids["text"].fillna("").astype(str)
+    is_bullet_start = text_s.map(lambda x: _starts_with_any_token(x, _BULLET_TOKENS))
+    df_with_block_ids.loc[is_bullet_start & ~has_table_id, "_join_sep"] = "\n"
+
     # Rule 3: Lines with hierarchy markers use newlines (if not part of a table)
     if "hierarchy_marker" in df_with_block_ids.columns:
-        hm_s = df_with_block_ids["hierarchy_marker"].astype("string")
-        has_hm = hm_s.notna() & hm_s.str.strip().ne("")
-        has_hm_non_table = has_hm & ~has_table_id
-        df_with_block_ids.loc[has_hm_non_table, "_join_sep"] = "\n"
+        has_hm = df_with_block_ids["hierarchy_marker"].fillna("").astype(str).str.strip().ne("")
+        df_with_block_ids.loc[has_hm & ~has_table_id, "_join_sep"] = "\n"
     
     return df_with_block_ids
 
@@ -651,28 +731,26 @@ def _compute_line_separator(df_with_block_ids: pd.DataFrame) -> pd.DataFrame:
 def _build_text_from_lines(lines: pd.DataFrame) -> str:
     """
     Build block text by joining line texts with their respective separators.
-    
+
     Args:
         lines: DataFrame rows for ONE block (in document order)
-    
+
     Returns:
         Joined text string
     """
-    texts = lines["text"].astype("string").fillna("").tolist()
-    seps = lines["_join_sep"].astype("string").fillna(" ").tolist()
-    
+    texts = lines["text"].fillna("").astype(str).tolist()
+    seps = lines["_join_sep"].fillna(" ").astype(str).tolist()
+
     out_parts: list[str] = []
     for i, t in enumerate(texts):
-        t2 = str(t).strip()
+        t2 = t.strip()
         if not t2:
             continue
         if not out_parts:
-            # First line: no separator
             out_parts.append(t2)
         else:
-            # Subsequent lines: use separator
-            out_parts.append(str(seps[i]) + t2)
-    
+            out_parts.append(seps[i] + t2)
+
     return "".join(out_parts)
 
 
@@ -685,22 +763,24 @@ def _join_text(
     blocks_df: pd.DataFrame,
     table_cells_df: pd.DataFrame = None,
     table_representation: str = "markdown",
+    chart_points_df: pd.DataFrame = None,
 ) -> pd.DataFrame:
     """
     Join line texts into block text with strategy-specific formatting.
-    
+
     Text joining strategies:
-      1. Blocks with table_id (including table, toc, exhibits): Use table rendering
-      2. block_type = "toc" or "exhibits" (without table_id): Join with newlines
-      3. Lines with bullet tokens or hierarchy markers: Join with newlines
-      4. Default: Join with spaces
-    
+      1. Blocks with table_id (table, toc, exhibits): use table rendering
+      2. Blocks with chart_id: use chart rendering
+      3. toc/exhibits without table_id, bullet lines, hierarchy markers: join with newlines
+      4. Default: join with spaces
+
     Args:
         df_with_block_ids: Lines df with _block_id column
         blocks_df: Aggregated blocks df (without text column)
         table_cells_df: Full table cells dataframe (for table formatting)
-        table_representation: Format for table output ("markdown", "jsonl", "melted", "narrated")
-    
+        table_representation: Format for table/chart output ("markdown", "jsonl", "melted")
+        chart_points_df: Chart points dataframe (for chart formatting)
+
     Returns:
         blocks_df with "text" column added
     """
@@ -708,46 +788,97 @@ def _join_text(
     # STEP 1: COMPUTE LINE SEPARATORS
     # -------------------------------------------------------------------------
     df_with_block_ids = _compute_line_separator(df_with_block_ids)
-    
+
     # -------------------------------------------------------------------------
-    # STEP 2: BUILD TEXT PER BLOCK
+    # STEP 2: IDENTIFY SPECIAL BLOCKS (table / chart rendering)
+    # Use the first row of each block to determine its type and IDs.
     # -------------------------------------------------------------------------
-    def _build_block_text(lines: pd.DataFrame) -> str:
-        """Build text for one block based on block_type and table_id."""
-        if lines.empty:
-            return ""
-        
-        # Get block_type and table_id (all lines in a block share the same values)
-        block_type = lines["block_type"].iloc[0] if "block_type" in lines.columns else None
-        table_id = lines["table_id"].iloc[0] if "table_id" in lines.columns else None
-        
-        # Check if this block has a table
-        has_table = table_id is not None and str(table_id).strip() != ""
-        
-        # Strategy 1: Blocks with tables (table, toc, exhibits)
-        if block_type == "table" or (block_type in ["toc", "exhibits"] and has_table):
-            return _generate_table_block(
-                table_id,
-                lines,
-                table_cells_df,
-                table_representation,
-            )
-        
-        # Strategy 2-4: Text blocks (use computed separators)
-        return _build_text_from_lines(lines)
-    
-    text_df = (
-        df_with_block_ids.groupby("_block_id", sort=False, observed=True)
-        .apply(_build_block_text, include_groups=False)
-        .reset_index()
-        .rename(columns={"_block_id": "block_id", 0: "text"})
+    first = df_with_block_ids.groupby("_block_id", sort=False).first()
+
+    _bt  = first["block_type"].fillna("") if "block_type" in first.columns else pd.Series("", index=first.index)
+    _tid = first["table_id"].fillna("").astype(str).str.strip() if "table_id" in first.columns else pd.Series("", index=first.index)
+    _cid = first["chart_id"].fillna("").astype(str).str.strip() if "chart_id" in first.columns else pd.Series("", index=first.index)
+
+    _has_table = ~_tid.isin({"", "nan", "None"})
+    _has_chart = ~_cid.isin({"", "nan", "None"})
+
+    is_special_block = (
+        (_bt == "table") |
+        (_bt.isin(["toc", "exhibits"]) & _has_table) |
+        (_bt == "chart") |
+        _has_chart
     )
-    
+    special_block_ids = set(first.index[is_special_block])
+
     # -------------------------------------------------------------------------
-    # STEP 3: MERGE TEXT INTO BLOCKS
+    # STEP 3: VECTORIZED TEXT JOINING FOR REGULAR BLOCKS
+    # Avoids per-group Python calls entirely for blocks that just join text.
     # -------------------------------------------------------------------------
-    blocks_df = blocks_df.merge(text_df, on="block_id", how="left")
-    
+    is_text_line = ~df_with_block_ids["_block_id"].isin(special_block_ids)
+    text_lines = df_with_block_ids[is_text_line]
+
+    result_parts: list[pd.DataFrame] = []
+
+    if not text_lines.empty:
+        text_vals = text_lines["text"].fillna("").astype(str).str.strip()
+        is_nonempty = text_vals.ne("")
+
+        nonempty = text_lines[is_nonempty].copy()
+        nonempty["_text"] = text_vals[is_nonempty].values
+        # Rank non-empty lines within each block (0 = first line, gets no sep prefix)
+        nonempty["_rank"] = nonempty.groupby("_block_id", sort=False).cumcount()
+        nonempty["_part"] = nonempty["_join_sep"].fillna(" ").astype(str) + nonempty["_text"]
+        rank0 = nonempty["_rank"] == 0
+        nonempty.loc[rank0, "_part"] = nonempty.loc[rank0, "_text"]
+
+        joined = (
+            nonempty.groupby("_block_id", sort=False)["_part"]
+            .apply("".join)
+            .reset_index()
+            .rename(columns={"_block_id": "block_id", "_part": "text"})
+        )
+        result_parts.append(joined)
+
+        # Blocks where every line was empty → emit empty string
+        missing_ids = set(text_lines["_block_id"].unique()) - set(joined["block_id"])
+        if missing_ids:
+            result_parts.append(pd.DataFrame({"block_id": list(missing_ids), "text": ""}))
+
+    # -------------------------------------------------------------------------
+    # STEP 4: groupby.apply FOR TABLE / CHART BLOCKS (small subset)
+    # -------------------------------------------------------------------------
+    special_lines = df_with_block_ids[~is_text_line]
+
+    if not special_lines.empty:
+        def _build_special_text(lines: pd.DataFrame) -> str:
+            if lines.empty:
+                return ""
+            block_type = lines["block_type"].iloc[0] if "block_type" in lines.columns else None
+            table_id  = lines["table_id"].iloc[0]  if "table_id"  in lines.columns else None
+            chart_id  = lines["chart_id"].iloc[0]  if "chart_id"  in lines.columns else None
+            has_table = table_id is not None and str(table_id).strip() not in ("", "nan", "None")
+            has_chart = chart_id is not None and str(chart_id).strip() not in ("", "nan", "None")
+
+            if block_type == "table" or (block_type in ["toc", "exhibits"] and has_table):
+                return _generate_table_block(table_id, lines, table_cells_df, table_representation)
+            if block_type == "chart" or has_chart:
+                return _generate_chart_block(chart_id, lines, chart_points_df, table_representation)
+            return _build_text_from_lines(lines)
+
+        special_joined = (
+            special_lines.groupby("_block_id", sort=False, observed=True)
+            .apply(_build_special_text, include_groups=False)
+            .reset_index()
+            .rename(columns={"_block_id": "block_id", 0: "text"})
+        )
+        result_parts.append(special_joined)
+
+    # -------------------------------------------------------------------------
+    # STEP 5: MERGE TEXT INTO BLOCKS
+    # -------------------------------------------------------------------------
+    all_results = pd.concat(result_parts, ignore_index=True) if result_parts else pd.DataFrame(columns=["block_id", "text"])
+    blocks_df = blocks_df.merge(all_results, on="block_id", how="left")
+
     return blocks_df
 
 
@@ -758,37 +889,42 @@ def _join_text(
 def merge_blocks(
     lines_df: pd.DataFrame,
     table_cells_df: pd.DataFrame = None,
+    chart_points_df: pd.DataFrame = None,
     table_representation: str = "markdown",
 ) -> pd.DataFrame:
     """
     Merge lines into logical blocks.
-    
+
     Process:
       1. Validate inputs and prepare for aggregation
       2. Assign block IDs (decision logic)
       3. Aggregate to block level (shared boilerplate)
-      4. Join text with smart separators (tables use table_representation)
+      4. Join text with smart separators (tables/charts use table_representation)
       5. Compute embed_char_count (includes whitespace for embedding estimation)
       6. Sort by document order
-    
+
     Args:
         lines_df: Lines-level DataFrame
         table_cells_df: Table cells DataFrame (for table formatting)
-        table_representation: Format for table output ("markdown", "jsonl", "melted", "narrated")
-    
+        table_representation: Format for table/chart output ("markdown", "jsonl", "melted")
+        chart_points_df: Chart points DataFrame (for chart formatting)
+
     Returns:
         Blocks-level DataFrame with embed_char_count column added
     """
+    # -------------------------
+    # STEP 1: VALIDATE
+    # -------------------------
     if lines_df is None or lines_df.empty:
         return pd.DataFrame()
-    
+
     # -------------------------
-    # STEP 1: ASSIGN BLOCK IDs
+    # STEP 2: ASSIGN BLOCK IDs
     # -------------------------
     df = _assign_block_ids(lines_df.copy())
-    
+
     # -------------------------
-    # STEP 2: AGGREGATE
+    # STEP 3: AGGREGATE
     # -------------------------
     agg_spec = build_standard_agg_spec(
         include_hierarchy=True,
@@ -810,7 +946,7 @@ def merge_blocks(
     # -------------------------
     # STEP 4: JOIN TEXT
     # -------------------------
-    blocks_df = _join_text(df, blocks_df, table_cells_df, table_representation)
+    blocks_df = _join_text(df, blocks_df, table_cells_df, table_representation, chart_points_df)
     
     # -------------------------
     # STEP 5: COMPUTE EMBED CHAR COUNT
@@ -818,7 +954,7 @@ def merge_blocks(
     # embed_char_count includes all characters (including whitespace) for embedding estimation
     # This differs from char_count which only counts net characters
     if "text" in blocks_df.columns:
-        blocks_df["embed_char_count"] = blocks_df["text"].astype("string").fillna("").str.len()
+        blocks_df["embed_char_count"] = blocks_df["text"].fillna("").astype(str).str.len()
     else:
         blocks_df["embed_char_count"] = 0
     

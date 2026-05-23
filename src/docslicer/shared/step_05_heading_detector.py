@@ -20,11 +20,12 @@ The hierarchy tree (weights, heading_id, parent/level) lives in step_06.
 """
 
 from __future__ import annotations
-import json
 import hashlib
+import json
+import re
+
 import numpy as np
 import pandas as pd
-import re
 
 # ================================================================================
 # Pre-filter forbidden heading line formats (text that will never be a heading)
@@ -34,24 +35,24 @@ _FORBIDDEN_BLOCK_TYPES = {"table", "image", "hr", "page_label", "navigation", "t
 
 _FORBIDDEN_SUBSTRINGS = {
     # signature indicators
-    "/s/", "signed:", 
+    "/s/", "signed:",
     # urls
     "http:", "https", "www.",
-    #other
+    # other
     "page"
 }
 
 _FORBIDDEN_START_TEXT = {
     # stars and quotes
     "*", "'",'"', "“", "”", "‘", "’", "„", "«", "»",
-    # Bullet tokens
+    # bullet tokens
     "-", "–", "—", "•", "·", "…", "■", "▪", "",
     "+", "☒", "☐", "○", "◦", "►", "▸", "‣", "⁃",
     "✓", "✔", "✗", "✘", "✖", "✕",
-    # Other
-    "©", "®", "™", "§", "¶", "†", "‡", "•", "…", "‹", "›", "“", "”", "‘", "’", "„", "«", "»",
+    # other punctuation
+    "©", "®", "™", "§", "¶", "†", "‡", "‹", "›",
     # signature indicators
-    "By:", "Name:", "Title:", "Date:"
+    "By:", "Name:", "Title:", "Date:",
 }
 
 # Parenthesized line patterns:
@@ -502,7 +503,20 @@ def _validate_alpha_heading_series(lines_df: pd.DataFrame) -> pd.DataFrame:
 # Core heading scoring function
 # ================================================================================
 
-# ----- Helpers ----- #
+# ----- Config ----- #
+
+# Colors considered "basic" (black/white/greys) — not treated as special for color rarity scoring
+_BASIC_COLORS = frozenset({
+    "#000000", "#ffffff", "#fff", "#000",
+    "#111111", "#222222", "#333333", "#444444", "#555555", "#666666",
+    "#777777", "#888888", "#999999", "#aaaaaa", "#bbbbbb", "#cccccc",
+    "#dddddd", "#eeeeee",
+})
+
+# Pattern used in coverpage suppression to identify FORM/SCHEDULE headings
+_FORM_PATTERN = r"^\s*(FORM|SCHEDULE)\b"
+
+
 
 def _to_bool_series(s: pd.Series, default: bool = False) -> pd.Series:
     """
@@ -560,20 +574,20 @@ def _add_heading_score(lines_df: pd.DataFrame) -> pd.DataFrame:
     """
     Takes lines_df and returns it with one extra column: `heading_score`.
 
-    Scoring rules (as requested):
+    Scoring rules:
     [GENERAL]
     - font_size_ratio:
       - 1.01 to 1.2: +1
       - 1.2 to 1.4: +2
       - >1.4: +3
-      - <1: -10
-    - char_count
+      - <0.75: -5
+    - char_count:
       - < 50: +0.5
       - >100: -1
-      - >250: -5
+      - >250: -3
     - capitalized_word_ratio = capitalized_word_count/word_count
       - >0.75: +0.5
-    - is_bold = true: +1.5
+    - is_bold = true: +2.5
     - is_italic = true: +1.5
     - is_underlined = true: +1.5
     - text_align = center: +1
@@ -586,7 +600,6 @@ def _add_heading_score(lines_df: pd.DataFrame) -> pd.DataFrame:
     """
     out = lines_df.copy()
 
-    n = len(out)
     score = pd.Series(0.0, index=out.index, dtype="float64")
 
     # --- font_size_ratio
@@ -659,18 +672,7 @@ def _add_heading_score(lines_df: pd.DataFrame) -> pd.DataFrame:
         mode_color = nsc_norm.dropna().mode()
         prevalent = mode_color.iloc[0] if not mode_color.empty else pd.NA
 
-        # Exclude "basic" colors from being considered "special"
-        BASIC_COLORS = {
-            "#000000",  # black
-            "#ffffff",  # white
-            "#fff",     # shorthand white (just in case)
-            "#000",     # shorthand black
-            "#111111", "#222222", "#333333", "#444444", "#555555", "#666666",
-            "#777777", "#888888", "#999999", "#aaaaaa", "#bbbbbb", "#cccccc",
-            "#dddddd", "#eeeeee",
-        }
-
-        is_basic = nsc_norm.isin(BASIC_COLORS)
+        is_basic = nsc_norm.isin(_BASIC_COLORS)
 
         # +1 if:
         # - color is present
@@ -740,10 +742,11 @@ def _apply_contextual_score_adjustments(lines_df: pd.DataFrame) -> pd.DataFrame:
     if "heading_score" not in out.columns:
         return out
 
-    # style key: "hierarchy_type|non_stroking_color|is_bold|is_italic|is_underlined|font_family|font_size_ratio"
-    # font_size_ratio is bucketed to 1 decimal place to absorb minor float variation
+    # style key: bold|italic|underlined|font_family|font_size_ratio (bucketed to 1dp)
+    # color_rarity already captures non_stroking_color; hierarchy_type and is_uppercase
+    # caused too many accidental style-run hits in practice.
     style_parts = []
-    for col in ["is_bold", "is_italic", "is_underlined", "font_family"]: #Removed "hierarchy_type" - accidental hits, "non_stroking_color" - already captured by color_rarity, "is_uppercase" - accidental hits
+    for col in ["is_bold", "is_italic", "is_underlined", "font_family"]:
         if col in out.columns:
             style_parts.append(out[col].fillna(False).astype(str))
     if "font_size_ratio" in out.columns:
@@ -755,7 +758,11 @@ def _apply_contextual_score_adjustments(lines_df: pd.DataFrame) -> pd.DataFrame:
     sort_col = "line_id" if "line_id" in out.columns else None
     working_idx = out.sort_values(sort_col).index if sort_col else out.index
 
-    style_key = pd.concat(style_parts, axis=1).agg("|".join, axis=1).loc[working_idx]
+    # Vectorized string join — avoids a row-by-row Python loop from .agg()
+    style_key = style_parts[0].copy()
+    for _part in style_parts[1:]:
+        style_key = style_key + "|" + _part
+    style_key = style_key.loc[working_idx]
 
     same_prev2 = (style_key == style_key.shift(2)).fillna(False)
     same_prev  = (style_key == style_key.shift(1)).fillna(False)
@@ -784,20 +791,17 @@ def _apply_contextual_score_adjustments(lines_df: pd.DataFrame) -> pd.DataFrame:
     adj_aligned = adj.reindex(out.index).fillna(0.0)
     out["heading_score"] = (out["heading_score"] + adj_aligned).astype("float64")
 
-    # Append contextual adjustment to debug JSON
+    # Append contextual adjustment to debug JSON — only patch rows where adj != 0
     if "heading_score_debug" in out.columns:
-        def _append_contextual(row: pd.Series) -> str:
-            v = adj_aligned.loc[row.name]
-            if v == 0.0:
-                return row["heading_score_debug"]
+        nonzero_idx = adj_aligned.index[adj_aligned != 0.0]
+        for _i in nonzero_idx:
+            v = adj_aligned.loc[_i]
             try:
-                d = json.loads(row["heading_score_debug"])
+                d = json.loads(out.at[_i, "heading_score_debug"])
             except (ValueError, TypeError):
                 d = {}
             d["contextual_adjustment"] = round(float(v), 4)
-            return json.dumps(d)
-
-        out["heading_score_debug"] = out.apply(_append_contextual, axis=1)
+            out.at[_i, "heading_score_debug"] = json.dumps(d)
 
     return out
 
@@ -1235,21 +1239,26 @@ def _add_heading_fingerprints_and_ids(lines_df: pd.DataFrame) -> pd.DataFrame:
     if not is_heading.any():
         return out
 
-    def _sorted_idx(idx):
-        sub = out.loc[idx]
-        sort_cols = [c for c in ("page_number", "line_id") if c in sub.columns]
-        return sub.sort_values(sort_cols, kind="mergesort").index if sort_cols else sub.index
+    # Pre-extract only heading rows, sorted — avoids iterating all rows and
+    # repeated out.loc[i] Series construction inside the loop.
+    sort_cols = [c for c in ("page_number", "line_id") if c in out.columns]
+    fp_cols_present = [c for c in _FINGERPRINT_COLS if c in out.columns]
+    extra_cols = [c for c in sort_cols if c not in fp_cols_present]
 
-    idx = _sorted_idx(out.index)
+    heading_sub = out.loc[is_heading, fp_cols_present + extra_cols].copy()
+    if sort_cols:
+        heading_sub = heading_sub.sort_values(sort_cols, kind="mergesort")
+    heading_idx = heading_sub.index
+
+    # Bulk convert to plain dicts once — O(1) field access in the loop below
+    records = heading_sub[fp_cols_present].to_dict("index")
+
     next_id = 1
     seen = []
 
-    for i in idx:
-        if not is_heading.loc[i]:
-            continue
-
-        row = out.loc[i]
-        fp = {col: (_normalize_scalar(row[col]) if col in out.columns else None) for col in _FINGERPRINT_COLS}
+    for i in heading_idx:
+        row_dict = records[i]
+        fp = {col: (_normalize_scalar(row_dict[col]) if col in row_dict else None) for col in _FINGERPRINT_COLS}
 
         ht = fp.get("heading_type")
         if ht is None or (isinstance(ht, str) and ht.strip() == ""):
@@ -1392,7 +1401,6 @@ def _suppress_headings(df: pd.DataFrame) -> pd.DataFrame:
             has_run = any(sorted_ids[i + 2] - sorted_ids[i] == 2 for i in range(len(sorted_ids) - 2))
             if has_run:
                 scope_headings = out.loc[scope_heading_idx].copy()
-                _FORM_PATTERN = r"^\s*(FORM|SCHEDULE)\b"
                 kw = (scope_headings["text"].astype("string").fillna("")
                       .str.contains(_FORM_PATTERN, case=False, regex=True)
                       if "text" in scope_headings.columns
@@ -1404,6 +1412,7 @@ def _suppress_headings(df: pd.DataFrame) -> pd.DataFrame:
                 best_line_id = pd.to_numeric(candidates["line_id"], errors="coerce").min()
                 keep_idx = candidates.index[pd.to_numeric(candidates["line_id"], errors="coerce") == best_line_id][0]
                 # If the winner heading spans multiple merged lines (same heading_id), keep all of them
+                #TODO at this point heading_id is not in the df, only gets added by step 06
                 if "heading_id" in out.columns:
                     winner_hid = out.loc[keep_idx, "heading_id"]
                     if pd.notna(winner_hid):
@@ -1455,7 +1464,7 @@ def _finalize_block_types(df: pd.DataFrame) -> pd.DataFrame:
 
 def detect_headings(
     lines_df: pd.DataFrame,
-    compiled_patterns,
+    compiled_patterns,  # HierarchyTypePatternConfig
 ) -> pd.DataFrame:
     """
     Heading detection pipeline. Answers: is this line a heading?

@@ -214,6 +214,7 @@ def build_standard_agg_spec(
             "page_label_value",
             "layout_id",
             "layout_type",
+            "chart_id",
             "block_type",
             "section",
             # PDF-pipeline columns (harmless no-ops on other pipelines)
