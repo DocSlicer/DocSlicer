@@ -21,6 +21,8 @@ _UNIT_PHRASES = frozenset(
         "in billions",
         "except per share",
         "per share",
+        "percentage",
+        "(%)",
         "year ended",
         "years ended",
         "month ended",
@@ -31,6 +33,13 @@ _UNIT_PHRASES = frozenset(
         "six months",
         "nine months",
         "twelve months",
+        "total",
+        "actual",
+        "adjusted",
+        "number",
+        "shares",
+        "amount",
+        "value",
     }
 )
 _NUMBER_RE = re.compile(r"^[\(\-]?\$?[\d,]+(\.\d+)?\)?$")
@@ -118,11 +127,17 @@ def detect_cell_roles(
         if row_cells["text"].fillna("").apply(_looks_numeric).any():
             break
 
+        # If the row-label column (col 0) has content this is a data row, not a header
+        col0_cells = row_cells[row_cells["col_start"] == 0]
+        col0_blank = col0_cells.empty or col0_cells["text"].fillna("").str.strip().eq("").all()
+        if not col0_blank:
+            break
+
         combined = " ".join(row_cells["text"].fillna("").str.lower())
         nonblank = row_cells[row_cells["text"].fillna("").str.strip() != ""]
         is_currency_unit_row = (
             not nonblank.empty
-            and nonblank["text"].apply(_is_currency_unit_cell).all()
+            and nonblank["text"].apply(_is_currency_unit_cell).any()
         )
         if (
             _YEAR_PAT.search(combined)
@@ -132,13 +147,8 @@ def detect_cell_roles(
         ):
             header_rows.add(r)
         else:
-            # Include rows where the first cell is blank, likely indicator of a header row
-            col0_cells = row_cells[row_cells["col_start"] == 0]
-            col0_blank = col0_cells.empty or col0_cells["text"].fillna("").str.strip().eq("").all()
-            if col0_blank:
-                header_rows.add(r)
-            else:
-                break
+            # col0 is blank/absent — treat as continuation of the header zone
+            header_rows.add(r)
 
     # --- 2. Assign roles ---
     df["role"] = "data"

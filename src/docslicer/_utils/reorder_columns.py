@@ -162,6 +162,7 @@ MASTER_COLUMN_ORDER: List[str] = [
     "hierarchy_marker",
     "hierarchy_type",
     "heading_type",
+    "embed_char_count", #Temporarily
     "heading_fp_id",
     "heading_fingerprint",
     "active_heading_id",
@@ -224,7 +225,7 @@ MASTER_COLUMN_ORDER: List[str] = [
     # ===== 7. Calculated features =====
     # Counts
     "token_count", # From Tiktoken
-    "embed_char_count",
+    #"embed_char_count",
     "char_count",
     "alpha_count",
     "digit_count",

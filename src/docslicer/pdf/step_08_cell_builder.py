@@ -80,7 +80,7 @@ def _is_numeric_like(text: str) -> bool:
     if not text:
         return False
     text = str(text).strip()
-    return bool(text) and all(ch.isdigit() or ch in ",.()-+% " for ch in text)
+    return bool(text) and all(ch.isdigit() or ch in ",.()-+% —–" for ch in text)
 
 
 # ================================================================================
@@ -252,23 +252,211 @@ def _sort_reading_order(df: pd.DataFrame) -> pd.DataFrame:
 # CELL ID ASSIGNMENT
 # ================================================================================
 
+def _sentence_score(
+    ls: pd.DataFrame,
+    alpha_ratio: pd.Series,
+    numeric_ratio: pd.Series,
+    numeric_token_ratio: pd.Series,
+    digit_token_ratio: pd.Series,
+) -> tuple[dict, dict]:
+    """Score each line for sentence-likeness. Returns (is_sentence_map, score_map)."""
+    n_col    = ls["_n"]
+    atok_col = ls["_atok"]
+    cap_col  = ls["_cap"]
+    sw_col   = ls["_sw"]
+    hp_col   = ls["_hap"]
+
+    score = pd.Series(0, index=ls.index, dtype=np.int32)
+    score += np.where(n_col >= 8, 2, np.where(n_col >= 6, 1, 0))
+    score += np.where(sw_col >= 2, 2, np.where(sw_col == 1, 1, 0))
+    score += hp_col.astype(int)
+    score += np.where(alpha_ratio >= 0.75, 2, np.where(alpha_ratio >= 0.60, 1, 0))
+    score -= np.where(numeric_ratio >= 0.35, 3,
+              np.where(numeric_ratio >= 0.20, 2,
+              np.where(numeric_ratio >= 0.12, 1, 0)))
+    score -= np.where(numeric_token_ratio >= 0.25, 3,
+              np.where(numeric_token_ratio >= 0.10, 2,
+              np.where(numeric_token_ratio >= 0.05, 1, 0)))
+    score -= np.where(digit_token_ratio >= 0.20, 3,
+              np.where(digit_token_ratio >= 0.10, 2,
+              np.where(digit_token_ratio >= 0.05, 1, 0)))
+    score += ((atok_col >= 4) & (cap_col <= atok_col * 0.5)).astype(int)
+    score -= ((cap_col >= 4) & (sw_col == 0)).astype(int) * 2
+
+    is_sentence_map: dict = ((score >= 4) & (n_col >= 5)).to_dict()
+    score_map:       dict = score.to_dict()
+    return is_sentence_map, score_map
+
+
+def _table_like_score(
+    ls: pd.DataFrame,
+    numeric_ratio: pd.Series,
+    digit_token_ratio: pd.Series,
+    line_arr: np.ndarray,
+    x_left_arr: np.ndarray,
+    x_right_arr: np.ndarray,
+    is_sentence_map: dict,
+    score_map: dict,
+) -> tuple[dict, dict]:
+    """Score each line for table-likeness. Returns (is_table_like_map, table_score_map).
+
+    Sentence-like lines are always excluded.
+    df must already be sorted by (line_id, x_left) for the gap shift to be correct.
+    """
+    n_col   = ls["_n"]
+    cap_col = ls["_cap"]
+
+    # Per-line gap stats: shift x_left within each line group to get neighbour gaps.
+    _line_s  = pd.Series(line_arr)
+    _next_xl = pd.Series(x_left_arr).groupby(_line_s).shift(-1)
+    _gap_s   = (_next_xl - pd.Series(x_right_arr)).where(
+        _next_xl.notna() & (_next_xl - pd.Series(x_right_arr) > 0)
+    )
+    _gap_agg = (
+        pd.DataFrame({"_lid": line_arr, "_gap": _gap_s})
+        .dropna(subset=["_gap"])
+        .groupby("_lid")["_gap"]
+        .agg(median_x0x1_gap="median", max_x0x1_gap="max")
+    )
+    _gap_agg["gap_ratio"] = _gap_agg["max_x0x1_gap"] / (_gap_agg["median_x0x1_gap"] + 1e-6)
+
+    gap_ratio_col  = _gap_agg["gap_ratio"].reindex(ls.index, fill_value=0.0)
+    median_gap_col = _gap_agg["median_x0x1_gap"].reindex(ls.index, fill_value=0.0)
+    cap_ratio      = cap_col / ls["_atok"].clip(lower=1)
+
+    tscore = pd.Series(0.0, index=ls.index)
+    tscore += np.clip((numeric_ratio - 0.2) * 3.0, -0.5, 1.5)
+    tscore += np.clip((digit_token_ratio - 0.1) * 3.0, -0.5, 1.5)
+    tscore += np.where(gap_ratio_col < 2.0,  -1.5,
+              np.where(gap_ratio_col < 5.0,   np.interp(gap_ratio_col,  [2.0, 5.0],  [0.0, 1.0]),
+              np.where(gap_ratio_col < 15.0,  np.interp(gap_ratio_col,  [5.0, 15.0], [1.0, 2.0]),
+              2.0)))
+    tscore += np.where(median_gap_col < 5.0,  -1.5,
+              np.where(median_gap_col < 10.0, np.interp(median_gap_col, [5.0, 10.0],  [0.0, 1.0]),
+              np.where(median_gap_col < 15.0, np.interp(median_gap_col, [10.0, 15.0], [1.0, 1.5]),
+              1.7)))
+    tscore += np.where(cap_ratio < 0.2, -0.5,
+              np.where(cap_ratio < 0.7, np.interp(cap_ratio, [0.2, 0.7], [0.0, 1.0]),
+              np.interp(np.minimum(cap_ratio, 1.0), [0.7, 1.0], [1.0, 1.5])))
+
+    sentence_mask    = pd.Series(is_sentence_map).reindex(ls.index, fill_value=False)
+    is_table_like_map: dict = ((tscore >= 2.0) & ~sentence_mask & (n_col >= 1)).to_dict()
+    table_score_map:   dict = tscore.to_dict()
+    return is_table_like_map, table_score_map
+
+
+def _compute_line_classifications(
+    df: pd.DataFrame,
+    line_arr: np.ndarray,
+    x_left_arr: np.ndarray,
+    x_right_arr: np.ndarray,
+    text_arr: np.ndarray,
+) -> tuple[dict, dict, dict, dict, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Vectorized pre-pass: classify every line as sentence-like and/or table-like,
+    and return the per-word merge flags needed by the cell-ID loop.
+
+    Returns
+    -------
+    is_sentence_map   : line_id -> bool
+    score_map         : line_id -> int   (sentence score)
+    is_table_like_map : line_id -> bool
+    table_score_map   : line_id -> float
+    bullet_flags      : bool array, len = len(df)
+    dollar_flags      : bool array, len = len(df)
+    numeric_flags     : bool array, len = len(df)
+    """
+    stripped = pd.Series(text_arr).str.strip()
+    t_norm   = stripped.str.lower().str.strip(_STRIP_CHARS)
+
+    # --- Per-word flags ---
+    bullet_flags = (
+        np.frompyfunc(is_bullet_token, 1, 1)(stripped.to_numpy()).astype(bool)
+        if _BULLET_MERGE_ENABLED else
+        np.zeros(len(text_arr), dtype=bool)
+    )
+    dollar_flags    = (stripped == "$").to_numpy()
+    numeric_flags   = np.frompyfunc(_is_numeric_like, 1, 1)(stripped.to_numpy()).astype(bool)
+    has_digit_flags = np.array([any(c.isdigit() for c in t) for t in stripped], dtype=bool)
+    is_stopword_arr = t_norm.isin(_STOPWORDS).to_numpy()
+
+    if "alpha_count" in df.columns:
+        alpha_ok = df["alpha_count"].gt(0).to_numpy()
+    else:
+        alpha_ok = stripped.str.contains(r"[a-zA-Z]", na=False).to_numpy()
+    has_alpha_punct = alpha_ok & stripped.str.contains(r"[.,;:]", na=False).to_numpy()
+
+    # --- Single groupby: aggregate all per-word flags into per-line stats ---
+    df["_sw"]  = is_stopword_arr
+    df["_hap"] = has_alpha_punct
+    df["_num"] = numeric_flags
+    df["_hd"]  = has_digit_flags
+
+    agg_dict: dict = {
+        "text": "count", "_sw": "sum", "_hap": "any", "_num": "sum", "_hd": "sum",
+    }
+    for col in ("alpha_word_count", "digit_count", "capitalized_word_count", "char_count"):
+        if col in df.columns:
+            agg_dict[col] = "sum"
+
+    ls = df.groupby("line_id", sort=False).agg(agg_dict).rename(columns={
+        "text":                  "_n",
+        "alpha_word_count":      "_atok",
+        "digit_count":           "_dch",
+        "capitalized_word_count":"_cap",
+        "char_count":            "_tch",
+    })
+    df.drop(columns=["_sw", "_hap", "_num", "_hd"], inplace=True)
+
+    # Fill optional columns that may be absent
+    for col, default in [("_atok", 0), ("_dch", 0), ("_cap", 0), ("_tch", 1)]:
+        if col not in ls.columns:
+            ls[col] = default
+
+    n_col    = ls["_n"]
+    dch_col  = ls["_dch"]
+    tch_col  = ls["_tch"]
+    num_col  = ls["_num"]
+    hd_col   = ls["_hd"]
+
+    alpha_ratio         = ls["_atok"] / n_col.clip(lower=1)
+    numeric_ratio       = dch_col     / tch_col.clip(lower=1)
+    numeric_token_ratio = num_col     / n_col.clip(lower=1)
+    digit_token_ratio   = hd_col      / n_col.clip(lower=1)
+
+    is_sentence_map, score_map = _sentence_score(
+        ls, alpha_ratio, numeric_ratio, numeric_token_ratio, digit_token_ratio,
+    )
+    is_table_like_map, table_score_map = _table_like_score(
+        ls, numeric_ratio, digit_token_ratio,
+        line_arr, x_left_arr, x_right_arr,
+        is_sentence_map, score_map,
+    )
+
+    return (
+        is_sentence_map, score_map,
+        is_table_like_map, table_score_map,
+        bullet_flags, dollar_flags, numeric_flags,
+    )
+
+
 def _assign_cell_ids(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Assign a global cell_id to df based on horizontal gaps within each line_id.
+    Assign a global cell_id to every word based on horizontal gaps within each line_id.
 
-    Rules per line_id (left→right):
-      - If sentence-like: use _SENTENCE_MERGE_MAX_GAP
-      - Else: font-size-interpolated threshold
-      - Bullet/dollar special merges override threshold
-
-    All per-word flags and per-line sentence scores are computed in a single
-    vectorized pass before the loop, so no pandas calls happen inside it.
+    Gap threshold per line:
+      - sentence-like  → _SENTENCE_MERGE_MAX_GAP (wider, tolerates justification spacing)
+      - table-like     → font-interpolated threshold × 0.5 (tighter, avoids merging cells)
+      - default        → font-interpolated threshold
+    Bullet and dollar-sign tokens have their own gap overrides regardless of line type.
     """
     if df.empty:
         df = df.copy()
-        df["cell_id"] = pd.Series(dtype="int64")
+        df["cell_id"]          = pd.Series(dtype="int64")
         df["is_sentence_like"] = pd.Series(dtype="bool")
-        df["sentence_score"] = pd.Series(dtype="int32")
+        df["sentence_score"]   = pd.Series(dtype="int32")
+        df["is_table_like"]    = pd.Series(dtype="bool")
+        df["table_score"]      = pd.Series(dtype="float32")
         return df
 
     df = df.sort_values(
@@ -282,69 +470,19 @@ def _assign_cell_ids(df: pd.DataFrame) -> pd.DataFrame:
     font_size_arr = df["font_size"].to_numpy(dtype=float)
     text_arr      = df["text"].astype(str).to_numpy()
 
-    # ---- Pre-compute per-word flags (one vectorized pass over all words) ----
-    stripped      = pd.Series(text_arr).str.strip()
-    t_norm        = stripped.str.lower().str.strip(_STRIP_CHARS)
-
-    # np.frompyfunc vectorises Python callables without a Python-level loop
-    bullet_flags  = (
-        np.frompyfunc(is_bullet_token, 1, 1)(stripped.to_numpy()).astype(bool)
-        if _BULLET_MERGE_ENABLED else
-        np.zeros(len(text_arr), dtype=bool)
-    )
-    dollar_flags  = (stripped == "$").to_numpy()
-    numeric_flags = np.frompyfunc(_is_numeric_like, 1, 1)(stripped.to_numpy()).astype(bool)
-    is_stopword_arr = t_norm.isin(_STOPWORDS).to_numpy()
-
-    if "alpha_count" in df.columns:
-        alpha_ok = df["alpha_count"].gt(0).to_numpy()
-    else:
-        alpha_ok = stripped.str.contains(r"[a-zA-Z]", na=False).to_numpy()
-    has_alpha_punct = alpha_ok & stripped.str.contains(r"[.,;:]", na=False).to_numpy()
-
-    # ---- Pre-compute per-line sentence scores (single groupby over all lines) ----
-    df["_sw"]  = is_stopword_arr
-    df["_hap"] = has_alpha_punct
-
-    agg_dict: dict = {"text": "count", "_sw": "sum", "_hap": "any"}
-    for col in ("alpha_word_count", "digit_count", "capitalized_word_count", "char_count"):
-        if col in df.columns:
-            agg_dict[col] = "sum"
-
-    ls = df.groupby("line_id", sort=False).agg(agg_dict)
-    df.drop(columns=["_sw", "_hap"], inplace=True)
-
-    n_col    = ls["text"]
-    atok_col = ls.get("alpha_word_count",       pd.Series(0, index=ls.index))
-    dch_col  = ls.get("digit_count",            pd.Series(0, index=ls.index))
-    cap_col  = ls.get("capitalized_word_count", pd.Series(0, index=ls.index))
-    tch_col  = ls.get("char_count",             pd.Series(1, index=ls.index))
-    sw_col   = ls["_sw"]
-    hp_col   = ls["_hap"]
-
-    alpha_ratio   = atok_col / n_col.clip(lower=1)
-    numeric_ratio = dch_col  / tch_col.clip(lower=1)
-
-    score = pd.Series(0, index=ls.index, dtype=np.int32)
-    score += np.where(n_col >= 8, 2, np.where(n_col >= 6, 1, 0))
-    score += np.where(sw_col >= 2, 2, np.where(sw_col == 1, 1, 0))
-    score += hp_col.astype(int)
-    score += np.where(alpha_ratio >= 0.75, 2, np.where(alpha_ratio >= 0.60, 1, 0))
-    score -= np.where(numeric_ratio >= 0.35, 3,
-              np.where(numeric_ratio >= 0.20, 2,
-              np.where(numeric_ratio >= 0.12, 1, 0)))
-    score += ((atok_col >= 4) & (cap_col <= atok_col * 0.5)).astype(int)
-    score -= ((cap_col >= 4) & (sw_col == 0)).astype(int) * 2
-
-    # Lines with < 5 words are never sentence-like (mirrors is_sentence_like_line)
-    is_sentence_map: dict = ((score >= 4) & (n_col >= 5)).to_dict()
-    score_map:       dict = score.to_dict()
+    (
+        is_sentence_map, score_map,
+        is_table_like_map, table_score_map,
+        bullet_flags, dollar_flags, numeric_flags,
+    ) = _compute_line_classifications(df, line_arr, x_left_arr, x_right_arr, text_arr)
 
     # ---- Main loop: pure array lookups, no pandas calls inside ----
     n = len(df)
     cell_id_arr        = np.empty(n, dtype=np.int64)
     is_sentence_arr    = np.empty(n, dtype=bool)
     sentence_score_arr = np.empty(n, dtype=np.int32)
+    is_table_like_arr  = np.empty(n, dtype=bool)
+    table_score_arr    = np.empty(n, dtype=np.float32)
 
     next_cell_id = 1
     i = 0
@@ -355,9 +493,11 @@ def _assign_cell_ids(df: pd.DataFrame) -> pd.DataFrame:
         while j < n and line_arr[j] == current_line:
             j += 1
 
-        is_sentence             = is_sentence_map.get(current_line, False)
-        is_sentence_arr[i:j]    = is_sentence
-        sentence_score_arr[i:j] = score_map.get(current_line, 0)
+        is_sentence              = is_sentence_map.get(current_line, False)
+        is_sentence_arr[i:j]     = is_sentence
+        sentence_score_arr[i:j]  = score_map.get(current_line, 0)
+        is_table_like_arr[i:j]   = is_table_like_map.get(current_line, False)
+        table_score_arr[i:j]     = table_score_map.get(current_line, 0.0)
 
         if is_sentence:
             line_threshold = _SENTENCE_MERGE_MAX_GAP
@@ -366,6 +506,8 @@ def _assign_cell_ids(df: pd.DataFrame) -> pd.DataFrame:
             valid_fonts = valid_fonts[valid_fonts > 0]
             median_font = float(np.median(valid_fonts)) if valid_fonts.size > 0 else None
             line_threshold = _interpolate_font_gap(median_font)
+            if is_table_like_map.get(current_line, False):
+                line_threshold *= 0.5
 
         current_cell   = next_cell_id
         cell_id_arr[i] = current_cell
@@ -381,7 +523,7 @@ def _assign_cell_ids(df: pd.DataFrame) -> pd.DataFrame:
                 continue
 
             if (gap <= line_threshold
-                    or (bullet_flags[k] and bool(text_arr[k + 1].strip()) and gap <= _BULLET_MERGE_MAX_GAP)
+                    or (bullet_flags[k] and k == i and bool(text_arr[k + 1].strip()) and gap <= _BULLET_MERGE_MAX_GAP)
                     or (dollar_flags[k] and numeric_flags[k + 1] and gap <= _DOLLAR_MERGE_MAX_GAP)):
                 cell_id_arr[k + 1] = current_cell
             else:
@@ -395,6 +537,8 @@ def _assign_cell_ids(df: pd.DataFrame) -> pd.DataFrame:
     df["cell_id"]          = cell_id_arr
     df["is_sentence_like"] = is_sentence_arr
     df["sentence_score"]   = sentence_score_arr
+    df["is_table_like"]    = is_table_like_arr
+    df["table_score"]      = table_score_arr
     return df
 
 
@@ -416,6 +560,8 @@ def _build_cells_df(df_words: pd.DataFrame) -> pd.DataFrame:
             "gutter_id_right",
             "is_sentence_like",
             "sentence_score",
+            "is_table_like",
+            "table_score",
         ],
         include_geometry=True,
         include_style=True,

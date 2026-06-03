@@ -129,19 +129,32 @@ class _Cell(NamedTuple):
     ix: Optional[str]
 
 
+def _iter_own_trs(table_el):
+    """Yield <tr> elements that directly belong to table_el, skipping nested tables."""
+    for tr in table_el.find_all("tr"):
+        for ancestor in tr.parents:
+            if ancestor is table_el:
+                yield tr
+                break
+            if ancestor.name == "table":
+                break  # belongs to a nested table, skip
+
+
 def _parse_html_table(table_el) -> list[_Cell]:
     """
     Parse a single <table> BeautifulSoup element into a list of origin cells.
 
     Only origin cells are emitted (one per logical cell, not one per grid position).
     rowspan/colspan reflect the original HTML values.
+    Nested <table> elements inside cells are ignored — their text folds into the
+    outer cell via get_text(), matching how extract_boxes.js attributes those boxes.
     """
     cells: list[_Cell] = []
     cell_id = 0
     # pending[col] = remaining rows this column is still occupied by a rowspan cell
     pending: dict[int, int] = {}
 
-    for r_idx, tr in enumerate(table_el.find_all("tr", recursive=True)):
+    for r_idx, tr in enumerate(_iter_own_trs(table_el)):
         tds = tr.find_all(["td", "th"], recursive=False)
         if not tds:
             tds = tr.find_all(["td", "th"])

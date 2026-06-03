@@ -513,6 +513,24 @@ def _compute_covered_cols(group_df: pd.DataFrame) -> set[int]:
 
 
 def _get_completion_threshold(band_total_cols: int, row_index: int) -> int:
+    """
+    Return how many columns must be covered for this row to count as 'complete',
+    given the total number of columns in the band and the row index (1-based).
+
+    Scheme (from your table):
+
+        band_total_cols   min_normal   min_top   num_top_rows
+        ----------------------------------------------------
+        2                 2            1         1
+        3                 3            2         1
+        4                 4            3         2
+        5                 4            3         2
+        6                 4            3         3
+        7                 4            3         3
+        8                 4            3         3
+
+    For >8 cols we just treat it like 8 (plateau).
+    """
     if band_total_cols <= 0:
         return 0
     if band_total_cols == 1:

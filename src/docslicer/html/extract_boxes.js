@@ -473,6 +473,9 @@
   };
   
   // Helper to find table and row IDs
+  // Only the outermost <table> (not itself inside a <td>/<th>) is treated as a
+  // real table. Nested tables used for layout inside a cell are skipped — their
+  // content is attributed to the enclosing real table/row/cell instead.
   const findTableContext = (node) => {
     let parent = node.nodeType === Node.TEXT_NODE ? node.parentElement : node;
     let tableId = NaN;
@@ -480,50 +483,60 @@
     let tableHeaderFlag = false;
     let tableCellIndex = NaN;
     let tableRowCellCount = NaN;
-    let foundTable = null;
-    let foundRow = null;
-    let foundCell = null;
-    
+
+    // Accumulate row/cell context at the current nesting level.
+    // Reset when we pass through a nested <table> boundary.
+    let pendingCell = null;
+    let pendingRow = null;
+    let pendingHeaderFlag = false;
+
     while (parent) {
       const tag = parent.tagName ? parent.tagName.toUpperCase() : "";
-      
-      // Find cell first (closest)
-      if (!foundCell && isTableCellTag(tag)) {
-        foundCell = parent;
+
+      if (!pendingCell && isTableCellTag(tag)) {
+        pendingCell = parent;
       }
 
-      // Check if inside a TH tag
-      if (!tableHeaderFlag && tag === "TH") {
-        tableHeaderFlag = true;
+      if (!pendingHeaderFlag && tag === "TH") {
+        pendingHeaderFlag = true;
       }
-      
-      // Find row first (closest)
-      if (!foundRow && tag === "TR") {
-        foundRow = parent;
-        if (!rowIds.has(parent)) {
-          rowIds.set(parent, rowCounter++);
-        }
-        tableRowId = rowIds.get(parent);
-        ensureRowCellInfo(parent);
-        tableRowCellCount = rowCellCounts.get(parent);
-        if (foundCell && cellIndexes.has(foundCell)) {
-          tableCellIndex = cellIndexes.get(foundCell);
+
+      if (!pendingRow && tag === "TR") {
+        pendingRow = parent;
+      }
+
+      if (tag === "TABLE") {
+        if (parent.closest("td, th")) {
+          // Nested layout table — skip it and reset pending context for outer level
+          pendingCell = null;
+          pendingRow = null;
+          pendingHeaderFlag = false;
+        } else {
+          // Outermost real table — commit context
+          if (!tableIds.has(parent)) {
+            tableIds.set(parent, tableCounter++);
+          }
+          tableId = tableIds.get(parent);
+          tableHeaderFlag = pendingHeaderFlag;
+
+          if (pendingRow) {
+            if (!rowIds.has(pendingRow)) {
+              rowIds.set(pendingRow, rowCounter++);
+            }
+            tableRowId = rowIds.get(pendingRow);
+            ensureRowCellInfo(pendingRow);
+            tableRowCellCount = rowCellCounts.get(pendingRow);
+            if (pendingCell && cellIndexes.has(pendingCell)) {
+              tableCellIndex = cellIndexes.get(pendingCell);
+            }
+          }
+          break;
         }
       }
-      
-      // Find table
-      if (!foundTable && tag === "TABLE") {
-        foundTable = parent;
-        if (!tableIds.has(parent)) {
-          tableIds.set(parent, tableCounter++);
-        }
-        tableId = tableIds.get(parent);
-        break; // Stop after finding table
-      }
-      
+
       parent = parent.parentElement;
     }
-    
+
     return { tableId, tableRowId, tableHeaderFlag, tableCellIndex, tableRowCellCount };
   };
 

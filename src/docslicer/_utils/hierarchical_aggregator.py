@@ -243,6 +243,7 @@ def build_standard_agg_spec(
             "heading_fp_id": "first",
             "heading_fingerprint": "first",
             "heading_hash": "first",
+            "hybrid_heading_text": "first",
         })
     
     # Geometry (bounding box)

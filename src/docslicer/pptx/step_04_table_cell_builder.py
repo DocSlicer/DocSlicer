@@ -265,7 +265,10 @@ def build_table_cells(
     result["text"] = result["text"].fillna("")
     result = result.drop(columns=["_first_row_style"])
 
-    result = detect_cell_roles(result, with_row_label=False)
+    result = pd.concat(
+        [detect_cell_roles(grp, with_row_label=False) for _, grp in result.groupby("table_id", sort=False)],
+        ignore_index=True,
+    )
 
     return result[_OUTPUT_COLS].reset_index(drop=True)
 

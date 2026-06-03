@@ -37,11 +37,21 @@ _SOFTMIN_CHUNK_CHARS_MAX = 2000
 _MIN_CHUNK_CHARS_MIN = 100
 _MIN_CHUNK_CHARS_MAX = 1000
 
+# DP is the globally optimal solution for chunk partitioning: it finds the exact split of n blocks
+# into k contiguous groups that minimizes a scoring function (penalizing deviation from the target
+# chunk size). Without strict constraints, the worst-case cost scales cubically to O(n³) — a single 
+# group of 332 blocks with a high character count was measured taking ~30s on real production data. 
+# 
+# Beyond the threshold below, we fall back to a greedy O(n) packer targeting optimal_chunk_chars. 
+# The visual and retrieval quality remains near-identical for large groups because the optimal split 
+# at scale naturally converges to a simple "pack to target size" behavior.
+_DP_MAX_BLOCKS = 100
+
 # Block roles that should be removed from chunk content
-_NOISE_BLOCK_TYPES= {"hr", "page_label", "image", "suppressed_repeated_heading", "navigation", "watermark"}
+_NOISE_BLOCK_TYPES= {"hr", "page_label", "image", "suppressed_repeated_heading", "navigation"}
 
 # Block roles that should be treated as headings (for chunk_heading)
-_HEADING_BLOCK_TYPES = {"heading", "toc_heading", "exhibit_heading"}
+_HEADING_BLOCK_TYPES = {"heading", "toc_heading", "exhibit_heading", "hybrid_heading_paragraph"}
 
 
 # =======================================================================================================================
@@ -402,40 +412,63 @@ def _explode_oversize_blocks_within_group(
 # Main Decision Engine
 # ------------------------------
 
-def _score_chunk_len(
-    L: int,
+# Dynamic Programming Algorithm (DP)
+def _score_chunk_len_vec(
+    L_arr: np.ndarray,
     max_chunk_chars: int,
     optimal_chunk_chars: int,
     softmin_chunk_chars: int,
     min_chunk_chars: int,
-) -> float:
-    """
-    Scoring / penalty for a candidate chunk length L.
-
-    Hard constraints:
-      - L > max_chunk_chars  => invalid (inf)
-    Soft preferences:
-      - prefer near optimal_chunk_chars
-      - discourage < softmin_chunk_chars
-      - strongly discourage < min_chunk_chars
-    """
-    if L > max_chunk_chars:
-        return float("inf")
-
-    # Base: distance to optimal
-    cost = float((L - optimal_chunk_chars) ** 2)
-
-    # Hard min: very strong penalty (but not inf, so we can "choose the least bad" if forced)
-    if L < min_chunk_chars:
-        cost += 50.0 * float((min_chunk_chars - L) ** 2)
-    # Soft min: moderate penalty
-    elif L < softmin_chunk_chars:
-        cost += 5.0 * float((softmin_chunk_chars - L) ** 2)
-
+) -> np.ndarray:
+    """Vectorized version of _score_chunk_len operating on a numpy array of lengths."""
+    L = L_arr.astype(np.float64)
+    cost = (L - optimal_chunk_chars) ** 2
+    cost = np.where(L > max_chunk_chars, np.inf, cost)
+    hard_min = L < min_chunk_chars
+    soft_min = (~hard_min) & (L < softmin_chunk_chars)
+    cost = np.where(hard_min, cost + 50.0 * (min_chunk_chars - L) ** 2, cost)
+    cost = np.where(soft_min, cost + 5.0 * (softmin_chunk_chars - L) ** 2, cost)
     return cost
 
-# Dynamic Programming Algorithm (DP)
-def _partition_blocks_dp( 
+
+def _partition_blocks_greedy(
+    block_lens: List[int],
+    heading_chars: int,
+    max_chunk_chars: int,
+    optimal_chunk_chars: int,
+) -> List[Tuple[int, int]]:
+    """
+    O(n) greedy partition: accumulate blocks until we reach optimal_chunk_chars,
+    then start a new chunk. Respects max_chunk_chars as a hard ceiling.
+    """
+    n = len(block_lens)
+    if n == 0:
+        return []
+
+    cuts: List[Tuple[int, int]] = []
+    start = 0
+    acc = heading_chars
+
+    for i, L in enumerate(block_lens):
+        next_acc = acc + L
+        # Flush before adding this block if it would push past optimal AND we have content
+        if acc > heading_chars and next_acc > optimal_chunk_chars:
+            cuts.append((start, i - 1))
+            start = i
+            acc = heading_chars + L
+        else:
+            acc = next_acc
+            # Hard ceiling: flush immediately if even a single block exceeds max
+            if acc > max_chunk_chars and i > start:
+                cuts.append((start, i - 1))
+                start = i
+                acc = heading_chars + L
+
+    cuts.append((start, n - 1))
+    return cuts
+
+
+def _partition_blocks_dp(
     block_lens: List[int],
     heading_chars: int,
     max_chunk_chars: int,
@@ -447,6 +480,9 @@ def _partition_blocks_dp(
     Partition ordered blocks into k contiguous groups using DP, where
     each group's effective length is heading_chars + sum(block_lens[group]).
 
+    Falls back to a greedy O(n) approach when the group has too many blocks
+    for DP to be practical.
+
     Returns list of (start_idx, end_idx) inclusive indices into block_lens.
     """
     n = len(block_lens)
@@ -457,10 +493,6 @@ def _partition_blocks_dp(
     for i, v in enumerate(block_lens, start=1):
         prefix[i] = prefix[i - 1] + int(v)
 
-    def seg_sum(a: int, b: int) -> int:
-        # inclusive [a,b]
-        return int(prefix[b + 1] - prefix[a])
-
     total = heading_chars + int(prefix[n])
 
     k_min = int(np.ceil(total / max_chunk_chars))
@@ -470,30 +502,45 @@ def _partition_blocks_dp(
     k_lo = max(1, k_min)
     k_hi = max(k_lo, min(n, k_target + 1))  # +1 gives a bit of flexibility
 
+    # Greedy fallback when the DP work estimate exceeds the budget.
+    # DP cost scales as k_hi² × n; empirically k_hi²×n ≈ 8M → ~30s, so cap at 800K (~3s).
+    if n > _DP_MAX_BLOCKS or k_hi * k_hi * n > 800_000:
+        return _partition_blocks_greedy(block_lens, heading_chars, max_chunk_chars, optimal_chunk_chars)
+
     best_cost = float("inf")
     best_cuts: Optional[List[Tuple[int, int]]] = None
 
-    # DP for each k candidate
+    # DP for each k candidate — inner j-loop vectorized over numpy
     for k in range(k_lo, k_hi + 1):
         # dp[c][i] = min cost to partition first i blocks into c groups
-        dp = np.full((k + 1, n + 1), float("inf"), dtype=np.float64)
+        dp = np.full((k + 1, n + 1), np.inf, dtype=np.float64)
         prev = np.full((k + 1, n + 1), -1, dtype=np.int64)
         dp[0, 0] = 0.0
 
         for c in range(1, k + 1):
-            for i in range(1, n + 1):
-                # last group ends at i-1, starts at j
-                # require at least c-1 blocks before if we want non-empty groups
-                j_start = c - 1
-                for j in range(j_start, i):
-                    L = heading_chars + seg_sum(j, i - 1)
-                    cost = _score_chunk_len(L, max_chunk_chars, optimal_chunk_chars, softmin_chunk_chars, min_chunk_chars)
-                    if not np.isfinite(cost):
-                        continue
-                    cand = dp[c - 1, j] + cost
-                    if cand < dp[c, i]:
-                        dp[c, i] = cand
-                        prev[c, i] = j
+            j_start = c - 1
+            for i in range(c, n + 1):
+                # j ranges from j_start to i-1 — vectorize this whole slice
+                j_vals = np.arange(j_start, i, dtype=np.int64)
+
+                # L[j] = heading_chars + prefix[i] - prefix[j]
+                L_vals = (heading_chars + int(prefix[i])) - prefix[j_vals].astype(np.float64)
+                cost_vals = _score_chunk_len_vec(
+                    L_vals, max_chunk_chars, optimal_chunk_chars, softmin_chunk_chars, min_chunk_chars
+                )
+
+                prev_dp = dp[c - 1, j_vals]
+                cand_vals = prev_dp + cost_vals
+
+                # Only consider candidates where the predecessor state was reachable
+                cand_vals = np.where(np.isfinite(prev_dp), cand_vals, np.inf)
+
+                best_local = int(np.argmin(cand_vals))
+                best_val = cand_vals[best_local]
+
+                if best_val < dp[c, i]:
+                    dp[c, i] = best_val
+                    prev[c, i] = j_vals[best_local]
 
         final_cost = float(dp[k, n])
         if final_cost < best_cost:
@@ -647,6 +694,7 @@ def _assign_chunk_indices(
             global_chunk_idx += 1
             continue
 
+        _t0_dp = __import__("time").perf_counter()
         cuts = _partition_blocks_dp(
             block_lens,
             heading_chars=heading_chars,
@@ -655,6 +703,9 @@ def _assign_chunk_indices(
             softmin_chunk_chars=softmin_chunk_chars,
             min_chunk_chars=min_chunk_chars,
         )
+        _dp_elapsed = __import__("time").perf_counter() - _t0_dp
+        if _dp_elapsed > 0.5:
+            print(f"[chunk_builder] SLOW DP: active_heading_id={active_hid!r}  n={len(block_lens)}  total_chars={total_len}  cuts={len(cuts)}  time={_dp_elapsed:.2f}s")
 
         for local_idx, (a, b) in enumerate(cuts, start=1):
             segment_indices = content_indices[a : b + 1]
@@ -715,8 +766,11 @@ def _join_chunk_text(blocks_with_chunk_index: pd.DataFrame, chunks_df: pd.DataFr
             
             if heading_mask.any():
                 heading_row = g.loc[heading_mask].iloc[0]
-                # Extract heading text
-                heading_text = heading_row.get("text", "")
+                # For hybrid_heading_paragraph, use hybrid_heading_text (not the full paragraph text)
+                if str(heading_row.get("block_type", "")).strip().lower() == "hybrid_heading_paragraph":
+                    heading_text = heading_row.get("hybrid_heading_text", "") or heading_row.get("text", "")
+                else:
+                    heading_text = heading_row.get("text", "")
                 metadata["chunk_heading"] = str(heading_text) if pd.notna(heading_text) else ""
                 
                 # Extract all heading metadata columns
@@ -754,19 +808,34 @@ def _join_chunk_text(blocks_with_chunk_index: pd.DataFrame, chunks_df: pd.DataFr
         heading_mask = block_types.isin(_HEADING_BLOCK_TYPES)
         
         heading_text = ""
+        hybrid_body = ""  # paragraph body from a hybrid_heading_paragraph (first chunk only)
         if heading_mask.any():
             # This chunk contains the heading block
             heading_row = group.loc[heading_mask].iloc[0]
-            heading_text = str(heading_row.get("text", "")) if pd.notna(heading_row.get("text")) else ""
+            # For hybrid_heading_paragraph, use hybrid_heading_text (not the full paragraph text)
+            if str(heading_row.get("block_type", "")).strip().lower() == "hybrid_heading_paragraph":
+                raw = heading_row.get("hybrid_heading_text", "") or heading_row.get("text", "")
+                # Preserve the paragraph body (full text minus the heading prefix)
+                full_text = str(heading_row.get("text", "")) if pd.notna(heading_row.get("text")) else ""
+                heading_prefix = str(raw).strip() if pd.notna(raw) else ""
+                if heading_prefix and full_text.startswith(heading_prefix):
+                    hybrid_body = full_text[len(heading_prefix):].strip()
+                elif full_text and not heading_prefix:
+                    hybrid_body = full_text
+            else:
+                raw = heading_row.get("text", "")
+            heading_text = str(raw) if pd.notna(raw) else ""
         elif active_hid and active_hid in heading_metadata:
             # This chunk doesn't have the heading block, but it belongs to a heading section
             # Look up the heading text from metadata
             heading_text = heading_metadata[active_hid].get("chunk_heading", "")
-        
+
         # Get content blocks (exclude headings)
         content_blocks = group.loc[~heading_mask]
         block_texts = content_blocks["text"].astype("string").fillna("")
-        content_text = "\n\n".join([t for t in block_texts if t])
+        # For the first chunk of a hybrid_heading_paragraph, insert the paragraph body first
+        content_parts = ([hybrid_body] if hybrid_body else []) + [t for t in block_texts if t]
+        content_text = "\n\n".join(content_parts)
         
         # Combine heading (with ##) and content
         if heading_text and content_text:
