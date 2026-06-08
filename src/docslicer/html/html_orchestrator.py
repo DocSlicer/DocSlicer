@@ -54,7 +54,8 @@ def run_pipeline(
     html: str | None,
     source_url: str | None,
     on_stage: Optional[Callable[[str], None]] = None,
-) -> Tuple[Dict[str, Any], pd.DataFrame, Optional[pd.DataFrame]]:
+    debug: bool = False,
+) -> Tuple[Dict[str, Any], pd.DataFrame, Optional[pd.DataFrame], Dict[str, pd.DataFrame]]:
     """
     Run HTML-specific document processing steps.
 
@@ -66,9 +67,12 @@ def run_pipeline(
         html: Raw HTML string, or None when source_url is provided.
         source_url: URL to fetch/render, or None when html is provided.
         on_stage: Optional callback for progress updates.
+        debug: When True, return intermediate DataFrames as a fourth tuple element.
 
     Returns:
-        Tuple of (discovered_metadata, df_lines, df_table_cells)
+        Tuple of (discovered_metadata, df_lines, df_table_cells, debug_steps).
+        debug_steps is an ordered dict of intermediate DataFrames when debug=True,
+        empty dict otherwise.
     """
     _, page_label_config, _, _ = load_yamls()
 
@@ -127,7 +131,7 @@ def run_pipeline(
 
     if df_boxes.empty:
         logger.warning("Empty DataFrame after box extraction, returning early")
-        return {}, df_boxes, None
+        return {}, df_boxes, None, {}
 
     # Step 02 - Box Cleaning
     df_boxes = clean_boxes(df_boxes, keep_debug_cols=False, dry_run=False)
@@ -140,12 +144,12 @@ def run_pipeline(
         df_boxes = pd.DataFrame(boxes)
         if df_boxes.empty:
             logger.warning("Still empty after networkidle retry, returning early")
-            return {}, df_boxes, None
+            return {}, df_boxes, None, {}
         df_boxes = clean_boxes(df_boxes, keep_debug_cols=False, dry_run=False)
 
     if df_boxes.empty:
         logger.warning("Empty DataFrame after box cleaning, returning early")
-        return {}, df_boxes, None
+        return {}, df_boxes, None, {}
 
     # Step 03 - Page Labels (runs on boxes — needs box_id)
     df_boxes, page_labels, page_label_groups = assign_page_labels(df_boxes, page_label_config)
@@ -206,4 +210,11 @@ def run_pipeline(
     elif df_table_cells is not None and df_table_cells.empty:
         df_table_cells = None
 
-    return discovered_metadata, df_lines, df_table_cells
+    debug_steps: Dict[str, pd.DataFrame] = {}
+    if debug:
+        debug_steps["boxes"] = df_boxes
+        debug_steps["lines"] = df_lines
+        if df_table_cells is not None:
+            debug_steps["table_cells"] = df_table_cells
+
+    return discovered_metadata, df_lines, df_table_cells, debug_steps

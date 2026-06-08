@@ -6,6 +6,20 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 
+def _format_hierarchy_json(nodes: list[dict], indent: int = 2) -> str:
+    def _fmt(node: dict, level: int) -> str:
+        pad = " " * (level * indent)
+        if not node.get("children"):
+            return f'{pad}{{"text": {json.dumps(node["text"])}}}'
+        child_lines = ",\n".join(_fmt(c, level + 1) for c in node["children"])
+        return (
+            f'{pad}{{"text": {json.dumps(node["text"])}, "children": [\n'
+            f'{child_lines}\n'
+            f'{pad}]}}'
+        )
+    return "[\n" + ",\n".join(_fmt(n, 1) for n in nodes) + "\n]\n"
+
+
 def _norm_id(v: object) -> str:
     """Normalise a table/block id that may have been serialised as '1.0' → '1'."""
     s = str(v).strip()
@@ -53,7 +67,6 @@ class Chunk:
     char_count: int
     bbox: BBox | None                                 # PDF only
     link_url: list[str]                              # unique URLs found in chunk
-    ixbrl_ids: list[str]                             # unique iXBRL IDs found in chunk
     table_ids: list[str]                             # table IDs referenced in chunk
     extra: dict = field(default_factory=dict)        # caller-requested extra fields from the pipeline df
 
@@ -72,22 +85,18 @@ class Chunk:
             char_count=d.get("char_count", 0),
             bbox=BBox.from_dict(d.get("bbox")),
             link_url=d.get("link_url", []),
-            ixbrl_ids=d.get("ixbrl_ids", []),
             table_ids=[_norm_id(v) for v in d.get("table_ids", [])],
             extra=d.get("extra", {}),
         )
 
     def to_dict(self) -> dict:
-        d = asdict(self)
-        if not d["ixbrl_ids"]:
-            del d["ixbrl_ids"]
-        return d
+        return asdict(self)
 
 
 @dataclass
 class Block:
     id: str
-    role: str                                        # paragraph | heading | table | toc | exhibits | navigation | …
+    type: str                                        # paragraph | heading | table | toc | exhibits | navigation | …
     page_number: int
     page_label: str | None                           # e.g. "A-6", "iv" — distinct from page_number
     section: str                                     # body | toc | exhibit | header | footer | coverpage
@@ -96,7 +105,6 @@ class Block:
     char_count: int
     bbox: BBox | None                                 # PDF only
     link_url: list[str]                              # unique URLs found in block
-    ixbrl_ids: list[str]                             # unique iXBRL IDs found in block
     table_ids: list[str]                             # table IDs referenced in block
     extra: dict = field(default_factory=dict)        # caller-requested extra fields from the pipeline df
 
@@ -104,7 +112,7 @@ class Block:
     def from_dict(cls, d: dict) -> "Block":
         return cls(
             id=d["id"],
-            role=d.get("role", ""),
+            type=d.get("type", ""),
             page_number=d.get("page_number", 0),
             page_label=d.get("page_label"),
             section=d.get("section", ""),
@@ -113,16 +121,12 @@ class Block:
             char_count=d.get("char_count", 0),
             bbox=BBox.from_dict(d.get("bbox")),
             link_url=d.get("link_url", []),
-            ixbrl_ids=d.get("ixbrl_ids", []),
             table_ids=[_norm_id(v) for v in d.get("table_ids", [])],
             extra=d.get("extra", {}),
         )
 
     def to_dict(self) -> dict:
-        d = asdict(self)
-        if not d["ixbrl_ids"]:
-            del d["ixbrl_ids"]
-        return d
+        return asdict(self)
 
 
 @dataclass
@@ -263,7 +267,9 @@ class HierarchyTree:
 
     def save(self, path: str | Path, minimal: bool = False, indent: int = 2) -> None:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        Path(path).write_text(json.dumps(self.to_dict(minimal=minimal), indent=indent), encoding="utf-8")
+        data = self.to_dict(minimal=minimal)
+        text = _format_hierarchy_json(data) if minimal else json.dumps(data, indent=indent)
+        Path(path).write_text(text, encoding="utf-8")
 
     def save_outline(self, path: str | Path) -> None:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -515,7 +521,7 @@ class ParseResult:
         for block in self.blocks:
             if block.section in excluded_sections:
                 continue
-            if block.role in _SKIP_ROLES:
+            if block.type in _SKIP_ROLES:
                 continue
 
             text = block.text.strip()
@@ -525,11 +531,11 @@ class ParseResult:
                 label = block.page_label or str(block.page_number)
                 parts.append(f"<!-- page {label} -->")
 
-            if block.role in _HEADING_ROLES:
+            if block.type in _HEADING_ROLES:
                 level = level_map.get(text, 2)
                 prefix = "#" * max(1, min(6, level))
                 parts.append(f"{prefix} {text}")
-            elif block.role == "table":
+            elif block.type == "table":
                 if include_tables:
                     table = tables_by_id.get(block.table_ids[0]) if block.table_ids else None
                     raw = table.markdown if table else text
@@ -563,15 +569,15 @@ class ParseResult:
         for block in self.blocks:
             if block.section in excluded_sections:
                 continue
-            if block.role in _SKIP_ROLES:
+            if block.type in _SKIP_ROLES:
                 continue
 
             text = block.text.strip()
 
-            if block.role in _HEADING_ROLES:
+            if block.type in _HEADING_ROLES:
                 if text:
                     parts.append(text)
-            elif block.role == "table":
+            elif block.type == "table":
                 if include_tables:
                     table = tables_by_id.get(block.table_ids[0]) if block.table_ids else None
                     parts.append(table.markdown if table else text)

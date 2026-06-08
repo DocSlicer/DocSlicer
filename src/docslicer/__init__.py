@@ -147,9 +147,10 @@ def parse_pdf(
     source: _Source,
     max_chunk_size: int = 3200,
     optimal_chunk_size: int = 1500,
-    extract_tables: bool = True,
+    min_chunk_size: int = 700,
     chunking: bool = True,
-    regions: list[str] | None = None,
+    merge_small_chunks: bool = True,
+    table_representation: str = "markdown",
     debug: bool = False,
     extra_fields: list[str] | None = None,
 ) -> ParseResult:
@@ -159,12 +160,15 @@ def parse_pdf(
         source: PDF file path, raw bytes, or file-like object.
         max_chunk_size: Maximum characters per chunk (default 3200).
         optimal_chunk_size: Target characters per chunk (default 1500).
-        extract_tables: Include table extraction (default True).
+        min_chunk_size: Soft minimum characters per chunk (default 700). Chunks
+            below this size are merged when possible; short chunks at section
+            boundaries may still be smaller.
         chunking: Build chunks from blocks (default True). Set to False to skip
             chunking and return only blocks, which is faster.
-        regions: Filter output to these regions only, e.g. ["body", "toc"].
-            Allowed values: body | header | footer | toc | exhibit.
-            None means all regions (default).
+        merge_small_chunks: Merge chunks that fall below min_chunk_size into
+            adjacent chunks (default True).
+        table_representation: How tables are serialized into chunk text. One of
+            "markdown" (default), "jsonl", or "melted".
         debug: Populate result.pipeline_steps with intermediate DataFrames.
         extra_fields: Additional pipeline DataFrame columns to attach to each
             Block and Chunk under their ``.extra`` dict, e.g.
@@ -173,9 +177,10 @@ def parse_pdf(
     config = ParseConfig(
         max_chunk_size=max_chunk_size,
         optimal_chunk_size=optimal_chunk_size,
-        extract_tables=extract_tables,
+        min_chunk_size=min_chunk_size,
         chunking=chunking,
-        regions=regions,
+        merge_small_chunks=merge_small_chunks,
+        table_representation=table_representation,
         debug=debug,
         extra_fields=extra_fields or [],
     )
@@ -188,9 +193,10 @@ def parse_docx(
     source: _Source,
     max_chunk_size: int = 3200,
     optimal_chunk_size: int = 1500,
-    extract_tables: bool = True,
+    min_chunk_size: int = 700,
     chunking: bool = True,
-    regions: list[str] | None = None,
+    merge_small_chunks: bool = True,
+    table_representation: str = "markdown",
     debug: bool = False,
     extra_fields: list[str] | None = None,
 ) -> ParseResult:
@@ -200,10 +206,13 @@ def parse_docx(
         source: DOCX file path, raw bytes, or file-like object.
         max_chunk_size: Maximum characters per chunk (default 3200).
         optimal_chunk_size: Target characters per chunk (default 1500).
-        extract_tables: Include table extraction (default True).
+        min_chunk_size: Soft minimum characters per chunk (default 700).
         chunking: Build chunks from blocks (default True). Set to False to skip
             chunking and return only blocks, which is faster.
-        regions: Filter output to these regions only.
+        merge_small_chunks: Merge chunks that fall below min_chunk_size into
+            adjacent chunks (default True).
+        table_representation: How tables are serialized into chunk text. One of
+            "markdown" (default), "jsonl", or "melted".
         debug: Populate result.pipeline_steps with intermediate DataFrames.
         extra_fields: Additional pipeline DataFrame columns to attach to each
             Block and Chunk under their ``.extra`` dict. Unknown columns get None.
@@ -211,9 +220,10 @@ def parse_docx(
     config = ParseConfig(
         max_chunk_size=max_chunk_size,
         optimal_chunk_size=optimal_chunk_size,
-        extract_tables=extract_tables,
+        min_chunk_size=min_chunk_size,
         chunking=chunking,
-        regions=regions,
+        merge_small_chunks=merge_small_chunks,
+        table_representation=table_representation,
         debug=debug,
         extra_fields=extra_fields or [],
     )
@@ -226,9 +236,10 @@ def parse_pptx(
     source: _Source,
     max_chunk_size: int = 3200,
     optimal_chunk_size: int = 1500,
-    extract_tables: bool = True,
+    min_chunk_size: int = 700,
     chunking: bool = True,
-    regions: list[str] | None = None,
+    merge_small_chunks: bool = True,
+    table_representation: str = "markdown",
     debug: bool = False,
     extra_fields: list[str] | None = None,
 ) -> ParseResult:
@@ -238,10 +249,13 @@ def parse_pptx(
         source: PPTX file path, raw bytes, or file-like object.
         max_chunk_size: Maximum characters per chunk (default 3200).
         optimal_chunk_size: Target characters per chunk (default 1500).
-        extract_tables: Include table extraction (default True).
+        min_chunk_size: Soft minimum characters per chunk (default 700).
         chunking: Build chunks from blocks (default True). Set to False to skip
             chunking and return only blocks, which is faster.
-        regions: Filter output to these regions only.
+        merge_small_chunks: Merge chunks that fall below min_chunk_size into
+            adjacent chunks (default True).
+        table_representation: How tables are serialized into chunk text. One of
+            "markdown" (default), "jsonl", or "melted".
         debug: Populate result.pipeline_steps with intermediate DataFrames.
         extra_fields: Additional pipeline DataFrame columns to attach to each
             Block and Chunk under their ``.extra`` dict. Unknown columns get None.
@@ -249,9 +263,10 @@ def parse_pptx(
     config = ParseConfig(
         max_chunk_size=max_chunk_size,
         optimal_chunk_size=optimal_chunk_size,
-        extract_tables=extract_tables,
+        min_chunk_size=min_chunk_size,
         chunking=chunking,
-        regions=regions,
+        merge_small_chunks=merge_small_chunks,
+        table_representation=table_representation,
         debug=debug,
         extra_fields=extra_fields or [],
     )
@@ -265,9 +280,10 @@ def parse_html(
     source_url: str | None = None,
     max_chunk_size: int = 3200,
     optimal_chunk_size: int = 1500,
-    extract_tables: bool = True,
+    min_chunk_size: int = 700,
     chunking: bool = True,
-    regions: list[str] | None = None,
+    merge_small_chunks: bool = True,
+    table_representation: str = "markdown",
     debug: bool = False,
     extra_fields: list[str] | None = None,
 ) -> ParseResult:
@@ -278,14 +294,21 @@ def parse_html(
             When a URL is passed (starts with http:// or https://), the page is
             fetched automatically — SEC/Congress URLs use a rate-limited fetcher,
             all others are rendered via Playwright for full JS execution.
+            URL parsing requires two steps: ``pip install 'docslicer[html]'`` to
+            install the Python package, then ``playwright install`` to download
+            the browser binaries. Without the second step, parsing a URL raises
+            an error even if the package is installed.
         source_url: Original URL of the page (used for link normalisation when
             source is an HTML string or file, not a URL).
         max_chunk_size: Maximum characters per chunk (default 3200).
         optimal_chunk_size: Target characters per chunk (default 1500).
-        extract_tables: Include table extraction (default True).
+        min_chunk_size: Soft minimum characters per chunk (default 700).
         chunking: Build chunks from blocks (default True). Set to False to skip
             chunking and return only blocks, which is faster.
-        regions: Filter output to these regions only.
+        merge_small_chunks: Merge chunks that fall below min_chunk_size into
+            adjacent chunks (default True).
+        table_representation: How tables are serialized into chunk text. One of
+            "markdown" (default), "jsonl", or "melted".
         debug: Populate result.pipeline_steps with intermediate DataFrames.
         extra_fields: Additional pipeline DataFrame columns to attach to each
             Block and Chunk under their ``.extra`` dict. Unknown columns get None.
@@ -293,9 +316,10 @@ def parse_html(
     config = ParseConfig(
         max_chunk_size=max_chunk_size,
         optimal_chunk_size=optimal_chunk_size,
-        extract_tables=extract_tables,
+        min_chunk_size=min_chunk_size,
         chunking=chunking,
-        regions=regions,
+        merge_small_chunks=merge_small_chunks,
+        table_representation=table_representation,
         debug=debug,
         extra_fields=extra_fields or [],
     )
@@ -319,7 +343,7 @@ def parse_document(
     2. Magic bytes (PDF starts with ``%PDF``)
     3. Falls back to HTML
 
-    All keyword arguments are forwarded to parse_pdf or parse_html.
+    All keyword arguments are forwarded to parse_pdf, parse_docx, parse_pptx, or parse_html.
     """
     # Bytes: check magic bytes
     if isinstance(source, bytes):
@@ -505,7 +529,14 @@ class DocumentParser:
 
         return _run_pipeline(str(source), "html", source_url=source_url, config=config)
 
-    def parse_all(self, sources: list[_Source], /) -> Iterator[ParseResult]:
-        """Parse multiple documents lazily, reusing this instance's config."""
+    def parse_all(self, sources: list[_Source], /) -> "Iterator[tuple[_Source, ParseResult | Exception]]":
+        """Parse multiple documents lazily, reusing this instance's config.
+
+        Yields ``(source, ParseResult)`` on success, ``(source, Exception)`` on
+        failure — a failed file never aborts the batch.
+        """
         for source in sources:
-            yield self.parse(source)
+            try:
+                yield source, self.parse(source)
+            except Exception as exc:
+                yield source, exc

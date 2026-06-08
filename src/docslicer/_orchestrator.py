@@ -269,7 +269,6 @@ def _build_chunks(df_chunks: pd.DataFrame, extra_fields: list[str] | None = None
             parent_chunk_id=parent_chunk_id,
             bbox=_bbox(row),
             link_url=_str_list(row, "link_url"),
-            ixbrl_ids=_str_list(row, "ixbrl_id"),
             table_ids=_str_list(row, "table_id"),
             extra=_extra(row, _extra_fields),
         ))
@@ -288,13 +287,12 @@ def _build_blocks(df_blocks: pd.DataFrame, extra_fields: list[str] | None = None
             text=str(row.get("text", "")),
             page_number=int(row.get("page_number", 0)),
             page_label=page_label,
-            role=str(row.get("block_type", "")),
+            type=str(row.get("block_type", "")),
             section=str(row.get("section", "")),
             chunk_id=None,  # block→chunk link not available without re-running chunk assignment
             char_count=int(row.get("embed_char_count", 0)),
             bbox=_bbox(row),
             link_url=_str_list(row, "link_url"),
-            ixbrl_ids=_str_list(row, "ixbrl_id"),
             table_ids=_str_list(row, "table_id"),
             extra=_extra(row, _extra_fields),
         ))
@@ -363,6 +361,7 @@ def _build_result(
     run_id: str,
     config: ParseConfig,
     processing_time: float | None = None,
+    early_steps: dict[str, pd.DataFrame] | None = None,
 ) -> ParseResult:
     metadata = _resolve_metadata(
         discovered_metadata, source_url, source_filename, file_size_bytes, run_id, df_blocks,
@@ -373,17 +372,12 @@ def _build_result(
     tables = _build_tables(df_table_cells)
     hierarchy = _build_hierarchy(df_blocks, df_chunks)
 
-    # Apply region filter if requested
-    if config.regions:
-        allowed = set(config.regions)
-        chunks = [c for c in chunks if c.section in allowed]
-        blocks = [b for b in blocks if b.section in allowed]
-
     pipeline_steps: dict[str, pd.DataFrame] = {}
     if config.debug:
+        pipeline_steps.update(early_steps or {})
         pipeline_steps["blocks"] = df_blocks
         pipeline_steps["chunks"] = df_chunks
-        if df_table_cells is not None:
+        if df_table_cells is not None and "table_cells" not in pipeline_steps:
             pipeline_steps["table_cells"] = df_table_cells
 
     return ParseResult(
@@ -417,11 +411,13 @@ def _run_pipeline(
     else:
         file_size_bytes = None
 
+    early_steps: dict[str, pd.DataFrame] = {}
+
     if content_type == "pdf":
         if not isinstance(content, bytes):
             raise TypeError("PDF content must be bytes")
-        discovered_metadata, df_lines, df_table_cells = _run_pdf_pipeline(
-            pdf_bytes=content, source_url=source_url
+        discovered_metadata, df_lines, df_table_cells, early_steps = _run_pdf_pipeline(
+            pdf_bytes=content, source_url=source_url, debug=config.debug
         )
         discovered_metadata["content_type"] = "pdf"
     elif content_type == "docx":
@@ -430,17 +426,23 @@ def _run_pipeline(
         from .docx.docx_orchestrator import run_pipeline as _run_docx_pipeline
         from .docx.step_00_metadata import extract_core_properties
         from .metadata import add_document_information
-        package, run_df, df_table_cells, _, df_lines = _run_docx_pipeline(content)
+        package, df_runs, df_table_cells, df_paragraphs, df_lines = _run_docx_pipeline(content)
         discovered_metadata = extract_core_properties(package)
         discovered_metadata["has_ocr"] = False
         discovered_metadata["content_type"] = "docx"
         if not discovered_metadata["page_count"]:
             discovered_metadata["page_count"] = (
-                int(run_df["page_number"].max())
-                if not run_df.empty and "page_number" in run_df.columns
+                int(df_runs["page_number"].max())
+                if not df_runs.empty and "page_number" in df_runs.columns
                 else 0
             )
         add_document_information(discovered_metadata, df_lines=df_lines)
+        if config.debug:
+            early_steps["runs"] = df_runs
+            early_steps["paragraphs"] = df_paragraphs
+            early_steps["lines"] = df_lines
+            if df_table_cells is not None:
+                early_steps["table_cells"] = df_table_cells
     elif content_type == "pptx":
         if not isinstance(content, bytes):
             raise TypeError("PPTX content must be bytes")
@@ -448,17 +450,24 @@ def _run_pipeline(
         from .pptx.pptx_orchestrator import run_pipeline as _run_pptx_pipeline
         from .pptx.step_00_metadata import extract_core_properties
 
-        package, run_df, _, df_table_cells, _, df_lines = _run_pptx_pipeline(content)
+        package, df_runs, df_chart_points, df_table_cells, df_paragraphs, df_lines = _run_pptx_pipeline(content)
         discovered_metadata = extract_core_properties(package)
         discovered_metadata["has_ocr"] = False
         discovered_metadata["content_type"] = "pptx"
         if not discovered_metadata["page_count"]:
             discovered_metadata["page_count"] = (
-                int(run_df["page_number"].max())
-                if not run_df.empty and "page_number" in run_df.columns
+                int(df_runs["page_number"].max())
+                if not df_runs.empty and "page_number" in df_runs.columns
                 else 0
             )
         add_document_information(discovered_metadata, df_lines=df_lines)
+        if config.debug:
+            early_steps["runs"] = df_runs
+            early_steps["chart_points"] = df_chart_points
+            early_steps["paragraphs"] = df_paragraphs
+            early_steps["lines"] = df_lines
+            if df_table_cells is not None:
+                early_steps["table_cells"] = df_table_cells
     elif content_type == "html":
         if content is not None and not isinstance(content, str):
             raise TypeError("HTML content must be a string")
@@ -470,10 +479,12 @@ def _run_pipeline(
                 "pip install 'docslicer[html]' && playwright install"
             )
         from .html.html_orchestrator import run_pipeline as _run_html_pipeline
-        discovered_metadata, df_lines, df_table_cells = _run_html_pipeline(
-            html=content, source_url=source_url
+        discovered_metadata, df_lines, df_table_cells, html_steps = _run_html_pipeline(
+            html=content, source_url=source_url, debug=config.debug
         )
         discovered_metadata["content_type"] = "html"
+        if config.debug:
+            early_steps.update(html_steps)
     else:
         raise ValueError(f"Unsupported content type: {content_type!r}. Use 'pdf', 'html', 'docx', or 'pptx'.")
 
@@ -509,4 +520,5 @@ def _run_pipeline(
         config.run_id,
         config,
         processing_time=time.perf_counter() - _t0,
+        early_steps=early_steps,
     )

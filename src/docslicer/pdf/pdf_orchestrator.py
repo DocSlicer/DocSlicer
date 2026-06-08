@@ -82,7 +82,8 @@ def run_pipeline(
     pdf_bytes: bytes,
     source_url: str = None,
     on_stage: Optional[Callable[[str], None]] = None,
-) -> Tuple[Dict[str, Any], pd.DataFrame, Optional[pd.DataFrame]]:
+    debug: bool = False,
+) -> Tuple[Dict[str, Any], pd.DataFrame, Optional[pd.DataFrame], Dict[str, pd.DataFrame]]:
     """
     Run PDF-specific document processing steps.
 
@@ -92,7 +93,9 @@ def run_pipeline(
         on_stage: Optional callback for progress updates
 
     Returns:
-        Tuple of (discovered_metadata, df_lines, df_table_cells)
+        Tuple of (discovered_metadata, df_lines, df_table_cells, debug_steps).
+        debug_steps is an ordered dict of intermediate DataFrames when debug=True,
+        empty dict otherwise.
     """
     page_label_dict, page_label_config, _, _ = load_yamls()
 
@@ -149,7 +152,7 @@ def run_pipeline(
 
         if df_words.empty:
             # No text even after OCR — nothing to parse
-            return discovered_metadata, pd.DataFrame(), None
+            return discovered_metadata, pd.DataFrame(), None, {}
 
         # ── Stage: Enrichment ────────────────────────────────────────────────
         if on_stage:
@@ -202,7 +205,16 @@ def run_pipeline(
 
         discovered_metadata["is_password_protected"] = False
 
-        return discovered_metadata, df_lines, df_table_cells
+        debug_steps: Dict[str, pd.DataFrame] = {}
+        if debug:
+            debug_steps["words"] = df_words
+            debug_steps["shapes"] = df_shapes
+            debug_steps["cells"] = df_cells
+            debug_steps["lines"] = df_lines
+            if df_table_cells is not None:
+                debug_steps["table_cells"] = df_table_cells
+
+        return discovered_metadata, df_lines, df_table_cells, debug_steps
 
     finally:
         try:

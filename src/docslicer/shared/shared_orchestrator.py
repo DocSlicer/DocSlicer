@@ -119,7 +119,7 @@ def run_pipeline(
     df_blocks = merge_blocks(
         df,
         df_table_cells,
-        table_representation="markdown"
+        table_representation=config.table_representation,
     )
 
     # Step 07 - Chunk Building (blocks -> chunks)
@@ -130,9 +130,9 @@ def run_pipeline(
         df_blocks,
         max_chunk_chars=config.max_chunk_size,
         optimal_chunk_chars=config.optimal_chunk_size,
-        softmin_chunk_chars=700,
+        softmin_chunk_chars=config.min_chunk_size,
         min_chunk_chars=400,
-        merge_small_chunks=True,
+        merge_small_chunks=config.merge_small_chunks,
     )
 
     # ============================================================

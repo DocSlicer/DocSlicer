@@ -8,10 +8,10 @@ from dataclasses import dataclass, field
 class ParseConfig:
     max_chunk_size: int = 3200
     optimal_chunk_size: int = 1500
-    min_chunk_size: int = 400
-    extract_tables: bool = True
+    min_chunk_size: int = 700
     chunking: bool = True
-    regions: list[str] | None = None
+    merge_small_chunks: bool = True
+    table_representation: str = "markdown"
     debug: bool = False
     extra_fields: list[str] = field(default_factory=list)
     run_id: str = field(default_factory=lambda: str(_uuid.uuid4()))

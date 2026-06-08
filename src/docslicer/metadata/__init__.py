@@ -20,7 +20,6 @@ from .language import (
     extract_language_from_text,
     add_language_info,
 )
-from .profile import detect_document_profile, add_profile_info
 from .enricher import add_document_information
 
 __all__ = [
@@ -31,7 +30,6 @@ __all__ = [
     "add_author_info",
     "add_title_info",
     "add_language_info",
-    "add_profile_info",
     "extract_author_from_pdf_metadata",
     "extract_author_from_html_metadata",
     "extract_author_from_text",
@@ -41,5 +39,4 @@ __all__ = [
     "extract_language_from_pdf_metadata",
     "extract_language_from_html_metadata",
     "extract_language_from_text",
-    "detect_document_profile",
 ]

@@ -503,8 +503,8 @@ __all__ = [
 class BBox:
     """Standalone bounding box (for utility functions)."""
     x_left: float
-    x_right: float
     y_top: float
+    x_right: float
     y_bottom: float
 
     @property
@@ -543,7 +543,7 @@ class BBox:
         x_right = float(row.get("x_right", row.get("x1", row.get("x_max", row.get("right", 0)))))
         y_top = float(row.get("y_top", row.get("top", 0)))
         y_bottom = float(row.get("y_bottom", row.get("bottom", 0)))
-        return cls(x_left=x_left, x_right=x_right, y_top=y_top, y_bottom=y_bottom)
+        return cls(x_left=x_left, y_top=y_top, x_right=x_right, y_bottom=y_bottom)
 
 
 # ==========================================

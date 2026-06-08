@@ -9,7 +9,6 @@ import pandas as pd
 from .author import add_author_info
 from .title import add_title_info
 from .language import add_language_info
-from .profile import add_profile_info
 
 
 def add_document_information(
@@ -25,7 +24,6 @@ def add_document_information(
     - add_author_info: Extracts author information
     - add_title_info: Extracts title information
     - add_language_info: Extracts and resolves language information
-    - add_profile_info: Detects document profile
 
     Args:
         doc_meta: Metadata dict to update (modified in-place)
@@ -52,4 +50,3 @@ def add_document_information(
     add_author_info(doc_meta, pdf_path=pdf_path, html_content=html_head, df_lines=df_lines)
     add_title_info(doc_meta, pdf_path=pdf_path, html_content=html_head, df_lines=df_lines)
     add_language_info(doc_meta, pdf_path=pdf_path, html_content=html_head, df_lines=df_lines)
-    add_profile_info(doc_meta, df_lines=df_lines)
