@@ -52,6 +52,7 @@ _BULLET_MERGE_ENABLED   = True
 _BULLET_MERGE_MAX_GAP   = 30.0   # max gap for bullet → text merge
 _DOLLAR_MERGE_MAX_GAP   = 60.0   # max gap for "$" → number merge
 _SENTENCE_MERGE_MAX_GAP = 10.0   # wider tolerance for justified paragraph text
+_TABLE_THRESHOLD_FACTOR = 2 / 3  # font-gap multiplier for table-like lines (tighter to avoid merging columns)
 
 # Underline detection thresholds
 _UNDERLINE_COVERAGE_THRESHOLD  = 95.0
@@ -446,7 +447,7 @@ def _assign_cell_ids(df: pd.DataFrame) -> pd.DataFrame:
 
     Gap threshold per line:
       - sentence-like  → _SENTENCE_MERGE_MAX_GAP (wider, tolerates justification spacing)
-      - table-like     → font-interpolated threshold × 0.5 (tighter, avoids merging cells)
+      - table-like     → font-interpolated threshold × _TABLE_THRESHOLD_FACTOR (tighter, avoids merging cells)
       - default        → font-interpolated threshold
     Bullet and dollar-sign tokens have their own gap overrides regardless of line type.
     """
@@ -507,7 +508,7 @@ def _assign_cell_ids(df: pd.DataFrame) -> pd.DataFrame:
             median_font = float(np.median(valid_fonts)) if valid_fonts.size > 0 else None
             line_threshold = _interpolate_font_gap(median_font)
             if is_table_like_map.get(current_line, False):
-                line_threshold *= 0.5
+                line_threshold *= _TABLE_THRESHOLD_FACTOR
 
         current_cell   = next_cell_id
         cell_id_arr[i] = current_cell

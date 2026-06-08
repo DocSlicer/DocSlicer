@@ -123,6 +123,9 @@ def run_pipeline(
     )
 
     # Step 07 - Chunk Building (blocks -> chunks)
+    if not config.chunking:
+        return df_blocks, pd.DataFrame()
+
     df_chunks = build_chunks(
         df_blocks,
         max_chunk_chars=config.max_chunk_size,

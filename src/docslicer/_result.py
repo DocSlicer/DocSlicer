@@ -1,9 +1,17 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+
+def _norm_id(v: object) -> str:
+    """Normalise a table/block id that may have been serialised as '1.0' → '1'."""
+    s = str(v).strip()
+    if s.endswith(".0") and s[:-2].lstrip("-").isdigit():
+        return s[:-2]
+    return s
 
 from .metadata.schema import DocumentMetadata
 
@@ -24,6 +32,12 @@ class BBox:
     x_right: float
     y_bottom: float
 
+    @classmethod
+    def from_dict(cls, d: dict | None) -> "BBox | None":
+        if d is None:
+            return None
+        return cls(x_left=d["x_left"], y_top=d["y_top"], x_right=d["x_right"], y_bottom=d["y_bottom"])
+
 
 @dataclass
 class Chunk:
@@ -42,6 +56,26 @@ class Chunk:
     ixbrl_ids: list[str]                             # unique iXBRL IDs found in chunk
     table_ids: list[str]                             # table IDs referenced in chunk
     extra: dict = field(default_factory=dict)        # caller-requested extra fields from the pipeline df
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Chunk":
+        return cls(
+            id=d["id"],
+            parent_chunk_id=d.get("parent_chunk_id"),
+            chunk_index=d.get("chunk_index", 0),
+            page_number=d.get("page_number", 0),
+            page_label=d.get("page_label"),
+            section=d.get("section", ""),
+            heading=d.get("heading"),
+            path=d.get("path", []),
+            text=d.get("text", ""),
+            char_count=d.get("char_count", 0),
+            bbox=BBox.from_dict(d.get("bbox")),
+            link_url=d.get("link_url", []),
+            ixbrl_ids=d.get("ixbrl_ids", []),
+            table_ids=[_norm_id(v) for v in d.get("table_ids", [])],
+            extra=d.get("extra", {}),
+        )
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -66,6 +100,24 @@ class Block:
     table_ids: list[str]                             # table IDs referenced in block
     extra: dict = field(default_factory=dict)        # caller-requested extra fields from the pipeline df
 
+    @classmethod
+    def from_dict(cls, d: dict) -> "Block":
+        return cls(
+            id=d["id"],
+            role=d.get("role", ""),
+            page_number=d.get("page_number", 0),
+            page_label=d.get("page_label"),
+            section=d.get("section", ""),
+            text=d.get("text", ""),
+            chunk_id=d.get("chunk_id"),
+            char_count=d.get("char_count", 0),
+            bbox=BBox.from_dict(d.get("bbox")),
+            link_url=d.get("link_url", []),
+            ixbrl_ids=d.get("ixbrl_ids", []),
+            table_ids=[_norm_id(v) for v in d.get("table_ids", [])],
+            extra=d.get("extra", {}),
+        )
+
     def to_dict(self) -> dict:
         d = asdict(self)
         if not d["ixbrl_ids"]:
@@ -83,6 +135,18 @@ class TableCell:
     text: str
     bbox: BBox | None                                 # PDF only
 
+    @classmethod
+    def from_dict(cls, d: dict) -> "TableCell":
+        return cls(
+            row=d.get("row", 0),
+            col=d.get("col", 0),
+            rowspan=d.get("rowspan", 1),
+            colspan=d.get("colspan", 1),
+            role=d.get("role", ""),
+            text=d.get("text", ""),
+            bbox=BBox.from_dict(d.get("bbox")),
+        )
+
     def to_dict(self) -> dict:
         return asdict(self)
 
@@ -97,6 +161,19 @@ class Table:
     bbox: BBox | None                                 # PDF only; union of all cell bboxes
     markdown: str                                     # convenience — full table as markdown
     cells: list[TableCell]
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Table":
+        return cls(
+            id=d["id"],
+            caption=d.get("caption"),
+            page_number=d.get("page_number", 0),
+            page_label=d.get("page_label"),
+            chunk_id=d.get("chunk_id", ""),
+            bbox=BBox.from_dict(d.get("bbox")),
+            markdown=d.get("markdown", ""),
+            cells=[TableCell.from_dict(c) for c in d.get("cells", [])],
+        )
 
     def to_dataframe(self) -> "pd.DataFrame":
         import pandas as pd
@@ -116,6 +193,23 @@ class HierarchyNode:
     page_label: str | None
     chunk_ids: list[str]
     children: list[HierarchyNode]
+    path: list[str] = field(default_factory=list)  # ancestor texts; populated by .level() and .find_heading()
+    block_ids: list[str] = field(default_factory=list)  # all block ids under this heading section
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "HierarchyNode":
+        return cls(
+            heading_id=d["heading_id"],
+            text=d.get("text", ""),
+            level=d.get("level", 1),
+            heading_type=d.get("heading_type", "free_form"),
+            page_number=d.get("page_number"),
+            page_label=d.get("page_label"),
+            chunk_ids=d.get("chunk_ids", []),
+            children=[cls.from_dict(c) for c in d.get("children", [])],
+            path=d.get("path", []),
+            block_ids=d.get("block_ids", []),
+        )
 
     def to_dict(self, minimal: bool = False) -> dict:
         if minimal:
@@ -123,12 +217,30 @@ class HierarchyNode:
             if self.children:
                 d["children"] = [c.to_dict(minimal=True) for c in self.children]
             return d
-        return asdict(self)
+        d = {
+            "heading_id": self.heading_id,
+            "text": self.text,
+            "level": self.level,
+            "heading_type": self.heading_type,
+            "page_number": self.page_number,
+            "page_label": self.page_label,
+            "chunk_ids": self.chunk_ids,
+            "children": [c.to_dict() for c in self.children],
+        }
+        if self.path:
+            d["path"] = self.path
+        if self.block_ids:
+            d["block_ids"] = self.block_ids
+        return d
 
 
 @dataclass
 class HierarchyTree:
     roots: list[HierarchyNode]
+
+    @classmethod
+    def from_dict(cls, data: list[dict]) -> "HierarchyTree":
+        return cls(roots=[HierarchyNode.from_dict(n) for n in data])
 
     def __iter__(self):
         return iter(self.roots)
@@ -166,6 +278,92 @@ class HierarchyTree:
         for root in self.roots:
             _visit(root, 0)
         return "\n".join(lines)
+
+    def _locate(self, heading_id: int) -> tuple[HierarchyNode | None, list[str], int]:
+        """Return (node, ancestor_path, depth) for the given heading_id, or (None, [], 0)."""
+        def _search(node: HierarchyNode, ancestors: list[str], depth: int):
+            if node.heading_id == heading_id:
+                return node, ancestors, depth
+            for child in node.children:
+                result = _search(child, ancestors + [node.text], depth + 1)
+                if result[0] is not None:
+                    return result
+            return None, [], 0
+        for root in self.roots:
+            result = _search(root, [], 1)
+            if result[0] is not None:
+                return result
+        return None, [], 0
+
+    def level(self, n: int, parent: HierarchyNode | int | None = None) -> list[HierarchyNode]:
+        """Return all nodes at depth n with their ancestor path populated.
+
+        Args:
+            n: 1-based depth (1 = top-level headings).
+            parent: Optional HierarchyNode or heading_id to restrict results to
+                descendants of that node.
+        """
+        results: list[HierarchyNode] = []
+
+        def _collect(node: HierarchyNode, ancestors: list[str], depth: int) -> None:
+            if depth == n:
+                results.append(replace(node, path=list(ancestors)))
+                return
+            if depth > n:
+                return
+            for child in node.children:
+                _collect(child, ancestors + [node.text], depth + 1)
+
+        if parent is None:
+            for root in self.roots:
+                _collect(root, [], 1)
+        else:
+            parent_id = parent.heading_id if isinstance(parent, HierarchyNode) else int(parent)
+            parent_node, parent_ancestors, parent_depth = self._locate(parent_id)
+            if parent_node is None:
+                return []
+            for child in parent_node.children:
+                _collect(child, parent_ancestors + [parent_node.text], parent_depth + 1)
+
+        return results
+
+    def find_heading(self, text: str, case_sensitive: bool = False) -> list[HierarchyNode]:
+        """Return all nodes whose text contains ``text``, with ancestor path populated.
+
+        Args:
+            text: Substring to search for.
+            case_sensitive: If False (default), search is case-insensitive.
+        """
+        results: list[HierarchyNode] = []
+        needle = text if case_sensitive else text.lower()
+
+        def _visit(node: HierarchyNode, ancestors: list[str]) -> None:
+            haystack = node.text if case_sensitive else node.text.lower()
+            if needle in haystack:
+                results.append(replace(node, path=list(ancestors)))
+            for child in node.children:
+                _visit(child, ancestors + [node.text])
+
+        for root in self.roots:
+            _visit(root, [])
+
+        return results
+
+
+def _collect_chunk_ids(node: HierarchyNode, recursive: bool) -> set[str]:
+    ids = set(node.chunk_ids)
+    if recursive:
+        for child in node.children:
+            ids |= _collect_chunk_ids(child, recursive)
+    return ids
+
+
+def _collect_block_ids(node: HierarchyNode, recursive: bool) -> set[str]:
+    ids = set(node.block_ids)
+    if recursive:
+        for child in node.children:
+            ids |= _collect_block_ids(child, recursive)
+    return ids
 
 
 def _prettify_table(markdown: str) -> str:
@@ -246,6 +444,28 @@ class ParseResult:
     hierarchy: HierarchyTree = field(default_factory=lambda: HierarchyTree(roots=[]))
     pipeline_steps: dict[str, "pd.DataFrame"] = field(default_factory=dict)
 
+    @classmethod
+    def from_dict(cls, d: dict) -> "ParseResult":
+        """Reconstruct a ParseResult from a dict produced by to_dict()."""
+        return cls(
+            chunks=[Chunk.from_dict(c) for c in d.get("chunks", [])],
+            blocks=[Block.from_dict(b) for b in d.get("blocks", [])],
+            tables=[Table.from_dict(t) for t in d.get("tables", [])],
+            metadata=DocumentMetadata.from_dict(d.get("metadata", {})),
+            hierarchy=HierarchyTree.from_dict(d.get("hierarchy", [])),
+        )
+
+    @classmethod
+    def load(cls, path: str | Path) -> "ParseResult":
+        """Load a ParseResult from a JSON file saved with .save() or .to_json()."""
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        return cls.from_dict(data)
+
+    @property
+    def text(self) -> str:
+        """Plain text of the document body, excluding headers, footers, and TOC."""
+        return self.export_to_text()
+
     def to_dict(self) -> dict:
         return {
             "schema": "DocSlicerResult",
@@ -256,6 +476,10 @@ class ParseResult:
             "tables": [t.to_dict() for t in self.tables],
             "hierarchy": self.hierarchy.to_dict(),
         }
+
+    def to_json(self, indent: int = 2) -> str:
+        """Return the full parse result as a JSON string."""
+        return json.dumps(self.to_dict(), indent=indent, ensure_ascii=False)
 
     def export_to_dict(self) -> dict:
         return self.to_dict()
@@ -437,6 +661,103 @@ class ParseResult:
     def tables_df(self) -> "pd.DataFrame":
         import pandas as pd
         return pd.DataFrame([t.to_dict() for t in self.tables])
+
+    # ── Hierarchy navigation ──────────────────────────────────────────────────
+
+    def find_heading(self, text: str, case_sensitive: bool = False) -> list[HierarchyNode]:
+        """Return all hierarchy nodes whose text contains ``text``."""
+        return self.hierarchy.find_heading(text, case_sensitive=case_sensitive)
+
+    def _resolve_heading(self, heading: HierarchyNode | int) -> HierarchyNode | None:
+        if isinstance(heading, HierarchyNode):
+            return heading
+        for node in self.hierarchy.flatten():
+            if node.heading_id == heading:
+                return node
+        return None
+
+    def chunks_under(self, heading: HierarchyNode | int, recursive: bool = True) -> list[Chunk]:
+        """Return all chunks under a heading.
+
+        Args:
+            heading: A HierarchyNode or heading_id int.
+            recursive: Include chunks from descendant headings (default True).
+        """
+        node = self._resolve_heading(heading)
+        if node is None:
+            return []
+        chunk_ids = _collect_chunk_ids(node, recursive)
+        return [c for c in self.chunks if c.id in chunk_ids]
+
+    def blocks_under(self, heading: HierarchyNode | int, recursive: bool = True) -> list[Block]:
+        """Return all blocks under a heading.
+
+        Prefers direct block_ids when available (exact). Falls back to the
+        page-range approximation derived from chunks when block_ids are absent.
+
+        Args:
+            heading: A HierarchyNode or heading_id int.
+            recursive: Include blocks from descendant headings (default True).
+        """
+        node = self._resolve_heading(heading)
+        if node is None:
+            return []
+
+        # Prefer direct block_ids (populated by _build_hierarchy)
+        block_ids = _collect_block_ids(node, recursive)
+        if block_ids:
+            return [b for b in self.blocks if b.id in block_ids]
+
+        # Fall back to page-range approximation via chunks
+        relevant_chunks = self.chunks_under(node, recursive=recursive)
+        if not relevant_chunks:
+            return []
+        pages = {c.page_number for c in relevant_chunks}
+        sections = {c.section for c in relevant_chunks}
+        return [b for b in self.blocks if b.page_number in pages and b.section in sections]
+
+    def tables_under(self, heading: HierarchyNode | int, recursive: bool = True) -> list[Table]:
+        """Return all tables referenced under a heading.
+
+        Uses chunk.table_ids when chunks are available; falls back to
+        block.table_ids when chunking was disabled.
+
+        Args:
+            heading: A HierarchyNode or heading_id int.
+            recursive: Include tables from descendant headings (default True).
+        """
+        node = self._resolve_heading(heading)
+        if node is None:
+            return []
+        relevant_chunks = self.chunks_under(node, recursive=recursive)
+        if relevant_chunks:
+            table_ids = {tid for c in relevant_chunks for tid in c.table_ids}
+        else:
+            relevant_blocks = self.blocks_under(node, recursive=recursive)
+            table_ids = {tid for b in relevant_blocks for tid in b.table_ids}
+        if not table_ids:
+            return []
+        return [t for t in self.tables if t.id in table_ids]
+
+    # ── Page navigation ───────────────────────────────────────────────────────
+
+    def chunks_by_page(self, page: int | str) -> list[Chunk]:
+        """Return chunks on a given page. Pass int for page_number, str for page_label."""
+        if isinstance(page, str):
+            return [c for c in self.chunks if c.page_label == page]
+        return [c for c in self.chunks if c.page_number == page]
+
+    def blocks_by_page(self, page: int | str) -> list[Block]:
+        """Return blocks on a given page. Pass int for page_number, str for page_label."""
+        if isinstance(page, str):
+            return [b for b in self.blocks if b.page_label == page]
+        return [b for b in self.blocks if b.page_number == page]
+
+    def tables_by_page(self, page: int | str) -> list[Table]:
+        """Return tables on a given page. Pass int for page_number, str for page_label."""
+        if isinstance(page, str):
+            return [t for t in self.tables if t.page_label == page]
+        return [t for t in self.tables if t.page_number == page]
 
     def save(self, path: str | Path) -> None:
         """Save parse results to disk.

@@ -10,6 +10,7 @@ class ParseConfig:
     optimal_chunk_size: int = 1500
     min_chunk_size: int = 400
     extract_tables: bool = True
+    chunking: bool = True
     regions: list[str] | None = None
     debug: bool = False
     extra_fields: list[str] = field(default_factory=list)

@@ -1152,6 +1152,16 @@ def qc_pdf_page_label_series(
         347 to 352 while only one page passed).  Disabled by default because some
         documents use non-unit page label increments (article numbers, etc.).
 
+    Rule 3 — minimum consecutive run (always on):
+        At least one series must contain a run of consecutive labeled PDF pages of
+        length >= min(5, num_pages_in_doc).  A 3-page document only needs 3; a
+        200-page document needs 5.  If this gate fails all labels are cleared.
+
+    Rule 4 — label coverage (always on):
+        At least 50% of the document's distinct page numbers must have a winner
+        label.  If fewer pages are labeled the detection is too sparse to trust
+        and all labels are cleared.
+
     Pages cleared by this function are also stripped of block_type, series_id,
     value, and type so that the subsequent spread step treats them as unlabeled.
     """
@@ -1173,6 +1183,39 @@ def qc_pdf_page_label_series(
 
     if winners.empty:
         return out
+
+    # Rule 3: minimum consecutive run gate.
+    # Count distinct pages in the full document (not just winner rows).
+    num_pages = int(pd.to_numeric(out[page_col], errors="coerce").nunique())
+    min_run = min(5, max(1, num_pages))
+
+    # Find the longest run of consecutive PDF pages that all have a winner label.
+    labeled_pages = sorted(winners["_p"].astype(int).unique().tolist())
+    max_run = 1
+    cur_run = 1
+    for k in range(1, len(labeled_pages)):
+        if labeled_pages[k] == labeled_pages[k - 1] + 1:
+            cur_run += 1
+            max_run = max(max_run, cur_run)
+        else:
+            cur_run = 1
+
+    def _clear_all_labels(frame: pd.DataFrame) -> pd.DataFrame:
+        for col in (label_col, value_col, type_col, series_id_col):
+            if col in frame.columns:
+                frame[col] = None
+        if block_type_col in frame.columns:
+            frame.loc[frame[block_type_col] == "page_label", block_type_col] = None
+        return frame
+
+    if max_run < min_run:
+        return _clear_all_labels(out)
+
+    # Rule 4: label coverage gate.
+    # At least 50% of the document's pages must have a winner label.
+    num_labeled_pages = len(labeled_pages)
+    if num_pages > 0 and (num_labeled_pages / num_pages) < 0.50:
+        return _clear_all_labels(out)
 
     pages_to_clear: set = set()
 

@@ -93,6 +93,40 @@ class DocumentMetadata:
 
     # ------------------------------------------------------------------
 
+    @classmethod
+    def from_dict(cls, d: dict) -> "DocumentMetadata":
+        """Reconstruct from a dict produced by to_dict()."""
+        return cls(
+            document_id=d.get("document_id", _gen_uuid()),
+            run_id=d.get("run_id", _gen_uuid()),
+            processed_at=d.get("processed_at"),
+            content_type=d.get("content_type", "unknown"),
+            source_filename=d.get("source_filename"),
+            source_url=d.get("source_url"),
+            file_size_bytes=d.get("file_size_bytes"),
+            is_password_protected=d.get("is_password_protected", False),
+            page_count=d.get("page_count"),
+            page_width=d.get("page_width"),
+            page_height=d.get("page_height"),
+            page_format=d.get("page_format"),
+            has_mixed_page_sizes=d.get("has_mixed_page_sizes", False),
+            has_ocr=d.get("has_ocr", False),
+            needs_ocr=d.get("needs_ocr", False),
+            is_scanned=d.get("is_scanned", False),
+            chars=d.get("chars"),
+            estimated_tokens=d.get("estimated_tokens"),
+            title=d.get("title"),
+            author=d.get("author"),
+            language=d.get("language"),
+            language_confidence=d.get("language_confidence"),
+            language_source=d.get("language_source"),
+            profile=d.get("profile"),
+            document_type=d.get("document_type"),
+            parsing_quality_score=d.get("parsing_quality_score"),
+            processing_time=d.get("processing_time"),
+            extra=d.get("extra", {}),
+        )
+
     def to_dict(self) -> dict:
         """Serialize public fields only — pipeline intermediates are excluded."""
         out: dict = {

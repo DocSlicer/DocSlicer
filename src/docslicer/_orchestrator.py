@@ -112,14 +112,28 @@ def _bbox(row: pd.Series) -> BBox | None:
     )
 
 
+def _norm_id_str(v) -> str:
+    """Stringify a value, normalising float-typed integers (83.0 → '83')."""
+    if isinstance(v, float):
+        if pd.isna(v):
+            return ""
+        if v == int(v):
+            return str(int(v))
+    s = str(v).strip()
+    # Also handle string form "83.0" that may arrive after an earlier astype(str)
+    if s.endswith(".0") and s[:-2].lstrip("-").isdigit():
+        return s[:-2]
+    return s
+
+
 def _str_list(row: pd.Series, col: str) -> list[str]:
     """Safely extract a list of strings from a column that may hold a list, None, or scalar."""
     val = row.get(col) if col in row.index else None
     if val is None or (isinstance(val, float) and pd.isna(val)):
         return []
     if isinstance(val, list):
-        return [str(v) for v in val if v is not None and str(v).strip()]
-    s = str(val).strip()
+        return [_norm_id_str(v) for v in val if v is not None and _norm_id_str(v)]
+    s = _norm_id_str(val)
     return [s] if s else []
 
 
@@ -147,6 +161,23 @@ def _build_hierarchy(df_blocks: pd.DataFrame, df_chunks: pd.DataFrame) -> Hierar
             key = str(active_hid).strip()
             if key:
                 chunk_ids_map[key] = list(grp["chunk_id"].astype(str))
+
+    # heading_id (str) -> list of block_ids in that heading's section
+    # Computed by forward-filling heading_id across the sorted blocks df.
+    block_ids_map: dict[str, list[str]] = {}
+    if "block_id" in df_blocks.columns:
+        needed = [c for c in ["page_number", "block_id", "heading_id"] if c in df_blocks.columns]
+        blk = df_blocks[needed].copy()
+        sort_cols = [c for c in ["page_number", "block_id"] if c in blk.columns]
+        if sort_cols:
+            blk = blk.sort_values(sort_cols, kind="mergesort").reset_index(drop=True)
+        hid_col = blk["heading_id"].astype(str).replace({"<NA>": "", "nan": "", "None": ""})
+        # Normalize float-typed integer ids ("10.0" → "10") so keys match str(int(heading_id))
+        hid_col = hid_col.str.replace(r"\.0+$", "", regex=True)
+        blk["_active_hid"] = hid_col.where(hid_col != "", other=pd.NA).ffill().fillna("")
+        for ahid, grp in blk.groupby("_active_hid", sort=False):
+            if ahid:
+                block_ids_map[str(ahid)] = list(grp["block_id"].astype(str))
 
     nodes: dict[int, HierarchyNode] = {}
     parent_map: dict[int, int | None] = {}
@@ -177,6 +208,7 @@ def _build_hierarchy(df_blocks: pd.DataFrame, df_chunks: pd.DataFrame) -> Hierar
             page_number=page_number,
             page_label=page_label,
             chunk_ids=chunk_ids_map.get(str(hid), []),
+            block_ids=block_ids_map.get(str(hid), []),
             children=[],
         )
         parent_map[hid] = parent_id

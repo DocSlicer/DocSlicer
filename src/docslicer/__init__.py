@@ -148,6 +148,7 @@ def parse_pdf(
     max_chunk_size: int = 3200,
     optimal_chunk_size: int = 1500,
     extract_tables: bool = True,
+    chunking: bool = True,
     regions: list[str] | None = None,
     debug: bool = False,
     extra_fields: list[str] | None = None,
@@ -159,6 +160,8 @@ def parse_pdf(
         max_chunk_size: Maximum characters per chunk (default 3200).
         optimal_chunk_size: Target characters per chunk (default 1500).
         extract_tables: Include table extraction (default True).
+        chunking: Build chunks from blocks (default True). Set to False to skip
+            chunking and return only blocks, which is faster.
         regions: Filter output to these regions only, e.g. ["body", "toc"].
             Allowed values: body | header | footer | toc | exhibit.
             None means all regions (default).
@@ -171,6 +174,7 @@ def parse_pdf(
         max_chunk_size=max_chunk_size,
         optimal_chunk_size=optimal_chunk_size,
         extract_tables=extract_tables,
+        chunking=chunking,
         regions=regions,
         debug=debug,
         extra_fields=extra_fields or [],
@@ -185,6 +189,7 @@ def parse_docx(
     max_chunk_size: int = 3200,
     optimal_chunk_size: int = 1500,
     extract_tables: bool = True,
+    chunking: bool = True,
     regions: list[str] | None = None,
     debug: bool = False,
     extra_fields: list[str] | None = None,
@@ -196,6 +201,8 @@ def parse_docx(
         max_chunk_size: Maximum characters per chunk (default 3200).
         optimal_chunk_size: Target characters per chunk (default 1500).
         extract_tables: Include table extraction (default True).
+        chunking: Build chunks from blocks (default True). Set to False to skip
+            chunking and return only blocks, which is faster.
         regions: Filter output to these regions only.
         debug: Populate result.pipeline_steps with intermediate DataFrames.
         extra_fields: Additional pipeline DataFrame columns to attach to each
@@ -205,6 +212,7 @@ def parse_docx(
         max_chunk_size=max_chunk_size,
         optimal_chunk_size=optimal_chunk_size,
         extract_tables=extract_tables,
+        chunking=chunking,
         regions=regions,
         debug=debug,
         extra_fields=extra_fields or [],
@@ -219,6 +227,7 @@ def parse_pptx(
     max_chunk_size: int = 3200,
     optimal_chunk_size: int = 1500,
     extract_tables: bool = True,
+    chunking: bool = True,
     regions: list[str] | None = None,
     debug: bool = False,
     extra_fields: list[str] | None = None,
@@ -230,6 +239,8 @@ def parse_pptx(
         max_chunk_size: Maximum characters per chunk (default 3200).
         optimal_chunk_size: Target characters per chunk (default 1500).
         extract_tables: Include table extraction (default True).
+        chunking: Build chunks from blocks (default True). Set to False to skip
+            chunking and return only blocks, which is faster.
         regions: Filter output to these regions only.
         debug: Populate result.pipeline_steps with intermediate DataFrames.
         extra_fields: Additional pipeline DataFrame columns to attach to each
@@ -239,6 +250,7 @@ def parse_pptx(
         max_chunk_size=max_chunk_size,
         optimal_chunk_size=optimal_chunk_size,
         extract_tables=extract_tables,
+        chunking=chunking,
         regions=regions,
         debug=debug,
         extra_fields=extra_fields or [],
@@ -254,6 +266,7 @@ def parse_html(
     max_chunk_size: int = 3200,
     optimal_chunk_size: int = 1500,
     extract_tables: bool = True,
+    chunking: bool = True,
     regions: list[str] | None = None,
     debug: bool = False,
     extra_fields: list[str] | None = None,
@@ -270,6 +283,8 @@ def parse_html(
         max_chunk_size: Maximum characters per chunk (default 3200).
         optimal_chunk_size: Target characters per chunk (default 1500).
         extract_tables: Include table extraction (default True).
+        chunking: Build chunks from blocks (default True). Set to False to skip
+            chunking and return only blocks, which is faster.
         regions: Filter output to these regions only.
         debug: Populate result.pipeline_steps with intermediate DataFrames.
         extra_fields: Additional pipeline DataFrame columns to attach to each
@@ -279,6 +294,7 @@ def parse_html(
         max_chunk_size=max_chunk_size,
         optimal_chunk_size=optimal_chunk_size,
         extract_tables=extract_tables,
+        chunking=chunking,
         regions=regions,
         debug=debug,
         extra_fields=extra_fields or [],

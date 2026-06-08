@@ -514,7 +514,7 @@ _BASIC_COLORS = frozenset({
 })
 
 # Pattern used in coverpage suppression to identify FORM/SCHEDULE headings
-_FORM_PATTERN = r"^\s*(FORM|SCHEDULE)\b"
+_FORM_PATTERN = r"^\s*(?:FORM|SCHEDULE)\b"
 
 
 
@@ -746,7 +746,7 @@ def _apply_contextual_score_adjustments(lines_df: pd.DataFrame) -> pd.DataFrame:
     # color_rarity already captures non_stroking_color; hierarchy_type and is_uppercase
     # caused too many accidental style-run hits in practice.
     style_parts = []
-    for col in ["is_bold", "is_italic", "is_underlined", "font_family"]:
+    for col in ["is_bold", "is_italic", "is_underlined", "font_family", "hierarchy_type"]:
         if col in out.columns:
             style_parts.append(out[col].fillna(False).astype(str))
     if "font_size_ratio" in out.columns:

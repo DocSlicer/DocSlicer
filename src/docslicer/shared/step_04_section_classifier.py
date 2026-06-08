@@ -1,114 +1,433 @@
 """
-Document region assignment for parsed document DataFrames.
+Document section identification for parsed document DataFrames.
 
-Each row in the input DataFrame represents one text line from a document.
-This module assigns a ``section`` value to every row, classifying
-it as one of: ``toc``, ``exhibits``, ``coverpage``, ``last_page``,
-``body``, ``front_matter``, ``back_matter``, ``annex``, ``financials``,
-or ``schedules``.
+classify_sections() runs in multiple passes:
 
-Assignment runs in four passes, each of which only fills rows whose
-``section`` is still null:
+Pass A — build_temp_sections()
+    Reduce rows to a per-page index, detect section boundaries from
+    page-label format changes, value restarts, and docx section_id changes,
+    then assemble a compact section index.  The temp_section_id is joined
+    back to the row-level DataFrame as a new column.
 
-1. **Block-role pass** — rows with a known ``block_type`` (``toc``,
-   ``toc_heading``, ``exhibit``, ``exhibit_heading``) are assigned directly.
-
-2. **Coverpage pass** — the leading pages of the document are examined
-   using four detection strategies tried in order (first match wins):
-
-   * Scenario 1 – pages with a blank ``page_label`` in a doc that
-     otherwise has labels.
-   * Scenario 2 – pages before an early TOC when labels are fully
-     populated or absent.
-   * Scenario 3 – visual/layout heuristics (center-aligned text, low
-     density, coloured background) when no labels are present.
-   * Scenario 4 – SEC filing text-based detection: at least
-     ``SEC_MIN_HITS`` full-line matches against ``SEC_COVERPAGE_HEURISTICS``
-     plus at least one checkbox character (☐ / ☒).
-
-3. **Last-page pass** — the final page is tagged when it matches a
-   blank-label or low-density/contact-info pattern.
-
-4. **Page-label pass** — remaining pages are classified by their
-   ``page_label_type`` (arabic → body, roman → front/back matter,
-   alpha-prefixed → annex/financials/schedules, etc.).
-
-Required column: ``page_number`` (int-coercible).
-Optional columns improve accuracy: ``block_type``, ``page_label``,
-``page_label_type``, ``page_label_value``, ``text``, ``text_align``,
-``char_count``, ``background_non_stroking_color``.
+Pass B–D  (TODO: coming next)
+    Split temp sections for coverpage / last_page, assign human-readable
+    section labels, and smear the final 'section' column back to rows.
 """
 from __future__ import annotations
 
-from typing import Literal
-
-import pandas as pd
 import re
 
-from docslicer.constants import SectionType  # noqa: F401  (re-exported for callers)
+import pandas as pd
 
 
 # ================================================================================
-# STEP 1: Assign section from block_type
+# Constants
 # ================================================================================
 
-_BLOCK_TYPE_TO_SECTION = {
-    "toc": "toc",
-    "toc_heading": "toc",
-    "exhibits": "exhibits",
-    "exhibit_heading": "exhibits",
-}
+_KNOWN_LABEL_FORMATS: frozenset[str] = frozenset({
+    "arabic", "arabic_sub", "roman", "roman_numeric",
+    "alpha_numeric", "alpha_roman",
+})
+
+_ALPHA_FORMATS: frozenset[str] = frozenset({"alpha_numeric", "alpha_roman"})
+_ARABIC_FORMATS: frozenset[str] = frozenset({"arabic", "arabic_sub"})
+_ROMAN_FORMATS: frozenset[str] = frozenset({"roman", "roman_numeric"})
+
+_TOC_BLOCK_TYPES: frozenset[str] = frozenset({"toc", "toc_heading"})
+
+# Extracts the leading letter from alpha-prefixed labels like "A-1", "F-12", "S-3"
+_ALPHA_PREFIX_RE = re.compile(r"^\s*([A-Za-z])\s*[-–.]")
+
+# Roman numeral parser (covers values up to 3999)
+_ROMAN_MAP = [
+    (1000, "m"), (900, "cm"), (500, "d"), (400, "cd"),
+    (100,  "c"), (90,  "xc"), (50,  "l"), (40,  "xl"),
+    (10,   "x"), (9,   "ix"), (5,   "v"), (4,   "iv"), (1, "i"),
+]
 
 
-def classify_sections_from_block_type(df: pd.DataFrame) -> pd.DataFrame:
+def _roman_to_int(s: str) -> int | None:
+    """Parse a roman numeral string to an integer, or return None on failure."""
+    s = s.strip().lower()
+    if not s:
+        return None
+    result = 0
+    i = 0
+    for value, numeral in _ROMAN_MAP:
+        while s[i: i + len(numeral)] == numeral:
+            result += value
+            i += len(numeral)
+    return result if i == len(s) else None
+
+
+def _parse_label_value(label_text: str | None, label_type: str | None) -> int | None:
     """
-    Assign ``section`` for rows whose ``block_type`` maps to a known
-    region.  Rows with an already-set ``section`` are left untouched.
+    Extract an integer from a raw page label string.
 
-    Optional columns: ``block_type``, ``section``.
+    Used as a fallback when the ``page_label_value`` column is absent
+    (e.g. the HTML pipeline does not pre-parse this).
+
+    Handles:
+    - arabic / arabic_sub: strip to digits and parse
+    - roman / roman_numeric: roman numeral conversion
+    - alpha_numeric / alpha_roman: extract the trailing integer portion
     """
-    if df.empty:
-        out = df.copy()
-        if "section" not in out.columns:
-            out["section"] = pd.Series(dtype=object)
-        return out
+    if not label_text or not label_type:
+        return None
+    txt = label_text.strip()
+    if not txt:
+        return None
 
-    if "block_type" not in df.columns:
-        out = df.copy()
-        if "section" not in out.columns:
-            out["section"] = pd.Series(index=out.index, dtype=object)
-        return out
+    ltype = label_type.lower()
 
-    out = df.copy()
+    if ltype in ("arabic", "arabic_sub"):
+        m = re.search(r"\d+", txt)
+        return int(m.group()) if m else None
 
-    if "section" not in out.columns:
-        out["section"] = pd.Series(index=out.index, dtype=object)
+    if ltype in ("roman", "roman_numeric"):
+        # roman_numeric may have a trailing number: "I-1" → use the roman part
+        m = re.match(r"^([ivxlcdmIVXLCDM]+)", txt)
+        if m:
+            return _roman_to_int(m.group(1))
+        return None
 
-    br = out["block_type"].astype(str).str.strip().str.lower()
-    mapped = br.map(_BLOCK_TYPE_TO_SECTION)
-    out["section"] = out["section"].where(out["section"].notna(), mapped)
+    if ltype in ("alpha_numeric", "alpha_roman"):
+        # e.g. "A-1", "B-12" → trailing integer
+        m = re.search(r"(\d+)\s*$", txt)
+        return int(m.group(1)) if m else None
 
-    return out
+    return None
 
 
 # ================================================================================
-# STEP 2A: Assign coverpage
+# Pass A — step 1: reduce line-level df to one row per page
+# ================================================================================
+
+def _first_nonblank(s: pd.Series) -> object:
+    """Return the first non-null, non-empty-string value in *s*, or None."""
+    for v in s:
+        if v is None:
+            continue
+        if isinstance(v, float) and pd.isna(v):
+            continue
+        if isinstance(v, str) and not v.strip():
+            continue
+        return v
+    return None
+
+
+def _reduce_to_page_index(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Collapse the line-level DataFrame to one row per page.
+
+    Output columns:
+        page_number, label_type, label_value, label_blank,
+        docx_section_id (int or None), has_toc_block (bool)
+    """
+    pn = df["page_number"].astype(int)
+    pages = sorted(pn.unique())
+
+    records = []
+    for p in pages:
+        rows = df[pn.eq(p)]
+
+        # Docx: prefer body rows for label extraction; header/footer rows carry
+        # their own repeated labels that shouldn't drive section boundaries.
+        if "header_footer_type" in rows.columns:
+            body = rows[rows["header_footer_type"].astype(str).str.lower().eq("body")]
+            label_rows = body if not body.empty else rows
+        else:
+            label_rows = rows
+
+        # Dominant label type — prefer any known format over unknown/None
+        label_type: str | None = None
+        if "page_label_type" in label_rows.columns:
+            s = label_rows["page_label_type"].astype("string")
+            known = s[s.isin(_KNOWN_LABEL_FORMATS)]
+            if not known.empty:
+                label_type = str(known.iloc[0])
+            else:
+                raw = _first_nonblank(label_rows["page_label_type"])
+                label_type = str(raw) if raw is not None else None
+
+        # First integer label value on this page.
+        # Prefer the pre-parsed page_label_value column (PDF pipeline); fall
+        # back to parsing the raw page_label text (HTML pipeline omits the column).
+        label_value: int | None = None
+        if "page_label_value" in label_rows.columns:
+            vals = pd.to_numeric(label_rows["page_label_value"], errors="coerce").dropna()
+            if not vals.empty:
+                label_value = int(vals.iloc[0])
+        if label_value is None and "page_label" in label_rows.columns:
+            raw_lbl = _first_nonblank(label_rows["page_label"])
+            if raw_lbl is not None:
+                label_value = _parse_label_value(str(raw_lbl), label_type)
+
+        # Is the page label blank?
+        label_blank = True
+        if "page_label" in label_rows.columns:
+            non_blank = label_rows["page_label"].astype("string").str.strip()
+            non_blank = non_blank[non_blank.ne("") & non_blank.notna()]
+            label_blank = non_blank.empty
+        elif label_type is not None:
+            label_blank = False
+
+        # Docx section_id: most common value among all rows on this page
+        docx_section_id: int | None = None
+        if "section_id" in rows.columns:
+            sid_vals = pd.to_numeric(rows["section_id"], errors="coerce").dropna()
+            if not sid_vals.empty:
+                docx_section_id = int(sid_vals.mode().iloc[0])
+
+        # Any TOC block on this page?
+        has_toc = False
+        if "block_type" in rows.columns:
+            has_toc = bool(
+                rows["block_type"].astype("string").str.lower()
+                .isin(_TOC_BLOCK_TYPES).any()
+            )
+
+        # Leading letter of alpha-prefixed labels ("A-1" → "A", "F-3" → "F")
+        label_prefix: str | None = None
+        if label_type in _ALPHA_FORMATS and "page_label" in label_rows.columns:
+            raw_lbl = _first_nonblank(label_rows["page_label"])
+            if raw_lbl is not None:
+                m = _ALPHA_PREFIX_RE.match(str(raw_lbl).strip())
+                if m:
+                    label_prefix = m.group(1).upper()
+
+        records.append({
+            "page_number": p,
+            "label_type": label_type,
+            "label_value": label_value,
+            "label_blank": label_blank,
+            "label_prefix": label_prefix,
+            "docx_section_id": docx_section_id,
+            "has_toc_block": has_toc,
+        })
+
+    return pd.DataFrame(records)
+
+
+# ================================================================================
+# Pass A — step 2: detect section boundaries
+# ================================================================================
+
+def _detect_boundaries(page_index: pd.DataFrame) -> list[int]:
+    """
+    Walk the page index and return page numbers where a new temp section begins.
+
+    Boundary triggers (checked in order; first match wins per page transition):
+
+    1. docx_section_id changes between consecutive pages.
+    2. page_label_type format changes between two known formats.
+    3. Value restart within the same format:
+       a. Value drops to 1 from a higher value.
+       b. Current page is blank and the next page has value 2
+          (the blank page is implicitly "1", next confirms the restart).
+
+    The first page is always included as the start of section 1.
+    """
+    if page_index.empty:
+        return []
+
+    rows = page_index.reset_index(drop=True)
+    n = len(rows)
+    boundaries: list[int] = [int(rows.at[0, "page_number"])]
+
+    has_docx = (
+        "docx_section_id" in rows.columns
+        and rows["docx_section_id"].notna().any()
+    )
+
+    for i in range(1, n):
+        prev = rows.iloc[i - 1]
+        curr = rows.iloc[i]
+        nxt = rows.iloc[i + 1] if i + 1 < n else None
+        page_num = int(curr["page_number"])
+        trigger: str | None = None
+
+        # 1. Docx section_id change
+        if has_docx:
+            p_sid = prev["docx_section_id"]
+            c_sid = curr["docx_section_id"]
+            if pd.notna(p_sid) and pd.notna(c_sid) and int(p_sid) != int(c_sid):
+                trigger = "docx_section_id"
+
+        # 2. Effective label format change.
+        #    Blank pages use the sentinel "_blank" so that blank↔non-blank
+        #    and format-to-format transitions all fire a boundary.
+        #    Consecutive blank pages share the same sentinel → no boundary.
+        if trigger is None:
+            p_eff = "_blank" if bool(prev["label_blank"]) else (prev["label_type"] or "_unknown")
+            c_eff = "_blank" if bool(curr["label_blank"]) else (curr["label_type"] or "_unknown")
+            if p_eff != c_eff:
+                trigger = "label_format_change"
+
+        # 3a. Value restart: same format, value drops to 1 from > 1
+        if trigger is None:
+            c_blank = bool(curr["label_blank"])
+            p_blank = bool(prev["label_blank"])
+            if not c_blank and not p_blank:
+                p_type = prev["label_type"]
+                c_type = curr["label_type"]
+                p_val = prev["label_value"]
+                c_val = curr["label_value"]
+                if (
+                    isinstance(c_type, str) and c_type in _KNOWN_LABEL_FORMATS
+                    and p_type == c_type
+                    and pd.notna(c_val) and int(c_val) == 1
+                    and pd.notna(p_val) and int(p_val) > 1
+                ):
+                    trigger = "value_restart"
+
+        # 3b. Blank-then-2: curr is blank, next page has value 2,
+        #     and the previous page had value > 2 in the same format.
+        if trigger is None and bool(curr["label_blank"]) and nxt is not None:
+            p_type = prev["label_type"]
+            n_type = nxt["label_type"]
+            p_val = prev["label_value"]
+            n_val = nxt["label_value"]
+            if (
+                isinstance(p_type, str) and p_type in _KNOWN_LABEL_FORMATS
+                and pd.notna(n_type) and str(n_type) == p_type
+                and pd.notna(n_val) and int(n_val) == 2
+                and pd.notna(p_val) and int(p_val) > 2
+            ):
+                trigger = "value_restart_blank"
+
+        if trigger is not None:
+            boundaries.append(page_num)
+
+    return boundaries
+
+
+# ================================================================================
+# Pass A — step 3: assemble the section index
+# ================================================================================
+
+def _assemble_section_index(
+    page_index: pd.DataFrame,
+    boundaries: list[int],
+) -> tuple[pd.DataFrame, dict[int, int]]:
+    """
+    Produce one row per temp section from the page index and boundary list.
+
+    Output columns:
+        temp_section_id, start_page, end_page, n_pages,
+        label_format, label_value_start, label_value_end,
+        all_blank, has_toc_block, docx_section_ids
+
+    Also returns ``page_to_sid``: a dict mapping every actual page_number
+    in the index to its temp_section_id.
+    """
+    if page_index.empty or not boundaries:
+        return pd.DataFrame(), {}
+
+    pi = page_index.set_index("page_number")
+    all_pages = sorted(page_index["page_number"].tolist())
+    boundary_set = set(boundaries)
+
+    # Map every page to its temp_section_id
+    current_sid = 0
+    page_to_sid: dict[int, int] = {}
+    for p in all_pages:
+        if p in boundary_set:
+            current_sid += 1
+        page_to_sid[p] = current_sid
+
+    has_docx = "docx_section_id" in pi.columns
+
+    records = []
+    for sid in range(1, current_sid + 1):
+        sec_pages = sorted(p for p, s in page_to_sid.items() if s == sid)
+        if not sec_pages:
+            continue
+
+        sec_rows = pi.loc[pi.index.isin(sec_pages)]
+
+        # Dominant label format among known types
+        known = sec_rows["label_type"].astype("string")
+        known = known[known.isin(_KNOWN_LABEL_FORMATS)]
+        label_format: str | None = str(known.mode().iloc[0]) if not known.empty else None
+
+        # First and last integer label values
+        vals = pd.to_numeric(sec_rows["label_value"], errors="coerce").dropna()
+        val_start: int | None = int(vals.iloc[0]) if not vals.empty else None
+        val_end: int | None = int(vals.iloc[-1]) if not vals.empty else None
+
+        blank_mask = sec_rows["label_blank"].fillna(True).astype(bool)
+        all_blank = bool(blank_mask.all())
+        blank_pages = sorted(int(p) for p in sec_rows.index[blank_mask])
+        has_toc = bool(sec_rows["has_toc_block"].any())
+
+        # Alpha prefix — dominant letter among pages that have one
+        label_prefix: str | None = None
+        if label_format in _ALPHA_FORMATS and "label_prefix" in sec_rows.columns:
+            prefixes = sec_rows["label_prefix"].dropna()
+            if not prefixes.empty:
+                label_prefix = str(prefixes.mode().iloc[0])
+
+        docx_ids: str | None = None
+        if has_docx:
+            uids = sec_rows["docx_section_id"].dropna().unique()
+            if len(uids):
+                docx_ids = ",".join(str(x) for x in sorted(int(x) for x in uids))
+
+        records.append({
+            "temp_section_id": sid,
+            "start_page": sec_pages[0],
+            "end_page": sec_pages[-1],
+            "n_pages": len(sec_pages),
+            "label_format": label_format,
+            "label_value_start": val_start,
+            "label_value_end": val_end,
+            "all_blank": all_blank,
+            "n_blank": len(blank_pages),
+            "blank_pages": blank_pages,
+            "has_toc_block": has_toc,
+            "label_prefix": label_prefix,
+            "docx_section_ids": docx_ids,
+        })
+
+    return pd.DataFrame(records), page_to_sid
+
+
+def _build_temp_sections(
+    df: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[int, int]]:
+    """
+    Run Pass A in full.
+
+    Returns:
+        (page_index, section_index, page_to_sid)
+
+    ``page_to_sid`` maps every page_number that appears in *df* to its
+    temp_section_id.  Using the actual pages (not a range) means non-
+    consecutive or gap-bearing page numbering is handled correctly.
+    """
+    page_index = _reduce_to_page_index(df)
+    boundaries = _detect_boundaries(page_index)
+    section_index, page_to_sid = _assemble_section_index(page_index, boundaries)
+    return page_index, section_index, page_to_sid
+
+
+# ================================================================================
+# Pass B: assign coverpage and last_page labels
 # ================================================================================
 
 _MAX_PAGES_COVERPAGE = 5
 _MAX_TOC_DISTANCE = 5
 
-# Thresholds for the layout-scoring coverpage detector (scenario 3).
-_COVER_CENTER_RATIO_MULT = 2.0   # page center_ratio must exceed  median * this
-_COVER_DENSITY_RATIO_MAX = 0.5   # page density must be below     median * this
-_COVER_BG_RATIO_MULT = 2.0       # page bg_ratio must exceed      median * this
+# Layout thresholds (scenario 3)
+_COVER_CENTER_RATIO_MULT = 2.0
+_COVER_DENSITY_RATIO_MAX = 0.5
+_COVER_BG_RATIO_MULT = 2.0
 
-# ---------------------------------------------------------------------------
-# SEC filing coverpage heuristics (scenario 4)
-# ---------------------------------------------------------------------------
-# Each entry is one candidate "hit".  A full-line match (stripped,
-# case-insensitive) against any entry counts as one unique hit.
-# Extend or trim this list to adjust which filings are recognised.
+_LAST_DENSITY_RATIO_MAX = 0.75
+_LAST_BG_RATIO_MULT = 1.5
+
+# SEC text heuristics (scenario 4)
 SEC_COVERPAGE_HEURISTICS: list[str] = [
     "SECURITIES AND EXCHANGE COMMISSION",
     "Washington, D.C. 20549",
@@ -118,183 +437,259 @@ SEC_COVERPAGE_HEURISTICS: list[str] = [
     "(Registrant's telephone number, including area code)",
     "(CUSIP Number of Class of Securities)",
 ]
-
-# Number of distinct heuristic lines that must match for scenario 4 to fire.
 SEC_MIN_HITS: int = 3
-
-# Checkbox characters that must appear at least once (scenario 4).
 SEC_CHECKBOX_CHARS: frozenset[str] = frozenset({"☐", "☒"})
 
-
-def _norm_str_series(s: pd.Series) -> pd.Series:
-    return s.astype("string").str.strip().str.lower()
-
-
-def _is_blank_str_series(s: pd.Series) -> pd.Series:
-    ss = s.astype("string")
-    return ss.isna() | (ss.str.strip() == "")
+_EMAIL_RE = re.compile(r"\b[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}\b", re.IGNORECASE)
+_PHONE_RE = re.compile(r"(?<!\w)(?:\+?\d[\d().\- ]{6,}\d)(?!\w)")
 
 
-def _ensure_section(out: pd.DataFrame) -> None:
-    if "section" not in out.columns:
-        out["section"] = pd.Series(index=out.index, dtype=object)
+# ---------------------------------------------------------------------------
+# Section-index row builder (used when splitting a section in Pass B)
+# ---------------------------------------------------------------------------
+
+def _build_section_row(
+    sid: int,
+    pages: list[int],
+    pi_rows: pd.DataFrame,
+    *,
+    section: object = pd.NA,
+) -> dict:
+    """Build one section-index row dict from a list of pages and their page-index rows."""
+    known = pi_rows["label_type"].astype("string")
+    known = known[known.isin(_KNOWN_LABEL_FORMATS)]
+    label_format: str | None = str(known.mode().iloc[0]) if not known.empty else None
+
+    vals = pd.to_numeric(pi_rows["label_value"], errors="coerce").dropna()
+    blank_mask = pi_rows["label_blank"].fillna(True).astype(bool)
+    blank_pages_list = sorted(int(p) for p in pi_rows.index[blank_mask])
+
+    has_docx = "docx_section_id" in pi_rows.columns
+    docx_ids: str | None = None
+    if has_docx:
+        uids = pi_rows["docx_section_id"].dropna().unique()
+        if len(uids):
+            docx_ids = ",".join(str(x) for x in sorted(int(x) for x in uids))
+
+    label_prefix: str | None = None
+    if label_format in _ALPHA_FORMATS and "label_prefix" in pi_rows.columns:
+        prefixes = pi_rows["label_prefix"].dropna()
+        if not prefixes.empty:
+            label_prefix = str(prefixes.mode().iloc[0])
+
+    return {
+        "temp_section_id": sid,
+        "start_page": pages[0],
+        "end_page": pages[-1],
+        "n_pages": len(pages),
+        "label_format": label_format,
+        "label_value_start": int(vals.iloc[0]) if not vals.empty else None,
+        "label_value_end": int(vals.iloc[-1]) if not vals.empty else None,
+        "all_blank": bool(blank_mask.all()),
+        "n_blank": len(blank_pages_list),
+        "blank_pages": blank_pages_list,
+        "has_toc_block": bool(pi_rows["has_toc_block"].any()),
+        "label_prefix": label_prefix,
+        "docx_section_ids": docx_ids,
+        "section": section,
+    }
 
 
-def _pages_mask(out: pd.DataFrame, pages: set[int]) -> pd.Series:
-    return out["page_number"].astype(int).isin(pages)
+# ---------------------------------------------------------------------------
+# Splitting helper
+# ---------------------------------------------------------------------------
 
-
-def _assign_coverpage_on_pages(out: pd.DataFrame, pages: set[int]) -> None:
-    if not pages:
-        return
-    m = _pages_mask(out, pages)
-    out.loc[m & out["section"].isna(), "section"] = "coverpage"
-
-
-def _detect_coverpage_scenario_1(out: pd.DataFrame) -> set[int]:
+def _apply_page_cover_set(
+    section_index: pd.DataFrame,
+    page_index: pd.DataFrame,
+    page_to_sid: dict[int, int],
+    cover_pages: set[int],
+) -> tuple[pd.DataFrame, dict[int, int]]:
     """
-    Applies when the document has page labels but the leading pages lack one.
+    Given a set of page numbers identified as coverpage (from scenarios 3/4),
+    mark the corresponding sections and split any section where only a prefix
+    of its pages belongs to the cover set.
 
-    Returns the contiguous run of blank-labeled pages starting at page 1,
-    capped at ``_MAX_PAGES_COVERPAGE``.
+    Returns the updated (section_index, page_to_sid).
     """
-    if "page_label" not in out.columns:
-        return set()
+    if not cover_pages:
+        return section_index, page_to_sid
 
-    lbl_blank = _is_blank_str_series(out["page_label"])
-    if not bool((~lbl_blank).any()):
-        return set()  # no labels anywhere in the document
+    pi = page_index.set_index("page_number")
+    affected_sids = {page_to_sid[p] for p in cover_pages if p in page_to_sid}
 
-    per_page_blank_all = lbl_blank.groupby(out["page_number"].astype(int)).all()
+    new_rows: list[dict] = []
+    new_page_to_sid: dict[int, int] = {}
+    new_sid = 0
 
-    cover_pages: set[int] = set()
-    for p in range(1, _MAX_PAGES_COVERPAGE + 1):
-        if bool(per_page_blank_all.get(p, False)):
-            cover_pages.add(p)
+    for _, row in section_index.sort_values("start_page").iterrows():
+        old_sid = int(row["temp_section_id"])
+
+        if old_sid not in affected_sids:
+            new_sid += 1
+            d = row.to_dict()
+            d["temp_section_id"] = new_sid
+            new_rows.append(d)
+            for p, s in page_to_sid.items():
+                if s == old_sid:
+                    new_page_to_sid[p] = new_sid
+            continue
+
+        sec_pages = sorted(p for p, s in page_to_sid.items() if s == old_sid)
+        in_cover = [p for p in sec_pages if p in cover_pages]
+        not_cover = [p for p in sec_pages if p not in cover_pages]
+
+        if not not_cover:
+            # Whole section is coverpage
+            new_sid += 1
+            d = row.to_dict()
+            d["temp_section_id"] = new_sid
+            d["section"] = "coverpage"
+            new_rows.append(d)
+            for p in sec_pages:
+                new_page_to_sid[p] = new_sid
         else:
+            # Split: cover prefix → coverpage, remainder → unlabeled
+            new_sid += 1
+            cover_sid = new_sid
+            new_rows.append(_build_section_row(
+                cover_sid, in_cover, pi.loc[pi.index.isin(in_cover)], section="coverpage"
+            ))
+            for p in in_cover:
+                new_page_to_sid[p] = cover_sid
+
+            new_sid += 1
+            rest_sid = new_sid
+            new_rows.append(_build_section_row(
+                rest_sid, not_cover, pi.loc[pi.index.isin(not_cover)]
+            ))
+            for p in not_cover:
+                new_page_to_sid[p] = rest_sid
+
+    return pd.DataFrame(new_rows), new_page_to_sid
+
+
+# ---------------------------------------------------------------------------
+# Coverpage scenarios (operate on section index; scenarios 3/4 also use df)
+# ---------------------------------------------------------------------------
+
+def _coverpage_scenario_1(section_index: pd.DataFrame) -> set[int]:
+    """
+    Leading all-blank sections within the first _MAX_PAGES_COVERPAGE pages.
+    Requires that at least one section is NOT all-blank.
+    """
+    if bool(section_index["all_blank"].all()):
+        return set()  # entire document is unlabeled → can't decide here
+
+    result: set[int] = set()
+    cumulative = 0
+    for _, row in section_index.sort_values("start_page").iterrows():
+        if not bool(row["all_blank"]):
             break
-    return cover_pages
+        new_total = cumulative + int(row["n_pages"])
+        if new_total > _MAX_PAGES_COVERPAGE:
+            break
+        cumulative = new_total
+        result.add(int(row["temp_section_id"]))
+    return result
 
 
-def _detect_coverpage_scenario_2(out: pd.DataFrame) -> set[int]:
+def _coverpage_scenario_2(section_index: pd.DataFrame) -> set[int]:
     """
-    Applies when a TOC is detected within the first ``_MAX_TOC_DISTANCE``
-    pages and all page labels are filled (or absent).
-
-    Returns all pages before the first TOC page, capped at
-    ``_MAX_PAGES_COVERPAGE``.
+    Sections that precede the first early TOC section
+    (has_toc_block=True and start_page ≤ _MAX_TOC_DISTANCE),
+    capped at _MAX_PAGES_COVERPAGE total pages.
     """
-    if "section" not in out.columns:
+    sorted_si = section_index.sort_values("start_page")
+
+    # Find first section with an early TOC
+    toc_sid: int | None = None
+    for _, row in sorted_si.iterrows():
+        if bool(row["has_toc_block"]) and int(row["start_page"]) <= _MAX_TOC_DISTANCE:
+            toc_sid = int(row["temp_section_id"])
+            break
+
+    if toc_sid is None:
         return set()
 
-    pn = out["page_number"].astype(int)
-    is_toc_line = _norm_str_series(out["section"]).eq("toc")
-    toc_pages = pn[is_toc_line].unique()
-    if toc_pages.size == 0:
-        return set()
-
-    first_toc_page = int(pd.Series(toc_pages).min())
-    if first_toc_page < 1 or first_toc_page > _MAX_TOC_DISTANCE:
-        return set()
-
-    if "page_label" in out.columns:
-        lbl_blank = _is_blank_str_series(out["page_label"])
-        if bool((~lbl_blank).any()):
-            # Labels exist; reject if any page has a blank label.
-            per_page_blank_all = lbl_blank.groupby(pn).all()
-            if bool(per_page_blank_all.any()):
-                return set()
-
-    if first_toc_page <= 1:
-        return set()
-
-    last_cover = min(first_toc_page - 1, _MAX_PAGES_COVERPAGE)
-    return set(range(1, last_cover + 1))
+    result: set[int] = set()
+    cumulative = 0
+    for _, row in sorted_si.iterrows():
+        if int(row["temp_section_id"]) == toc_sid:
+            break
+        new_total = cumulative + int(row["n_pages"])
+        if new_total > _MAX_PAGES_COVERPAGE:
+            break
+        cumulative = new_total
+        result.add(int(row["temp_section_id"]))
+    return result
 
 
-def _detect_coverpage_scenario_3(out: pd.DataFrame) -> set[int]:
+def _coverpage_scenario_3_pages(
+    section_index: pd.DataFrame,
+    df: pd.DataFrame,
+) -> set[int]:
     """
-    Layout-based fallback for documents with no page labels and no early TOC.
+    Layout-based fallback for fully unlabeled documents.
 
-    Scores each of the first ``_MAX_PAGES_COVERPAGE`` pages against global
-    page-level medians:
-
-    * +1 if ``center_ratio`` is significantly above the median.
-    * +1 if character density is significantly below the median.
-    * +1 if background-color ratio is significantly above the median.
-
-    Returns the contiguous prefix of pages starting at page 1 where the
-    score is ≥ 2.
+    Only fires when every section is all-blank (no label anywhere).
+    Scores pages 1–_MAX_PAGES_COVERPAGE by center-align ratio, density,
+    and background color against document medians.  Returns the contiguous
+    prefix where score ≥ 2.
     """
-    pn = out["page_number"].astype(int)
+    if not bool(section_index["all_blank"].all()):
+        return set()  # labels exist somewhere → not applicable
 
-    if "section" in out.columns:
-        is_toc_line = _norm_str_series(out["section"]).eq("toc")
-        if bool(((pn <= _MAX_TOC_DISTANCE) & is_toc_line).any()):
+    if "section" in df.columns:
+        # Bail if an early TOC was already marked
+        pn = df["page_number"].astype(int)
+        has_early_toc = (
+            df["block_type"].astype("string").str.lower().isin(_TOC_BLOCK_TYPES)
+            & pn.le(_MAX_TOC_DISTANCE)
+        ).any() if "block_type" in df.columns else False
+        if has_early_toc:
             return set()
 
-    if "page_label" in out.columns:
-        lbl_blank = _is_blank_str_series(out["page_label"])
-        if bool((~lbl_blank).any()):
-            return set()
-
-    have_align = "text_align" in out.columns
-    have_chars = "char_count" in out.columns
-    have_bg = "background_non_stroking_color" in out.columns
+    pn = df["page_number"].astype(int)
+    have_align = "text_align" in df.columns
+    have_chars = "char_count" in df.columns
+    have_bg = "background_non_stroking_color" in df.columns
 
     per_page_total = pn.value_counts(sort=False)
 
     if have_align:
-        is_center = _norm_str_series(out["text_align"]).eq("center")
-        per_page_center = is_center.groupby(pn).sum()
-        per_page_center_ratio = (per_page_center / per_page_total).fillna(0.0)
+        is_center = df["text_align"].astype("string").str.strip().str.lower().eq("center")
+        center_ratio = (is_center.groupby(pn).sum() / per_page_total).fillna(0.0)
     else:
-        per_page_center_ratio = pd.Series(0.0, index=per_page_total.index)
+        center_ratio = pd.Series(0.0, index=per_page_total.index)
 
     if have_chars:
-        chars = pd.to_numeric(out["char_count"], errors="coerce").fillna(0)
-        per_page_density = chars.groupby(pn).sum()
+        chars = pd.to_numeric(df["char_count"], errors="coerce").fillna(0)
+        density = chars.groupby(pn).sum()
     else:
-        per_page_density = pd.Series(0.0, index=per_page_total.index)
+        density = pd.Series(0.0, index=per_page_total.index)
 
     if have_bg:
-        bg_blank = _is_blank_str_series(out["background_non_stroking_color"])
-        per_page_bg = (~bg_blank).groupby(pn).sum()
-        per_page_bg_ratio = (per_page_bg / per_page_total).fillna(0.0)
+        bg_blank = df["background_non_stroking_color"].astype("string").str.strip().eq("")
+        bg_ratio = ((~bg_blank).groupby(pn).sum() / per_page_total).fillna(0.0)
     else:
-        per_page_bg_ratio = pd.Series(0.0, index=per_page_total.index)
+        bg_ratio = pd.Series(0.0, index=per_page_total.index)
 
-    med_center = float(per_page_center_ratio.median()) if not per_page_center_ratio.empty else 0.0
-    med_density = float(per_page_density.median()) if not per_page_density.empty else 0.0
-    med_bg = float(per_page_bg_ratio.median()) if not per_page_bg_ratio.empty else 0.0
+    med_center = float(center_ratio.median()) if not center_ratio.empty else 0.0
+    med_density = float(density.median()) if not density.empty else 0.0
+    med_bg = float(bg_ratio.median()) if not bg_ratio.empty else 0.0
 
     cover_pages: set[int] = set()
-    for p in range(1, _MAX_PAGES_COVERPAGE + 1):
+    for p in range(int(pn.min()), int(pn.min()) + _MAX_PAGES_COVERPAGE):
         if p not in per_page_total.index:
             break
-
         score = 0
-
-        r_center = float(per_page_center_ratio.get(p, 0.0))
-        if med_center <= 0:
-            if r_center >= 0.30:
-                score += 1
-        else:
-            if r_center >= med_center * _COVER_CENTER_RATIO_MULT:
-                score += 1
-
-        d = float(per_page_density.get(p, 0.0))
-        if med_density > 0 and d <= med_density * _COVER_DENSITY_RATIO_MAX:
-            score += 1
-
-        r_bg = float(per_page_bg_ratio.get(p, 0.0))
-        if med_bg <= 0:
-            if r_bg >= 0.10:
-                score += 1
-        else:
-            if r_bg >= med_bg * _COVER_BG_RATIO_MULT:
-                score += 1
-
+        r_c = float(center_ratio.get(p, 0.0))
+        score += 1 if (med_center <= 0 and r_c >= 0.30) or (med_center > 0 and r_c >= med_center * _COVER_CENTER_RATIO_MULT) else 0
+        d = float(density.get(p, 0.0))
+        score += 1 if med_density > 0 and d <= med_density * _COVER_DENSITY_RATIO_MAX else 0
+        r_bg = float(bg_ratio.get(p, 0.0))
+        score += 1 if (med_bg <= 0 and r_bg >= 0.10) or (med_bg > 0 and r_bg >= med_bg * _COVER_BG_RATIO_MULT) else 0
         if score >= 2:
             cover_pages.add(p)
         else:
@@ -303,40 +698,26 @@ def _detect_coverpage_scenario_3(out: pd.DataFrame) -> set[int]:
     return cover_pages
 
 
-def _detect_coverpage_scenario_4(
-    out: pd.DataFrame,
-    heuristics: list[str] | None = None,
-    min_hits: int = SEC_MIN_HITS,
+def _coverpage_scenario_4_pages(
+    section_index: pd.DataFrame,
+    df: pd.DataFrame,
 ) -> set[int]:
     """
-    Text-based fallback for SEC filings that lack page labels and have no
-    early TOC (and therefore don't trigger scenarios 1–3).
+    SEC text-heuristic fallback for fully unlabeled documents.
 
-    Fires when, across pages 1–``_MAX_PAGES_COVERPAGE``:
-
-    1. At least ``min_hits`` *distinct* entries from ``heuristics`` appear
-       as exact full-line matches (stripped, case-insensitive).
-    2. At least one checkbox character (☐ / ☒) is present.
-
-    Returns ``range(1, last_matched_page + 1)`` as the coverpage set.
-
-    Parameters
-    ----------
-    heuristics:
-        Override the module-level ``SEC_COVERPAGE_HEURISTICS`` list.
-    min_hits:
-        Override ``SEC_MIN_HITS``.
+    Only fires when every section is all-blank.  Requires at least
+    SEC_MIN_HITS distinct heuristic lines and one checkbox character
+    across the first _MAX_PAGES_COVERPAGE pages.
     """
-    if "text" not in out.columns:
+    if not bool(section_index["all_blank"].all()):
         return set()
 
-    _heuristics = heuristics if heuristics is not None else SEC_COVERPAGE_HEURISTICS
-    norm_heuristics = {h.strip().lower() for h in _heuristics}
-    if not norm_heuristics:
+    if "text" not in df.columns:
         return set()
 
-    pn = out["page_number"].astype(int)
-    cand = out[pn <= _MAX_PAGES_COVERPAGE]
+    norm_heuristics = {h.strip().lower() for h in SEC_COVERPAGE_HEURISTICS}
+    pn = df["page_number"].astype(int)
+    cand = df[pn <= _MAX_PAGES_COVERPAGE]
     if cand.empty:
         return set()
 
@@ -344,554 +725,414 @@ def _detect_coverpage_scenario_4(
     text_lower = text_stripped.str.lower()
 
     hits_mask = text_lower.isin(norm_heuristics)
-    if int(text_lower[hits_mask].nunique()) < min_hits:
+    if int(text_lower[hits_mask].nunique()) < SEC_MIN_HITS:
         return set()
 
-    checkbox_pattern = "|".join(re.escape(c) for c in SEC_CHECKBOX_CHARS)
-    checkbox_mask = text_stripped.str.contains(checkbox_pattern, regex=True, na=False)
+    checkbox_pat = "|".join(re.escape(c) for c in SEC_CHECKBOX_CHARS)
+    checkbox_mask = text_stripped.str.contains(checkbox_pat, regex=True, na=False)
     if not bool(checkbox_mask.any()):
         return set()
 
     hit_pages = set(cand.loc[hits_mask, "page_number"].astype(int))
     checkbox_pages = set(cand.loc[checkbox_mask, "page_number"].astype(int))
-
     last_relevant = max(hit_pages | checkbox_pages)
-    return set(range(1, last_relevant + 1))
+    return set(range(int(pn.min()), last_relevant + 1))
 
 
-def assign_coverpage(df: pd.DataFrame) -> pd.DataFrame:
+# ---------------------------------------------------------------------------
+# Last-page scenarios
+# ---------------------------------------------------------------------------
+
+def _last_page_scenario_1(section_index: pd.DataFrame) -> int | None:
     """
-    Assign ``section = 'coverpage'`` to leading pages of the document.
-
-    Tries four detection strategies in order; the first that identifies at
-    least one page is used and the rest are skipped.  Existing non-null
-    ``section`` values are never overwritten.
-
-    Requires: ``page_number``.
+    The trailing section is all-blank and exactly one page long.
+    Returns its section_id, or None.
     """
-    if df.empty:
-        out = df.copy()
-        _ensure_section(out)
-        return out
+    if bool(section_index["all_blank"].all()):
+        return None  # whole document blank
 
-    if "page_number" not in df.columns:
-        raise KeyError("assign_coverpage: missing required column: 'page_number'")
-
-    out = df.copy()
-    _ensure_section(out)
-
-    for detect in (
-        _detect_coverpage_scenario_1,
-        _detect_coverpage_scenario_2,
-        _detect_coverpage_scenario_3,
-        _detect_coverpage_scenario_4,
-    ):
-        pages = detect(out)
-        if pages:
-            _assign_coverpage_on_pages(out, pages)
-            return out
-
-    return out
+    last = section_index.sort_values("start_page").iloc[-1]
+    if bool(last["all_blank"]) and int(last["n_pages"]) == 1:
+        return int(last["temp_section_id"])
+    return None
 
 
-# ================================================================================
-# STEP 2B: Assign last_page
-# ================================================================================
-
-_LAST_DENSITY_RATIO_MAX = 0.75  # last page density must be below  median * this
-_LAST_BG_RATIO_MULT = 1.5       # last page bg_ratio must exceed    median * this
-
-_EMAIL_RE = re.compile(r"\b[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}\b", re.IGNORECASE)
-
-# Matches international phone numbers with common separators; a digit-count
-# gate (≥ 9 digits) is applied after matching to suppress false positives.
-_PHONE_RE = re.compile(r"(?<!\w)(?:\+?\d[\d().\- ]{6,}\d)(?!\w)")
-
-
-def _last_page_has_email_or_phone(out: pd.DataFrame, last_page: int) -> bool:
-    if "text" not in out.columns:
+def _last_page_has_contact(df: pd.DataFrame, last_page: int) -> bool:
+    """Return True if the last page contains an email address or phone number."""
+    if "text" not in df.columns:
         return False
-
-    pn = out["page_number"].astype(int)
-    text = out.loc[pn.eq(last_page), "text"].astype("string")
-
-    if text.empty:
-        return False
-
-    blob = " ".join(text.dropna().astype(str).tolist())
-    if not blob:
-        return False
-
+    text_rows = df.loc[df["page_number"].astype(int).eq(last_page), "text"]
+    blob = " ".join(text_rows.astype(str).dropna())
     if _EMAIL_RE.search(blob):
         return True
-
     m = _PHONE_RE.search(blob)
-    if not m:
-        return False
-
-    digits = sum(ch.isdigit() for ch in m.group(0))
-    return digits >= 9
+    return bool(m) and sum(ch.isdigit() for ch in m.group(0)) >= 9
 
 
-def _detect_last_page_scenario_1(out: pd.DataFrame) -> int | None:
+def _last_page_scenario_2(
+    section_index: pd.DataFrame,
+    df: pd.DataFrame,
+    cover_sids: set[int],
+) -> int | None:
     """
-    Applies when the document has page labels and exactly one trailing page
-    lacks a label.  That page is returned as ``last_page``; two or more
-    unlabeled trailing pages indicate a back-matter section, not a
-    standalone last page, so ``None`` is returned.
+    Layout and contact-info scoring for the final page of the document.
+
+    Scores:
+    +1  character density is well below the document median
+    +1  background-colour ratio is well above the median
+    +1  page contains an email address or phone number
+
+    Returns the last section's id when score ≥ 2 and that section is
+    exactly one page long, else None.
     """
-    if "page_label" not in out.columns:
-        return None
+    pn = df["page_number"].astype(int)
 
-    pn = out["page_number"].astype(int)
-
-    lbl_blank = _is_blank_str_series(out["page_label"])
-    if not bool((~lbl_blank).any()):
-        return None
-
-    per_page_blank_all = lbl_blank.groupby(pn).all()
-    last_page = int(pn.max())
-
-    trailing_blank = 0
-    p = last_page
-    while p >= 1 and bool(per_page_blank_all.get(p, False)):
-        trailing_blank += 1
-        p -= 1
-
-    return last_page if trailing_blank == 1 else None
-
-
-def _detect_last_page_scenario_2(out: pd.DataFrame) -> int | None:
-    """
-    Layout and contact-info based detector for documents whose labels are
-    fully populated (blank pages only permitted on already-assigned coverpage
-    pages) or entirely absent.
-
-    Scores the final page:
-
-    * +1 if character density is significantly below the document median.
-    * +1 if background-color ratio is significantly above the median.
-    * +1 if the page contains an email address or phone number.
-
-    Returns the last page number when the score is ≥ 2, otherwise ``None``.
-    """
-    pn = out["page_number"].astype(int)
-    last_page = int(pn.max())
-
-    if "page_label" in out.columns:
-        lbl_blank = _is_blank_str_series(out["page_label"])
+    # If blank pages exist outside coverpage, don't apply this scenario —
+    # the trailing blank section would have been caught by scenario 1.
+    if "page_label" in df.columns:
+        lbl_blank = df["page_label"].astype("string").str.strip().eq("")
         if bool((~lbl_blank).any()):
-            per_page_blank_all = lbl_blank.groupby(pn).all()
+            blank_pages_series = lbl_blank.groupby(pn).all()
+            cover_pages_set = {
+                p for _, row in section_index[section_index["temp_section_id"].isin(cover_sids)].iterrows()
+                for p in range(int(row["start_page"]), int(row["end_page"]) + 1)
+            }
+            extra_blanks = {int(p) for p, v in blank_pages_series.items() if v} - cover_pages_set
+            if extra_blanks:
+                return None
 
-            if bool(per_page_blank_all.any()):
-                if "section" in out.columns:
-                    is_cover = _norm_str_series(out["section"]).eq("coverpage")
-                    cover_pages = set(pn[is_cover].unique().tolist())
-                else:
-                    cover_pages = set()
+    last_sid_row = section_index.sort_values("start_page").iloc[-1]
+    if int(last_sid_row["n_pages"]) != 1:
+        return None  # only applies to a single-page tail
 
-                blank_pages = set(per_page_blank_all[per_page_blank_all].index.astype(int).tolist())
-                if blank_pages - cover_pages:
-                    return None
+    last_page = int(last_sid_row["end_page"])
 
-    have_chars = "char_count" in out.columns
-    have_bg = "background_non_stroking_color" in out.columns
+    have_chars = "char_count" in df.columns
+    have_bg = "background_non_stroking_color" in df.columns
 
     per_page_total = pn.value_counts(sort=False)
+    density = (
+        pd.to_numeric(df["char_count"], errors="coerce").fillna(0).groupby(pn).sum()
+        if have_chars else pd.Series(0.0, index=per_page_total.index)
+    )
+    bg_blank = df["background_non_stroking_color"].astype("string").str.strip().eq("") if have_bg else None
+    bg_ratio = (
+        ((~bg_blank).groupby(pn).sum() / per_page_total).fillna(0.0)
+        if have_bg else pd.Series(0.0, index=per_page_total.index)
+    )
 
-    if have_chars:
-        chars = pd.to_numeric(out["char_count"], errors="coerce").fillna(0)
-        per_page_density = chars.groupby(pn).sum()
-    else:
-        per_page_density = pd.Series(0.0, index=per_page_total.index)
-
-    if have_bg:
-        bg_blank = _is_blank_str_series(out["background_non_stroking_color"])
-        per_page_bg = (~bg_blank).groupby(pn).sum()
-        per_page_bg_ratio = (per_page_bg / per_page_total).fillna(0.0)
-    else:
-        per_page_bg_ratio = pd.Series(0.0, index=per_page_total.index)
-
-    med_density = float(per_page_density.median()) if not per_page_density.empty else 0.0
-    med_bg = float(per_page_bg_ratio.median()) if not per_page_bg_ratio.empty else 0.0
+    med_density = float(density.median()) if not density.empty else 0.0
+    med_bg = float(bg_ratio.median()) if not bg_ratio.empty else 0.0
 
     score = 0
-
-    d_last = float(per_page_density.get(last_page, 0.0))
+    d_last = float(density.get(last_page, 0.0))
     if med_density > 0 and d_last <= med_density * _LAST_DENSITY_RATIO_MAX:
         score += 1
-
-    r_bg_last = float(per_page_bg_ratio.get(last_page, 0.0))
-    if med_bg <= 0:
-        if r_bg_last >= 0.10:
-            score += 1
-    else:
-        if r_bg_last >= med_bg * _LAST_BG_RATIO_MULT:
-            score += 1
-
-    if _last_page_has_email_or_phone(out, last_page):
+    r_bg = float(bg_ratio.get(last_page, 0.0))
+    if (med_bg <= 0 and r_bg >= 0.10) or (med_bg > 0 and r_bg >= med_bg * _LAST_BG_RATIO_MULT):
+        score += 1
+    if _last_page_has_contact(df, last_page):
         score += 1
 
-    return last_page if score >= 2 else None
+    return int(last_sid_row["temp_section_id"]) if score >= 2 else None
 
 
-def assign_last_page(df: pd.DataFrame) -> pd.DataFrame:
+# ---------------------------------------------------------------------------
+# Main Pass B orchestrator
+# ---------------------------------------------------------------------------
+
+def _assign_coverpage_and_last_page(
+    section_index: pd.DataFrame,
+    page_index: pd.DataFrame,
+    df: pd.DataFrame,
+    page_to_sid: dict[int, int],
+) -> tuple[pd.DataFrame, dict[int, int]]:
     """
-    Assign ``section = 'last_page'`` to the final page of the
-    document when it matches a known closing-page pattern.
+    Pass B: detect and mark coverpage and last_page sections.
 
-    At most one page (the highest ``page_number``) can receive this region.
-    Existing non-null ``section`` values are never overwritten.
+    Coverpage is tried in four scenarios (first match wins):
+      1. Leading all-blank sections
+      2. Sections before an early TOC section
+      3. Layout scoring (fully unlabeled documents)
+      4. SEC text heuristics (fully unlabeled documents)
 
-    Requires: ``page_number``.
+    Last-page is tried in two scenarios (first match wins):
+      1. Single trailing all-blank section
+      2. Single trailing section whose last page scores on layout/contact signals
     """
-    if df.empty:
-        out = df.copy()
-        _ensure_section(out)
-        return out
+    si = section_index.copy()
+    if "section" not in si.columns:
+        si["section"] = pd.NA
 
-    if "page_number" not in df.columns:
-        raise KeyError("assign_last_page: missing required column: 'page_number'")
+    # --- Coverpage ---
+    cover_sids: set[int] = set()
 
-    out = df.copy()
-    _ensure_section(out)
+    cover_sids = _coverpage_scenario_1(si)
+    if not cover_sids:
+        cover_sids = _coverpage_scenario_2(si)
 
-    lp = _detect_last_page_scenario_1(out) or _detect_last_page_scenario_2(out)
+    if cover_sids:
+        si.loc[si["temp_section_id"].isin(cover_sids), "section"] = "coverpage"
+    else:
+        # Scenarios 3 and 4 return page sets and may need to split a section
+        cover_pages = _coverpage_scenario_3_pages(si, df)
+        if not cover_pages:
+            cover_pages = _coverpage_scenario_4_pages(si, df)
+        if cover_pages:
+            si, page_to_sid = _apply_page_cover_set(si, page_index, page_to_sid, cover_pages)
+            cover_sids = {
+                int(row["temp_section_id"])
+                for _, row in si.iterrows()
+                if str(row.get("section", "")) == "coverpage"
+            }
 
-    if lp is None:
-        return out
+    # --- Last page ---
+    last_sid = _last_page_scenario_1(si)
+    if last_sid is None:
+        last_sid = _last_page_scenario_2(si, df, cover_sids)
+    if last_sid is not None:
+        si.loc[si["temp_section_id"] == last_sid, "section"] = "last_page"
 
-    pn = out["page_number"].astype(int)
-    out.loc[pn.eq(lp) & out["section"].isna(), "section"] = "last_page"
-    return out
+    return si, page_to_sid
 
 
 # ================================================================================
-# STEP 3: Assign standard regions from page_label_type
+# Pass C: assign human-readable section labels
 # ================================================================================
 
-_STD_REGIONS = {
-    "body",
-    "annex",
-    "financials",
-    "schedules",
-    "front_matter",
-    "back_matter",
-}
-
-_ALPHA_TYPES = {"alpha_numeric", "alpha_roman"}
-_ROMAN_TYPES = {"roman", "roman_numeric"}
-
-
-def _first_nonblank_str(s: pd.Series) -> str | None:
-    ss = s.astype("string")
-    ss = ss[~_is_blank_str_series(ss)]
-    if ss.empty:
-        return None
-    return str(ss.iloc[0])
-
-
-def _build_page_index_df(out: pd.DataFrame) -> pd.DataFrame:
+def _assign_section_labels(section_index: pd.DataFrame) -> pd.DataFrame:
     """
-    Reduce the line-level DataFrame to one row per page with:
-    ``page_number``, ``label_blank_all``, ``page_label_type``,
-    ``page_label_value``, ``has_coverpage``, ``has_toc``.
+    Pass C: assign human-readable section labels to unlabeled sections.
+
+    Sections already labeled (coverpage, last_page) are left untouched.
+    Assignment order:
+      1. Alpha-prefixed  → financials (F), schedules (S), annex (all others)
+      2. Longest arabic  → body  (tie-break: earliest start_page)
+      3. Remaining arabic before body → front_matter; after → back_matter
+      4. Roman before body → front_matter; after → back_matter
+      5. Remaining (blank / unknown) before body → front_matter; after → back_matter
+      6. Still unassigned → body  (safety net)
     """
-    pn = out["page_number"].astype(int)
+    si = section_index.copy()
+    if "section" not in si.columns:
+        si["section"] = pd.NA
 
-    page = pd.DataFrame(index=pd.Index(sorted(pn.unique()), name="page_number"))
-    page["page_number"] = page.index.astype(int)
+    def _unlabeled(row) -> bool:
+        v = row.get("section")
+        return pd.isna(v) or str(v).strip() == ""
 
-    if "page_label" in out.columns:
-        lbl_blank = _is_blank_str_series(out["page_label"])
-        page["label_blank_all"] = lbl_blank.groupby(pn).all().reindex(page.index, fill_value=True)
-    else:
-        page["label_blank_all"] = True
-
-    if "page_label_type" in out.columns:
-        page["page_label_type"] = (
-            out.groupby(pn)["page_label_type"].apply(_first_nonblank_str).reindex(page.index)
-        )
-    else:
-        page["page_label_type"] = None
-
-    if "page_label_value" in out.columns:
-        page["page_label_value"] = (
-            out.groupby(pn)["page_label_value"].apply(_first_nonblank_str).reindex(page.index)
-        )
-    else:
-        page["page_label_value"] = None
-
-    dr = _norm_str_series(out["section"]) if "section" in out.columns else pd.Series([], dtype="string")
-    page["has_coverpage"] = dr.eq("coverpage").groupby(pn).any().reindex(page.index, fill_value=False)
-    page["has_toc"] = dr.eq("toc").groupby(pn).any().reindex(page.index, fill_value=False)
-
-    return page
-
-
-_ALPHA_PREFIX_RE = re.compile(r"^\s*([A-Z])\s*[-–]\s*([A-Z0-9IVXLCDM]+)\s*$", re.IGNORECASE)
-
-
-def _alpha_prefix(val: str | None) -> str | None:
-    if not val:
-        return None
-    m = _ALPHA_PREFIX_RE.match(str(val).strip())
-    if not m:
-        return None
-    return m.group(1).upper()
-
-
-def _contiguous_runs(pages: list[int]) -> list[tuple[int, int, int]]:
-    """Return ``(start, end, length)`` tuples for each contiguous run in *pages*."""
-    if not pages:
-        return []
-    runs = []
-    s = e = pages[0]
-    for p in pages[1:]:
-        if p == e + 1:
-            e = p
+    # 1. Alpha-prefixed sections
+    # Consecutive alpha_numeric sections form a run. Within each run the
+    # collective set of distinct prefixes decides the label: sole "F" →
+    # financials, sole "S" → schedules, mixed / unknown → annex.
+    # alpha_roman sections are always annex and do NOT break a run.
+    sorted_idx = si.sort_values("start_page").index.tolist()
+    runs: list[list[int]] = []
+    current_run: list[int] = []
+    for idx in sorted_idx:
+        row = si.loc[idx]
+        if _unlabeled(row) and row.get("label_format") == "alpha_numeric":
+            current_run.append(idx)
         else:
-            runs.append((s, e, e - s + 1))
-            s = e = p
-    runs.append((s, e, e - s + 1))
-    return runs
+            if current_run:
+                runs.append(current_run)
+                current_run = []
+    if current_run:
+        runs.append(current_run)
 
+    for run in runs:
+        prefixes = {str(si.at[idx, "label_prefix"] or "").upper() for idx in run}
+        prefixes.discard("")
+        if prefixes == {"F"}:
+            label = "financials"
+        elif prefixes == {"S"}:
+            label = "schedules"
+        else:
+            label = "annex"
+        for idx in run:
+            si.at[idx, "section"] = label
 
-def _assign_per_page_regions(page: pd.DataFrame) -> dict[int, str]:
-    """
-    Derive a proposed ``section`` for each page based on label type.
-
-    Uses ``page.at[p, col]`` for scalar lookups because ``page`` is indexed
-    by ``page_number`` (an Index, not a Series).
-    """
-    pages = page["page_number"].astype(int).tolist()
-    if not pages:
-        return {}
-
-    proposed: dict[int, str] = {}
-
-    doc_pages_set = set(pages)
-    min_page = min(pages)
-    max_page = max(pages)
-
-    label_blank = page["label_blank_all"].fillna(False).astype(bool)
-    ptype = page["page_label_type"].fillna("").astype("string").str.strip().str.lower()
-    has_cover = page["has_coverpage"].fillna(False).astype(bool)
-    has_toc = page["has_toc"].fillna(False).astype(bool)
-
-    # When no page labels exist at all, every non-coverpage page is body.
-    # has_toc is intentionally excluded: toc rows already carry section="toc" from
-    # pass 1, so the dr_isna mask in classify_sections_from_page_labels protects
-    # them. Without this, a single-page document whose only page has a TOC would
-    # get no body assignment at all.
-    if not bool((~label_blank).any()):
-        for p in pages:
-            if not bool(has_cover.at[p]):
-                proposed[p] = "body"
-        return proposed
-
-    cover_pages = page.loc[has_cover, "page_number"].astype(int).tolist()
-    cover_end = max(cover_pages) if cover_pages else None
-
-    toc_pages = page.loc[has_toc, "page_number"].astype(int).tolist()
-    first_toc = min(toc_pages) if toc_pages else None
-
-    # A TOC page immediately following the coverpage is classified as
-    # front_matter rather than body.
-    toc_under_cover: int | None = None
-    if cover_end is not None and toc_pages:
-        toc_after_cover = [p for p in toc_pages if p > cover_end]
-        if toc_after_cover:
-            cand = min(toc_after_cover)
-            if cand == cover_end + 1:
-                toc_under_cover = cand
-                proposed[toc_under_cover] = "front_matter"
-
-    # (1) Alpha-prefixed labels → annex / financials / schedules
-    is_alpha = ptype.isin(_ALPHA_TYPES) & (~label_blank)
-    alpha_pages = page.loc[is_alpha, "page_number"].astype(int).tolist()
-    if alpha_pages:
-        prefixes = []
-        for p in alpha_pages:
-            v = page.at[p, "page_label_value"]
-            pref = _alpha_prefix(None if pd.isna(v) else str(v))
-            if pref:
-                prefixes.append(pref)
-
-        prefix_set = set(prefixes)
-        alpha_region = "annex"
-        if prefix_set == {"F"}:
-            alpha_region = "financials"
-        elif prefix_set == {"S"}:
-            alpha_region = "schedules"
-
-        for p in alpha_pages:
-            proposed[p] = alpha_region
-
-    # (2) Body = longest contiguous run of filled arabic pages (excluding
-    #     coverpage and the TOC page directly under the coverpage).
-    is_arabic_filled = ptype.eq("arabic") & (~label_blank)
-    eligible_for_body = is_arabic_filled & (~has_cover)
-    if toc_under_cover is not None:
-        eligible_for_body = eligible_for_body & (page["page_number"].astype(int) != toc_under_cover)
-
-    arabic_pages = page.loc[eligible_for_body, "page_number"].astype(int).sort_values().tolist()
-    arabic_runs = _contiguous_runs(arabic_pages)
-
-    body_run: tuple[int, int, int] | None = None
-    if arabic_runs:
-        body_run = sorted(arabic_runs, key=lambda t: (-t[2], t[0]))[0]
-        bs, be, _ = body_run
-        for p in range(bs, be + 1):
-            proposed.setdefault(p, "body")
-
-    # (3) Roman-numbered pages → front_matter (before body) or back_matter (after).
-    is_roman_filled = ptype.isin(_ROMAN_TYPES) & (~label_blank)
-    roman_pages = page.loc[is_roman_filled, "page_number"].astype(int).tolist()
-
-    if body_run is not None:
-        bs, be, _ = body_run
-        for p in roman_pages:
-            if p < bs:
-                proposed.setdefault(p, "front_matter")
-            elif p > be:
-                proposed.setdefault(p, "back_matter")
-    else:
-        for p in roman_pages:
-            proposed.setdefault(p, "front_matter")
-
-    # (4) Blank-labeled arabic pages between coverpage and first TOC → front_matter.
-    if cover_end is not None and first_toc is not None and first_toc > cover_end + 1:
-        for p in range(cover_end + 1, first_toc):
-            if p not in doc_pages_set:
-                continue
-            if (ptype.at[p] == "arabic") and bool(label_blank.at[p]):
-                proposed.setdefault(p, "front_matter")
-
-    # (5) Trailing blank-labeled pages → back_matter.
-    trailing_blank = 0
-    p = max_page
-    while p >= min_page and p in doc_pages_set and bool(label_blank.at[p]):
-        trailing_blank += 1
-        p -= 1
-
-    if trailing_blank > 0:
-        for pp in range(max_page - trailing_blank + 1, max_page + 1):
-            if pp in doc_pages_set:
-                proposed.setdefault(pp, "back_matter")
-
-    # (6) Secondary arabic runs (page-number resets) → front_matter or back_matter;
-    #     immediately preceding blank pages are attached to the same region.
-    if arabic_runs:
-        for (rs, re_, _len) in arabic_runs:
-            if body_run is not None and (rs, re_, _len) == body_run:
-                continue
-
-            if body_run is None:
-                run_region = "back_matter"
-            else:
-                bs, be, _ = body_run
-                run_region = "front_matter" if re_ < bs else "back_matter"
-
-            for p in range(rs, re_ + 1):
-                proposed.setdefault(p, run_region)
-
-            q = rs - 1
-            while q >= min_page and q in doc_pages_set:
-                if not bool(label_blank.at[q]):
-                    break
-                if bool(has_cover.at[q]) or bool(has_toc.at[q]):
-                    break
-                proposed.setdefault(q, run_region)
-                q -= 1
-
-    return proposed
-
-
-def classify_sections_from_page_labels(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Assign standard regions (``body``, ``front_matter``, ``back_matter``,
-    ``annex``, ``financials``, ``schedules``) based on ``page_label``,
-    ``page_label_type``, and ``page_label_value``.
-
-    Existing non-null ``section`` values are never overwritten.
-
-    Requires: ``page_number``.
-    """
-    if df.empty:
-        out = df.copy()
-        _ensure_section(out)
-        return out
-
-    if "page_number" not in df.columns:
-        raise KeyError("classify_sections_from_page_labels: missing required column: 'page_number'")
-
-    out = df.copy()
-    _ensure_section(out)
-
-    page = _build_page_index_df(out)
-    per_page_region = _assign_per_page_regions(page)
-
-    if not per_page_region:
-        return out
-
-    pn = out["page_number"].astype(int)
-    dr_isna = out["section"].isna()
-
-    for region in _STD_REGIONS:
-        pages_for_region = {p for p, r in per_page_region.items() if r == region}
-        if not pages_for_region:
+    for idx, row in si.iterrows():
+        if not _unlabeled(row):
             continue
-        m = pn.isin(pages_for_region)
-        out.loc[m & dr_isna, "section"] = region
+        if row.get("label_format") == "alpha_roman":
+            si.at[idx, "section"] = "annex"
 
-    return out
+    # 2. Body = longest unlabeled arabic section; tie-break: earliest start_page
+    arabic_candidates: list[tuple[int, int, int]] = []  # (start_page, sid, n_pages)
+    for idx, row in si.iterrows():
+        if not _unlabeled(row):
+            continue
+        if row.get("label_format") not in _ARABIC_FORMATS:
+            continue
+        arabic_candidates.append((int(row["start_page"]), int(row["temp_section_id"]), int(row["n_pages"])))
+
+    body_sid: int | None = None
+    if arabic_candidates:
+        best = sorted(arabic_candidates, key=lambda t: (-t[2], t[0]))[0]
+        body_sid = best[1]
+        si.loc[si["temp_section_id"] == body_sid, "section"] = "body"
+
+    # Reference point: start page of the body section (or document start if no body yet)
+    if body_sid is not None:
+        body_start = int(si.loc[si["temp_section_id"] == body_sid, "start_page"].iloc[0])
+    else:
+        unlabeled_starts = si[si.apply(_unlabeled, axis=1)]["start_page"]
+        body_start = int(unlabeled_starts.min()) if not unlabeled_starts.empty else 0
+
+    # 3. Remaining arabic sections
+    for idx, row in si.iterrows():
+        if not _unlabeled(row):
+            continue
+        if row.get("label_format") not in _ARABIC_FORMATS:
+            continue
+        si.at[idx, "section"] = "front_matter" if int(row["start_page"]) < body_start else "back_matter"
+
+    # 4. Roman sections
+    for idx, row in si.iterrows():
+        if not _unlabeled(row):
+            continue
+        if row.get("label_format") not in _ROMAN_FORMATS:
+            continue
+        si.at[idx, "section"] = "front_matter" if int(row["start_page"]) < body_start else "back_matter"
+
+    # 5. Remaining blank / unknown sections
+    for idx, row in si.iterrows():
+        if not _unlabeled(row):
+            continue
+        if body_sid is None:
+            si.at[idx, "section"] = "body"
+        else:
+            si.at[idx, "section"] = "front_matter" if int(row["start_page"]) < body_start else "back_matter"
+
+    # 6. Safety net
+    for idx, row in si.iterrows():
+        if _unlabeled(row):
+            si.at[idx, "section"] = "body"
+
+    return si
+
+
+# ================================================================================
+# Debug printer
+# ================================================================================
+
+_BLANK_PAGES_INLINE_MAX = 8  # show individual page numbers up to this count
+
+
+def _print_section_index(section_index: pd.DataFrame) -> None:
+    """Print the temp section index to stdout as a compact table."""
+    if section_index.empty:
+        print("(no temp sections detected)")
+        return
+
+    n = len(section_index)
+    sep = "=" * 90
+    print(f"\n{sep}")
+    print(f"TEMP SECTION INDEX  ({n} section{'s' if n != 1 else ''})")
+    print(sep)
+    print(
+        f"{'ID':>3}  {'pages':<14}  {'n':>4}  "
+        f"{'format':<14}  {'val_start':>9}  {'val_end':>7}  "
+        f"{'blank':>5}  {'n_blank':>7}  {'toc':>3}  {'section':<12}  docx_ids"
+    )
+    print("-" * 90)
+
+    for _, row in section_index.iterrows():
+        page_range = f"p{int(row['start_page'])}-{int(row['end_page'])}"
+        vs = str(int(row["label_value_start"])) if pd.notna(row["label_value_start"]) else ""
+        ve = str(int(row["label_value_end"])) if pd.notna(row["label_value_end"]) else ""
+        n_blank = int(row.get("n_blank", 0) or 0)
+        blank_flag = "all" if row["all_blank"] else (str(n_blank) if n_blank else "no")
+        sec_label = str(row["section"]) if "section" in row.index and pd.notna(row["section"]) else ""
+        print(
+            f"{int(row['temp_section_id']):>3}  "
+            f"{page_range:<14}  "
+            f"{int(row['n_pages']):>4}  "
+            f"{str(row['label_format'] if pd.notna(row['label_format']) else ''):14}  "
+            f"{vs:>9}  "
+            f"{ve:>7}  "
+            f"{blank_flag:>5}  "
+            f"{n_blank:>7}  "
+            f"{'yes' if row['has_toc_block'] else 'no':>3}  "
+            f"{sec_label:<12}  "
+            f"{str(row['docx_section_ids'] or '')}"
+        )
+        # Annotate individual blank page numbers when there are only a few
+        blank_pages = row.get("blank_pages") or []
+        if 0 < n_blank <= _BLANK_PAGES_INLINE_MAX:
+            pages_str = ", ".join(f"p{p}" for p in blank_pages)
+            print(f"     └─ blank: {pages_str}")
+
+    print(f"{sep}\n")
 
 
 # ================================================================================
 # Public API
 # ================================================================================
 
-def classify_sections(df: pd.DataFrame) -> pd.DataFrame:
+def classify_sections(df: pd.DataFrame, *, debug: bool = False) -> pd.DataFrame:
     """
     Assign a ``section`` to every row in *df*.
 
-    This is the main entry point.  It runs the four assignment passes in
-    order and returns a copy of *df* with the ``section`` column
-    populated.  Existing non-null values are preserved throughout.
-
-    Passes
-    ------
-    1. ``classify_sections_from_block_type`` — maps ``block_type`` values
-       ``toc``, ``toc_heading``, ``exhibit``, and ``exhibit_heading`` to
-       ``toc`` / ``exhibits``.
-
-    2. ``assign_coverpage`` — detects the leading cover page(s) using up to
-       four strategies (blank labels → TOC anchor → layout scoring →
-       SEC text heuristics).
-
-    3. ``assign_last_page`` — detects a standalone closing page using blank
-       labels or low-density / contact-info signals.
-
-    4. ``classify_sections_from_page_labels`` — classifies the remaining
-       pages as ``body``, ``front_matter``, ``back_matter``, ``annex``,
-       ``financials``, or ``schedules`` based on page label type and value.
+    Pass A — build temp_section_id index from page-label boundaries.
+    Pass B — detect and mark coverpage and last_page sections.
 
     Parameters
     ----------
     df:
-        Line-level DataFrame.  Must contain a ``page_number`` column.
-        All other columns are optional; missing columns reduce detection
-        accuracy but never raise errors.
+        Line-level DataFrame.  Must contain ``page_number``.
+        Optional columns that improve accuracy: ``page_label``,
+        ``page_label_type``, ``page_label_value``, ``section_id``
+        (docx only), ``block_type``, ``header_footer_type`` (docx only),
+        ``text_align``, ``char_count``, ``background_non_stroking_color``,
+        ``text``.
+    debug:
+        When True, print the section index table (post Pass B) to stdout.
 
     Returns
     -------
     pd.DataFrame
-        A copy of *df* with ``section`` filled where detectable.
-        Rows that could not be classified are left as ``NaN``.
+        Copy of *df* with ``temp_section_id`` (int) and ``section`` columns.
+        Rows not covered by any detected section receive ``pd.NA``.
     """
-    df = classify_sections_from_block_type(df)
-    df = assign_coverpage(df)
-    df = assign_last_page(df)
-    df = classify_sections_from_page_labels(df)
-    return df
+    if df.empty or "page_number" not in df.columns:
+        out = df.copy()
+        out["temp_section_id"] = pd.NA
+        out["section"] = pd.NA
+        return out
+
+    out = df.copy()
+
+    # Pass A
+    page_index, section_index, page_to_sid = _build_temp_sections(out)
+
+    # Pass B
+    section_index, page_to_sid = _assign_coverpage_and_last_page(
+        section_index, page_index, out, page_to_sid
+    )
+
+    # Pass C
+    section_index = _assign_section_labels(section_index)
+
+    if debug:
+        _print_section_index(section_index)
+
+    if page_to_sid:
+        pn = out["page_number"].astype(int)
+        out["temp_section_id"] = pn.map(page_to_sid)
+
+        # Build page → section mapping from the updated index
+        page_to_section: dict[int, str] = {}
+        for _, row in section_index.iterrows():
+            sec = row.get("section")
+            if pd.notna(sec):
+                for p, s in page_to_sid.items():
+                    if s == int(row["temp_section_id"]):
+                        page_to_section[p] = str(sec)
+        out["section"] = pn.map(page_to_section)
+    else:
+        out["temp_section_id"] = pd.NA
+        out["section"] = pd.NA
+
+    return out

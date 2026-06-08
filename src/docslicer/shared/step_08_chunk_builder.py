@@ -14,6 +14,7 @@ import tiktoken
 from .._utils.hierarchical_aggregator import (
     build_standard_agg_spec,
     aggregate_hierarchical,
+    _collect_unique_list,
 )
 
 # =======================================================================================================================
@@ -1152,6 +1153,7 @@ def _aggregate_merged_chunks_fields(group: pd.DataFrame) -> pd.Series:
         include_metadata=True,
         include_table=False,
         include_html_provenance=False,
+        extra_agg={"table_id": _collect_unique_list},
     )
     
     # Add chunk-specific fields
@@ -1676,7 +1678,7 @@ def build_chunks(
     # STEP 3: AGGREGATE
     # -------------------------
     agg_spec = build_standard_agg_spec(
-        identity_cols=["page_number", "active_heading_id"],
+        identity_cols=["page_number", "active_heading_id", "page_label", "page_label_type", "page_label_value", "section"],
         include_hierarchy=True,
         include_geometry=True,
         include_style=True,
@@ -1685,6 +1687,7 @@ def build_chunks(
         include_table=True,
         count_col="block_id",
         extra_first=["layout_id", "layout_type"],
+        extra_agg={"table_id": _collect_unique_list},
     )
     
     chunks_df = aggregate_hierarchical(

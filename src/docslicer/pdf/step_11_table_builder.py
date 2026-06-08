@@ -50,6 +50,8 @@ Pipeline (northstar — steps marked [TODO] are not yet implemented):
 
 from __future__ import annotations
 
+from itertools import groupby as _itertools_groupby
+
 import numpy as np
 import pandas as pd
 
@@ -148,16 +150,16 @@ def _assign_column_layout(
     # Max cells per line within each band — only bands with >1 need grid inference.
     # Use cell_count propagated from line_builder if available; fall back to groupby.
     if "cell_count" in result.columns:
-        band_max = result.groupby(["page_number", group_col])["cell_count"].max()
+        band_max = result.groupby(["page_number", group_col], sort=False)["cell_count"].max()
     else:
-        line_sizes = result.groupby("line_id")["cell_id"].transform("count")
+        line_sizes = result.groupby("line_id", sort=False)["cell_id"].transform("count")
         result["_tmp_line_size"] = line_sizes
-        band_max = result.groupby(["page_number", group_col])["_tmp_line_size"].max()
+        band_max = result.groupby(["page_number", group_col], sort=False)["_tmp_line_size"].max()
         result = result.drop(columns=["_tmp_line_size"])
 
     multi_cell_bands = set(band_max[band_max > 1].index.tolist())
 
-    for (page, band), band_df in result.groupby(["page_number", group_col]):
+    for (page, band), band_df in result.groupby(["page_number", group_col], sort=False):
         if (page, band) not in multi_cell_bands:
             continue  # already initialised with correct single-cell values
 
@@ -170,7 +172,7 @@ def _assign_column_layout(
         # Pre-group by line_id once; store sorted numpy arrays to avoid
         # repeated DataFrame filtering and itertuples overhead.
         line_groups: dict[int, tuple[np.ndarray, np.ndarray]] = {}
-        for lid, grp in band_df.groupby("line_id"):
+        for lid, grp in band_df.groupby("line_id", sort=False):
             grp_sorted = grp.sort_values("x_left")
             line_groups[lid] = (
                 grp_sorted["x_left"].to_numpy(dtype=float),
@@ -695,19 +697,21 @@ def _reindex_layout_id_and_add_table_id(
         .sort_values(["page_number", "line_id_min"])
         .reset_index()
     )
-    old_to_new = {
-        int(row["layout_id"]): i + 1
-        for i, row in layout_order.iterrows()
-    }
+    old_to_new = dict(zip(
+        layout_order["layout_id"].astype(int),
+        range(1, len(layout_order) + 1),
+    ))
 
-    table_counter = 0
-    old_to_table_id: dict[int, int | None] = {}
-    for _, row in layout_order.iterrows():
-        if row["layout_type"] == "table":
-            table_counter += 1
-            old_to_table_id[int(row["layout_id"])] = table_counter
-        else:
-            old_to_table_id[int(row["layout_id"])] = None
+    is_table_arr = (layout_order["layout_type"] == "table").to_numpy()
+    table_nums   = is_table_arr.cumsum()
+    old_to_table_id: dict[int, int | None] = {
+        int(lid): (int(tnum) if flag else None)
+        for lid, tnum, flag in zip(
+            layout_order["layout_id"],
+            table_nums,
+            is_table_arr,
+        )
+    }
 
     df_cells = df_cells.copy()
     df_cells["layout_id"] = df_cells["layout_id"].map(old_to_new)
@@ -901,8 +905,13 @@ def _compute_grid_line_last_map(df_tables: pd.DataFrame) -> dict:
         .reset_index()
     )
     return {
-        (int(r["layout_id"]), int(r["page_number"]), int(r[col])): int(r["line_id"])
-        for _, r in last_df.iterrows()
+        (int(a), int(b), int(c)): int(d)
+        for a, b, c, d in zip(
+            last_df["layout_id"],
+            last_df["page_number"],
+            last_df[col],
+            last_df["line_id"],
+        )
     }
 
 
@@ -960,25 +969,24 @@ def _flush_slot(
     page_number: int,
     table_id: int,
 ) -> tuple[int, int]:
+    # slot["cells"] contains (line_id, col_start, col_end, cell_id, text, gid) tuples.
+    # text is always a str (pre-converted upstream); gid is int | None.
     text_raw_lines: list[str] = []
     cell_ids: list[int] = []
     line_ids: list[int] = []
     seen_line_ids: set[int] = set()
 
-    for row in sorted(slot["cells"], key=lambda r: (r.line_id, r.col_start)):
-        lid = int(row.line_id)
+    cells_sorted = sorted(slot["cells"], key=lambda r: (r[0], r[1]))
+
+    for cell in cells_sorted:
+        lid = cell[0]
         if lid not in seen_line_ids:
             seen_line_ids.add(lid)
             line_ids.append(lid)
-        cell_ids.append(int(row.cell_id))
+        cell_ids.append(cell[3])
 
-    # Build per-line text in line_id order
-    from itertools import groupby as _groupby
-    for lid, grp in _groupby(
-        sorted(slot["cells"], key=lambda r: (r.line_id, r.col_start)),
-        key=lambda r: r.line_id,
-    ):
-        parts = [str(r.text or "").strip() for r in grp if str(r.text or "").strip()]
+    for lid, grp in _itertools_groupby(cells_sorted, key=lambda r: r[0]):
+        parts = [r[4].strip() for r in grp if r[4].strip()]
         if parts:
             text_raw_lines.append(" ".join(parts))
 
@@ -1049,13 +1057,43 @@ def _build_table_cells(df_cells: pd.DataFrame) -> pd.DataFrame:
         band_total_cols = int(df_seg["band_total_cols"].max())
         table_id        = int(df_seg["table_id"].iloc[0]) if "table_id" in df_seg.columns else 0
 
-        # Precompute: for each shape_id in this table, the set of col_starts
-        # that carry it.  When a shape fires, all those columns flush together.
+        # --- Extract columns as arrays once per segment ---
+        n        = len(df_seg)
+        cs_arr   = df_seg["col_start"].to_numpy(dtype=np.int32)
+        ce_arr   = df_seg["col_end"].to_numpy(dtype=np.int32)
+        cid_arr  = df_seg["cell_id"].to_numpy(dtype=np.int64)
+        lid_arr  = df_seg["line_id"].to_numpy(dtype=np.int64)
+        txt_arr  = df_seg["text"].fillna("").astype(str).to_numpy()
+
+        # Pre-convert gid: NaN/NA → None, valid → int
+        _gid_series  = df_seg["shape_id_horizontal_grid_line"]
+        _notna       = _gid_series.notna().to_numpy()
+        _gid_int_arr = (
+            pd.to_numeric(_gid_series, errors="coerce")
+            .fillna(-1).astype(np.int64).to_numpy()
+        )
+
+        # --- Pre-group by line_id into dict[int, list[cell_tuple]] ---
+        # Cell tuple layout: (line_id, col_start, col_end, cell_id, text, gid_or_None)
+        # df_seg is already sorted by (line_id, col_start), so each list is in col order.
+        line_to_cells: dict[int, list] = {}
+        for i in range(n):
+            lid = int(lid_arr[i])
+            gid = int(_gid_int_arr[i]) if _notna[i] else None
+            cell = (lid, int(cs_arr[i]), int(ce_arr[i]), int(cid_arr[i]), txt_arr[i], gid)
+            if lid not in line_to_cells:
+                line_to_cells[lid] = []
+            line_to_cells[lid].append(cell)
+
+        # --- Pre-compute shape_to_col_starts from pre-grouped data ---
         shape_to_col_starts: dict[int, set[int]] = {}
-        for row in df_seg.itertuples(index=False):
-            gid_raw = getattr(row, "shape_id_horizontal_grid_line", None)
-            if gid_raw is not None and not pd.isna(gid_raw):
-                shape_to_col_starts.setdefault(int(gid_raw), set()).add(int(row.col_start))
+        for cells in line_to_cells.values():
+            for cell in cells:
+                gid = cell[5]
+                if gid is not None:
+                    if gid not in shape_to_col_starts:
+                        shape_to_col_starts[gid] = set()
+                    shape_to_col_starts[gid].add(cell[1])
 
         slot_open: dict[int, dict] = {}
         global_row_idx = 0
@@ -1064,95 +1102,84 @@ def _build_table_cells(df_cells: pd.DataFrame) -> pd.DataFrame:
         # col_start -> index in `records` of the last flushed cell for that col
         col_to_record_idx: dict[int, int] = {}
 
-        for line_id in sorted(df_seg["line_id"].dropna().unique().tolist()):
-            df_line = df_seg[df_seg["line_id"] == line_id].sort_values("col_start")
+        for line_id in sorted(line_to_cells.keys()):
+            line_cells = line_to_cells[line_id]
 
             # ── Priority 1: retroactive attach ───────────────────────────────
-            # If any grid-line on this line was already anchored to a prior
-            # flushed row, append this line's cells (and any pending open slots)
-            # to those prior records instead of opening new slots.
             anchor_gid = None
-            for row in df_line.itertuples(index=False):
-                gid_raw = getattr(row, "shape_id_horizontal_grid_line", None)
-                if gid_raw is not None and not pd.isna(gid_raw):
-                    gid = int(gid_raw)
-                    if grid_line_row_anchor.get(gid):
-                        anchor_gid = gid
-                        break
+            for cell in line_cells:
+                gid = cell[5]
+                if gid is not None and grid_line_row_anchor.get(gid):
+                    anchor_gid = gid
+                    break
 
             if anchor_gid is not None:
-                # Drain pending open slots first (lines accumulated since last flush)
-                # so they appear in correct order before the current (triggering) line.
+                # Drain pending open slots first so they appear before the current line.
                 for cs, slot in sorted(slot_open.items()):
                     rec_idx = col_to_record_idx.get(cs)
                     if rec_idx is None:
                         rec_idx = _nearest_col_record(col_to_record_idx, cs)
                     if rec_idx is not None:
                         rec = records[rec_idx]
-                        for cell in slot["cells"]:
-                            txt = str(cell.text or "").strip()
+                        for c in slot["cells"]:
+                            txt = c[4].strip()
                             if txt:
                                 rec["text"] = (rec["text"] + " " + txt).strip() if rec["text"] else txt
                                 rec["text_raw_lines"].append(txt)
-                            rec["cell_ids"].append(int(cell.cell_id))
-                            lid = int(cell.line_id)
-                            if lid not in rec["line_ids"]:
-                                rec["line_ids"].append(lid)
+                            rec["cell_ids"].append(c[3])
+                            c_lid = c[0]
+                            if c_lid not in rec["line_ids"]:
+                                rec["line_ids"].append(c_lid)
                 slot_open.clear()
 
-                # Then append the current (triggering) line's cells
-                for row in df_line.itertuples(index=False):
-                    cs = int(row.col_start)
+                # Append the current (triggering) line's cells
+                for cell in line_cells:
+                    cs = cell[1]
                     rec_idx = col_to_record_idx.get(cs)
                     if rec_idx is None:
                         rec_idx = _nearest_col_record(col_to_record_idx, cs)
                     if rec_idx is not None:
                         rec = records[rec_idx]
-                        txt = str(row.text or "").strip()
+                        txt = cell[4].strip()
                         if txt:
                             rec["text"] = (rec["text"] + " " + txt).strip() if rec["text"] else txt
                             rec["text_raw_lines"].append(txt)
-                        rec["cell_ids"].append(int(row.cell_id))
-                        lid = int(row.line_id)
-                        if lid not in rec["line_ids"]:
-                            rec["line_ids"].append(lid)
+                        rec["cell_ids"].append(cell[3])
+                        c_lid = cell[0]
+                        if c_lid not in rec["line_ids"]:
+                            rec["line_ids"].append(c_lid)
 
                 continue  # skip normal accumulation / flush logic
 
             # ── Accumulate current line into open slots ───────────────────────
             flush_col_starts: set[int] = set()
             covered: set[int] = set()
-            fired_gids: set[int] = set()   # gids at their last instance on this line
-            all_line_gids: set[int] = set() # all gids seen on this line (any instance)
+            fired_gids: set[int] = set()
+            all_line_gids: set[int] = set()
 
-            for row in df_line.itertuples(index=False):
-                cs = int(row.col_start)
-                ce = int(row.col_end)
+            for cell in line_cells:
+                cs, ce, gid = cell[1], cell[2], cell[5]
 
                 if cs not in slot_open:
                     slot_open[cs] = {
-                        "col_end":  ce,
-                        "colspan":  ce - cs + 1,
+                        "col_end":   ce,
+                        "colspan":   ce - cs + 1,
                         "row_start": global_row_idx,
-                        "cells":    [],
+                        "cells":     [],
                     }
-                slot_open[cs]["cells"].append(row)
+                slot_open[cs]["cells"].append(cell)
 
                 for c in range(cs, ce + 1):
                     covered.add(c)
 
-                # Collect grid-line triggers (applied after priority check below)
-                gid_raw = getattr(row, "shape_id_horizontal_grid_line", None)
-                if gid_raw is not None and not pd.isna(gid_raw):
-                    gid = int(gid_raw)
+                if gid is not None:
                     all_line_gids.add(gid)
                     key = (int(layout_id), int(page_number), gid)
-                    if grid_line_last_map.get(key) == int(line_id):
+                    if grid_line_last_map.get(key) == line_id:
                         fired_gids.add(gid)
                         flush_col_starts |= shape_to_col_starts.get(gid, set())
 
             # ── Priority 2: complete-row flush (wins over grid-line partial) ──
-            # "Complete" means the current single line covers enough col positions.
             complete_flush = _is_complete_row(covered, band_total_cols, global_row_idx + 1)
             if complete_flush:
                 flush_col_starts = set(slot_open.keys())
@@ -1172,9 +1199,6 @@ def _build_table_cells(df_cells: pd.DataFrame) -> pd.DataFrame:
                     )
                     col_to_record_idx[cs] = rec_idx
 
-                # Anchor grid-line shapes that belong to this flushed row:
-                # - complete flush: all gids seen on this line (even non-last instances)
-                # - partial flush: only the gids that fired (reached last instance)
                 gids_to_anchor = all_line_gids if complete_flush else fired_gids
                 for gid in gids_to_anchor:
                     grid_line_row_anchor[gid] = True
