@@ -108,11 +108,17 @@ def _pre_filter_lines(lines_df: pd.DataFrame) -> pd.DataFrame:
         for substring in forbidden_substrings:
             keep &= ~text_lower.str.contains(re.escape(substring), na=False)
 
-    # (5) minimum 3 characters
+    # (5) minimum 3 characters — exempt named headings (non-blank hierarchy_marker)
+    # so that short markers like "I." are not stripped before the subtitle merge runs
+    has_named_marker = (
+        df["hierarchy_marker"].astype("string").str.strip().str.len() > 0
+        if "hierarchy_marker" in df.columns
+        else pd.Series(False, index=df.index)
+    )
     if "char_count" in df.columns:
-        keep &= _to_float_series(df["char_count"], default=0.0) >= 3
+        keep &= (_to_float_series(df["char_count"], default=0.0) >= 3) | has_named_marker
     else:
-        keep &= text.str.strip().str.len() >= 3
+        keep &= (text.str.strip().str.len() >= 3) | has_named_marker
 
     return df.loc[keep].copy()
 

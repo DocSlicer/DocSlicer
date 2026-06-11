@@ -1833,6 +1833,31 @@ def _propagate_page_labels_upward(df: pd.DataFrame) -> pd.DataFrame:
     return out.sort_index()
 
 
+def _passes_hr_quality_gate(hr_count: int, doc_char_len: int) -> bool:
+    """
+    Return False if the number of HR page breaks is too sparse for the document size.
+
+    Uses the same scaling formula as ``_passes_global_quality_gate``:
+
+        minimum_breaks = floor(doc_char_len * 0.90 / 5000)
+
+    For a 500 000-char document this yields 90; a single accidental HR would be
+    rejected.  The minimum is 0 for documents shorter than ~5 556 chars, so very
+    short files are never penalised.
+
+    Args:
+        hr_count: Number of qualifying HR page-break rows detected.
+        doc_char_len: Total character length of the document text.
+
+    Returns:
+        True if HR-based pagination should be applied, False if it should be skipped.
+    """
+    minimum_breaks = int(doc_char_len * 0.90) // 5000
+    if minimum_breaks > 0 and hr_count < minimum_breaks:
+        return False
+    return True
+
+
 def _infer_page_numbers_from_hr(df: pd.DataFrame) -> pd.DataFrame:
     """
     Infer page numbers from full-width HR markers when no page labels exist.
@@ -1841,6 +1866,11 @@ def _infer_page_numbers_from_hr(df: pd.DataFrame) -> pd.DataFrame:
     (default 80) is treated as a page-break separator.  The HR row itself stays on
     page N; the following row starts page N+1.
 
+    A quality gate rejects inference when the HR count is too sparse relative to the
+    document size (same scaling formula as the label-based quality gate).  This
+    prevents a single accidental HR in a large document from splitting it into two
+    spurious pages.
+
     This is the fallback strategy for filings such as 8-Ks that use SEC-style
     horizontal rules to divide pages but carry no numeric page labels.
 
@@ -1848,7 +1878,8 @@ def _infer_page_numbers_from_hr(df: pd.DataFrame) -> pd.DataFrame:
         df: DataFrame sorted by ``box_id``, must contain a ``text`` column.
 
     Returns:
-        DataFrame with ``page_number`` set to inferred values (starting at 1).
+        DataFrame with ``page_number`` set to inferred values (starting at 1),
+        or the original DataFrame unchanged if the quality gate rejects inference.
     """
     if "text" not in df.columns:
         return df
@@ -1866,6 +1897,12 @@ def _infer_page_numbers_from_hr(df: pd.DataFrame) -> pd.DataFrame:
 
     # A row triggers a page break if its HR width meets the threshold.
     is_page_break = hr_pct >= HR_PAGE_BREAK_MIN_PCT
+
+    # Quality gate: reject if HR breaks are too sparse for the document size.
+    hr_count = int(is_page_break.sum())
+    doc_char_len = int(out["text"].fillna("").astype(str).str.len().sum())
+    if not _passes_hr_quality_gate(hr_count, doc_char_len):
+        return df
 
     # Shift forward by one so the HR itself stays on page N and the next
     # row begins page N+1.  fill_value=False keeps the first row on page 1.

@@ -11,14 +11,19 @@ result = docslicer.parse_document("annual_report.pdf")
 
 # Inspect the outline first
 result.hierarchy.to_outline()
-# - Executive Summary
-# - Risk Factors
-#   - Market Risk
-#   - Credit Risk
-#   - Liquidity Risk
-# - Financial Statements
-#   - Consolidated Balance Sheet
-#   - Notes to Financial Statements
+# - PART I — FINANCIAL INFORMATION
+#   - Item 1. Financial Statements
+#     - Notes to Condensed Consolidated Financial Statements
+#       - Note 4 – Financial Instruments
+#         - Derivative Instruments and Hedging
+#           - Foreign Exchange Rate Risk
+#           - Interest Rate Risk
+#         - Accounts Receivable
+#           - Trade Receivables
+#   - Item 2. Management's Discussion and Analysis
+#     - Liquidity and Capital Resources
+# - PART II — OTHER INFORMATION
+#   ...
 
 # Pull only the chunks you need
 risk_section = result.find_heading("Risk Factors")[0]
@@ -28,6 +33,24 @@ chunks = result.chunks_under(risk_section)
 for table in result.tables_under(risk_section):
     print(table.markdown)
 ```
+
+---
+
+## Features
+
+- **No LLM, VLM, or ML models** — fully deterministic; no model weights to download, no GPU required, no cold-start delay
+- **Lightweight** — ~1.5 MB wheel with no heavy ML dependencies
+- **Deep hierarchy extraction** — works for both numbered (`1.`, `1.2.`, `1.2.3`) and free-form headings; uses font size, bold weight, and document structure — not inference; handles re-entry after exhibit breaks and repeated navigation headings across pages
+- **Structure-aware chunking** — splits at heading and paragraph boundaries, preserving semantic coherence
+- **Zero character overlap** — chunks are non-overlapping by default; no duplicated tokens in your context window
+- **Agentic-friendly** — reduces token spend on long documents: have the agent inspect the outline first, then pull only the relevant chunks into context instead of feeding a 500-page document verbatim; well-suited for legal texts, technical SOPs, financial filings, and compliance documents
+- **Unified result object** — `chunks`, `blocks`, `tables`, `metadata`, and `hierarchy` in one place
+- **Structured tables** — tables come back as cells, not flat text; export as Markdown, JSONL, or melted format
+- **Multiple export formats** — CSV, Markdown, JSONL, Parquet, JSON, plain text, and DataFrames
+- **Reading order preserved** — including multi-column PDF layouts
+- **Supports `pdf`, `docx`, `pptx`, and `html`** — including JS-rendered pages via Playwright
+- **Robust URL fetching** — always renders pages in a real browser, handling cookie banners and bot protection out of the box; also preserves styling signals like boldness that raw HTML omits, producing sharper heading detection and chunk quality
+- **OCR fallback** — auto-detects scanned pages and falls back to Tesseract when the extra is installed
 
 ---
 
@@ -53,7 +76,7 @@ pip install 'docslicer[parquet]' # Parquet export support
 
 ---
 
-## What you get back
+## What you get back (ParseResult)
 
 `parse_document` returns a `ParseResult`:
 
@@ -69,7 +92,7 @@ Each `Chunk` carries:
 
 ```python
 chunk.text          # str   — chunk text
-chunk.path          # list  — ["## Risk Factors", "### Market Risk"]
+chunk.path          # list  — full heading breadcrumb from root to nearest heading
 chunk.heading       # str   — nearest heading above this chunk
 chunk.section       # str   — body | toc | exhibit | header | footer | coverpage | …
 chunk.page_number   # int   — 1-based physical page
@@ -78,6 +101,21 @@ chunk.table_ids     # list  — IDs of tables referenced in this chunk
 chunk.link_url      # list  — URLs found in this chunk
 chunk.bbox          # BBox  — bounding box (PDF only)
 ```
+
+Every chunk carries its full heading breadcrumb, no matter how deeply nested. For example, a paragraph six levels deep in a financial filing:
+
+```python
+chunk.path == [
+    "# PART I — FINANCIAL INFORMATION",
+    "## Item 1. Financial Statements",
+    "### Notes to Condensed Consolidated Financial Statements (Unaudited)",
+    "#### Note 4 – Financial Instruments",
+    "##### Accounts Receivable",
+    "###### Trade Receivables",
+]
+```
+
+This lets downstream code filter or group chunks by any level of the hierarchy without re-parsing the document.
 
 ---
 
@@ -94,9 +132,7 @@ Not supported: `.doc`, `.ppt` (legacy Office formats), `.xlsx`.
 
 ---
 
-## Usage
-
-### Parse a document
+## Parsing
 
 `parse_document` auto-detects the format from the file extension or magic bytes. Pass a file path, URL, raw `bytes`, or a file-like object:
 
@@ -118,8 +154,26 @@ result = docslicer.parse_document(
     chunking=False,               # skip chunking, return blocks only (faster)
     merge_small_chunks=True,      # merge chunks below min_chunk_size (default True)
     table_representation="jsonl", # "markdown" (default) | "jsonl" | "melted"
+    extra_fields=["is_bold", "font_size", "font_name"],  # surface internal pipeline columns on each chunk/block via .extra
 )
 ```
+
+### How merge_small_chunks works
+
+Because DocSlicer is structure-aware, it initially produces one chunk per heading or paragraph boundary. For documents with many short sections this can yield a lot of small chunks. With `merge_small_chunks=True` (the default), sibling sections under the same parent heading are merged together until they reach `min_chunk_size` — but never across heading boundaries into a different parent.
+
+For example, these five short sections all fall under `## Products and Services Performance`:
+
+```
+### Mac          → "Mac net sales decreased …"            (~120 chars)
+### iPad         → "iPad net sales increased …"           (~180 chars)
+### Wearables    → "Wearables net sales decreased …"      (~130 chars)
+### Services     → "Services net sales increased …"       (~160 chars)
+```
+
+Instead of four tiny chunks, they get merged into one coherent chunk that still carries the correct `path` for each paragraph. Set `merge_small_chunks=False` if you need one chunk per section regardless of size.
+
+---
 
 ### Table representation formats
 
@@ -161,21 +215,78 @@ when chunks are fed into structured extraction or tool-use pipelines:
 …
 ```
 
-### Navigate by heading
+### Batch processing
 
 ```python
-# Find a heading
-nodes = result.find_heading("Financial Statements")
-node = nodes[0]
+for path, result in docslicer.parse_all("documents/", recursive=True):
+    if isinstance(result, Exception):
+        print(f"Failed {path}: {result}")
+    else:
+        print(f"{path}: {len(result.chunks)} chunks")
+```
 
-# Retrieve content under it (recursive by default)
-chunks = result.chunks_under(node)
-blocks = result.blocks_under(node)
-tables = result.tables_under(node)
+### Reuse config across documents
 
-# Walk the outline
+```python
+from docslicer import DocumentParser, ParseConfig
+
+parser = DocumentParser(ParseConfig(max_chunk_size=1500, optimal_chunk_size=600))
+
+for path in paths:
+    result = parser.parse(path)
+```
+
+---
+
+## Navigating the hierarchy
+
+Most chunking libraries give you a flat list of text segments. DocSlicer also gives you a navigable tree of the document's heading structure, extracted deterministically from the document itself.
+
+This is particularly useful for agents and retrieval pipelines working with long documents: rather than feeding the entire document into context, the agent can inspect the outline first to understand the structure, decide which sections are relevant, and then pull only those chunks — keeping token usage proportional to the task.
+
+### Inspect the outline
+
+```python
+# Print the full heading tree
+result.hierarchy.to_outline()
+
+# Walk all top-level sections and see how much content each contains
 for node in result.hierarchy.level(1):
     print(node.text, "→", len(result.chunks_under(node)), "chunks")
+```
+
+### Drill into a section
+
+`.level(n)` returns all headings at depth `n`. Pass a `parent` to scope it to a
+specific subtree — the typical pattern for an agent navigating a long document:
+
+```python
+# All top-level headings
+l1 = result.hierarchy.level(1)
+
+# Pick one, then list its subsections
+section = result.find_heading("Financial Statements")[0]
+for node in result.hierarchy.level(2, parent=section):
+    print(node.text, f"(p.{node.page_number})")
+
+# Drill one level deeper
+subsection = result.hierarchy.level(2, parent=section)[0]
+for node in result.hierarchy.level(3, parent=subsection):
+    print(node.text)
+```
+
+### Retrieve content under a heading
+
+`find_heading` matches any node whose text contains the search term (case-insensitive).
+All retrieval methods recurse into subsections by default.
+
+```python
+node = result.find_heading("Financial Instruments")[0]
+
+chunks = result.chunks_under(node)              # text chunks, ready for embedding or prompting
+chunks = result.chunks_under(node, recursive=False)  # direct heading only, no subsections
+tables = result.tables_under(node)              # structured tables in this section
+blocks = result.blocks_under(node)              # raw paragraph/heading blocks
 ```
 
 ### Navigate by page
@@ -187,17 +298,9 @@ result.blocks_by_page(14)
 result.tables_by_page(14)
 ```
 
-### Batch processing
+---
 
-```python
-for path, result in docslicer.parse_all("documents/", recursive=True):
-    if isinstance(result, Exception):
-        print(f"Failed {path}: {result}")
-    else:
-        print(f"{path}: {len(result.chunks)} chunks")
-```
-
-### Export
+## Export
 
 ```python
 # Save everything
@@ -217,23 +320,18 @@ txt = result.export_to_text()
 df = result.chunks_df()
 ```
 
-### Reuse config across documents
-
-```python
-from docslicer import DocumentParser, ParseConfig
-
-parser = DocumentParser(ParseConfig(max_chunk_size=1500, optimal_chunk_size=600))
-
-for path in paths:
-    result = parser.parse(path)
-```
-
 ### Debug mode
 
 ```python
 result = docslicer.parse_document("report.pdf", debug=True)
-result.save_debug("debug_steps/")
-# → one CSV per pipeline step, showing intermediate DataFrames
+
+# result.pipeline_steps is an ordered dict of step name → DataFrame
+for name, df in result.pipeline_steps.items():
+    print(name, df.shape)
+    df.to_csv(f"debug/{name}.csv", index=False)
+
+# PDF steps:  words → shapes → cells → lines → table_cells → blocks → chunks
+# DOCX steps: runs → paragraphs → lines → table_cells → blocks → chunks
 ```
 
 ---
@@ -249,19 +347,6 @@ pip install 'docslicer[ocr]'
 # Linux:  apt install tesseract-ocr
 # macOS:  brew install tesseract
 ```
-
----
-
-## How chunking works
-
-DocSlicer chunks at heading and paragraph boundaries — never in the middle of a
-sentence, never with character overlap. Each chunk tracks its full heading path
-(`chunk.path`) so downstream retrieval can filter by section without re-parsing.
-
-Heading hierarchy is extracted deterministically from font size, bold weight,
-numbering patterns, and document structure — not from LLM inference. The algorithm
-handles nested numbered sections (`1.`, `1.2.`, `1.2.3`), re-entry after exhibit
-breaks, and repeated navigation headings across pages.
 
 ---
 
@@ -281,4 +366,4 @@ docslicer.parse_html("filing.html")
 
 ## License
 
-MIT
+Apache 2.0

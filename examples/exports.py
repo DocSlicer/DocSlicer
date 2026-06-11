@@ -58,6 +58,14 @@ print(f"Saved plain text   → {OUTPUT / 'result.txt'}")
 result.export_tables_csv(OUTPUT / "tables.csv", encoding="utf-8-sig")
 print(f"Saved tables       → {OUTPUT / 'tables.csv'}  (Excel-friendly UTF-8 BOM)")
 
+# ── Table of contents ─────────────────────────────────────────────────────────
+# Renders the raw TOC blocks from the document (toc_heading + toc block types).
+# Returns an empty string when no TOC was detected.
+
+toc = result.export_toc()
+(OUTPUT / "toc.md").write_text(toc, encoding="utf-8")
+print(f"Saved TOC          → {OUTPUT / 'toc.md'}")
+
 # ── Hierarchy ─────────────────────────────────────────────────────────────────
 
 result.hierarchy.save(OUTPUT / "hierarchy.json")

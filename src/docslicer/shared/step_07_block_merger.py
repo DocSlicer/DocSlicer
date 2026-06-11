@@ -48,11 +48,12 @@ def _assign_block_ids(df: pd.DataFrame) -> pd.DataFrame:
     
     Block splitting strategy:
       1. ALWAYS split when:
-         - block_type changes
+         - block_type changes (unless both rows share the same non-null heading_id)
          - layout_id changes
          - page_number changes (safety)
          - col_start changes (text_multicol only - each column becomes separate block)
          - heading_id changes (for consecutive heading lines - different headings become separate blocks)
+         NOTE: rows sharing the same heading_id are never split by block_type or style changes.
       
       2. CONDITIONALLY split for paragraph blocks in text layouts:
          a) Style property changes WITHIN same layout_id:
@@ -203,14 +204,23 @@ def _assign_block_ids(df: pd.DataFrame) -> pd.DataFrame:
             df["heading_id"].ne(prev_heading_id)
         )
     
+    # Rows that share the same non-null heading_id must stay in the same block —
+    # suppress block_type and style splits for them (page/layout boundaries still apply)
+    same_heading_group = pd.Series(False, index=df.index)
+    if "heading_id" in df.columns:
+        prev_heading_id_gen = df["heading_id"].shift(1)
+        hid_notna = df["heading_id"].notna() & prev_heading_id_gen.notna()
+        same_heading_group = hid_notna & df["heading_id"].eq(prev_heading_id_gen)
+
     is_new_block = (
-        df["block_type"].ne(prev_block_type) |  # Role change
+        (df["block_type"].ne(prev_block_type) |  # Role change
         df["layout_id"].ne(prev_layout) |        # Layout change
         df["page_number"].ne(prev_page) |        # Page change
         col_start_change |                        # Column change (text_multicol only)
         indent_increase |                         # Indentation increase (conditional)
         style_change |                            # Style property change (within same layout)
-        heading_id_change                         # Heading ID change (consecutive headings only)
+        heading_id_change)                        # Heading ID change (consecutive headings only)
+        & ~same_heading_group                     # Never split rows that share the same heading_id
     )
     
     # First line always starts a new block

@@ -32,6 +32,10 @@ hierarchy_rules:
     patterns:
       - regex: '^\s*(?:Section|SECTION)\s+'
 
+  - hierarchy_type: subsection     # Example: "Subsection 1 Supply of services by intermediaries"
+    patterns:
+      - regex: '^\s*(?:Subsection|SUBSECTION)\s+'
+
   - hierarchy_type: proposal     # Example: "PROPOSAL 3: ADJOURNMENT OF THE SPECIAL MEETING"
     patterns:
       - regex: '^\s*(?:Proposal|PROPOSAL)\s+'
@@ -65,6 +69,10 @@ hierarchy_rules:
   - hierarchy_type: chapter               # Example: "CHAPTER 3"
     patterns:
       - regex: '^\s*(?:Chapter|CHAPTER)\s+'
+  
+  - hierarchy_type: subchapter     # Example: "Subchapter B — Offerings"
+    patterns:
+      - regex: '^\s*(?:Subchapter|SUBCHAPTER)\s+'
 
   - hierarchy_type: amendment     # Example: "Amendment No. 5"
     patterns:
@@ -169,14 +177,15 @@ hierarchy_rules:
   - hierarchy_type: numbered_heading        # Example: "10.2 Revenue", "1. Introduction", "1 - Introduction" -- excludes years like 1920, 2020, etc.
     patterns:
       #- regex: '^(?!\s*(19|20)\d{2}\b)\s*\d+(?:\.\d+)*\.?'
-      - regex: '^(?!\s*(19|20)\d{2}\b)\s*\d+(?:\.\d+)*(?:\.(?=\s+["\u201C\u2018\[<]?(?-i:[A-Z]))|(?=\s+["\u201C\u2018\[<]?(?-i:[A-Z]))|(?=\s+[-\u2013\u2014]\s+["\u201C\u2018\[<]?(?-i:[A-Z])))' # stricter version with lookahead, either followed by a dot, dash separator, or capital letter, optionally preceded by an opening quote, bracket, or angle bracket
+      - regex: '^(?!\s*(19|20)\d{2}\b)\s*\d+(?:\.\d+)*(?:\.(?=\s+["\u201C\u2018\[<]?(?-i:[A-Z0-9]))|(?=\s+["\u201C\u2018\[<]?(?-i:[A-Z0-9]))|(?=\s+[-\u2013\u2014]\s+["\u201C\u2018\[<]?(?-i:[A-Z0-9])))' # stricter version with lookahead, either followed by a dot, dash separator, or capital letter, optionally preceded by an opening quote, bracket, or angle bracket
         flags: 'i'
 
   - hierarchy_type: roman_numbered_heading         # Example: "II. Background", "II - Background"
     patterns:
       #- regex: '^\s*[ivxlcdm]+\.'
-      - regex: '^\s*[ivxlcdm]+(?:\.(?=\s+(?-i:[A-Z]))|(?=\s+(?-i:[A-Z]))|(?=\s+[-\u2013\u2014]\s+(?-i:[A-Z])))'
+      - regex: '^\s*[ivxlcdm]+(?:\.(?=\s+(?-i:[A-Z0-9]))|(?=\s+(?-i:[A-Z0-9]))|(?=\s+[-\u2013\u2014]\s+(?-i:[A-Z0-9])))'
         flags: 'i'
+      - regex: '^\s*(?-i:(?=[IVXLC])(?:C|XC|XL|L?X{0,3})(?:IX|IV|V?I{0,3}))\.?\s*$'  # standalone validated roman numeral I–C on its own line, e.g. "I." or "XIV."
 
   # =========================
   # Alpha headings
@@ -190,9 +199,10 @@ hierarchy_rules:
 
   - hierarchy_type: alpha_numbered_heading         # Example: "A1. Tasks", "A1 Tasks", "A1 - Tasks" - Excludes Q1 to Q4
     patterns:
-      - regex: '^\s*(?![Qq][1-4]\b)[A-Za-z]\.?\d+(?:\.\d+)*\.?(?:\.(?=\s+(?-i:[A-Z]))|(?=\s+(?-i:[A-Z]))|(?=\s+[-\u2013\u2014]\s+(?-i:[A-Z])))'
+      - regex: '^\s*(?![Qq][1-4]\b)[A-Za-z]\.?\d+(?:\.\d+)*\.?(?:\.(?=\s+(?-i:[A-Z0-9]))|(?=\s+(?-i:[A-Z0-9]))|(?=\s+[-\u2013\u2014]\s+(?-i:[A-Z0-9])))'
         flags: 'i'
 
   - hierarchy_type: alpha_heading                  # Example: "A Additional", "A. Additional", "A - Additional"
     patterns:
-      - regex: '^\s*(?-i:[A-Z])\.?(?:(?=\s+(?-i:[A-Z]))|(?=\s+[-\u2013\u2014]\s+(?-i:[A-Z])))'
+      - regex: '^\s*(?-i:[A-Z])\.?(?:(?=\s+(?-i:[A-Z0-9]))|(?=\s+[-\u2013\u2014]\s+(?-i:[A-Z0-9])))'
+      - regex: '^\s*[A-Za-z]\.\s*$'  # standalone letter+dot on its own line, e.g. "A." or "b."

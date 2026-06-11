@@ -168,6 +168,8 @@ def _assign_heading_id(df: pd.DataFrame) -> pd.DataFrame:
                  if "text" in out.columns else None)
     ht_vals = (out.loc[heading_idx, "heading_type"].astype("string").fillna("").values
                if "heading_type" in out.columns else None)
+    hm_vals = (out.loc[heading_idx, "hierarchy_marker"].astype("string").fillna("").values
+               if "hierarchy_marker" in out.columns else None)
 
     idx_list = list(heading_idx)
     next_id = 1
@@ -194,7 +196,14 @@ def _assign_heading_id(df: pd.DataFrame) -> pd.DataFrame:
                         pfx_i_str = pfx_i.group(0).strip() if pfx_i else ""
                         if pfx_i_str != pfx_j.group(0).strip():
                             diff_numbered_prefix = True
-            if same_fp and consecutive and not diff_numbered_prefix:
+            # Named heading followed by a blank-marker subtitle on the next line
+            named_heading_subtitle = (
+                hm_vals is not None
+                and consecutive
+                and str(hm_vals[j - 1]).strip() != ""
+                and str(hm_vals[j]).strip() == ""
+            )
+            if (same_fp and consecutive and not diff_numbered_prefix) or named_heading_subtitle:
                 out.at[idx_list[j], "heading_id"] = cur_id
                 j += 1
             else:

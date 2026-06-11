@@ -494,18 +494,16 @@ class ParseResult:
         self,
         include_page_markers: bool = True,
         include_tables: bool = True,
-        include_headers_footers: bool = False,
-        include_toc: bool = False,
-        prettify: bool = False,
+        include_toc: bool = True,
+        include_furniture: bool = True,
+        prettify: bool = True,
     ) -> str:
         """Render the document as Markdown using blocks as the source of truth."""
         _HEADING_ROLES = {
             "heading", "toc_heading", "exhibit_heading", "hybrid_heading_paragraph",
         }
-        _SKIP_ROLES = {"navigation", "suppressed_repeated_heading"}
+        _FURNITURE_ROLES = {"navigation", "suppressed_repeated_heading", "page_label"}
         excluded_sections: set[str] = set()
-        if not include_headers_footers:
-            excluded_sections |= {"header", "footer"}
         if not include_toc:
             excluded_sections.add("toc")
 
@@ -521,7 +519,7 @@ class ParseResult:
         for block in self.blocks:
             if block.section in excluded_sections:
                 continue
-            if block.type in _SKIP_ROLES:
+            if not include_furniture and block.type in _FURNITURE_ROLES:
                 continue
 
             text = block.text.strip()
@@ -548,17 +546,15 @@ class ParseResult:
     def export_to_text(
         self,
         include_tables: bool = True,
-        include_headers_footers: bool = False,
         include_toc: bool = False,
+        include_furniture: bool = True,
     ) -> str:
         """Render the document as plain text (no Markdown formatting)."""
         _HEADING_ROLES = {
             "heading", "toc_heading", "exhibit_heading", "hybrid_heading_paragraph",
         }
-        _SKIP_ROLES = {"navigation", "suppressed_repeated_heading"}
+        _FURNITURE_ROLES = {"navigation", "suppressed_repeated_heading", "page_label"}
         excluded_sections: set[str] = set()
-        if not include_headers_footers:
-            excluded_sections |= {"header", "footer"}
         if not include_toc:
             excluded_sections.add("toc")
 
@@ -569,7 +565,7 @@ class ParseResult:
         for block in self.blocks:
             if block.section in excluded_sections:
                 continue
-            if block.type in _SKIP_ROLES:
+            if not include_furniture and block.type in _FURNITURE_ROLES:
                 continue
 
             text = block.text.strip()
@@ -584,6 +580,24 @@ class ParseResult:
             elif text:
                 parts.append(text)
 
+        return "\n\n".join(parts)
+
+    def export_toc(self) -> str:
+        """Return the document's table of contents as a Markdown string.
+
+        Renders blocks with type ``toc_heading`` or ``toc`` in document order.
+        Returns an empty string when no TOC was detected.
+        """
+        parts: list[str] = []
+        for block in self.blocks:
+            if block.type == "toc_heading":
+                text = block.text.strip()
+                if text:
+                    parts.append(f"# {text}")
+            elif block.type == "toc":
+                text = block.text.strip()
+                if text:
+                    parts.append(text)
         return "\n\n".join(parts)
 
     def export_tables_csv(self, path: str | Path, encoding: str = "utf-8") -> None:
