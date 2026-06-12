@@ -502,7 +502,7 @@ class ParseResult:
         _HEADING_ROLES = {
             "heading", "toc_heading", "exhibit_heading", "hybrid_heading_paragraph",
         }
-        _FURNITURE_ROLES = {"navigation", "suppressed_repeated_heading", "page_label"}
+        _FURNITURE_ROLES = {"navigation", "suppressed_repeated_heading", "page_label", "vertical_text"}
         excluded_sections: set[str] = set()
         if not include_toc:
             excluded_sections.add("toc")
@@ -553,7 +553,7 @@ class ParseResult:
         _HEADING_ROLES = {
             "heading", "toc_heading", "exhibit_heading", "hybrid_heading_paragraph",
         }
-        _FURNITURE_ROLES = {"navigation", "suppressed_repeated_heading", "page_label"}
+        _FURNITURE_ROLES = {"navigation", "suppressed_repeated_heading", "page_label", "vertical_text"}
         excluded_sections: set[str] = set()
         if not include_toc:
             excluded_sections.add("toc")

@@ -1275,8 +1275,10 @@ def detect_and_annotate_gutters(df_words: pd.DataFrame, df_shapes: pd.DataFrame)
         if df_words.empty:
             return _empty
 
-    # Filter to only LTR (left-to-right) text orientation
-    df_words = df_words[df_words["text_orientation"] == "LTR"].copy()
+    # Run gutter detection on LTR words only; non-LTR words are merged back at the end
+    ltr_mask = df_words["text_orientation"] == "LTR"
+    df_non_ltr = df_words[~ltr_mask].copy()
+    df_words = df_words[ltr_mask].copy()
     if df_words.empty:
         return _empty
 
@@ -1309,5 +1311,7 @@ def detect_and_annotate_gutters(df_words: pd.DataFrame, df_shapes: pd.DataFrame)
 
     # 10) Merge gutters onto words
     df_words = merge_gutters_onto_words(df_words, df_gutters)
+
+    df_words = pd.concat([df_words, df_non_ltr])
 
     return df_words, df_gutter_candidates, df_gutters

@@ -31,7 +31,7 @@ import pandas as pd
 # Pre-filter forbidden heading line formats (text that will never be a heading)
 # ================================================================================
 
-_FORBIDDEN_BLOCK_TYPES = {"table", "image", "hr", "page_label", "navigation", "toc", "exhibits", "speaker_notes", "shape", "chart"}
+_FORBIDDEN_BLOCK_TYPES = {"table", "image", "hr", "page_label", "navigation", "toc", "exhibits", "speaker_notes", "shape", "chart", "vertical_text"}
 
 _FORBIDDEN_SUBSTRINGS = {
     # signature indicators

@@ -26,7 +26,7 @@ _DEFAULT_MAX_CHUNK_CHARS = 3200       # Only split if active_heading_id content 
 _DEFAULT_OPTIMAL_CHUNK_CHARS = 1600   # Used to split when content exceeds this
 _DEFAULT_SOFTMIN_CHUNK_CHARS = 700    # Chunks below this size become undesirable
 _DEFAULT_MIN_CHUNK_CHARS = 400        # Min boundary for chunking
-_DEFAULT_OVERLAP_CHUNK_CHARS = 200    # Overlap between chunks if splitting is necessary
+#_DEFAULT_OVERLAP_CHUNK_CHARS = 200    # Overlap between chunks if splitting is necessary
 
 # Bounds for chunking parameters (validation limits)
 _MAX_CHUNK_CHARS_MIN = 800
@@ -49,7 +49,7 @@ _MIN_CHUNK_CHARS_MAX = 1000
 _DP_MAX_BLOCKS = 100
 
 # Block roles that should be removed from chunk content
-_NOISE_BLOCK_TYPES= {"hr", "page_label", "image", "suppressed_repeated_heading", "navigation"}
+_NOISE_BLOCK_TYPES= {"hr", "page_label", "image", "suppressed_repeated_heading", "navigation", "vertical_text"}
 
 # Block roles that should be treated as headings (for chunk_heading)
 _HEADING_BLOCK_TYPES = {"heading", "toc_heading", "exhibit_heading", "hybrid_heading_paragraph"}

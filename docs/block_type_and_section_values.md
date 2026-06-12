@@ -19,6 +19,10 @@ Classification of a block's content role. Set progressively through the shared p
 | `hybrid_heading_paragraph` | `shared/step_05_heading_detector` | Heading that also contains body text inline |
 | `suppressed_repeated_heading` | `shared/step_05_heading_detector` | Heading suppressed because it repeats across pages |
 | `paragraph` | `shared/step_05_heading_detector` | Default body text (fallback when no other type matches) |
+| `vertical_text` | `pdf/step_08_cell_builder` | Text with BTT or TTB orientation (e.g. rotated sidebar labels, spine text) |
+| `chart` | `pptx/step_05_paragraph_builder` | PPTX chart object (data points, axis labels, legends) |
+| `shape` | `pptx/step_05_paragraph_builder` | PPTX non-text shape with associated text content |
+| `speaker_notes` | `pptx/step_05_paragraph_builder` | PPTX speaker notes attached to a slide |
 | `watermark` | _(reserved)_ | Watermark / background text overlay |
 | `signature_block` | _(reserved)_ | Signature block at end of legal document |
 

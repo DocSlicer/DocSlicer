@@ -23,7 +23,7 @@ import pandas as pd
 
 from .._utils.line_merger import assign_line_id
 from .._utils.hierarchical_aggregator import aggregate_hierarchical, build_standard_agg_spec
-from .._utils.text_utils import is_bullet_token
+from .._utils.text_utils import _BULLET_TOKENS, is_bullet_token
 
 
 # ================================================================================
@@ -372,13 +372,13 @@ def _compute_line_classifications(
 
     # --- Per-word flags ---
     bullet_flags = (
-        np.frompyfunc(is_bullet_token, 1, 1)(stripped.to_numpy()).astype(bool)
+        stripped.isin(_BULLET_TOKENS).to_numpy()
         if _BULLET_MERGE_ENABLED else
         np.zeros(len(text_arr), dtype=bool)
     )
     dollar_flags    = (stripped == "$").to_numpy()
-    numeric_flags   = np.frompyfunc(_is_numeric_like, 1, 1)(stripped.to_numpy()).astype(bool)
-    has_digit_flags = np.array([any(c.isdigit() for c in t) for t in stripped], dtype=bool)
+    numeric_flags   = stripped.str.fullmatch(r'[\d,.() \-\+%—–]+', na=False).to_numpy()
+    has_digit_flags = stripped.str.contains(r'\d', na=False).to_numpy()
     is_stopword_arr = t_norm.isin(_STOPWORDS).to_numpy()
 
     if "alpha_count" in df.columns:
@@ -441,7 +441,7 @@ def _compute_line_classifications(
     )
 
 
-def _assign_cell_ids(df: pd.DataFrame) -> pd.DataFrame:
+def _assign_cell_ids(df: pd.DataFrame, skip_classification: bool = False) -> pd.DataFrame:
     """
     Assign a global cell_id to every word based on horizontal gaps within each line_id.
 
@@ -450,6 +450,9 @@ def _assign_cell_ids(df: pd.DataFrame) -> pd.DataFrame:
       - table-like     → font-interpolated threshold × _TABLE_THRESHOLD_FACTOR (tighter, avoids merging cells)
       - default        → font-interpolated threshold
     Bullet and dollar-sign tokens have their own gap overrides regardless of line type.
+
+    skip_classification: skip _compute_line_classifications and use default thresholds for
+    all lines. Used for vertical text where sentence/table scoring is meaningless.
     """
     if df.empty:
         df = df.copy()
@@ -471,11 +474,21 @@ def _assign_cell_ids(df: pd.DataFrame) -> pd.DataFrame:
     font_size_arr = df["font_size"].to_numpy(dtype=float)
     text_arr      = df["text"].astype(str).to_numpy()
 
-    (
-        is_sentence_map, score_map,
-        is_table_like_map, table_score_map,
-        bullet_flags, dollar_flags, numeric_flags,
-    ) = _compute_line_classifications(df, line_arr, x_left_arr, x_right_arr, text_arr)
+    if skip_classification:
+        n = len(df)
+        is_sentence_map:   dict = {}
+        score_map:         dict = {}
+        is_table_like_map: dict = {}
+        table_score_map:   dict = {}
+        bullet_flags  = np.zeros(n, dtype=bool)
+        dollar_flags  = np.zeros(n, dtype=bool)
+        numeric_flags = np.zeros(n, dtype=bool)
+    else:
+        (
+            is_sentence_map, score_map,
+            is_table_like_map, table_score_map,
+            bullet_flags, dollar_flags, numeric_flags,
+        ) = _compute_line_classifications(df, line_arr, x_left_arr, x_right_arr, text_arr)
 
     # ---- Main loop: pure array lookups, no pandas calls inside ----
     n = len(df)
@@ -1004,6 +1017,101 @@ def _assign_cell_underlines(
 
 
 # ================================================================================
+# VERTICAL TEXT PROCESSING
+# ================================================================================
+
+def _process_vertical_words(
+    df_vert: pd.DataFrame,
+    cell_id_offset: int,
+    line_id_offset: int,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Build cells from vertical (TTB/BTT) words using a coordinate-swap trick.
+
+    Words sharing the same x-band (a column of rotated text) become a "line".
+    Words close in y within that line merge into the same cell.
+
+    Implementation: swap x↔y so assign_line_id groups by x-proximity and
+    _assign_cell_ids merges by y-gaps — then swap back before aggregation.
+    All IDs are offset so they sort after every LTR cell/line on the page.
+
+    Returns (df_vert_cells, df_vert_words_with_ids).
+    """
+    if df_vert.empty:
+        return pd.DataFrame(), df_vert.copy()
+
+    df = df_vert.copy()
+
+    # --- Coord swap: x↔y ---
+    orig_xl = df["x_left"].to_numpy(dtype=float)
+    orig_xr = df["x_right"].to_numpy(dtype=float)
+    orig_yt = df["y_top"].to_numpy(dtype=float)
+    orig_yb = df["y_bottom"].to_numpy(dtype=float)
+
+    df["y_top"]    = orig_xl
+    df["y_bottom"] = orig_xr
+    df["x_left"]   = orig_yt
+    df["x_right"]  = orig_yb
+    if "width"  in df.columns:
+        df["width"]  = orig_yb - orig_yt
+    if "height" in df.columns:
+        df["height"] = orig_xr - orig_xl
+
+    # BTT: reading order is bottom→top (descending original y_top).
+    # After swap, original y_top is now x_left. Negate x so the ascending
+    # sort in _assign_cell_ids produces the correct bottom→top word order.
+    #
+    # Save the pre-negation x values as row-attached columns so they survive
+    # the sort+reset_index inside _assign_cell_ids; restore from them directly
+    # instead of trying to undo the negation after sorting.
+    df["_x_left_pre_neg"] = df["x_left"]
+    df["_x_right_pre_neg"] = df["x_right"]
+
+    if "text_orientation" in df.columns:
+        btt_mask = df["text_orientation"] == "BTT"
+        if btt_mask.any():
+            btt_xl = df.loc[btt_mask, "x_left"].to_numpy(dtype=float)
+            btt_xr = df.loc[btt_mask, "x_right"].to_numpy(dtype=float)
+            df.loc[btt_mask, "x_left"]  = -btt_xr
+            df.loc[btt_mask, "x_right"] = -btt_xl
+
+    # --- Run LTR pipeline in swapped coordinate space ---
+    df = df.sort_values(["page_number", "y_top", "x_left"], kind="mergesort").reset_index(drop=True)
+    df = assign_line_id(df)
+    df = _assign_cell_ids(df, skip_classification=True)
+
+    # --- Restore pre-negation x values (survives sort reorder because they're row-attached) ---
+    df["x_left"]  = df["_x_left_pre_neg"]
+    df["x_right"] = df["_x_right_pre_neg"]
+    df.drop(columns=["_x_left_pre_neg", "_x_right_pre_neg"], inplace=True)
+
+    # --- Swap back to original coordinates ---
+    cur_xl = df["x_left"].to_numpy(dtype=float)
+    cur_xr = df["x_right"].to_numpy(dtype=float)
+    cur_yt = df["y_top"].to_numpy(dtype=float)
+    cur_yb = df["y_bottom"].to_numpy(dtype=float)
+    df["x_left"]   = cur_yt
+    df["x_right"]  = cur_yb
+    df["y_top"]    = cur_xl
+    df["y_bottom"] = cur_xr
+    if "width"  in df.columns:
+        df["width"]  = cur_yb - cur_yt
+    if "height" in df.columns:
+        df["height"] = cur_xr - cur_xl
+
+    # --- Offset IDs so all vertical IDs sort after LTR IDs ---
+    df["line_id"] = df["line_id"] + line_id_offset
+    df["cell_id"] = df["cell_id"] + cell_id_offset
+
+    # --- Aggregate words → cells ---
+    df_vert_cells = _build_cells_df(df)
+
+    df_vert_cells["block_type"] = "vertical_text"
+
+    return df_vert_cells, df
+
+
+# ================================================================================
 # PUBLIC API
 # ================================================================================
 
@@ -1046,7 +1154,7 @@ def build_cells(
         df["reading_column"] = 1
     df["reading_column"] = df["reading_column"].fillna(1).astype(int)
 
-    # Separate vertical text; it bypasses cell-building
+    # Separate vertical text — processed via coord-swap pipeline after LTR cells.
     if "text_orientation" in df.columns:
         vert_mask = df["text_orientation"].isin(["TTB", "BTT"])
     else:
@@ -1055,15 +1163,53 @@ def build_cells(
     df_vert  = df[vert_mask].copy()
     df_horiz = df[~vert_mask].copy()
 
-    # --- Step 1: Sort into reading order, then assign line IDs ---
-    df_horiz = _sort_reading_order(df_horiz)
-    df_horiz = assign_line_id(df_horiz)
+    # --- Steps 1–3 + vertical: process per page so IDs are consecutive within each page.
+    # assign_line_id / _assign_cell_ids use a global counter, so we call them on
+    # one page at a time and apply a running offset to keep IDs globally unique.
+    pages = sorted(df["page_number"].unique())
+    horiz_pages: list[pd.DataFrame] = []
+    cells_pages: list[pd.DataFrame] = []
+    vert_cells_pages: list[pd.DataFrame] = []
+    vert_words_pages: list[pd.DataFrame] = []
+    running_cell = 0
+    running_line = 0
 
-    # --- Step 2: Cell ID assignment ---
-    df_horiz = _assign_cell_ids(df_horiz)
+    for page_num in pages:
+        df_h = df_horiz[df_horiz["page_number"] == page_num].copy()
+        df_v = df_vert[df_vert["page_number"] == page_num].copy()
 
-    # --- Step 3: Aggregate words → cells ---
-    df_cells = _build_cells_df(df_horiz)
+        if not df_h.empty:
+            df_h = _sort_reading_order(df_h)
+            df_h = assign_line_id(df_h)
+            df_h = _assign_cell_ids(df_h)
+            df_h["cell_id"] += running_cell
+            df_h["line_id"] += running_line
+
+        page_cell_max = int(df_h["cell_id"].max()) if not df_h.empty and "cell_id" in df_h.columns else running_cell
+        page_line_max = int(df_h["line_id"].max()) if not df_h.empty and "line_id" in df_h.columns else running_line
+
+        if not df_v.empty:
+            vc, vw = _process_vertical_words(df_v, page_cell_max, page_line_max)
+            vert_cells_pages.append(vc)
+            vert_words_pages.append(vw)
+            running_cell = int(vw["cell_id"].max()) if not vw.empty and "cell_id" in vw.columns else page_cell_max
+            running_line = int(vw["line_id"].max()) if not vw.empty and "line_id" in vw.columns else page_line_max
+        else:
+            running_cell = page_cell_max
+            running_line = page_line_max
+
+        if not df_h.empty:
+            horiz_pages.append(df_h)
+            cells_pages.append(_build_cells_df(df_h))
+
+    df_horiz = pd.concat(horiz_pages, ignore_index=True) if horiz_pages else pd.DataFrame()
+    df_cells = pd.concat(cells_pages, ignore_index=True) if cells_pages else pd.DataFrame()
+
+    if vert_cells_pages:
+        df_vert = pd.concat([w for w in vert_words_pages if not w.empty], ignore_index=True)
+        df_vert_cells_all = pd.concat([c for c in vert_cells_pages if not c.empty], ignore_index=True)
+        if not df_vert_cells_all.empty:
+            df_cells = pd.concat([df_cells, df_vert_cells_all], ignore_index=True)
 
     # Steps 4–7 mutate df_cells in-place (no intermediate copies).
 
@@ -1083,12 +1229,14 @@ def build_cells(
     if df_shapes is not None and not df_shapes.empty:
         df_cells, df_shapes = _assign_cell_underlines(df_cells, df_shapes)
 
-    # Recombine LTR + vertical words (vertical words carry no cell/line IDs)
-    # Also restore line-number words so df_words_out remains complete for debug.
+    # Recombine LTR + vertical + line-number words so df_words_out is complete for debug.
     df_words_out = (
         pd.concat([df_horiz, df_vert, df_line_numbers], ignore_index=True)
         .sort_values(["page_number", "y_top", "x_left"], kind="mergesort")
         .reset_index(drop=True)
     )
+
+    if not df_cells.empty and "cell_id" in df_cells.columns:
+        df_cells = df_cells.sort_values("cell_id", kind="mergesort").reset_index(drop=True)
 
     return df_cells, df_words_out

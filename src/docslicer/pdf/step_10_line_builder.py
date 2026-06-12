@@ -143,7 +143,16 @@ def _aggregate_cells_to_lines(df_cells: pd.DataFrame) -> pd.DataFrame:
     Flags:    True if any cell has the flag (max).
     shape_id_vertical_grid_line: union of all vertical grid-line IDs across cells.
     """
-    df = df_cells.sort_values(["line_id", "x_left", "y_top"], kind="mergesort").copy()
+    # Horizontal cells (LTR/RTL): sort by x_left so words go left→right.
+    # Vertical cells (TTB/BTT): sort by y_top so words go top→bottom.
+    # Using x_left for horizontal avoids OCR y_top jitter reordering words.
+    if "text_orientation" in df_cells.columns:
+        vert_mask = df_cells["text_orientation"].isin(["TTB", "BTT"])
+        df_h = df_cells[~vert_mask].sort_values(["line_id", "x_left", "y_top"], kind="mergesort")
+        df_v = df_cells[vert_mask].sort_values(["line_id", "y_top", "x_left"], kind="mergesort")
+        df = pd.concat([df_h, df_v]).sort_values("line_id", kind="mergesort").copy()
+    else:
+        df = df_cells.sort_values(["line_id", "x_left", "y_top"], kind="mergesort").copy()
 
     # Ensure flag columns are present (documents without links/underlines/etc).
     for col in _FLAG_COLS:
@@ -232,6 +241,13 @@ def _assign_horizontal_bands(df_lines: pd.DataFrame) -> pd.DataFrame:
     df["horizontal_band_id"] = 0
     df["page_gap_thresh"]    = 0.0
 
+    # Non-LTR lines (TTB/BTT) are excluded from gap analysis and band merging.
+    # They receive their own sequential band IDs after all LTR bands for their page.
+    if "text_orientation" in df.columns:
+        vert_mask = df["text_orientation"].isin(["TTB", "BTT"])
+    else:
+        vert_mask = pd.Series(False, index=df.index)
+
     # ------------------------------------------------------------------
     # Precompute sort keys so each gutter zone is fully resolved per
     # reading column before moving on.  This guarantees horizontal_band_id
@@ -273,9 +289,15 @@ def _assign_horizontal_bands(df_lines: pd.DataFrame) -> pd.DataFrame:
 
     for _, page_df in df.groupby("page_number", sort=True):
 
+        # Non-LTR lines are excluded from gap analysis and assigned their own
+        # sequential bands after all LTR bands for this page have been assigned.
+        page_vert_mask = vert_mask.loc[page_df.index]
+        page_vert_idx  = page_df.index[page_vert_mask].tolist()
+        page_ltr_df    = page_df[~page_vert_mask]
+
         # Sort: singlecol in y_top order; gutter zones grouped by
         # (zone_y, reading_column, y_top) so rc=1 is fully resolved before rc=2.
-        sorted_idx = page_df.sort_values(["_zone_y", "_rc_key", "y_top"]).index.tolist()
+        sorted_idx = page_ltr_df.sort_values(["_zone_y", "_rc_key", "y_top"]).index.tolist()
         n = len(sorted_idx)
 
         # Pre-extract arrays — avoids per-row .loc overhead inside the loops.
@@ -422,6 +444,15 @@ def _assign_horizontal_bands(df_lines: pd.DataFrame) -> pd.DataFrame:
         df.loc[sorted_idx, "median_gap"]         = median_gap
         df.loc[sorted_idx, "horizontal_band_id"] = band_ids
         df.loc[sorted_idx, "page_gap_thresh"]    = threshold
+
+        # Assign one band per non-LTR line, sorted by line_id (which is set above
+        # the max LTR line_id) so ordering is stable.
+        if page_vert_idx:
+            for idx in df.loc[page_vert_idx].sort_values("line_id").index:
+                band_counter += 1
+                df.at[idx, "median_gap"]         = median_gap
+                df.at[idx, "page_gap_thresh"]    = threshold
+                df.at[idx, "horizontal_band_id"] = band_counter
 
     df = df.drop(columns=["_gid", "_rc_key", "_zone_y"], errors="ignore")
     return df

@@ -72,6 +72,24 @@ def is_list_marker(text: object) -> bool:
 ITALIC_RE = re.compile(r"(italic|ital|oblique|slanted|cursive|skew|obl)", re.I)
 BOLD_RE   = re.compile(r"(bold|black|semi[- ]?bold|demi|medium|medi|heavy|extra|ultra)", re.I)
 
+# Computer Modern fonts encode style positionally, not as suffixes.
+# CMB* → bold (e.g. CMBX10, CMBXTI10, CMBXSL10, CMBSY10)
+# CMTI*, CMSL* → italic/slanted (but CMBX is bold, not italic)
+_CM_BOLD_RE   = re.compile(r"^(?:[A-Z]{6}\+)?CMB", re.I)
+_CM_ITALIC_RE = re.compile(r"^(?:[A-Z]{6}\+)?CM(?:TI|SL)", re.I)
+
+# Japanese fonts (Hiragino, Yu Gothic, etc.) use W-weight suffixes.
+# W6+ is bold; W1–W5 is regular/light.
+_JP_BOLD_RE = re.compile(r"[- ]W[6-9](?:\D|$)")
+
+
+def _is_bold_font(font_name: str) -> bool:
+    return bool(BOLD_RE.search(font_name) or _CM_BOLD_RE.match(font_name) or _JP_BOLD_RE.search(font_name))
+
+
+def _is_italic_font(font_name: str) -> bool:
+    return bool(ITALIC_RE.search(font_name) or _CM_ITALIC_RE.match(font_name))
+
 FONT_SUBSET_PREFIX = re.compile(r"^[A-Z]{6}\+")
 FONT_DIGIT_SUFFIX  = re.compile(r"\+\d+$")
 
@@ -166,10 +184,10 @@ def add_calculated_text_features(df: pd.DataFrame) -> pd.DataFrame:
             _fm = {f: _extract_font_family(f) for f in unique_fonts}
             out["font_family"] = font_name.map(_fm)
         if "bold_ratio" not in out.columns:
-            _bm = {f: 1.0 if BOLD_RE.search(f) else 0.0 for f in unique_fonts}
+            _bm = {f: 1.0 if _is_bold_font(f) else 0.0 for f in unique_fonts}
             out["bold_ratio"] = font_name.map(_bm)
         if "italic_ratio" not in out.columns:
-            _im = {f: 1.0 if ITALIC_RE.search(f) else 0.0 for f in unique_fonts}
+            _im = {f: 1.0 if _is_italic_font(f) else 0.0 for f in unique_fonts}
             out["italic_ratio"] = font_name.map(_im)
 
     # ---- Text features ----

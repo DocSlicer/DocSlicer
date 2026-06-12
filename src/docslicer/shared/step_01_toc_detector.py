@@ -40,6 +40,7 @@ _HIDDEN_BLOCK_TYPES = frozenset({
     "hr",
     "page_label",
     "navigation",
+    "vertical_text",
 })
 
 # Scoring weights — tuned empirically; adjust here to rebalance detection
