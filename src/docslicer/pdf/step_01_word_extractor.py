@@ -1,421 +1,282 @@
 """
-Step 01 – Raw word extraction (PyMuPDF version, semi-vectorized)
+Step 01 – Raw word extraction (pypdfium2 version)
 
 Responsibility:
-    - Open a PDF with PyMuPDF (fitz)
-    - Extract raw word tokens via `page.get_text("words")`
-    - Attach geometry + a representative span's raw style info
-      (font_name, font_size, non_stroking_color, stroking_color)
+    - Open a PDF with pypdfium2
+    - Iterate characters via textpage, group into whitespace-delimited words
+    - Attach font name, font size, fill/stroke color from the first char of each word
+    - Derive text_orientation from first→last char centre direction within the word
     - Convert all color values to hex format (#rrggbb)
     - NO high-level features (no bold/italic guesses, no ratios, etc.)
 
-Output columns (per row), matching a *subset* of WordSchema:
-    page_number
-    word_id
-    text
+Output columns match the _pymu version exactly:
+    page_number, word_id, text,
+    x_left, y_top, x_right, y_bottom, width, height,
+    page_width, page_height,
+    font_name, font_size,
+    non_stroking_color (#rrggbb or None),
+    stroking_color     (#rrggbb or None),
+    text_orientation   (LTR | RTL | TTB | BTT | UNKNOWN)
 
-    x_left, y_top, x_right, y_bottom
-    width, height
-    page_width, page_height
-
-    font_name
-    font_size
-    non_stroking_color (hex string: #rrggbb or None)
-    stroking_color (hex string: #rrggbb or None)
+Coordinate system: pypdfium2 charboxes are (left, bottom, right, top) in PDF
+space (y increases upward). We convert to screen space (y increases downward)
+to match the _pymu output: y_top = page_height - pdf_top.
 """
 
 from __future__ import annotations
 
+import ctypes
+import math
 from pathlib import Path
-from typing import Optional, Dict, Any, List, Tuple
-import warnings
-import sys
-import os
-from contextlib import contextmanager
+from typing import Any, Dict, List, Optional, Tuple
 
-import fitz  # PyMuPDF
+import pypdfium2 as pdfium
+import pypdfium2.raw as pdfium_c
 import pandas as pd
-import numpy as np
 
-from .._utils.color_utils import pdf_color_to_hex
 from .._utils.text_utils import add_calculated_text_features
 
 
-@contextmanager
-def _suppress_pdf_warnings():
-    """
-    Suppress warnings from PDF libraries about invalid color values.
-    
-    Many PDFs have malformed color definitions (e.g., name objects like '/P189'
-    instead of numeric values). These cause warnings in the underlying PDF library
-    that we can't fix and don't affect our extraction.
-    """
-    # Save stderr
-    old_stderr = sys.stderr
-    
-    try:
-        # Redirect stderr to devnull to suppress PDF library warnings
-        with open(os.devnull, 'w') as devnull:
-            sys.stderr = devnull
-            
-            # Also suppress Python warnings
-            with warnings.catch_warnings():
-                warnings.filterwarnings("ignore", message=".*Cannot set.*color.*invalid.*")
-                warnings.filterwarnings("ignore", category=UserWarning)
-                yield
-    finally:
-        # Restore stderr
-        sys.stderr = old_stderr
+_WHITESPACE = frozenset(' \t\r\n\x0c\xa0​‌‍﻿')
+
+# PDFium emits U+FFFE as a line-break marker in place of a soft hyphen.
+# When its tight bbox has non-zero width the hyphen is visually rendered in the PDF.
+_FFFE = '￾'
+
+_BYREF = ctypes.byref
 
 
-# ==================================================
-# Build the Span DF, equivalent to Char in pdfplumber
-# ==================================================
+# ── Low-level per-character helpers ──────────────────────────────────────────
 
-def _build_span_df(page) -> pd.DataFrame:
-    """
-    Build a DataFrame with one row per text span on the page.
-
-    Uses page.get_text("rawdict") → blocks → lines → spans.
-    We treat spans as our style carriers (font, size, color, direction).
-    """
-    raw = page.get_text("rawdict")
-    if not raw or "blocks" not in raw:
-        return pd.DataFrame()
-
-    span_rows: List[Dict[str, Any]] = []
-
-    for block in raw["blocks"]:
-        # Text blocks only
-        if block.get("type", 0) != 0:
-            continue
-
-        for line in block.get("lines", []):
-            for span in line.get("spans", []):
-                bbox = span.get("bbox")
-                if not bbox or len(bbox) != 4:
-                    continue
-
-                x0, y0, x1, y1 = bbox
-
-                # --- derive direction from chars, if possible ---
-                dx = dy = 0.0
-                chars = span.get("chars")  # list of char dicts, if present
-
-                if chars and len(chars) >= 2:
-                    # first + last char centers
-                    c0 = chars[0]
-                    c1 = chars[-1]
-
-                    bx0, by0, bx1, by1 = c0["bbox"]
-                    cx0 = (bx0 + bx1) / 2.0
-                    cy0 = (by0 + by1) / 2.0
-
-                    bx0, by0, bx1, by1 = c1["bbox"]
-                    cx1 = (bx0 + bx1) / 2.0
-                    cy1 = (by0 + by1) / 2.0
-
-                    dx = float(cx1 - cx0)
-                    dy = float(cy1 - cy0)
-
-                    norm = (dx * dx + dy * dy) ** 0.5
-                    if norm > 0:
-                        dx /= norm
-                        dy /= norm
-                    else:
-                        dx = 1.0
-                        dy = 0.0
-                else:
-                    # fallback to span["dir"] if chars missing or degenerate
-                    dir_vec = span.get("dir")
-                    if dir_vec and len(dir_vec) == 2:
-                        ddx, ddy = map(float, dir_vec)
-                        norm = (ddx * ddx + ddy * ddy) ** 0.5
-                        if norm > 0:
-                            dx = ddx / norm
-                            dy = ddy / norm
-                        else:
-                            dx = 1.0
-                            dy = 0.0
-                    else:
-                        dx, dy = 1.0, 0.0  # default LTR
-
-                # Convert color to hex format (handles all formats and invalid values)
-                non_stroking_color_hex = pdf_color_to_hex(span.get("color"))
-                stroking_color_hex = pdf_color_to_hex(span.get("stroke_color"))
-
-                span_rows.append(
-                    {
-                        "x0": float(x0),
-                        "top": float(y0),
-                        "x1": float(x1),
-                        "bottom": float(y1),
-                        "fontname": span.get("font"),
-                        "size": span.get("size"),
-                        "non_stroking_color": non_stroking_color_hex,
-                        "stroking_color": stroking_color_hex,
-                        "dir_x": dx,
-                        "dir_y": dy,
-                        "wmode": span.get("wmode", 0),
-                        "text": span.get("text", ""),
-                    }
-                )
-
-    if not span_rows:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(span_rows)
-
-    # Compute centers (vectorized)
-    df["cx"] = (df["x0"] + df["x1"]) / 2.0
-    df["cy"] = (df["top"] + df["bottom"]) / 2.0
-
-    # Give spans a stable ID for debugging
-    #df["span_id"] = range(1, len(df) + 1)
-
-    return df
-
-
-# ==================================================
-# Build the Words DF, equivalent to Word in pdfplumber
-# ==================================================
-
-def _build_words_df(words: List[Tuple[Any, ...]]) -> pd.DataFrame:
-    """
-    Build a DataFrame from PyMuPDF's 'words' list.
-
-    PyMuPDF page.get_text("words") tuples:
-        (x0, y0, x1, y1, "text", block_no, line_no, word_no)
-    """
-    if not words:
-        return pd.DataFrame()
-
-    rows: List[Dict[str, Any]] = []
-    for w in words:
-        # Defensive: allow len 5 or 8 (older vs newer versions)
-        x0, y0, x1, y1, text = w[:5]
-        rows.append(
-            {
-                "x_left": float(x0),
-                "x_right": float(x1),
-                "y_top": float(y0),
-                "y_bottom": float(y1),
-                "text": text or "",
-            }
-        )
-
-    df = pd.DataFrame(rows)
-
-    # Sort by (y_top, x_left) to mimic pdfplumber behavior
-    df = df.sort_values(["y_top", "x_left"], kind="mergesort").reset_index(drop=True)
-
-    # Geometry (vectorized)
-    df["width"] = df["x_right"] - df["x_left"]
-    df["height"] = df["y_bottom"] - df["y_top"]
-
-    # Normalize text
-    df["text"] = df["text"].fillna("").astype(str)
-
-    return df
-
-
-# ==================================================
-# Vectorized word-span matching, for Style parameters
-# ==================================================
-
-def _orientation_from_dir(dx: float, dy: float) -> str:
-    """
-    Map a direction vector (dx, dy) to a coarse orientation label.
-
-    dx, dy are from the first→last character centers.
-    PDF coords: y increases downward.
-    """
-    THRESH = 0.5
-
-    # Decide whether it's more horizontal or vertical
-    if abs(dx) >= abs(dy):
-        # Mostly horizontal
-        if dx >= THRESH:
-            return "LTR"
-        if dx <= -THRESH:
-            return "RTL"
+def _font_info(tp, i: int) -> Tuple[Optional[str], float]:
+    buf = ctypes.create_string_buffer(256)
+    flags = ctypes.c_int(0)
+    pdfium_c.FPDFText_GetFontInfo(tp, i, buf, 256, _BYREF(flags))
+    name = buf.value.decode("utf-8", errors="replace") or None
+    # FPDFText_GetMatrix returns the text matrix (Tm) WITHOUT the Tf font size factor.
+    # FPDFText_GetFontSize returns only the Tf value.
+    # Effective size = Tf × |Tm scale| covers both encoding styles:
+    #   Type A: Tf=12, Tm≈identity (scale=1)  → 12 × 1 = 12
+    #   Type B: Tf=1,  Tm=[fs,0,0,fs,...] → 1 × fs = fs
+    tf = float(pdfium_c.FPDFText_GetFontSize(tp, i))
+    m = pdfium_c.FS_MATRIX()
+    if pdfium_c.FPDFText_GetMatrix(tp, i, _BYREF(m)):
+        scale = max(math.hypot(m.a, m.b), math.hypot(m.c, m.d))
     else:
-        # Mostly vertical
-        if dy >= THRESH:
-            # y increasing down → visually top-to-bottom
-            return "TTB"
-        if dy <= -THRESH:
-            # y decreasing up → visually bottom-to-top
-            return "BTT"
-
-    return "UNKNOWN"
+        scale = 1.0
+    size = tf * scale if scale > 1e-6 else tf
+    return name, size
 
 
+def _fill_color(tp, i: int) -> Optional[str]:
+    r, g, b, a = ctypes.c_uint(), ctypes.c_uint(), ctypes.c_uint(), ctypes.c_uint()
+    if pdfium_c.FPDFText_GetFillColor(tp, i, _BYREF(r), _BYREF(g), _BYREF(b), _BYREF(a)):
+        return f"#{r.value:02x}{g.value:02x}{b.value:02x}"
+    return None
 
-def _attach_representative_spans(
-    words_df: pd.DataFrame,
-    span_df: pd.DataFrame,
-    eps: float = 0.5,
-) -> pd.DataFrame:
+
+def _stroke_color(tp, i: int) -> Optional[str]:
+    r, g, b, a = ctypes.c_uint(), ctypes.c_uint(), ctypes.c_uint(), ctypes.c_uint()
+    if pdfium_c.FPDFText_GetStrokeColor(tp, i, _BYREF(r), _BYREF(g), _BYREF(b), _BYREF(a)):
+        return f"#{r.value:02x}{g.value:02x}{b.value:02x}"
+    return None
+
+
+# ── Orientation ───────────────────────────────────────────────────────────────
+
+_THRESH = 0.5
+
+
+def _orientation_from_angle(angle_rad: float) -> str:
+    """Map a single-char rotation angle (radians, PDF space y-up) to an orientation label."""
+    dx = math.cos(angle_rad)
+    dy = math.sin(angle_rad)  # positive = upward in PDF = BTT on screen
+    if abs(dx) >= abs(dy):
+        return "LTR" if dx >= _THRESH else ("RTL" if dx <= -_THRESH else "UNKNOWN")
+    # vertical — flip sign because screen y is downward
+    return "BTT" if dy >= _THRESH else ("TTB" if dy <= -_THRESH else "UNKNOWN")
+
+
+def _orientation_from_centers(
+    boxes: List[Tuple[float, float, float, float]],
+) -> str:
     """
-    For each word, pick a representative span and attach its style columns
-    + text_orientation.
-
-    Strategy (per word):
-        1. Find spans whose bbox intersects the word bbox (with eps tolerance).
-        2. For those spans, compute:
-           - intersection area / word area
-           - whether span height is comparable to word height
-           - whether span is vertical (|dy| > |dx|)
-        3. Build a score from these features and choose the max.
-        4. If *no* spans intersect, fall back to globally nearest span center.
-
-    This avoids tiny decorative spans stealing matches from the big vertical
-    TOC spans that actually represent the text.
+    Derive orientation from the vector between the first and last char centres.
+    boxes are in screen coords (y increases downward).
     """
-    if words_df.empty or span_df.empty:
-        out = words_df.copy()
-        for col in ("font_name", "font_size", "non_stroking_color", "stroking_color", "text_orientation"):
-            out[col] = None
-        return out
-
-    # Word geometry (W,)
-    W_x0 = words_df["x_left"].to_numpy(dtype=np.float64)
-    W_x1 = words_df["x_right"].to_numpy(dtype=np.float64)
-    W_y0 = words_df["y_top"].to_numpy(dtype=np.float64)
-    W_y1 = words_df["y_bottom"].to_numpy(dtype=np.float64)
-
-    # Span geometry and style (S,)
-    S_x0    = span_df["x0"].to_numpy(dtype=np.float64)
-    S_x1    = span_df["x1"].to_numpy(dtype=np.float64)
-    S_y0    = span_df["top"].to_numpy(dtype=np.float64)
-    S_y1    = span_df["bottom"].to_numpy(dtype=np.float64)
-    S_cx    = span_df["cx"].to_numpy(dtype=np.float64)
-    S_cy    = span_df["cy"].to_numpy(dtype=np.float64)
-    S_dir_x = span_df["dir_x"].to_numpy(dtype=np.float64)
-    S_dir_y = span_df["dir_y"].to_numpy(dtype=np.float64)
-    S_font  = span_df["fontname"].to_numpy()
-    S_size  = span_df["size"].to_numpy()
-    S_ns    = span_df["non_stroking_color"].to_numpy()
-    S_sc    = span_df["stroking_color"].to_numpy()
-
-    # Word metrics (W,)
-    W_cx     = (W_x0 + W_x1) * 0.5
-    W_cy     = (W_y0 + W_y1) * 0.5
-    w_height = np.maximum(W_y1 - W_y0, 1e-6)
-    w_area   = np.maximum(W_x1 - W_x0, 1e-6) * w_height
-
-    # Intersection mask (W, S)
-    intersects = (
-        (S_x0[np.newaxis, :] <= W_x1[:, np.newaxis] + eps)
-        & (S_x1[np.newaxis, :] >= W_x0[:, np.newaxis] - eps)
-        & (S_y0[np.newaxis, :] <= W_y1[:, np.newaxis] + eps)
-        & (S_y1[np.newaxis, :] >= W_y0[:, np.newaxis] - eps)
-    )
-
-    # Intersection area (W, S)
-    inter_area = (
-        np.maximum(0.0, np.minimum(S_x1[np.newaxis, :], W_x1[:, np.newaxis])
-                        - np.maximum(S_x0[np.newaxis, :], W_x0[:, np.newaxis]))
-        * np.maximum(0.0, np.minimum(S_y1[np.newaxis, :], W_y1[:, np.newaxis])
-                          - np.maximum(S_y0[np.newaxis, :], W_y0[:, np.newaxis]))
-    )
-
-    # Span-level features, broadcast over words
-    span_h        = S_y1 - S_y0                                              # (S,)
-    height_ok     = span_h[np.newaxis, :] >= 0.7 * w_height[:, np.newaxis]  # (W, S)
-    vertical_flag = np.abs(S_dir_y) > np.abs(S_dir_x)                       # (S,)
-
-    # Intersection score (W, S); non-intersecting entries → -inf
-    score = np.where(
-        intersects,
-        inter_area / w_area[:, np.newaxis]
-            + 0.5 * height_ok
-            + 0.2 * vertical_flag[np.newaxis, :],
-        -np.inf,
-    )
-
-    # Words that have ≥1 intersecting span with a positive score use intersection
-    # scoring; all others (no intersection or only zero-area touches) fall back to
-    # nearest-centre matching — preserving the original per-word logic exactly.
-    use_intersection = intersects.any(axis=1) & (score > 0).any(axis=1)  # (W,)
-
-    # Fallback: negative squared distance so argmax gives the nearest span centre
-    dist2 = (
-        (S_cx[np.newaxis, :] - W_cx[:, np.newaxis]) ** 2
-        + (S_cy[np.newaxis, :] - W_cy[:, np.newaxis]) ** 2
-    )
-
-    final_score = np.where(use_intersection[:, np.newaxis], score, -dist2)
-    best = final_score.argmax(axis=1)  # (W,) — positional indices into span arrays
-
-    # Vectorised orientation label from direction vectors
-    dx, dy = S_dir_x[best], S_dir_y[best]
-    mostly_horiz = np.abs(dx) >= np.abs(dy)
-    THRESH = 0.5
-    text_orientation = np.select(
-        [
-            mostly_horiz & (dx >= THRESH),
-            mostly_horiz & (dx <= -THRESH),
-            ~mostly_horiz & (dy >= THRESH),
-            ~mostly_horiz & (dy <= -THRESH),
-        ],
-        ["LTR", "RTL", "TTB", "BTT"],
-        default="UNKNOWN",
-    )
-
-    out = words_df.copy()
-    out["font_name"]          = S_font[best]
-    out["font_size"]          = S_size[best]
-    out["non_stroking_color"] = S_ns[best]
-    out["stroking_color"]     = S_sc[best]
-    out["text_orientation"]   = text_orientation
-    return out
+    if len(boxes) < 2:
+        return "UNKNOWN"
+    x0 = (boxes[0][0] + boxes[0][2]) / 2.0
+    y0 = (boxes[0][1] + boxes[0][3]) / 2.0
+    x1 = (boxes[-1][0] + boxes[-1][2]) / 2.0
+    y1 = (boxes[-1][1] + boxes[-1][3]) / 2.0
+    dx, dy = x1 - x0, y1 - y0
+    norm = math.hypot(dx, dy)
+    if norm < 1e-6:
+        return "UNKNOWN"
+    dx /= norm
+    dy /= norm
+    if abs(dx) >= abs(dy):
+        return "LTR" if dx >= _THRESH else ("RTL" if dx <= -_THRESH else "UNKNOWN")
+    return "TTB" if dy >= _THRESH else ("BTT" if dy <= -_THRESH else "UNKNOWN")
 
 
-# ==================================================
-# Per page orchestrator
-# ==================================================
+# ── Per-page extraction ───────────────────────────────────────────────────────
 
-def _extract_raw_words_for_page(
+def _extract_words_for_page(
     page,
     page_number: int,
     *,
     start_word_id: int,
 ) -> Tuple[pd.DataFrame, int]:
-    """
-    Page extraction using PyMuPDF:
+    page_width  = float(page.get_width())
+    page_height = float(page.get_height())
 
-        - spans_df from rawdict (style carriers)
-        - words_df from get_text("words")
-        - attach representative span per word
-        - return DataFrame with controlled column order
-    """
-    spans_df = _build_span_df(page)
-    words = page.get_text("words")
-    if not words:
+    tp = page.get_textpage()
+    try:
+        n = tp.count_chars()
+        if n == 0:
+            return pd.DataFrame(), start_word_id
+
+        rows: List[Dict[str, Any]] = []
+
+        # Pre-fetch all chars at once — avoids per-char ctypes buffer alloc + UTF-16 decode.
+        all_chars = tp.get_text_range(0, n)
+
+        # Per-word accumulators
+        char_texts:  List[str] = []
+        word_font:   Optional[str] = None
+        word_size:   float         = 0.0
+        word_fill:   Optional[str] = None
+        word_stroke: Optional[str] = None
+        first_angle: float         = 0.0
+        prev_x_right: float        = -1.0
+        # Running bbox — updated per char to avoid list + min/max in _flush.
+        word_x_left:   float = float("inf")
+        word_y_top:    float = float("inf")
+        word_x_right:  float = float("-inf")
+        word_y_bottom: float = float("-inf")
+        # Only first/last screen box needed for orientation.
+        word_first_box: Optional[Tuple[float, float, float, float]] = None
+        word_last_box:  Optional[Tuple[float, float, float, float]] = None
+        word_n_chars:   int = 0
+
+        # A gap wider than this fraction of font size → implicit word boundary.
+        # With loose charboxes, intra-word gaps are always ≤ 0 (boxes overlap).
+        # Inter-word gaps without an explicit space char are ~0.12–0.15 × font_size.
+        # 0.10 sits safely between those two ranges.
+        _GAP_FACTOR = 0.10
+
+        _INF = float("inf")
+
+        def _flush() -> None:
+            nonlocal word_first_box, word_last_box, word_n_chars
+            nonlocal word_x_left, word_y_top, word_x_right, word_y_bottom
+            if not char_texts:
+                return
+            orientation = (
+                _orientation_from_centers([word_first_box, word_last_box])
+                if word_n_chars >= 2
+                else _orientation_from_angle(first_angle)
+            )
+            rows.append({
+                "text":               "".join(char_texts),
+                "x_left":             word_x_left,
+                "y_top":              word_y_top,
+                "x_right":            word_x_right,
+                "y_bottom":           word_y_bottom,
+                "width":              word_x_right  - word_x_left,
+                "height":             word_y_bottom - word_y_top,
+                "font_name":          word_font,
+                "font_size":          word_size,
+                "non_stroking_color": word_fill,
+                "stroking_color":     word_stroke,
+                "text_orientation":   orientation,
+            })
+            char_texts.clear()
+            word_first_box = word_last_box = None
+            word_n_chars   = 0
+            word_x_left    = word_y_top   = _INF
+            word_x_right   = word_y_bottom = -_INF
+
+        def _start_word(i: int) -> None:
+            nonlocal word_font, word_size, word_fill, word_stroke, first_angle
+            word_font, word_size = _font_info(tp, i)
+            word_fill            = _fill_color(tp, i)
+            word_stroke          = _stroke_color(tp, i)
+            first_angle          = float(pdfium_c.FPDFText_GetCharAngle(tp, i))
+
+        def _add_char(ch: str, sb: Tuple[float, float, float, float]) -> None:
+            nonlocal word_first_box, word_last_box, word_n_chars
+            nonlocal word_x_left, word_y_top, word_x_right, word_y_bottom
+            char_texts.append(ch)
+            if word_first_box is None:
+                word_first_box = sb
+            word_last_box   = sb
+            word_n_chars   += 1
+            if sb[0] < word_x_left:    word_x_left   = sb[0]
+            if sb[1] < word_y_top:     word_y_top    = sb[1]
+            if sb[2] > word_x_right:   word_x_right  = sb[2]
+            if sb[3] > word_y_bottom:  word_y_bottom = sb[3]
+
+        for i in range(n):
+            ch = all_chars[i]
+
+            # charbox loose=True → full character cell height (matches PyMuPDF word height)
+            l, b, r, t = tp.get_charbox(i, loose=True)
+
+            if ch == _FFFE:
+                # PDFium line-break marker. Visible (non-zero tight width) → soft hyphen.
+                tl, _, tr, _ = tp.get_charbox(i, loose=False)
+                if tr - tl > 0.5 and char_texts:
+                    _add_char('-', (l, page_height - t, r, page_height - b))
+                _flush()
+                prev_x_right = -1.0
+                continue
+
+            if ch in _WHITESPACE:
+                _flush()
+                prev_x_right = -1.0
+                continue
+
+            # convert to screen space (y-down)
+            screen_box = (l, page_height - t, r, page_height - b)
+
+            if not char_texts:
+                _start_word(i)
+            elif prev_x_right >= 0:
+                gap = l - prev_x_right
+                if gap > _GAP_FACTOR * (word_size or 8.0):
+                    # Implicit space — start a new word
+                    _flush()
+                    _start_word(i)
+
+            _add_char(ch, screen_box)
+            prev_x_right = r
+
+        _flush()  # last word on page
+
+    finally:
+        tp.close()
+
+    if not rows:
         return pd.DataFrame(), start_word_id
 
-    words_df = _build_words_df(words)
-    words_df = _attach_representative_spans(words_df, spans_df)
+    df = pd.DataFrame(rows)
 
-    n_words = len(words_df)
-    word_ids = range(start_word_id + 1, start_word_id + 1 + n_words)
+    # Sort to match _pymu output order
+    df = df.sort_values(["y_top", "x_left"], kind="mergesort").reset_index(drop=True)
 
-    # Add IDs + context columns (vectorized)
-    words_df = words_df.copy()
-    words_df["word_id"] = list(word_ids)
-    words_df["page_number"] = page_number
-    words_df["page_width"] = float(page.rect.width)
-    words_df["page_height"] = float(page.rect.height)
+    n_words = len(df)
+    df["word_id"]     = range(start_word_id + 1, start_word_id + 1 + n_words)
+    df["page_number"] = page_number
+    df["page_width"]  = page_width
+    df["page_height"] = page_height
 
-    next_word_id = start_word_id + n_words
-    return words_df, next_word_id
+    return df, start_word_id + n_words
 
 
-# =============================
-# Public API
-# =============================
+# ── Public API ────────────────────────────────────────────────────────────────
 
 def extract_words(
     pdf_path: str | Path,
@@ -424,54 +285,45 @@ def extract_words(
     """
     Extract all words from a PDF and return a DataFrame with one row per word.
 
-    Columns match a subset of WordSchema: page_number, word_id, text,
+    Columns match the _pymu version: page_number, word_id, text,
     x_left, x_right, y_top, y_bottom, width, height, font_name, font_size,
     non_stroking_color, stroking_color (both as hex #rrggbb or None),
-    text_orientation, bold_ratio, italic_ratio, char_count, alpha_count,
-    digit_count, uppercase_count, token_count, alpha_token_count,
-    capitalized_token_count, page_width, page_height.
-
-    DocumentIdentity fields (document_name, document_id) are intentionally
-    excluded — the orchestrator adds those after extraction.
+    text_orientation, plus calculated text features.
     """
-
     pdf_path = Path(pdf_path).expanduser().resolve()
 
-    all_words_dfs: List[pd.DataFrame] = []
+    all_dfs: List[pd.DataFrame] = []
     next_word_id = 0
 
-    # Suppress PDF parsing warnings about invalid color values
-    with _suppress_pdf_warnings():
-        with fitz.open(pdf_path) as doc:
-            total_pages = doc.page_count
+    with pdfium.PdfDocument(pdf_path) as doc:
+        total_pages = len(doc)
 
-            if pages_to_process is None:
-                page_numbers = range(1, total_pages + 1)
-            else:
-                page_numbers = pages_to_process
+        page_numbers = (
+            range(1, total_pages + 1)
+            if pages_to_process is None
+            else pages_to_process
+        )
 
-            for page_number in page_numbers:
-                if page_number < 1 or page_number > total_pages:
-                    continue
+        for page_number in page_numbers:
+            if page_number < 1 or page_number > total_pages:
+                continue
 
-                page = doc.load_page(page_number - 1)
-
-                page_words_df, next_word_id = _extract_raw_words_for_page(
+            page = doc[page_number - 1]
+            try:
+                page_df, next_word_id = _extract_words_for_page(
                     page,
                     page_number=page_number,
                     start_word_id=next_word_id,
                 )
-                if not page_words_df.empty:
-                    all_words_dfs.append(page_words_df)
+            finally:
+                page.close()
 
-        if not all_words_dfs:
-            return pd.DataFrame()
+            if not page_df.empty:
+                all_dfs.append(page_df)
 
-        df = pd.concat(all_words_dfs, ignore_index=True)
-        
-        # --------------------
-        # Add calculated features (bold, italic, char, word, etc.)
-        # --------------------
-        df = add_calculated_text_features(df)
-        
-        return df
+    if not all_dfs:
+        return pd.DataFrame()
+
+    df = pd.concat(all_dfs, ignore_index=True)
+    df = add_calculated_text_features(df)
+    return df
