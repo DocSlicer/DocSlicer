@@ -155,78 +155,47 @@ def extract_author_from_pdf_metadata(pdf_path: Path) -> list[str]:
     Returns:
         List of author names (empty if none found or all are fake)
     """
-    import fitz  # PyMuPDF
     import xml.etree.ElementTree as ET
+    import pypdfium2 as pdfium
+    from ._pdf_xmp import read_xmp
+
+    def _split_authors(value: str) -> list[str]:
+        for delimiter in [";", " and ", " & "]:
+            if delimiter in value:
+                return [p.strip() for p in value.split(delimiter)]
+        return [value.strip()]
 
     try:
-        with fitz.open(pdf_path) as doc:
-            # First, try to extract from XMP metadata (more reliable for dc:creator)
-            xmp_metadata = doc.get_xml_metadata()
-            if xmp_metadata:
-                try:
-                    # Parse XMP and look for dc:creator
-                    root = ET.fromstring(xmp_metadata)
+        # 1. XMP dc:creator
+        xmp = read_xmp(pdf_path)
+        if xmp:
+            root = ET.fromstring(xmp)
+            ns = {
+                'rdf': 'http://www.w3.org/1999/02/22-rdf-syntax-ns#',
+                'dc': 'http://purl.org/dc/elements/1.1/',
+            }
+            creators = []
+            for elem in root.findall('.//dc:creator', ns):
+                for li in elem.findall('.//rdf:li', ns):
+                    if li.text:
+                        creators.append(li.text.strip())
+                if elem.text and elem.text.strip():
+                    creators.append(elem.text.strip())
+            valid = [a for a in creators if a and not _is_fake_author(a)]
+            if valid:
+                return valid[:5]
 
-                    # Define namespaces
-                    namespaces = {
-                        'rdf': 'http://www.w3.org/1999/02/22-rdf-syntax-ns#',
-                        'dc': 'http://purl.org/dc/elements/1.1/'
-                    }
-
-                    # Look for dc:creator elements
-                    creators = []
-                    for creator_elem in root.findall('.//dc:creator', namespaces):
-                        # dc:creator can contain rdf:Seq with rdf:li items
-                        for li in creator_elem.findall('.//rdf:li', namespaces):
-                            if li.text:
-                                creators.append(li.text.strip())
-
-                        # Or it might be direct text
-                        if creator_elem.text and creator_elem.text.strip():
-                            creators.append(creator_elem.text.strip())
-
-                    if creators:
-                        # Filter out fake authors
-                        valid_authors = [a for a in creators if a and not _is_fake_author(a)]
-                        if valid_authors:
-                            return valid_authors[:5]  # Limit to 5 authors max
-
-                except Exception:
-                    pass  # Fall through to standard metadata
-
-            # Fallback to standard metadata fields
-            metadata = doc.metadata or {}
-            author_fields = [
-                metadata.get("creator"),      # dc:creator
-                metadata.get("author"),       # /Author
-                metadata.get("Author"),       # case variation
-            ]
-
-            authors = []
-            for field_value in author_fields:
+        # 2. PDF info dict /Author then /Creator
+        with pdfium.PdfDocument(pdf_path) as doc:
+            for key in ("Author", "Creator"):
+                field_value = doc.get_metadata_value(key)
                 if not field_value:
                     continue
-
-                # Split on common delimiters (comma, semicolon, 'and')
-                parts = []
-                for delimiter in [";", " and ", " & "]:
-                    if delimiter in field_value:
-                        parts = [p.strip() for p in field_value.split(delimiter)]
-                        break
-
-                if not parts:
-                    parts = [field_value.strip()]
-
-                # Filter out fake authors
-                for author in parts:
-                    if author and not _is_fake_author(author):
-                        authors.append(author)
-
-                # If we found valid authors in this field, return them
+                authors = [a for a in _split_authors(field_value) if a and not _is_fake_author(a)]
                 if authors:
-                    return authors[:5]  # Limit to 5 authors max
+                    return authors[:5]
 
-            return []
+        return []
 
     except Exception:
         return []

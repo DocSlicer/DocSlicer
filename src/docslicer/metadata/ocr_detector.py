@@ -167,7 +167,6 @@ def add_page_and_ocr_info(
 
     total_chars = page_char_counts.sum()
     doc_meta["chars"] = int(total_chars)
-    doc_meta["estimated_tokens"] = int(total_chars // 4)
 
     # =============================
     # is_scanned: Zero chars + only full-page images

@@ -74,7 +74,6 @@ PRODUCTION_DROP_COLS = [
     "page_count",
     "chars",
     "total_chars",
-    "estimated_tokens",
     "is_scanned"
 ]
 

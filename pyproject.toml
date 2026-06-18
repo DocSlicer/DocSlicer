@@ -26,18 +26,18 @@ classifiers = [
 dependencies = [
     "pandas>=2.0",
     "numpy>=1.26",
-    "pymupdf>=1.25",
-    "pdfplumber>=0.11",
+    "pypdfium2>=5.0",
     "pyyaml>=6.0",
     "langdetect>=1.0",
-    "tiktoken>=0.10",
-    "Pillow>=10.0",
     "beautifulsoup4>=4.12",
     "lxml>=5.0",
     "httpx>=0.28",
 ]
 
 [project.optional-dependencies]
+llm = [
+    "tiktoken>=0.10",
+]
 html = [
     "playwright>=1.49",
 ]

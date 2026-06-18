@@ -31,6 +31,8 @@ def _resolve_metadata(
     run_id: str,
     df_blocks: pd.DataFrame,
     processing_time: float | None = None,
+    token_count: int | None = None,
+    token_count_exact: bool = False,
 ) -> DocumentMetadata:
     # Resolve title: prefer whichever of title_meta / title_text is longer
     title_meta = str(discovered.get("title_meta") or "")
@@ -75,7 +77,8 @@ def _resolve_metadata(
         needs_ocr=bool(discovered.get("needs_ocr", False)),
         is_scanned=bool(discovered.get("is_scanned", False)),
         chars=chars,
-        estimated_tokens=(chars // 4) if chars is not None else None,
+        token_count=token_count,
+        token_count_exact=token_count_exact,
         title=title,
         author=author,
         language=discovered.get("language"),
@@ -264,6 +267,7 @@ def _build_chunks(df_chunks: pd.DataFrame, extra_fields: list[str] | None = None
             section=str(row.get("section", "")),
             chunk_index=int(row.get("chunk_index", 0)),
             char_count=int(row.get("embed_char_count", 0)),
+            token_count=int(row.get("token_count", 0)),
             heading=heading,
             path=path,
             parent_chunk_id=parent_chunk_id,
@@ -363,9 +367,17 @@ def _build_result(
     processing_time: float | None = None,
     early_steps: dict[str, pd.DataFrame] | None = None,
 ) -> ParseResult:
+    doc_token_count: int | None = None
+    doc_token_count_exact = False
+    if not df_chunks.empty and "token_count" in df_chunks.columns:
+        doc_token_count = int(df_chunks["token_count"].fillna(0).sum())
+        doc_token_count_exact = bool(config.exact_tokens)
+
     metadata = _resolve_metadata(
         discovered_metadata, source_url, source_filename, file_size_bytes, run_id, df_blocks,
         processing_time=processing_time,
+        token_count=doc_token_count,
+        token_count_exact=doc_token_count_exact,
     )
     chunks = _build_chunks(df_chunks, config.extra_fields)
     blocks = _build_blocks(df_blocks, config.extra_fields)

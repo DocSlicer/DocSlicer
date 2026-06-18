@@ -65,6 +65,7 @@ class Chunk:
     path: list[str]                                  # full heading path from root, e.g. ["## Section 1", "### 1.1"]
     text: str
     char_count: int
+    token_count: int
     bbox: BBox | None                                 # PDF only
     link_url: list[str]                              # unique URLs found in chunk
     table_ids: list[str]                             # table IDs referenced in chunk
@@ -83,6 +84,7 @@ class Chunk:
             path=d.get("path", []),
             text=d.get("text", ""),
             char_count=d.get("char_count", 0),
+            token_count=d.get("token_count", 0),
             bbox=BBox.from_dict(d.get("bbox")),
             link_url=d.get("link_url", []),
             table_ids=[_norm_id(v) for v in d.get("table_ids", [])],

@@ -21,43 +21,33 @@ def extract_title_from_pdf_metadata(pdf_path: Path) -> Optional[str]:
     Returns:
         Title string or None if not found
     """
-    import fitz  # PyMuPDF
     import xml.etree.ElementTree as ET
+    import pypdfium2 as pdfium
+    from ._pdf_xmp import read_xmp
 
     try:
-        with fitz.open(pdf_path) as doc:
-            # First, try XMP metadata
-            xmp_metadata = doc.get_xml_metadata()
-            if xmp_metadata:
-                try:
-                    root = ET.fromstring(xmp_metadata)
+        # 1. XMP dc:title
+        xmp = read_xmp(pdf_path)
+        if xmp:
+            root = ET.fromstring(xmp)
+            ns = {
+                'rdf': 'http://www.w3.org/1999/02/22-rdf-syntax-ns#',
+                'dc': 'http://purl.org/dc/elements/1.1/',
+            }
+            for elem in root.findall('.//dc:title', ns):
+                for li in elem.findall('.//rdf:li', ns):
+                    if li.text and li.text.strip():
+                        return li.text.strip()
+                if elem.text and elem.text.strip():
+                    return elem.text.strip()
 
-                    namespaces = {
-                        'rdf': 'http://www.w3.org/1999/02/22-rdf-syntax-ns#',
-                        'dc': 'http://purl.org/dc/elements/1.1/'
-                    }
-
-                    # Look for dc:title
-                    for title_elem in root.findall('.//dc:title', namespaces):
-                        # dc:title can contain rdf:Alt with rdf:li items
-                        for li in title_elem.findall('.//rdf:li', namespaces):
-                            if li.text and li.text.strip():
-                                return li.text.strip()
-
-                        # Or direct text
-                        if title_elem.text and title_elem.text.strip():
-                            return title_elem.text.strip()
-
-                except Exception:
-                    pass  # Fall through to standard metadata
-
-            # Fallback to standard PDF Info /Title
-            metadata = doc.metadata or {}
-            title = metadata.get('title') or metadata.get('Title')
+        # 2. PDF info dict /Title
+        with pdfium.PdfDocument(pdf_path) as doc:
+            title = doc.get_metadata_value("Title")
             if title and title.strip():
                 return title.strip()
 
-            return None
+        return None
 
     except Exception:
         return None

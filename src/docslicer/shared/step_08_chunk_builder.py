@@ -9,8 +9,6 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import pandas as pd
-import tiktoken
-
 from .._utils.hierarchical_aggregator import (
     build_standard_agg_spec,
     aggregate_hierarchical,
@@ -1340,42 +1338,38 @@ def _rebuild_merged_chunks(chunks_df: pd.DataFrame) -> pd.DataFrame:
 # STEP 4: Add Token Count & Chunk IDs
 # =======================================================================================================================
 
-def _add_token_count(chunks_df: pd.DataFrame) -> pd.DataFrame:
+def _add_token_count(chunks_df: pd.DataFrame, exact_tokens: bool = False) -> pd.DataFrame:
     """
-    Add token_count to each chunk using tiktoken.
-    
-    Simplified to just tokenize the text field (which already includes headings with ##).
-    
-    Args:
-        chunks_df: DataFrame with text column
-        
-    Returns:
-        DataFrame with token_count column added
+    Add token_count to each chunk.
+
+    If exact_tokens=True, lazily imports tiktoken (cl100k_base) and falls back to
+    char-count estimation if the package is not installed.
+    If exact_tokens=False, always uses embed_char_count // 4.
     """
     if chunks_df is None or chunks_df.empty:
         chunks_df = chunks_df.copy() if chunks_df is not None else pd.DataFrame()
         chunks_df["token_count"] = 0
         return chunks_df
-    
+
     df = chunks_df.copy()
-    
-    # Initialize tiktoken encoder (using cl100k_base which is standard for GPT models)
-    try:
-        encoding = tiktoken.get_encoding("cl100k_base")
-    except Exception:
-        # Fallback if encoding not available
-        encoding = None
-    
-    def _calculate_token_count(text: str) -> int:
-        """Calculate token count for text."""
-        if encoding is None:
-            return 0
-        
-        text = str(text) if pd.notna(text) else ""
-        return len(encoding.encode(text))
-    
-    df["token_count"] = df["text"].apply(_calculate_token_count)
-    
+
+    exact = False
+    if exact_tokens:
+        try:
+            import tiktoken as _tiktoken
+            encoding = _tiktoken.get_encoding("cl100k_base")
+            exact = True
+        except Exception:
+            encoding = None
+
+    if exact:
+        df["token_count"] = df["text"].apply(
+            lambda t: len(encoding.encode(str(t) if pd.notna(t) else ""))
+        )
+    else:
+        char_counts = df["embed_char_count"] if "embed_char_count" in df.columns else df["text"].str.len().fillna(0)
+        df["token_count"] = (char_counts.fillna(0).astype(int) // 4).astype(int)
+
     return df
 
 
@@ -1613,6 +1607,7 @@ def build_chunks(
     softmin_chunk_chars: int = _DEFAULT_SOFTMIN_CHUNK_CHARS,
     min_chunk_chars: int = _DEFAULT_MIN_CHUNK_CHARS,
     merge_small_chunks: bool = True,
+    exact_tokens: bool = False,
 ) -> pd.DataFrame:
     """
     Build semantic chunks from blocks with heading hierarchy.
@@ -1729,7 +1724,7 @@ def build_chunks(
     # -------------------------
     # STEP 7: ADD TOKEN COUNT
     # -------------------------
-    chunks_df = _add_token_count(chunks_df)
+    chunks_df = _add_token_count(chunks_df, exact_tokens=exact_tokens)
     
     # -------------------------
     # STEP 8: ADD CHUNK IDS AND REINDEX

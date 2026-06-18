@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Iterable, List, Tuple, Optional
 from time import perf_counter
 
-import fitz  # PyMuPDF
+import pypdfium2 as pdfium
 import numpy as np
 import pandas as pd
 import cv2
@@ -49,18 +49,6 @@ class OCRPipelineConfig:
 # PDF -> Images (render ONCE)
 # ==================================================================================================
 
-def _pixmap_to_bgr(pix: fitz.Pixmap) -> np.ndarray:
-    """
-    Convert PyMuPDF pixmap samples to an OpenCV BGR image (uint8).
-    """
-    img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
-    if pix.n == 4:
-        # RGBA -> BGR
-        return cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
-    # RGB -> BGR
-    return cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-
-
 def _render_pdf_bytes_to_images_bgr(
     pdf_bytes: bytes,
     dpi_scale: float,
@@ -71,16 +59,12 @@ def _render_pdf_bytes_to_images_bgr(
     if not pdf_bytes:
         raise ValueError("pdf_bytes is empty")
 
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    doc = pdfium.PdfDocument(pdf_bytes)
     try:
         images: List[np.ndarray] = []
-        mat = fitz.Matrix(dpi_scale, dpi_scale)
-
-        for page_idx in range(len(doc)):
-            page = doc[page_idx]
-            pix = page.get_pixmap(matrix=mat, alpha=False)
-            images.append(_pixmap_to_bgr(pix))
-
+        for i in range(len(doc)):
+            bitmap = doc[i].render(scale=dpi_scale)  # BGR by default
+            images.append(bitmap.to_numpy())
         return images
     finally:
         doc.close()

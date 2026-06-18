@@ -11,6 +11,7 @@ class ParseConfig:
     min_chunk_size: int = 700
     chunking: bool = True
     merge_small_chunks: bool = True
+    exact_tokens: bool = False
     table_representation: str = "markdown"
     debug: bool = False
     extra_fields: list[str] = field(default_factory=list)

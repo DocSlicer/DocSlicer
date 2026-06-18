@@ -1,5 +1,5 @@
 """
-Step 01 – Raw word extraction (pypdfium2 version)
+Step 01 – Raw word extraction
 
 Responsibility:
     - Open a PDF with pypdfium2
@@ -9,7 +9,7 @@ Responsibility:
     - Convert all color values to hex format (#rrggbb)
     - NO high-level features (no bold/italic guesses, no ratios, etc.)
 
-Output columns match the _pymu version exactly:
+Output columns:
     page_number, word_id, text,
     x_left, y_top, x_right, y_bottom, width, height,
     page_width, page_height,
@@ -19,8 +19,8 @@ Output columns match the _pymu version exactly:
     text_orientation   (LTR | RTL | TTB | BTT | UNKNOWN)
 
 Coordinate system: pypdfium2 charboxes are (left, bottom, right, top) in PDF
-space (y increases upward). We convert to screen space (y increases downward)
-to match the _pymu output: y_top = page_height - pdf_top.
+space (y increases upward). We convert to screen space (y increases downward):
+y_top = page_height - pdf_top.
 """
 
 from __future__ import annotations
@@ -222,7 +222,7 @@ def _extract_words_for_page(
         for i in range(n):
             ch = all_chars[i]
 
-            # charbox loose=True → full character cell height (matches PyMuPDF word height)
+            # charbox loose=True → full character cell height (matches pypdfium2 word height)
             l, b, r, t = tp.get_charbox(i, loose=True)
 
             if ch == _FFFE:
@@ -264,7 +264,7 @@ def _extract_words_for_page(
 
     df = pd.DataFrame(rows)
 
-    # Sort to match _pymu output order
+    # Sort by top-to-bottom, left-to-right reading order
     df = df.sort_values(["y_top", "x_left"], kind="mergesort").reset_index(drop=True)
 
     n_words = len(df)
@@ -285,7 +285,7 @@ def extract_words(
     """
     Extract all words from a PDF and return a DataFrame with one row per word.
 
-    Columns match the _pymu version: page_number, word_id, text,
+    Columns: page_number, word_id, text,
     x_left, x_right, y_top, y_bottom, width, height, font_name, font_size,
     non_stroking_color, stroking_color (both as hex #rrggbb or None),
     text_orientation, plus calculated text features.

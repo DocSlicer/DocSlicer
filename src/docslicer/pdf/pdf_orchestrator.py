@@ -6,10 +6,10 @@ These steps extract and process PDF documents into a lines_df format
 that can then be processed by the shared orchestrator.
 
 Pipeline Steps:
-    01. Word Extraction      - Extract words from PDF (PyMuPDF)
+    01. Word Extraction      - Extract words from PDF (pypdfium2)
     02. Image Extraction     - Extract images from PDF
-    02b. Shape Extraction    - Extract shapes/lines from PDF (pdfplumber)
-    03. Link Extraction      - Extract hyperlinks (PyMuPDF)
+    02b. Shape Extraction    - Extract shapes/lines from PDF (pypdfium2)
+    03. Link Extraction      - Extract hyperlinks (pypdfium2)
     04. Shape Enhancer       - Merge/enhance shape metadata
     05a. Line Number Detect  - Flag margin line numbers in df_words
     05b. Gutter Detection    - Detect column gutters, annotate df_words
@@ -108,16 +108,16 @@ def run_pipeline(
         if on_stage:
             on_stage("parsing")
 
-        # Step 01 - Word Extraction (PyMuPDF)
+        # Step 01 - Word Extraction (pypdfium2)
         df_words = extract_words(pdf_path)
 
         # Step 02 - Image Extraction
         df_images = extract_images(pdf_path)
 
-        # Step 02b - Shape Extraction (pdfplumber)
+        # Step 02b - Shape Extraction (pypdfium2)
         df_shapes = extract_shapes(pdf_path)
 
-        # Step 03 - Link Extraction (PyMuPDF)
+        # Step 03 - Link Extraction (pypdfium2)
         df_links = extract_links(pdf_path)
 
         # ── OCR check (before enrichment, before cell construction) ─────────

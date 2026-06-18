@@ -52,7 +52,8 @@ class DocumentMetadata:
     # ------------------------------------------------------------------
 
     chars: Optional[int] = None
-    estimated_tokens: Optional[int] = None
+    token_count: Optional[int] = None
+    token_count_exact: bool = False
 
     # ------------------------------------------------------------------
     # Resolved document metadata (public output)
@@ -114,7 +115,8 @@ class DocumentMetadata:
             needs_ocr=d.get("needs_ocr", False),
             is_scanned=d.get("is_scanned", False),
             chars=d.get("chars"),
-            estimated_tokens=d.get("estimated_tokens"),
+            token_count=d.get("token_count"),
+            token_count_exact=d.get("token_count_exact", False),
             title=d.get("title"),
             author=d.get("author"),
             language=d.get("language"),
@@ -155,8 +157,9 @@ class DocumentMetadata:
         out["is_scanned"] = self.is_scanned
         if self.chars is not None:
             out["chars"] = self.chars
-        if self.estimated_tokens is not None:
-            out["estimated_tokens"] = self.estimated_tokens
+        if self.token_count is not None:
+            out["token_count"] = self.token_count
+            out["token_count_exact"] = self.token_count_exact
         if self.title is not None:
             out["title"] = self.title
         if self.author is not None:

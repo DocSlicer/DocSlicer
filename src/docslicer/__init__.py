@@ -151,6 +151,7 @@ def parse_pdf(
     chunking: bool = True,
     merge_small_chunks: bool = True,
     table_representation: str = "markdown",
+    exact_tokens: bool = False,
     debug: bool = False,
     extra_fields: list[str] | None = None,
 ) -> ParseResult:
@@ -169,6 +170,10 @@ def parse_pdf(
             adjacent chunks (default True).
         table_representation: How tables are serialized into chunk text. One of
             "markdown" (default), "jsonl", or "melted".
+        exact_tokens: Use tiktoken (cl100k_base) for exact token counts on each
+            chunk and the document total (default False). Falls back to char/4
+            estimation if tiktoken is not installed. Requires
+            ``pip install tiktoken`` for exact counts.
         debug: Populate result.pipeline_steps with intermediate DataFrames.
         extra_fields: Additional pipeline DataFrame columns to attach to each
             Block and Chunk under their ``.extra`` dict, e.g.
@@ -181,6 +186,7 @@ def parse_pdf(
         chunking=chunking,
         merge_small_chunks=merge_small_chunks,
         table_representation=table_representation,
+        exact_tokens=exact_tokens,
         debug=debug,
         extra_fields=extra_fields or [],
     )
@@ -197,6 +203,7 @@ def parse_docx(
     chunking: bool = True,
     merge_small_chunks: bool = True,
     table_representation: str = "markdown",
+    exact_tokens: bool = False,
     debug: bool = False,
     extra_fields: list[str] | None = None,
 ) -> ParseResult:
@@ -213,6 +220,8 @@ def parse_docx(
             adjacent chunks (default True).
         table_representation: How tables are serialized into chunk text. One of
             "markdown" (default), "jsonl", or "melted".
+        exact_tokens: Use tiktoken (cl100k_base) for exact token counts (default
+            False). Falls back to char/4 estimation if tiktoken is not installed.
         debug: Populate result.pipeline_steps with intermediate DataFrames.
         extra_fields: Additional pipeline DataFrame columns to attach to each
             Block and Chunk under their ``.extra`` dict. Unknown columns get None.
@@ -224,6 +233,7 @@ def parse_docx(
         chunking=chunking,
         merge_small_chunks=merge_small_chunks,
         table_representation=table_representation,
+        exact_tokens=exact_tokens,
         debug=debug,
         extra_fields=extra_fields or [],
     )
@@ -240,6 +250,7 @@ def parse_pptx(
     chunking: bool = True,
     merge_small_chunks: bool = True,
     table_representation: str = "markdown",
+    exact_tokens: bool = False,
     debug: bool = False,
     extra_fields: list[str] | None = None,
 ) -> ParseResult:
@@ -256,6 +267,8 @@ def parse_pptx(
             adjacent chunks (default True).
         table_representation: How tables are serialized into chunk text. One of
             "markdown" (default), "jsonl", or "melted".
+        exact_tokens: Use tiktoken (cl100k_base) for exact token counts (default
+            False). Falls back to char/4 estimation if tiktoken is not installed.
         debug: Populate result.pipeline_steps with intermediate DataFrames.
         extra_fields: Additional pipeline DataFrame columns to attach to each
             Block and Chunk under their ``.extra`` dict. Unknown columns get None.
@@ -267,6 +280,7 @@ def parse_pptx(
         chunking=chunking,
         merge_small_chunks=merge_small_chunks,
         table_representation=table_representation,
+        exact_tokens=exact_tokens,
         debug=debug,
         extra_fields=extra_fields or [],
     )
@@ -284,6 +298,7 @@ def parse_html(
     chunking: bool = True,
     merge_small_chunks: bool = True,
     table_representation: str = "markdown",
+    exact_tokens: bool = False,
     debug: bool = False,
     extra_fields: list[str] | None = None,
 ) -> ParseResult:
@@ -309,6 +324,8 @@ def parse_html(
             adjacent chunks (default True).
         table_representation: How tables are serialized into chunk text. One of
             "markdown" (default), "jsonl", or "melted".
+        exact_tokens: Use tiktoken (cl100k_base) for exact token counts (default
+            False). Falls back to char/4 estimation if tiktoken is not installed.
         debug: Populate result.pipeline_steps with intermediate DataFrames.
         extra_fields: Additional pipeline DataFrame columns to attach to each
             Block and Chunk under their ``.extra`` dict. Unknown columns get None.
@@ -320,6 +337,7 @@ def parse_html(
         chunking=chunking,
         merge_small_chunks=merge_small_chunks,
         table_representation=table_representation,
+        exact_tokens=exact_tokens,
         debug=debug,
         extra_fields=extra_fields or [],
     )

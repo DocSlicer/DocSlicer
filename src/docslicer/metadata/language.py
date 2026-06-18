@@ -54,58 +54,40 @@ def extract_language_from_pdf_metadata(pdf_path: Path) -> Optional[str]:
     Returns:
         Normalized language code (e.g., "en") or None
     """
-    import fitz  # PyMuPDF
     import xml.etree.ElementTree as ET
+    import pypdfium2 as pdfium
+    from ._pdf_xmp import read_xmp
 
     try:
-        with fitz.open(pdf_path) as doc:
-            # First, try the direct language property (reads /Lang)
-            if hasattr(doc, 'language') and doc.language:
-                lang = doc.language.strip()
-                if lang:
-                    return _normalize_language_code(lang)
+        # 1. XMP dc:language / xmp:Language
+        xmp = read_xmp(pdf_path)
+        if xmp:
+            root = ET.fromstring(xmp)
+            ns = {
+                'rdf': 'http://www.w3.org/1999/02/22-rdf-syntax-ns#',
+                'dc': 'http://purl.org/dc/elements/1.1/',
+                'xmp': 'http://ns.adobe.com/xap/1.0/',
+            }
+            for elem in root.findall('.//dc:language', ns):
+                for li in elem.findall('.//rdf:li', ns):
+                    if li.text and li.text.strip():
+                        return _normalize_language_code(li.text.strip())
+                if elem.text and elem.text.strip():
+                    return _normalize_language_code(elem.text.strip())
+            for elem in root.findall('.//xmp:Language', ns):
+                if elem.text and elem.text.strip():
+                    return _normalize_language_code(elem.text.strip())
 
-            # Try XMP metadata
-            xmp_metadata = doc.get_xml_metadata()
-            if xmp_metadata:
-                try:
-                    root = ET.fromstring(xmp_metadata)
+        # 2. PDF info dict (uncommon but some generators write it)
+        with pdfium.PdfDocument(pdf_path) as doc:
+            for key in ("Language", "Lang"):
+                value = doc.get_metadata_value(key)
+                if value and value.strip():
+                    return _normalize_language_code(value.strip())
 
-                    namespaces = {
-                        'rdf': 'http://www.w3.org/1999/02/22-rdf-syntax-ns#',
-                        'dc': 'http://purl.org/dc/elements/1.1/',
-                        'xmp': 'http://ns.adobe.com/xap/1.0/'
-                    }
+        return None
 
-                    # Look for dc:language
-                    for lang_elem in root.findall('.//dc:language', namespaces):
-                        # Can contain rdf:Alt with rdf:li items
-                        for li in lang_elem.findall('.//rdf:li', namespaces):
-                            if li.text and li.text.strip():
-                                return _normalize_language_code(li.text.strip())
-
-                        # Or direct text
-                        if lang_elem.text and lang_elem.text.strip():
-                            return _normalize_language_code(lang_elem.text.strip())
-
-                    # Look for xmp:Language
-                    for lang_elem in root.findall('.//xmp:Language', namespaces):
-                        if lang_elem.text and lang_elem.text.strip():
-                            return _normalize_language_code(lang_elem.text.strip())
-
-                except Exception as e:
-                    pass  # Fall through to standard metadata
-
-            # Fallback to standard metadata dict
-            metadata = doc.metadata or {}
-            for key in ['language', 'Language', 'lang', 'Lang']:
-                lang = metadata.get(key)
-                if lang and lang.strip():
-                    return _normalize_language_code(lang.strip())
-
-            return None
-
-    except Exception as e:
+    except Exception:
         return None
 
 

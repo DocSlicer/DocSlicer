@@ -70,7 +70,7 @@ def _sequence_to_rgb01(color_value: Sequence[Any]) -> Optional[tuple[float, floa
 
 def pdf_color_to_hex(color_value: Any) -> Optional[str]:
     """
-    Convert PDF color values from PyMuPDF/pdfplumber-style sources to hex.
+    Convert PDF color values from pypdfium2 to hex.
 
     Handles:
       - packed RGB integers, e.g. 16777215 -> '#ffffff'

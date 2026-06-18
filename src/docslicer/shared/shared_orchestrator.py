@@ -133,6 +133,7 @@ def run_pipeline(
         softmin_chunk_chars=config.min_chunk_size,
         min_chunk_chars=400,
         merge_small_chunks=config.merge_small_chunks,
+        exact_tokens=config.exact_tokens,
     )
 
     # ============================================================
