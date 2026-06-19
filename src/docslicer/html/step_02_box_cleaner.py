@@ -326,6 +326,7 @@ def clean_boxes(
     df_boxes: pd.DataFrame,
     keep_debug_cols: bool = False,
     dry_run: bool = False,
+    reorder_by_coordinates: bool = True,
 ) -> pd.DataFrame:
     """
     Full cleaning pipeline for a raw box DataFrame extracted from an HTML document.
@@ -339,13 +340,19 @@ def clean_boxes(
     4. **Merge fragments** – collapse boxes that share a ``structure_tag_id`` into a single row,
        preserving ``<br>``-split boxes as separate entries.
     5. **DOM ordering** – reassign ``box_id`` in reading order: regular content sorted by
-       ``structure_tag_id``; ``<hr>`` and ``<img>`` elements inserted by ``y_top`` position.
+       ``structure_tag_id``; ``<hr>`` and ``<img>`` elements inserted by ``y_top`` position
+       (skipped when ``reorder_by_coordinates=False`` — use for static extraction where
+       y_top is always 0 and DOM order is already correct).
     6. **Block role** – populate ``block_type`` for structural elements (``"hr"``, ``"image"``).
 
     Args:
         df_boxes: Raw box DataFrame as produced by the box extractor step.
         keep_debug_cols: Attach ``_drop_*`` diagnostic columns from the boilerplate filter.
         dry_run: Skip actual row removal in the boilerplate step (useful for inspection).
+        reorder_by_coordinates: When True (default), hr/img elements are slotted into the
+            regular content stream by y_top. Set to False for statically extracted boxes
+            where y_top is always 0 — boxes are already in DOM order and slotting by y_top
+            would push all hr/img elements to the top.
 
     Returns:
         Cleaned, ordered box DataFrame ready for downstream processing.
@@ -364,13 +371,13 @@ def clean_boxes(
     df_clean = _merge_boxes_by_structure_tag(df_clean)
 
     # 5) Reassign box_id in DOM order: regular content by structure_tag_id,
-    #    hr/img elements inserted by y_top
+    #    hr/img elements inserted by y_top (skipped for static extraction)
     if "box_id" in df_clean.columns and "structure_tag" in df_clean.columns:
         is_special = df_clean["structure_tag"].isin(["hr", "img"])
         special_rows = df_clean[is_special].copy()
         regular_rows = df_clean[~is_special].copy()
 
-        if not special_rows.empty and not regular_rows.empty and "y_top" in df_clean.columns:
+        if reorder_by_coordinates and not special_rows.empty and not regular_rows.empty and "y_top" in df_clean.columns:
             if "structure_tag_id" in regular_rows.columns:
                 regular_rows = regular_rows.sort_values("structure_tag_id").reset_index(drop=True)
             special_rows = special_rows.sort_values("y_top").reset_index(drop=True)
@@ -391,6 +398,7 @@ def clean_boxes(
                 .reset_index(drop=True)
             )
         else:
+            # Static extraction: DOM order is already correct — sort everything by structure_tag_id
             if "structure_tag_id" in df_clean.columns:
                 df_clean = df_clean.sort_values("structure_tag_id").reset_index(drop=True)
             else:

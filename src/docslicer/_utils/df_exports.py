@@ -98,7 +98,7 @@ def export_debug(df: pd.DataFrame, drop_none: bool = False) -> pd.DataFrame:
     """
     if df.empty:
         return df
-    
+
     df = df.copy()
     
     # Drop None-only columns if requested

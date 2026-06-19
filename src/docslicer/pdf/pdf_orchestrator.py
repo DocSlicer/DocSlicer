@@ -11,8 +11,9 @@ Pipeline Steps:
     02b. Shape Extraction    - Extract shapes/lines from PDF (pypdfium2)
     03. Link Extraction      - Extract hyperlinks (pypdfium2)
     04. Shape Enhancer       - Merge/enhance shape metadata
-    05a. Line Number Detect  - Flag margin line numbers in df_words
-    05b. Gutter Detection    - Detect column gutters, annotate df_words
+    05a. Footnote Detection  - Flag footnote blocks in df_words
+    05b. Line Number Detect  - Flag margin line numbers in df_words (excludes footnotes)
+    05c. Gutter Detection    - Detect column gutters, annotate df_words
     [OCR]                    - Run OCR pipeline if scanned document detected
     06. Cell Builder         - Build cells from words + shapes + links
     07. Page Labels          - Assign page labels to cells
@@ -37,6 +38,7 @@ from .step_02_image_extractor import extract_images
 from .step_03_shape_extractor import extract_shapes
 from .step_04_link_extractor import extract_links
 from .step_05_shape_merger import merge_shapes
+from .step_05c_footnote_detector import detect_footnotes
 from .step_06_line_number_detector import detect_line_numbers
 from .step_07_gutter_detector import detect_and_annotate_gutters
 from .step_08_cell_builder import build_cells
@@ -161,7 +163,10 @@ def run_pipeline(
         # Step 04 - Shape Enhancement
         df_shapes = merge_shapes(df_shapes, merge_lines=True)
 
-        # Step 05a - Line Number Detection
+        # Step 05a - Footnote Detection (pre-filter for line number detector)
+        df_words = detect_footnotes(df_words)
+
+        # Step 05b - Line Number Detection
         df_words = detect_line_numbers(df_words)
 
         # Step 05b - Gutter Detection

@@ -226,6 +226,7 @@ def _add_layout_id(df: pd.DataFrame) -> pd.DataFrame:
 def merge_boxes_to_lines(
     boxes_df: pd.DataFrame,
     remove_single_row_tables: bool = True,
+    merge_by_coordinates: bool = True,
 ) -> pd.DataFrame:
     """
     Merge boxes into lines:
@@ -234,15 +235,51 @@ def merge_boxes_to_lines(
     3. Aggregate using hierarchical_aggregator
     4. Optionally remove single-row tables and reindex
     5. Add layout_id
-    
+
     Args:
         boxes_df: DataFrame with box-level data
         remove_single_row_tables: If True, remove table_id/table_row_id for tables with only 1 row
+        merge_by_coordinates: When False, skip y-tolerance merging and give every non-table box
+            its own line. Use for statically extracted boxes where y_top/y_bottom are all 0.
     """
     if boxes_df is None or boxes_df.empty:
         return boxes_df
-    
+
     # Step 1: Assign line_id
+    # When coordinates are absent (static extraction), y_top/y_bottom are all 0, which
+    # causes every box to merge into one line via the tolerance check. Fix: synthetically
+    # space y values so non-table boxes are always far enough apart to avoid merging.
+    # Table cells still merge correctly via table_row_id (checked before coordinates).
+    if not merge_by_coordinates:
+        # With y_top=0 everywhere, assign_line_id's tolerance check merges everything.
+        # Give every logical row a unique y so only table_row_id-based merging applies.
+        # - Non-table boxes: unique y per box (each becomes its own line)
+        # - Table cells: same y for cells sharing a table_row_id, unique per row group
+        #   (coordinate check is skipped because table_row_id match fires first, but
+        #    cells from *different* rows would also have dy=0 and spuriously merge)
+        _STRIDE = LineMergerConfig().TOL_EXPANDED + 1  # > any merge tolerance
+        boxes_df = boxes_df.copy()
+        has_row_id = "table_row_id" in boxes_df.columns
+        is_table_box = boxes_df["table_row_id"].notna() if has_row_id else pd.Series(False, index=boxes_df.index)
+
+        # Assign a rank to each unique (table_id, table_row_id) pair in document order
+        if has_row_id and is_table_box.any():
+            row_groups = (
+                boxes_df[is_table_box]
+                .groupby(["table_id", "table_row_id"], sort=False)
+                .ngroup()
+            )
+
+        sequential_y = pd.Series(range(len(boxes_df)), index=boxes_df.index, dtype=float) * _STRIDE
+        synthetic_y = sequential_y.copy()
+
+        if has_row_id and is_table_box.any():
+            # All cells in the same TR share the same y (their row group rank × stride)
+            synthetic_y[is_table_box] = row_groups.values * _STRIDE
+
+        boxes_df["y_top"] = synthetic_y
+        boxes_df["y_bottom"] = synthetic_y
+
     boxes_with_lines = assign_line_id(boxes_df, y_alignment="top")
     
     # Step 2: Create text for each line (sorted by x_left, joined with spaces)

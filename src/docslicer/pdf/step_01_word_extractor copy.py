@@ -175,16 +175,22 @@ def _get_mark_name(mark) -> str | None:
 
 def _extract_text_obj_marks(
     page,
-) -> list[tuple[float, float, float, float, int | None, str | None, int]]:
+) -> list[tuple[float, float, float, float, int | None, str | None, int, float, float, float, float, float, float, float]]:
     """
     Iterate TEXT page objects in content-stream order.
 
-    Returns a list of (l, b, r, t, mcid, marked_tag, stream_idx) in PDF space
-    (y-up).  stream_idx counts only TEXT objects (0-based).
+    Returns a list of tuples:
+        (l, b, r, t, mcid, marked_tag, stream_idx, mat_a, mat_b, mat_c, mat_d, mat_e, mat_f, bbox_h)
+
+    Coordinates (l,b,r,t) are PDF space (y-up).  The mat_* fields are the
+    text rendering matrix from FPDFPageObj_GetMatrix — used by _compute_run_ids
+    to detect absolute Tm vs relative Td/T* boundaries.  bbox_h is the rendered
+    object height used as a font-size proxy in the run-seam thresholds.
     """
-    results: list[tuple[float, float, float, float, int | None, str | None, int]] = []
+    results = []
     _l = ctypes.c_float(); _b = ctypes.c_float()
     _r = ctypes.c_float(); _t = ctypes.c_float()
+    _mat = pdfium_c.FS_MATRIX()
     stream_idx = 0
     _mcid_tmp = ctypes.c_int(0)
 
@@ -195,6 +201,7 @@ def _extract_text_obj_marks(
             continue
 
         pdfium_c.FPDFPageObj_GetBounds(obj, _BYREF(_l), _BYREF(_b), _BYREF(_r), _BYREF(_t))
+        pdfium_c.FPDFPageObj_GetMatrix(obj, _BYREF(_mat))
 
         raw_mcid = pdfium_c.FPDFPageObj_GetMarkedContentID(obj)
         mcid: int | None = raw_mcid if raw_mcid >= 0 else None
@@ -218,7 +225,13 @@ def _extract_text_obj_marks(
         if marked_tag is None:
             marked_tag = fallback_tag
 
-        results.append((_l.value, _b.value, _r.value, _t.value, mcid, marked_tag, stream_idx))
+        bbox_h = max(_t.value - _b.value, 1.0)
+        results.append((
+            _l.value, _b.value, _r.value, _t.value,
+            mcid, marked_tag, stream_idx,
+            _mat.a, _mat.b, _mat.c, _mat.d, _mat.e, _mat.f,
+            bbox_h,
+        ))
         stream_idx += 1
 
     return results
@@ -281,39 +294,59 @@ def _extract_struct_info(
 
 
 def _compute_run_ids(
-    obj_marks: list[tuple[float, float, float, float, int | None, str | None, int]],
-    page_width: float,
+    obj_marks: list,
 ) -> dict[int, int]:
     """
     Assign a run_id to each TEXT page object (Tier C — untagged pages only).
 
-    A new run starts when consecutive objects show a positional gap that
-    suggests an absolute Tm repositioning rather than a relative Td/T* move:
-    large y-jump (>3× object height) or large x-jump (>35% of page width).
+    Uses the text rendering matrix from FPDFPageObj_GetMatrix to detect true
+    Tm boundaries, not a positional heuristic:
+
+    • A relative move (Td / TD / T*) only changes the translation (e, f) of
+      the current text matrix while leaving the linear part (a, b, c, d)
+      unchanged.
+    • An absolute Tm sets a brand-new matrix, so (a, b, c, d) can be anything.
+
+    Rule: if (a, b, c, d) changed vs the previous object → definite Tm → new run.
+    Fallback: same (a, b, c, d) but very large (e, f) jump → Tm that only
+    repositioned without rescaling (e.g. column-skip at constant font size).
+
+    Thresholds are expressed as multiples of bbox_h (the rendered object height),
+    which is the only reliable font-size proxy for both Type-A (Tf=size, Tm≈I)
+    and Type-B (Tf=1, Tm=[size,…]) producers.  math.hypot(a,b) from the matrix
+    only captures the scale for Type-B, giving 1.0 for Type-A — making the
+    thresholds 9–12× too tight.
 
     Returns stream_idx → run_id.
     """
     run_id = 0
     sidx_to_run: dict[int, int] = {}
-    prev_r = prev_cy = prev_h = None
+    prev = None   # (a, b, c, d, e, f, bbox_h)
 
-    for l, b, r, t, _, _, sidx in obj_marks:
-        cy = (b + t) * 0.5
-        h  = abs(t - b)
+    for entry in obj_marks:
+        _, _, _, _, _, _, sidx, ma, mb, mc, md, me, mf, bbox_h = entry
 
-        if prev_r is None:
+        if prev is None:
             sidx_to_run[sidx] = run_id
         else:
-            y_gap  = abs(cy - prev_cy)
-            x_gap  = abs(l - prev_r)
-            ref_h  = prev_h or 12.0
-            if y_gap > 3.0 * ref_h or x_gap > 0.35 * page_width:
+            pa, pb, pc, pd, pe, pf, pbh = prev
+            linear_changed = (
+                abs(ma - pa) + abs(mb - pb) + abs(mc - pc) + abs(md - pd) > 1e-3
+            )
+            if linear_changed:
+                # Scale or rotation changed: must be Tm.
                 run_id += 1
+            else:
+                # Linear part unchanged: Td/T* keeps the same scale.
+                # A Tm that only shifts position (no rescale) still produces a
+                # large translation jump — flag it as a new run.
+                ref = pbh  # rendered height of previous object (reliable font-size proxy)
+                if abs(mf - pf) > 3.0 * ref or abs(me - pe) > 5.0 * ref:
+                    run_id += 1
+
             sidx_to_run[sidx] = run_id
 
-        prev_r  = r
-        prev_cy = cy
-        prev_h  = h
+        prev = (ma, mb, mc, md, me, mf, bbox_h)
 
     return sidx_to_run
 
@@ -322,7 +355,6 @@ def _annotate_words(
     df: pd.DataFrame,
     page,
     page_height: float,
-    page_width: float,
 ) -> None:
     """
     Enrich *df* in-place with marked-content and struct-tree columns.
@@ -345,7 +377,7 @@ def _annotate_words(
         cy_pdf = page_height - (df["y_top"].to_numpy(float) + df["y_bottom"].to_numpy(float)) * 0.5
         TOL = 1.5
 
-        for l, b, r, t, mc, tag, sidx in obj_marks:
+        for l, b, r, t, mc, tag, sidx, *_mat in obj_marks:
             mask = (
                 (cx     >= l - TOL) & (cx     <= r + TOL) &
                 (cy_pdf >= b - TOL) & (cy_pdf <= t + TOL) &
@@ -377,7 +409,7 @@ def _annotate_words(
     has_any_mcid = any(mc is not None for mc in mcid_arr)
 
     if not has_any_mcid and obj_marks:
-        sidx_to_run = _compute_run_ids(obj_marks, page_width)
+        sidx_to_run = _compute_run_ids(obj_marks)
         for i, sidx in enumerate(sidx_arr):
             if sidx >= 0:
                 run_id_arr[i] = sidx_to_run.get(sidx)
@@ -594,7 +626,7 @@ def _extract_words_for_page(
     df["page_width"]  = page_width
     df["page_height"] = page_height
 
-    _annotate_words(df, page, page_height, page_width)
+    _annotate_words(df, page, page_height)
 
     return df, start_word_id + n_words
 

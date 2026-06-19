@@ -1285,11 +1285,14 @@ def drop_unreliable_prefix_labels(
     """
     out = df.copy()
 
-    # page-level view: one label_value per page (first non-null)
+    # page-level view: one label_value per page — read from winner rows only.
+    # Non-winner candidate rows also carry page_label_value (set during candidate
+    # marking) and would produce wrong first-non-null values per page if included.
+    winner_rows = out[out[label_col].notna() & (out[label_col].astype(str).str.len() > 0)]
     page_vals = (
-        out[[page_col, value_col]]
-        .assign(_p=pd.to_numeric(out[page_col], errors="coerce"),
-                _v=pd.to_numeric(out[value_col], errors="coerce"))
+        winner_rows[[page_col, value_col]]
+        .assign(_p=pd.to_numeric(winner_rows[page_col], errors="coerce"),
+                _v=pd.to_numeric(winner_rows[value_col], errors="coerce"))
         .dropna(subset=["_p"])
         .groupby("_p", as_index=False)["_v"]
         .apply(lambda s: s.dropna().iloc[0] if not s.dropna().empty else np.nan)

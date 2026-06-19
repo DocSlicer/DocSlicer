@@ -155,6 +155,18 @@ def build_paragraphs(
 
     para_df["text"] = para_df["paragraph_id"].map(para_text)
 
+    # 1-celled tables carry no structural table information — treat as plain textboxes.
+    if "table_id" in run_df.columns and "table_cell_id" in run_df.columns:
+        cell_counts = (
+            run_df[run_df["table_id"].notna()]
+            .groupby("table_id")["table_cell_id"]
+            .nunique()
+        )
+        single_cell_ids = set(cell_counts[cell_counts == 1].index)
+        if single_cell_ids and "table_id" in para_df.columns:
+            mask = para_df["table_id"].isin(single_cell_ids)
+            para_df.loc[mask, ["table_id", "table_row_id", "table_cell_id"]] = None
+
     # Derive block_type in ascending priority (table wins over all).
     para_df["block_type"] = None
     if "shape_type" in para_df.columns:

@@ -23,7 +23,6 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 # HTML-specific step imports
-from .step_01_box_extractor import extract_boxes_with_playwright
 from .step_02_box_cleaner import clean_boxes
 from .step_03_page_label_detector import assign_page_labels
 from .step_04_line_builder import merge_boxes_to_lines
@@ -103,27 +102,47 @@ def run_pipeline(
     if on_stage:
         on_stage("parsing")
 
-    # Step 01 - Box Extraction (Playwright)
-    # html XOR source_url must be set (enforced inside extract_boxes_with_playwright)
-    # For non-SEC URLs: Playwright navigates directly. If that fails, fall back to
-    # fetching bytes via http_fetcher and rendering with set_content.
+    # Step 01 - Box Extraction
+    # Try Playwright first; if not installed, fall back to static extractor.
     tried_networkidle = False
     try:
-        boxes, rendered_html = extract_boxes_with_playwright(html, source_url, wait_until="domcontentloaded")
-    except Exception as e:
-        if source_url:
-            logger.warning(f"Playwright navigation failed for {source_url}, falling back to http_fetcher: {e}")
-            scraped = fetch_url(source_url)
-            html = scraped.raw_bytes.decode(scraped.encoding or "utf-8", errors="replace")
-            html = _inject_base_url(html, scraped.final_url)
-            boxes, rendered_html = extract_boxes_with_playwright(html, source_url=None)
-        else:
-            raise
+        from .step_01_box_extractor import extract_boxes_with_playwright
+        _playwright_available = True
+    except ImportError:
+        logger.warning(
+            "Playwright is not installed — falling back to static box extractor. "
+            "Accuracy will be degraded: layout coordinates are unavailable and CSS-class styles are not resolved. "
+            "Bold or styled headings may go undetected, which can degrade chunk boundaries and hierarchy quality."
+        )
+        _playwright_available = False
+
+    if _playwright_available:
+        # For non-SEC URLs: Playwright navigates directly. If that fails, fall back to
+        # fetching bytes via http_fetcher and rendering with set_content.
+        try:
+            boxes, rendered_html = extract_boxes_with_playwright(html, source_url, wait_until="domcontentloaded")
+        except Exception as e:
+            if source_url:
+                logger.warning(f"Playwright navigation failed for {source_url}, falling back to http_fetcher: {e}")
+                scraped = fetch_url(source_url)
+                html = scraped.raw_bytes.decode(scraped.encoding or "utf-8", errors="replace")
+                html = _inject_base_url(html, scraped.final_url)
+                boxes, rendered_html = extract_boxes_with_playwright(html, source_url=None)
+            else:
+                raise
+    else:
+        if html is None:
+            # No Playwright to navigate, must have HTML content to proceed.
+            raise ValueError("Playwright is not installed and no HTML content was provided — cannot extract boxes.")
+        from .step_01_static_box_extractor import extract_boxes_static
+        boxes = extract_boxes_static(html)
+        rendered_html = html
+
     df_boxes = pd.DataFrame(boxes)
     logger.info(f"Step 01 - Box extraction complete, {len(df_boxes)} boxes")
 
     # Retry with networkidle if domcontentloaded produced no extractable boxes.
-    if df_boxes.empty and source_url:
+    if df_boxes.empty and source_url and _playwright_available:
         logger.info("No boxes after domcontentloaded extraction — retrying with networkidle")
         boxes, rendered_html = extract_boxes_with_playwright(html, source_url, wait_until="networkidle")
         tried_networkidle = True
@@ -134,10 +153,11 @@ def run_pipeline(
         return {}, df_boxes, None, {}
 
     # Step 02 - Box Cleaning
-    df_boxes = clean_boxes(df_boxes, keep_debug_cols=False, dry_run=False)
+    # Static extraction: hr/img are already in DOM order, skip y_top-based reordering
+    df_boxes = clean_boxes(df_boxes, keep_debug_cols=False, dry_run=False, reorder_by_coordinates=_playwright_available)
 
     # Retry with networkidle if cleaning wiped everything (e.g. only a footer survived domcontentloaded).
-    if df_boxes.empty and source_url and not tried_networkidle:
+    if df_boxes.empty and source_url and _playwright_available and not tried_networkidle:
         logger.info("No boxes after cleaning — retrying extraction with networkidle")
         boxes, rendered_html = extract_boxes_with_playwright(html, source_url, wait_until="networkidle")
         tried_networkidle = True
@@ -145,14 +165,16 @@ def run_pipeline(
         if df_boxes.empty:
             logger.warning("Still empty after networkidle retry, returning early")
             return {}, df_boxes, None, {}
-        df_boxes = clean_boxes(df_boxes, keep_debug_cols=False, dry_run=False)
+        df_boxes = clean_boxes(df_boxes, keep_debug_cols=False, dry_run=False, reorder_by_coordinates=_playwright_available)
 
     if df_boxes.empty:
         logger.warning("Empty DataFrame after box cleaning, returning early")
         return {}, df_boxes, None, {}
 
     # Step 03 - Page Labels (runs on boxes — needs box_id)
-    df_boxes, page_labels, page_label_groups = assign_page_labels(df_boxes, page_label_config)
+    df_boxes, page_labels, page_label_groups = assign_page_labels(
+        df_boxes, page_label_config, use_coordinate_filters=_playwright_available
+    )
 
     discovered_metadata: Dict[str, Any] = {}
     discovered_metadata["rendered_html"] = rendered_html
@@ -180,7 +202,7 @@ def run_pipeline(
 
     # Step 04 - Line Builder (boxes → lines); must run before table extractor
     # so that the final reindexed table_id values are available for ID matching.
-    df_lines = merge_boxes_to_lines(df_boxes, remove_single_row_tables=True)
+    df_lines = merge_boxes_to_lines(df_boxes, remove_single_row_tables=True, merge_by_coordinates=_playwright_available)
 
     # Step 05 - Table Extractor (uses df_lines.original_table_id for table_id sync)
     df_table_cells = extract_table_cells(

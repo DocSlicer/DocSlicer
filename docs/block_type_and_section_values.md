@@ -23,8 +23,13 @@ Classification of a block's content role. Set progressively through the shared p
 | `chart` | `pptx/step_05_paragraph_builder` | PPTX chart object (data points, axis labels, legends) |
 | `shape` | `pptx/step_05_paragraph_builder` | PPTX non-text shape with associated text content |
 | `speaker_notes` | `pptx/step_05_paragraph_builder` | PPTX speaker notes attached to a slide |
+| `header` | `docx/step_04_paragraph_builder` | Page header text (top margin region); typically repeats across pages |
+| `footer` | `docx/step_04_paragraph_builder` | Page footer text (bottom margin region); typically repeats across pages |
 | `watermark` | _(reserved)_ | Watermark / background text overlay |
 | `signature_block` | _(reserved)_ | Signature block at end of legal document |
+
+- Add: Comments, Footnote, Math, 
+- Maybe change navigation to bookmark
 
 **Noise types** (stripped before chunking): `hr`, `page_label`, `image`, `suppressed_repeated_heading`, `navigation`, `watermark`
 

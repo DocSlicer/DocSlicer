@@ -3,7 +3,9 @@ DOCX run → paragraph aggregator.
 
 Filters text/image runs and merges them by paragraph_id, producing one row per
 logical paragraph with concatenated text and character-count-weighted style.
-Header and footer parts are excluded so they don't pollute paragraph merging.
+When include_headers_footers is False (default) header/footer rows are dropped
+before processing.  When True they must already be expanded per-page (via
+expand_header_footer_runs) and receive block_type "header" or "footer".
 """
 
 from __future__ import annotations
@@ -72,17 +74,24 @@ def _paragraph_text(run_df: pd.DataFrame) -> pd.Series:
     return result.str.strip()
 
 
-def build_paragraphs(run_df: pd.DataFrame) -> pd.DataFrame:
+def build_paragraphs(
+    run_df: pd.DataFrame,
+    include_headers_footers: bool = False,
+) -> pd.DataFrame:
     """
     Aggregate run-level rows into paragraph-level rows.
 
     Keeps ``run_type`` in ``{"text", "image_ref"}`` runs, groups by
-    ``paragraph_id``. Header/footer parts are excluded before processing.
-    Style is weighted by character count; bold/italic/underlined ratios are
-    recomputed from sums. A ``block_type`` column is derived post-aggregation.
+    ``paragraph_id``. Style is weighted by character count; bold/italic/underlined
+    ratios are recomputed from sums. A ``block_type`` column is derived
+    post-aggregation.
 
     Args:
-        run_df: Output of ``extract_runs`` (after ``_inline_footnotes``).
+        run_df: Output of ``extract_runs`` (optionally post-processed by
+            ``expand_header_footer_runs``).
+        include_headers_footers: When False (default) header/footer rows are
+            dropped before processing.  When True they are expected to have
+            been expanded per-page and receive block_type "header"/"footer".
 
     Returns:
         One row per paragraph that contained at least one text or image run.
@@ -90,9 +99,7 @@ def build_paragraphs(run_df: pd.DataFrame) -> pd.DataFrame:
     if run_df.empty:
         return pd.DataFrame()
 
-    # Exclude header and footer parts — they are not body content and should
-    # not be merged into the paragraph sequence.
-    if "header_footer_type" in run_df.columns:
+    if not include_headers_footers and "header_footer_type" in run_df.columns:
         run_df = run_df[~run_df["header_footer_type"].isin({"header", "footer"})]
 
     if run_df.empty:
@@ -154,10 +161,14 @@ def build_paragraphs(run_df: pd.DataFrame) -> pd.DataFrame:
 
     # Derive block_type: image → paragraphs with at least one image_ref run;
     # table → paragraphs inside a table (table_id not null); table takes priority.
+    # header/footer overrides both so structural context is preserved.
     para_df["block_type"] = None
     if para_has_image:
         para_df.loc[para_df["paragraph_id"].isin(para_has_image), "block_type"] = "image"
     if "table_id" in para_df.columns:
         para_df.loc[para_df["table_id"].notna(), "block_type"] = "table"
+    if include_headers_footers and "header_footer_type" in para_df.columns:
+        para_df.loc[para_df["header_footer_type"] == "header", "block_type"] = "header"
+        para_df.loc[para_df["header_footer_type"] == "footer", "block_type"] = "footer"
 
     return para_df

@@ -656,6 +656,148 @@ def _select_footer_part(
     return None, None
 
 
+def _select_header_part(
+    info: _SectionInfo | None,
+    page_number: int,
+    section_first_page: int,
+) -> tuple[str | None, str | None]:
+    if info is None:
+        return None, None
+    page_in_section = page_number - section_first_page + 1
+    if info.has_title_page and page_in_section == 1 and "first" in info.header_parts:
+        return info.header_parts["first"], "first"
+    if info.has_even_and_odd_headers and page_number % 2 == 0 and "even" in info.header_parts:
+        return info.header_parts["even"], "even"
+    if "default" in info.header_parts:
+        return info.header_parts["default"], "default"
+    if info.header_parts:
+        header_type, header_part = next(iter(info.header_parts.items()))
+        return header_part, header_type
+    return None, None
+
+
+def expand_header_footer_runs(
+    run_df: pd.DataFrame,
+    package: DocxPackage,
+) -> pd.DataFrame:
+    """
+    Replace raw header/footer rows (one set per XML part) with per-page copies.
+
+    For each body page the appropriate header/footer XML part is selected using
+    section rules (first-page, even/odd, default).  Those runs are cloned, given
+    the correct page_number/section_id/page_label metadata, and reordered so
+    headers precede body content and footers follow it, per page.
+
+    Footnote/endnote/comment rows are appended unchanged at the end.
+    """
+    if "header_footer_type" not in run_df.columns:
+        return run_df
+
+    hf_mask = run_df["header_footer_type"].isin({"header", "footer"})
+    if not hf_mask.any():
+        return run_df
+
+    hf_df = run_df[hf_mask].copy()
+    other_df = run_df[~hf_mask]
+
+    body_mask = other_df["header_footer_type"].eq("body")
+    body_df = other_df[body_mask]
+    non_body_df = other_df[~body_mask]  # footnotes, endnotes, comments
+
+    # Build per-page metadata from first body run of each page (body rows have
+    # correct page_number, section_id, and page_label from prior pipeline steps).
+    page_meta: dict[int, dict] = {}
+    for page_num, group in body_df.groupby("page_number", sort=True):
+        first = group.iloc[0]
+        page_meta[int(page_num)] = {
+            "page_number": int(page_num),
+            "section_id": first.get("section_id"),
+            "page_label": first.get("page_label"),
+            "page_label_type": first.get("page_label_type"),
+            "page_width": first.get("page_width"),
+            "page_height": first.get("page_height"),
+        }
+
+    if not page_meta:
+        return other_df
+
+    section_infos = _collect_section_infos(package)
+
+    # section_first_pages[section_id_int] = min page_number in that section
+    section_first_pages: dict[int, int] = {}
+    for page_num, meta in page_meta.items():
+        sid = meta["section_id"]
+        if sid is None or (isinstance(sid, float) and pd.isna(sid)):
+            continue
+        try:
+            sid_int = int(sid)
+        except (TypeError, ValueError):
+            continue
+        if sid_int not in section_first_pages or page_num < section_first_pages[sid_int]:
+            section_first_pages[sid_int] = page_num
+
+    # Group h/f runs by source_part for fast lookup
+    hf_by_part: dict[str, pd.DataFrame] = {
+        part: grp for part, grp in hf_df.groupby("source_part", sort=False)
+    }
+
+    next_para_id = int(run_df["paragraph_id"].max()) + 1
+
+    def _clone_for_page(part_df: pd.DataFrame, meta: dict) -> pd.DataFrame:
+        nonlocal next_para_id
+        chunk = part_df.copy()
+        orig_ids = sorted(chunk["paragraph_id"].unique())
+        id_map = {old: next_para_id + i for i, old in enumerate(orig_ids)}
+        chunk["paragraph_id"] = chunk["paragraph_id"].map(id_map)
+        next_para_id += len(orig_ids)
+        for col, val in meta.items():
+            chunk[col] = val
+        # Replace static PAGE field rendered values with the actual page label.
+        # The rendered value (e.g. "4") is stored as run_type="text" inside a
+        # PAGE field (field_type="PAGE"); the correct label comes from body rows.
+        if "field_type" in chunk.columns and "run_type" in chunk.columns:
+            page_label_val = meta.get("page_label")
+            if page_label_val is not None:
+                page_field_mask = (chunk["run_type"] == "text") & (chunk["field_type"] == "PAGE")
+                if page_field_mask.any():
+                    chunk.loc[page_field_mask, "text"] = str(page_label_val)
+        return chunk
+
+    page_header_chunks: dict[int, pd.DataFrame] = {}
+    page_footer_chunks: dict[int, pd.DataFrame] = {}
+
+    for page_num in sorted(page_meta):
+        meta = page_meta[page_num]
+        sid = meta["section_id"]
+        try:
+            sid_int = int(sid) if (sid is not None and not (isinstance(sid, float) and pd.isna(sid))) else None
+        except (TypeError, ValueError):
+            sid_int = None
+
+        info = section_infos.get(sid_int) if sid_int is not None else None
+        first_page = section_first_pages.get(sid_int, page_num) if sid_int is not None else page_num
+
+        header_part, _ = _select_header_part(info, page_num, first_page)
+        if header_part and header_part in hf_by_part:
+            page_header_chunks[page_num] = _clone_for_page(hf_by_part[header_part], meta)
+
+        footer_part, _ = _select_footer_part(info, page_num, first_page)
+        if footer_part and footer_part in hf_by_part:
+            page_footer_chunks[page_num] = _clone_for_page(hf_by_part[footer_part], meta)
+
+    # Rebuild: for each page [header_rows][body_rows][footer_rows], then non-body
+    ordered: list[pd.DataFrame] = []
+    for page_num in sorted(page_meta):
+        if page_num in page_header_chunks:
+            ordered.append(page_header_chunks[page_num])
+        ordered.append(body_df[body_df["page_number"] == page_num])
+        if page_num in page_footer_chunks:
+            ordered.append(page_footer_chunks[page_num])
+
+    ordered.append(non_body_df)
+    return pd.concat(ordered, ignore_index=True)
+
+
 # ---------------------------------------------------------------------------
 # Number and page label formatting
 # ---------------------------------------------------------------------------

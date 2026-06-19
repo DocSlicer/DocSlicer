@@ -159,6 +159,7 @@ def assign_page_labels(
     page_label_config,
     tol_px: float = TOP_TOL_PX,
     debug: bool = False,
+    use_coordinate_filters: bool = True,
 ) -> Tuple[pd.DataFrame, List[PageLabel], List[PageLabelGroup]]:
     """
     Detect and assign page labels to document boxes.
@@ -191,6 +192,10 @@ def assign_page_labels(
         df: DataFrame with box metadata.
         page_label_config: Compiled page label pattern configuration.
         tol_px: Tolerance in pixels for top-band grouping (default: 4).
+        use_coordinate_filters: When False, skip band-based filters that rely on y_top
+            (crowded-band, long-text-band, linked-top-bands). Set to False for statically
+            extracted boxes where y_top is always 0 — all boxes collapse into one band,
+            which would wipe every candidate.
         debug: If True, retain intermediate columns in the returned DataFrame:
                ``page_label_token`` (filtered candidates),
                ``page_label_group_id``, and ``alternation_mode``.
@@ -227,7 +232,7 @@ def assign_page_labels(
     inv = _build_page_label_token_inventory(out, page_label_config)
 
     # Step 2: Apply filters (page-aware)
-    cand = _filter_page_label_tokens(out, inv, tol_px=tol_px)
+    cand = _filter_page_label_tokens(out, inv, tol_px=tol_px, use_coordinate_filters=use_coordinate_filters)
 
     # Attach columns needed by the sequence-detection pipeline.
     # _raw_token preserves the original string before normalization so that
@@ -510,6 +515,14 @@ def _try_extract_embedded_label(text: str) -> Optional[str]:
         if last:
             return last
 
+    # Pattern 3: word-prefix + structured label — "Annex A-1-86", "Exhibit F-5".
+    # Requires a hyphen in the last space-segment to exclude bare arabic ("Revenue 5")
+    # and bare roman ("Section iv") which are too ambiguous without document context.
+    if " " in stripped:
+        last = stripped.rsplit(" ", 1)[-1].strip()
+        if last and "-" in last:
+            return last
+
     return None
 
 
@@ -624,7 +637,8 @@ def _build_page_label_token_inventory(df: pd.DataFrame, page_label_config) -> pd
 def _filter_page_label_tokens(
     df: pd.DataFrame,
     token_inventory: pd.DataFrame,
-    tol_px: float = TOP_TOL_PX
+    tol_px: float = TOP_TOL_PX,
+    use_coordinate_filters: bool = True,
 ) -> pd.Series:
     """
     Filter token inventory to valid page label tokens.
@@ -685,8 +699,8 @@ def _filter_page_label_tokens(
     cand = cand.where(~is_excluded_letter, None)
 
     # Exclude rows in link bands (TOC entries) - now page-aware
-    # Only apply if has_link column is present
-    if "has_link" in df.columns:
+    # Only apply if has_link column is present and coordinates are reliable
+    if use_coordinate_filters and "has_link" in df.columns:
         linked_band_box_ids = _get_box_ids_in_linked_top_bands(df, tol_px=tol_px)
         in_link_band = df["box_id"].isin(linked_band_box_ids)
         cand = cand.where(~in_link_band, None)
@@ -738,13 +752,16 @@ def _filter_page_label_tokens(
     )
 
     # Exclude rows where the same top band has more than 2 items (likely headers/content).
-    band_counts = band_df.groupby(band_key).size()
-    crowded_midx = band_counts[band_counts > 2].index
-    in_crowded_band = pd.Series(row_band_midx.isin(crowded_midx), index=df.index)
-    cand = cand.where(~in_crowded_band, None)
+    # Skipped when use_coordinate_filters=False: all y_top=0 collapses everything into one
+    # band, which would wipe every candidate.
+    if use_coordinate_filters:
+        band_counts = band_df.groupby(band_key).size()
+        crowded_midx = band_counts[band_counts > 2].index
+        in_crowded_band = pd.Series(row_band_midx.isin(crowded_midx), index=df.index)
+        cand = cand.where(~in_crowded_band, None)
 
     # Exclude rows where the same top band has total character length > 50 (likely text content).
-    if "text" in df.columns:
+    if use_coordinate_filters and "text" in df.columns:
         band_df["text_len"] = df["text"].fillna("").astype(str).str.len()
         band_char_totals = band_df.groupby(band_key)["text_len"].sum()
         long_text_midx = band_char_totals[band_char_totals > 50].index
@@ -899,12 +916,17 @@ def _extract_custom_label_parts(token: str) -> Optional[Tuple[str, int]]:
         if roman_val:
             return (match.group(1), roman_val)
     
+    # Try alpha-numeric-sub: A-1-86, A-2-3 → prefix is "letter-major", number is minor
+    match = re.match(r'^([A-Z]-\d{1,3})-(\d+)$', upper_token)
+    if match:
+        return (match.group(1), int(match.group(2)))
+
     # Try alpha-numeric: F-1, A-23
     # Comes last since it's most general
     match = re.match(r'^([A-Z]+)-(\d+)$', upper_token)
     if match:
         return (match.group(1), int(match.group(2)))
-    
+
     return None
 
 
@@ -928,7 +950,7 @@ def _extract_page_label_value(token: str, label_type: PageLabelType) -> Union[in
         # Return as-is, will be converted to int during comparison
         return token
         
-    elif label_type in ["alpha_numeric", "alpha_roman", "roman_numeric"]:
+    elif label_type in ["alpha_numeric", "alpha_roman", "roman_numeric", "alpha_numeric_sub"]:
         parts = _extract_custom_label_parts(token)
         return parts
         
@@ -963,7 +985,7 @@ def _compare_page_label_values(val1: Union[int, str], val2: Union[int, str], lab
             return None
         return -1 if r1 < r2 else (0 if r1 == r2 else 1)
         
-    elif label_type in ["alpha_numeric", "alpha_roman", "roman_numeric"]:
+    elif label_type in ["alpha_numeric", "alpha_roman", "roman_numeric", "alpha_numeric_sub"]:
         # These are tuples (prefix, number)
         if not isinstance(val1, tuple) or not isinstance(val2, tuple):
             return None
@@ -1256,7 +1278,7 @@ def _build_candidate_sequences(candidates: List[PageLabelCandidate]) -> List[Can
         # - Center-aligned sequences are different from left-aligned sequences
         # - Alternating sequences use "left_right" key
         prefix = None
-        if label_type in ["alpha_numeric", "alpha_roman", "roman_numeric"]:
+        if label_type in ["alpha_numeric", "alpha_roman", "roman_numeric", "alpha_numeric_sub"]:
             if isinstance(token_value, tuple):
                 prefix = token_value[0]  # Extract prefix
         

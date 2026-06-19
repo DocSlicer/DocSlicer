@@ -63,7 +63,12 @@ def detect_line_numbers(df_words: pd.DataFrame) -> pd.DataFrame:
     # Assign temporary line IDs on a minimal copy (avoids mutating df_words).
     # Ignore non-LTR words before line merging so rotated/vertical footer text
     # cannot become the leftmost word for a line-number row.
-    df_tmp = df_words[_tmp_cols].copy()
+    # Also exclude words already identified as footnotes.
+    df_source = df_words
+    if "footnote_flag" in df_words.columns:
+        df_source = df_words[~df_words["footnote_flag"]]
+
+    df_tmp = df_source[_tmp_cols].copy()
     if "text_orientation" in df_tmp.columns:
         orientation = df_tmp["text_orientation"].fillna("LTR").astype(str).str.upper()
         df_tmp = df_tmp[orientation == "LTR"].copy()
