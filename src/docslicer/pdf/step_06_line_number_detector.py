@@ -23,9 +23,10 @@ from .._utils.line_merger import assign_line_id
 # =============================================================================
 
 _MIN_SERIES_LENGTH: int = 3       # minimum candidates to qualify as line numbers
-_X_ALIGN_TOLERANCE: float = 5.0   # pt — max x_left spread within an x-cluster
+_X_ALIGN_TOLERANCE: float = 7.0   # pt — max x_left spread within an x-cluster
 _MAX_NUMBER_WIDTH: float = 30.0   # pt — line-number token must be narrow
 _MAX_MISSING_NUMBERS_PER_PAGE: int = 1  # allow at most one skipped line number
+_FONT_SIZE_RATIO: float = 0.85    # line numbers may not be smaller than this × doc median, otherwise likely footnotes
 
 
 # =============================================================================
@@ -59,27 +60,31 @@ def detect_line_numbers(df_words: pd.DataFrame) -> pd.DataFrame:
     _tmp_cols = ["page_number", "word_id", "text", "x_left", "x_right", "y_top", "y_bottom"]
     if "text_orientation" in df_words.columns:
         _tmp_cols.append("text_orientation")
+    if "font_size" in df_words.columns:
+        _tmp_cols.append("font_size")
 
     # Assign temporary line IDs on a minimal copy (avoids mutating df_words).
     # Ignore non-LTR words before line merging so rotated/vertical footer text
     # cannot become the leftmost word for a line-number row.
-    # Also exclude words already identified as footnotes.
-    df_source = df_words
-    if "footnote_flag" in df_words.columns:
-        df_source = df_words[~df_words["footnote_flag"]]
-
-    df_tmp = df_source[_tmp_cols].copy()
+    df_tmp = df_words[_tmp_cols].copy()
     if "text_orientation" in df_tmp.columns:
         orientation = df_tmp["text_orientation"].fillna("LTR").astype(str).str.upper()
         df_tmp = df_tmp[orientation == "LTR"].copy()
 
     df_tmp = assign_line_id(df_tmp, y_alignment="center")
 
+    # Document-level font size median for the size KPI (None if column absent).
+    font_size_threshold: float | None = None
+    if "font_size" in df_words.columns:
+        valid_sizes = df_words["font_size"].replace(0, pd.NA).dropna()
+        if not valid_sizes.empty:
+            font_size_threshold = _FONT_SIZE_RATIO * float(valid_sizes.median())
+
     out = df_words.copy()
     out["line_number_flag"] = False
 
     for page_num, page_group in df_tmp.groupby("page_number"):
-        flagged_ids = _detect_page_line_numbers(page_group)
+        flagged_ids = _detect_page_line_numbers(page_group, font_size_threshold)
         if flagged_ids:
             mask = (out["page_number"] == page_num) & (out["word_id"].isin(flagged_ids))
             out.loc[mask, "line_number_flag"] = True
@@ -91,7 +96,10 @@ def detect_line_numbers(df_words: pd.DataFrame) -> pd.DataFrame:
 # Internal helpers
 # =============================================================================
 
-def _detect_page_line_numbers(page_df: pd.DataFrame) -> list[int]:
+def _detect_page_line_numbers(
+    page_df: pd.DataFrame,
+    font_size_threshold: float | None,
+) -> list[int]:
     """Return word_ids identified as line numbers on this page."""
 
     # Per line_id: pick the leftmost word — idxmin is C-level, no apply overhead
@@ -103,9 +111,15 @@ def _detect_page_line_numbers(page_df: pd.DataFrame) -> list[int]:
     is_pos_int = text_str.str.fullmatch(r"\d+", na=False) & (
         pd.to_numeric(text_str, errors="coerce").fillna(0) > 0
     )
+    size_ok = (
+        (candidates["font_size"] >= font_size_threshold)
+        if font_size_threshold is not None and "font_size" in candidates.columns
+        else True
+    )
     candidates = candidates[
         is_pos_int
         & ((candidates["x_right"] - candidates["x_left"]) <= _MAX_NUMBER_WIDTH)
+        & size_ok
     ].copy()
 
     if len(candidates) < _MIN_SERIES_LENGTH:

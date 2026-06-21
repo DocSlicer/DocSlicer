@@ -1294,8 +1294,9 @@ def drop_unreliable_prefix_labels(
         .assign(_p=pd.to_numeric(winner_rows[page_col], errors="coerce"),
                 _v=pd.to_numeric(winner_rows[value_col], errors="coerce"))
         .dropna(subset=["_p"])
-        .groupby("_p", as_index=False)["_v"]
+        .groupby("_p")["_v"]
         .apply(lambda s: s.dropna().iloc[0] if not s.dropna().empty else np.nan)
+        .reset_index()
         .rename(columns={"_p": "page", "_v": "val"})
     )
 

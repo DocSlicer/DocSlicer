@@ -1268,13 +1268,6 @@ def detect_and_annotate_gutters(df_words: pd.DataFrame, df_shapes: pd.DataFrame)
     if "text_orientation" not in df_words.columns:
         raise ValueError("df_words must contain a 'text_orientation' column")
 
-    # Exclude line numbers — they are not part of the text layout and must not
-    # influence gutter detection
-    if "line_number_flag" in df_words.columns:
-        df_words = df_words[df_words["line_number_flag"].ne(True)].copy()
-        if df_words.empty:
-            return _empty
-
     # Run gutter detection on LTR words only; non-LTR words are merged back at the end
     ltr_mask = df_words["text_orientation"] == "LTR"
     df_non_ltr = df_words[~ltr_mask].copy()

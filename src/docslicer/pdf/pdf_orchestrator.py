@@ -12,8 +12,9 @@ Pipeline Steps:
     03. Link Extraction      - Extract hyperlinks (pypdfium2)
     04. Shape Enhancer       - Merge/enhance shape metadata
     05a. Footnote Detection  - Flag footnote blocks in df_words
-    05b. Line Number Detect  - Flag margin line numbers in df_words (excludes footnotes)
-    05c. Gutter Detection    - Detect column gutters, annotate df_words
+    05b. Line Number Detect  - Flag margin line numbers in df_words
+    05c. Line Number Drop    - Remove flagged line-number words from df_words
+    05d. Gutter Detection    - Detect column gutters, annotate df_words
     [OCR]                    - Run OCR pipeline if scanned document detected
     06. Cell Builder         - Build cells from words + shapes + links
     07. Page Labels          - Assign page labels to cells
@@ -38,7 +39,6 @@ from .step_02_image_extractor import extract_images
 from .step_03_shape_extractor import extract_shapes
 from .step_04_link_extractor import extract_links
 from .step_05_shape_merger import merge_shapes
-from .step_05c_footnote_detector import detect_footnotes
 from .step_06_line_number_detector import detect_line_numbers
 from .step_07_gutter_detector import detect_and_annotate_gutters
 from .step_08_cell_builder import build_cells
@@ -163,13 +163,19 @@ def run_pipeline(
         # Step 04 - Shape Enhancement
         df_shapes = merge_shapes(df_shapes, merge_lines=True)
 
-        # Step 05a - Footnote Detection (pre-filter for line number detector)
-        df_words = detect_footnotes(df_words)
-
         # Step 05b - Line Number Detection
         df_words = detect_line_numbers(df_words)
 
-        # Step 05b - Gutter Detection
+        # Step 05c - Drop line-number words
+        # Line numbers are margin artefacts that must be removed entirely — unlike
+        # other annotations they cannot be represented as a meaningful block_type.
+        if "line_number_flag" in df_words.columns:
+            n_removed = df_words["line_number_flag"].sum()
+            if n_removed:
+                logger.debug("Dropping %d line-number word(s) from df_words", n_removed)
+            df_words = df_words[~df_words["line_number_flag"]].copy()
+
+        # Step 05d - Gutter Detection
         df_words, _, _ = detect_and_annotate_gutters(df_words, df_shapes)
 
         # ── Stage: Cell & Line Construction ─────────────────────────────────

@@ -22,11 +22,17 @@ Output columns:
     script_type        (None | "superscript" | "subscript"),
     mcid               (int | None  — marked-content ID from enclosing BDC),
     marked_tag         (str | None  — mark name: "Span", "P", "Artifact", …),
-    is_artifact        (bool        — True when marked_tag == "Artifact"),
     struct_tag         (str | None  — struct-tree element type: "P", "Span", …),
-    struct_group_id    (int | None  — struct leaf id > mcid > run_id; one per logical block),
+    struct_tag_id     (int | None  — DFS counter of the struct-tree element owning this word;
+                        two words with different ids are in different struct elements even if
+                        both have struct_tag == "P"),
+    struct_group_id    (int | None  — struct_tag_id > mcid+1e6 > text_object_id+2e6;
+                        namespaced to prevent cross-tranche collisions; same value = same logical block),
     reading_rank       (int | None  — DFS position in struct tree; global reading-order key),
-    run_id             (int | None  — Tier-C only: contiguous text-object run id)
+    text_object_id     (int | None  — 0-based sequential id per distinct PDFium text object,
+                        assigned via FPDFText_GetTextObject during the character loop;
+                        works inside form XObjects; increments on first encounter in
+                        textpage character order)
 
 Coordinate system: pypdfium2 charboxes are (left, bottom, right, top) in PDF
 space (y increases upward). We convert to screen space (y increases downward):
@@ -175,17 +181,17 @@ def _get_mark_name(mark) -> str | None:
 
 def _extract_text_obj_marks(
     page,
-) -> list[tuple[float, float, float, float, int | None, str | None, int]]:
+) -> list[tuple[float, float, float, float, int | None, str | None]]:
     """
     Iterate TEXT page objects in content-stream order.
 
-    Returns a list of (l, b, r, t, mcid, marked_tag, stream_idx) in PDF space
-    (y-up).  stream_idx counts only TEXT objects (0-based).
+    Returns a list of (l, b, r, t, mcid, marked_tag) in PDF space (y-up).
+    Used only for mcid/marked_tag assignment; text_object_id is now derived
+    directly from FPDFText_GetTextObject during the character loop.
     """
-    results: list[tuple[float, float, float, float, int | None, str | None, int]] = []
+    results: list[tuple[float, float, float, float, int | None, str | None]] = []
     _l = ctypes.c_float(); _b = ctypes.c_float()
     _r = ctypes.c_float(); _t = ctypes.c_float()
-    stream_idx = 0
     _mcid_tmp = ctypes.c_int(0)
 
     n_obj = pdfium_c.FPDFPage_CountObjects(page)
@@ -218,8 +224,7 @@ def _extract_text_obj_marks(
         if marked_tag is None:
             marked_tag = fallback_tag
 
-        results.append((_l.value, _b.value, _r.value, _t.value, mcid, marked_tag, stream_idx))
-        stream_idx += 1
+        results.append((_l.value, _b.value, _r.value, _t.value, mcid, marked_tag))
 
     return results
 
@@ -280,81 +285,41 @@ def _extract_struct_info(
     return mcid_to_tag, mcid_to_group, mcid_to_rank
 
 
-def _compute_run_ids(
-    obj_marks: list[tuple[float, float, float, float, int | None, str | None, int]],
-    page_width: float,
-) -> dict[int, int]:
-    """
-    Assign a run_id to each TEXT page object (Tier C — untagged pages only).
-
-    A new run starts when consecutive objects show a positional gap that
-    suggests an absolute Tm repositioning rather than a relative Td/T* move:
-    large y-jump (>3× object height) or large x-jump (>35% of page width).
-
-    Returns stream_idx → run_id.
-    """
-    run_id = 0
-    sidx_to_run: dict[int, int] = {}
-    prev_r = prev_cy = prev_h = None
-
-    for l, b, r, t, _, _, sidx in obj_marks:
-        cy = (b + t) * 0.5
-        h  = abs(t - b)
-
-        if prev_r is None:
-            sidx_to_run[sidx] = run_id
-        else:
-            y_gap  = abs(cy - prev_cy)
-            x_gap  = abs(l - prev_r)
-            ref_h  = prev_h or 12.0
-            if y_gap > 3.0 * ref_h or x_gap > 0.35 * page_width:
-                run_id += 1
-            sidx_to_run[sidx] = run_id
-
-        prev_r  = r
-        prev_cy = cy
-        prev_h  = h
-
-    return sidx_to_run
-
-
 def _annotate_words(
     df: pd.DataFrame,
     page,
     page_height: float,
-    page_width: float,
 ) -> None:
     """
     Enrich *df* in-place with marked-content and struct-tree columns.
 
-    Adds: mcid, marked_tag, is_artifact, struct_tag,
-          struct_group_id, reading_rank, run_id.
+    Adds: mcid, marked_tag, struct_tag, struct_tag_id,
+          struct_group_id, reading_rank.
+    text_object_id is already set by the character loop before this is called.
     """
     n = len(df)
     obj_marks = _extract_text_obj_marks(page)
 
     # ── Assign MCID/tag to each word via bbox containment (vectorised) ────────
-    mcid_arr   = np.empty(n, dtype=object)
-    tag_arr    = np.empty(n, dtype=object)
-    sidx_arr   = np.full(n, -1, dtype=np.int32)
-    mcid_arr[:] = None
-    tag_arr[:]  = None
+    mcid_arr    = np.empty(n, dtype=object); mcid_arr[:] = None
+    tag_arr     = np.empty(n, dtype=object); tag_arr[:]  = None
+    matched_arr = np.zeros(n, dtype=bool)   # guard: each word claimed by at most one obj
 
     if obj_marks and n > 0:
         cx     = (df["x_left"].to_numpy(float) + df["x_right"].to_numpy(float)) * 0.5
         cy_pdf = page_height - (df["y_top"].to_numpy(float) + df["y_bottom"].to_numpy(float)) * 0.5
         TOL = 1.5
 
-        for l, b, r, t, mc, tag, sidx in obj_marks:
+        for l, b, r, t, mc, tag in obj_marks:
             mask = (
                 (cx     >= l - TOL) & (cx     <= r + TOL) &
                 (cy_pdf >= b - TOL) & (cy_pdf <= t + TOL) &
-                (sidx_arr == -1)
+                ~matched_arr
             )
             if mask.any():
-                mcid_arr[mask]  = mc
-                tag_arr[mask]   = tag
-                sidx_arr[mask]  = sidx
+                mcid_arr[mask]    = mc
+                tag_arr[mask]     = tag
+                matched_arr[mask] = True
 
     # ── Struct tree ────────────────────────────────────────────────────────────
     mcid_to_stag, mcid_to_group, mcid_to_rank = _extract_struct_info(page)
@@ -365,41 +330,36 @@ def _annotate_words(
 
     for i, mc in enumerate(mcid_arr):
         if mc is not None:
-            stag   = mcid_to_stag.get(mc)
-            sgrp   = mcid_to_group.get(mc)
-            srank  = mcid_to_rank.get(mc)
+            stag  = mcid_to_stag.get(mc)
+            sgrp  = mcid_to_group.get(mc)
+            srank = mcid_to_rank.get(mc)
             if stag  is not None: stag_arr[i]   = stag
             if sgrp  is not None: sgroup_arr[i] = sgrp
             if srank is not None: srank_arr[i]  = srank
 
-    # ── Run IDs (Tier C only — no MCID marks on this page) ────────────────────
-    run_id_arr = np.empty(n, dtype=object); run_id_arr[:] = None
-    has_any_mcid = any(mc is not None for mc in mcid_arr)
+    # ── struct_group_id: struct_tag_id > mcid+1e6 > text_object_id+2e6 ──────
+    # Each tranche gets its own integer range to prevent cross-tranche collisions.
+    _MCID_OFFSET  = 1_000_000
+    _TXOBJ_OFFSET = 2_000_000
 
-    if not has_any_mcid and obj_marks:
-        sidx_to_run = _compute_run_ids(obj_marks, page_width)
-        for i, sidx in enumerate(sidx_arr):
-            if sidx >= 0:
-                run_id_arr[i] = sidx_to_run.get(sidx)
+    txobj_arr = df["text_object_id"].to_numpy(dtype=object)
 
-    # ── struct_group_id: struct elem id  >  mcid  >  run_id ──────────────────
     sg_arr = np.empty(n, dtype=object); sg_arr[:] = None
     for i in range(n):
         if sgroup_arr[i] is not None:
             sg_arr[i] = int(sgroup_arr[i])
         elif mcid_arr[i] is not None:
-            sg_arr[i] = int(mcid_arr[i])
-        elif run_id_arr[i] is not None:
-            sg_arr[i] = int(run_id_arr[i])
+            sg_arr[i] = _MCID_OFFSET + int(mcid_arr[i])
+        elif txobj_arr[i] is not None:
+            sg_arr[i] = _TXOBJ_OFFSET + int(txobj_arr[i])
 
     # ── Write columns ──────────────────────────────────────────────────────────
-    df["mcid"]            = mcid_arr
-    df["marked_tag"]      = tag_arr
-    df["is_artifact"]     = [t == "Artifact" for t in tag_arr]
-    df["struct_tag"]      = stag_arr
+    df["mcid"]           = mcid_arr
+    df["marked_tag"]     = tag_arr
+    df["struct_tag"]     = stag_arr
+    df["struct_tag_id"]  = sgroup_arr  # raw DFS counter; two P's with different ids are different blocks
     df["struct_group_id"] = sg_arr
-    df["reading_rank"]    = srank_arr
-    df["run_id"]          = run_id_arr
+    df["reading_rank"]   = srank_arr
 
 
 # ── Per-page extraction ───────────────────────────────────────────────────────
@@ -442,6 +402,10 @@ def _extract_words_for_page(
         word_ref_size:    float         = 0.0    # normal font-size before entering script
         word_ref_cy:      float         = 0.0    # normal y-centre before entering script
         word_first_cy:    float         = 0.0    # y-centre of first char in current word
+        # Text-object tracking via FPDFText_GetTextObject (works inside form XObjects)
+        _ptr_to_obj_id: Dict[int, int] = {}
+        _next_obj_id   = [0]              # list so closures can mutate without nonlocal
+        word_text_obj_id: Optional[int] = None
 
         _INF = float("inf")
 
@@ -472,6 +436,7 @@ def _extract_words_for_page(
                 "stroking_color":     word_stroke,
                 "text_orientation":   orientation,
                 "script_type":        word_script_type,
+                "text_object_id":     word_text_obj_id,
             })
             char_texts.clear()
             word_first_box = word_last_box = None
@@ -488,7 +453,7 @@ def _extract_words_for_page(
             ref_cy: float = 0.0,
         ) -> None:
             nonlocal word_font, word_size, word_fill, word_stroke, first_angle
-            nonlocal word_script_type, word_ref_size, word_ref_cy
+            nonlocal word_script_type, word_ref_size, word_ref_cy, word_text_obj_id
             word_font, word_size = _font_info(tp, i)
             word_fill            = _fill_color(tp, i)
             word_stroke          = _stroke_color(tp, i)
@@ -496,6 +461,15 @@ def _extract_words_for_page(
             word_script_type     = script_type
             word_ref_size        = ref_size
             word_ref_cy          = ref_cy
+            raw_ptr  = pdfium_c.FPDFText_GetTextObject(tp, i)
+            ptr_int  = ctypes.cast(raw_ptr, ctypes.c_void_p).value
+            if ptr_int:
+                if ptr_int not in _ptr_to_obj_id:
+                    _ptr_to_obj_id[ptr_int] = _next_obj_id[0]
+                    _next_obj_id[0] += 1
+                word_text_obj_id = _ptr_to_obj_id[ptr_int]
+            else:
+                word_text_obj_id = None
 
         def _add_char(ch: str, sb: Tuple[float, float, float, float]) -> None:
             nonlocal word_first_box, word_last_box, word_n_chars
@@ -594,7 +568,7 @@ def _extract_words_for_page(
     df["page_width"]  = page_width
     df["page_height"] = page_height
 
-    _annotate_words(df, page, page_height, page_width)
+    _annotate_words(df, page, page_height)
 
     return df, start_word_id + n_words
 
@@ -613,8 +587,8 @@ def extract_words(
     x_left, x_right, y_top, y_bottom, width, height, font_name, font_size,
     non_stroking_color, stroking_color (both as hex #rrggbb or None),
     text_orientation, script_type,
-    mcid, marked_tag, is_artifact, struct_tag, struct_group_id,
-    reading_rank, run_id,
+    mcid, marked_tag, struct_tag, struct_group_id,
+    reading_rank, text_matrix_id, text_object_id,
     plus calculated text features.
     """
     pdf_path = Path(pdf_path).expanduser().resolve()
