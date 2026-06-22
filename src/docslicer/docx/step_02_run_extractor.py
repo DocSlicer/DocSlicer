@@ -437,6 +437,15 @@ def _normalize_color(val: str | None) -> str | None:
     return None
 
 
+def _script_type(elem: etree._Element | None) -> str | None:
+    if elem is None:
+        return None
+    val = elem.get(f"{W}val")
+    if val in {"superscript", "subscript"}:
+        return val
+    return None
+
+
 def _extract_r_pr_props(r_pr: etree._Element | None) -> dict[str, Any]:
     r_style = _child(r_pr, "rStyle")
     color = _child(r_pr, "color")
@@ -448,6 +457,8 @@ def _extract_r_pr_props(r_pr: etree._Element | None) -> dict[str, Any]:
         "is_bold": _bool_val(_child(r_pr, "b")),
         "is_italic": _bool_val(_child(r_pr, "i")),
         "is_underline": _underline_val(_child(r_pr, "u")),
+        "is_strikethrough": _bool_val(_child(r_pr, "strike")),
+        "script_type": _script_type(_child(r_pr, "vertAlign")),
         "font_size": _font_size(size),
         "font_name": _font_name(font),
         "color": _normalize_color(_attr(color, "val")),
@@ -1220,6 +1231,8 @@ def _append_run_row(
             "is_bold": r_props.get("is_bold"),
             "is_italic": r_props.get("is_italic"),
             "is_underline": r_props.get("is_underline"),
+            "is_strikethrough": r_props.get("is_strikethrough"),
+            "script_type": r_props.get("script_type"),
             "bold_ratio": _ratio_from_bool(r_props.get("is_bold")),
             "italic_ratio": _ratio_from_bool(r_props.get("is_italic")),
             "underlined_ratio": _ratio_from_bool(r_props.get("is_underline")),
@@ -1297,6 +1310,8 @@ def _append_section_break_row(
             "is_bold": None,
             "is_italic": None,
             "is_underline": None,
+            "is_strikethrough": None,
+            "script_type": None,
             "bold_ratio": 0.0,
             "italic_ratio": 0.0,
             "underlined_ratio": 0.0,

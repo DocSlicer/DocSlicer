@@ -36,17 +36,17 @@ def _detect_page_format(width: float, height: float) -> str:
         "US_LEGAL": (612.0, 1008.0),
         "A3": (841.890, 1190.551),
         "TABLOID": (792.0, 1224.0),
-        "SLIDE_16_9": (720.0, 540.0),  # 10x5.625 inches at 72 DPI
-        "SLIDE_4_3": (720.0, 540.0),   # 10x7.5 inches at 72 DPI
+        "SLIDE_16_9": (540.0, 960.0),  # 13.33x7.5 inches at 72 DPI (widescreen)
+        "SLIDE_4_3": (540.0, 720.0),   # 10x7.5 inches at 72 DPI
     }
 
     for format_name, (fmt_w, fmt_h) in formats.items():
         if abs(w - fmt_w) <= TOLERANCE and abs(h - fmt_h) <= TOLERANCE:
             return f"{format_name}_{orientation}"
 
-    # Check for presentation slides by aspect ratio
-    ratio = h / w if w > 0 else 0
-    if 0.55 <= ratio <= 0.78:  # Between 16:9 (0.56) and 4:3 (0.75)
+    # Check for presentation slides by aspect ratio (w <= h after normalization)
+    ratio = w / h if h > 0 else 0
+    if 0.55 <= ratio <= 0.78:  # Between 16:9 (0.5625) and 4:3 (0.75)
         if ratio < 0.65:
             return f"SLIDE_16_9_{orientation}"
         else:

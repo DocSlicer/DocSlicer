@@ -9,7 +9,7 @@ import re
 import numpy as np
 import pandas as pd
 
-from .._utils.text_utils import is_list_marker
+from ..._utils.text_utils import is_list_marker
 
 # =======================================================================================================================
 # CONFIG

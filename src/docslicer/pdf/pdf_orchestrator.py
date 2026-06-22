@@ -40,7 +40,7 @@ from .step_03_shape_extractor import extract_shapes
 from .step_04_link_extractor import extract_links
 from .step_05_shape_merger import merge_shapes
 from .step_06_line_number_detector import detect_line_numbers
-from .step_07_gutter_detector import detect_and_annotate_gutters
+from ._utils.gutter_detector import detect_and_annotate_gutters
 from .step_08_cell_builder import build_cells
 from .step_09_page_label_detector import assign_pdf_page_labels
 from .step_10_line_builder import build_lines

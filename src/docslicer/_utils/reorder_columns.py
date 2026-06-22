@@ -249,6 +249,8 @@ MASTER_COLUMN_ORDER: List[str] = [
     "is_italic",
     "is_uppercase",
     "is_underlined",
+    "is_strikethrough",
+    "script_type", # "superscript", "subscript", or None (blank)
 
     # Average metrics
     "avg_word_len",
