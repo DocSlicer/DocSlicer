@@ -49,6 +49,7 @@ import numpy as np
 import pandas as pd
 
 from .._utils.text_utils import _BULLET_TOKENS
+from .._utils.hierarchical_aggregator import aggregate_hierarchical, build_standard_agg_spec
 
 
 # ================================================================================
@@ -70,6 +71,11 @@ class CellBuildConfig:
     bullet_max_gap_em: float = 3.0
     dollar_max_gap_em: float = 6.0
 
+    # --- Overlap tolerance ---
+    # Overlaps up to this many pt are treated as zero (superscript positioning,
+    # sub-pixel kerning artefacts). Overlaps beyond this force a cell boundary.
+    overlap_split_pt:   float = 2.0
+
     # --- Within-line gap distribution ---
     # When consecutive sorted gaps jump by >= this factor, the distribution is
     # considered bimodal (two gap clusters: word-spaces and wide inter-cell gaps).
@@ -82,6 +88,10 @@ class CellBuildConfig:
 
 
 CONFIG = CellBuildConfig()
+
+# Script detection thresholds (mirror step_01 constants applied at word granularity)
+_SCRIPT_DETECT_SIZE_RATIO = 0.82   # word font_size < this * cell ref → candidate
+_SCRIPT_DETECT_Y_FACTOR   = 0.20   # baseline shift > this * ref_size → confirmed
 
 _STOPWORDS = {
     "the", "and", "of", "to", "in", "for", "with", "as", "on", "by", "from", "at",
@@ -104,8 +114,8 @@ def _line_gap_stats(
     """
     Em-normalized inter-word gap statistics for ONE line.
 
-    Words must already be sorted left->right. Each gap is divided by the font
-    size of its left-hand (flanking) word, so the result is scale-invariant.
+    Words must already be sorted left->right. Each gap is divided by the larger
+    of the two flanking words' font sizes, so the result is scale-invariant.
 
     Returns a dict:
         gaps_em    : np.ndarray, len = n_words - 1   (np.nan for overlaps)
@@ -138,7 +148,7 @@ def _line_gap_stats(
         return empty
 
     gaps_pt = x_left[1:] - x_right[:-1]            # signed; negative = overlap
-    fs = font_size[:-1].astype(float)             # flanking (left) word's font
+    fs = np.maximum(font_size[:-1], font_size[1:]).astype(float)  # larger of left/right word
     fs = np.where((fs > 0) & np.isfinite(fs), fs, np.nan)
     gaps_em = gaps_pt / fs
 
@@ -306,8 +316,470 @@ def em_threshold_for_class(cls: str, config: CellBuildConfig = CONFIG) -> float:
 
 
 # ================================================================================
-# 4. ENTRY POINT
+# 4. CELL ID ASSIGNMENT  (horizontal words)
 # ================================================================================
+
+def _is_numeric_like(text: str) -> bool:
+    s = str(text).strip()
+    return bool(s) and all(ch.isdigit() or ch in ",.()-+%—– " for ch in s)
+
+
+def _assign_cell_ids_horiz(df: pd.DataFrame, config: CellBuildConfig = CONFIG) -> tuple[pd.DataFrame, int]:
+    """
+    Assign cell_id to horizontal words using the per-line em threshold and
+    gap_em_right already annotated on df.
+
+    Returns (annotated df, max_cell_id).
+    """
+    df = df.sort_values(["line_id", "x_left"], kind="mergesort").reset_index(drop=True)
+
+    text_arr    = df["text"].astype(str).to_numpy()
+    line_arr    = df["line_id"].to_numpy(dtype=np.int64)
+    x_left_arr  = df["x_left"].to_numpy(dtype=float)
+    x_right_arr = df["x_right"].to_numpy(dtype=float)
+    gap_em_arr  = pd.to_numeric(df["gap_em_right"], errors="coerce").to_numpy(dtype=float)
+    thr_arr     = pd.to_numeric(df["line_em_threshold"], errors="coerce").to_numpy(dtype=float)
+
+    stripped       = pd.Series(text_arr).str.strip()
+    bullet_flags   = stripped.isin(_BULLET_TOKENS).to_numpy()
+    dollar_flags   = (stripped == "$").to_numpy()
+    numeric_flags  = stripped.apply(_is_numeric_like).to_numpy()
+
+    n        = len(df)
+    cell_ids = np.empty(n, dtype=np.int64)
+
+    next_id = 1
+    i = 0
+    while i < n:
+        cur_line = line_arr[i]
+        j = i + 1
+        while j < n and line_arr[j] == cur_line:
+            j += 1
+
+        cur_cell   = next_id
+        cell_ids[i] = cur_cell
+
+        for k in range(i, j - 1):
+            raw_gap = x_left_arr[k + 1] - x_right_arr[k]
+            gap_em  = gap_em_arr[k]
+
+            if raw_gap < -config.overlap_split_pt:  # significant overlap → split
+                next_id   += 1
+                cur_cell   = next_id
+                cell_ids[k + 1] = cur_cell
+                continue
+
+            is_bullet_merge = (
+                bullet_flags[k] and k == i
+                and bool(text_arr[k + 1].strip())
+                and np.isfinite(gap_em)
+                and gap_em <= config.bullet_max_gap_em
+            )
+            is_dollar_merge = (
+                dollar_flags[k]
+                and numeric_flags[k + 1]
+                and np.isfinite(gap_em)
+                and gap_em <= config.dollar_max_gap_em
+            )
+            thr = thr_arr[k] if np.isfinite(thr_arr[k]) else config.em_undetermined
+            is_normal_merge = np.isfinite(gap_em) and gap_em <= thr
+
+            if is_bullet_merge or is_dollar_merge or is_normal_merge:
+                cell_ids[k + 1] = cur_cell
+            else:
+                next_id  += 1
+                cur_cell  = next_id
+                cell_ids[k + 1] = cur_cell
+
+        next_id += 1
+        i = j
+
+    df = df.copy()
+    df["cell_id"] = cell_ids
+    return df, next_id - 1
+
+
+# ================================================================================
+# 5. STRUCT GROUP MERGE  (cross-line merging via PDF logical structure)
+# ================================================================================
+
+def _merge_struct_groups(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Merge cell_ids that share a struct_group_id using union-find.
+
+    Each struct_group_id represents a logical PDF element (paragraph, list item, …)
+    that may span multiple visual lines. After horizontal cell assignment, words
+    in the same struct group but different cell_ids are unified under the lowest
+    cell_id in the group.
+    """
+    if "struct_group_id" not in df.columns:
+        return df
+
+    sg_mask = df["struct_group_id"].notna()
+    if not sg_mask.any():
+        return df
+
+    sg_sub = df.loc[sg_mask, ["struct_group_id", "cell_id"]].drop_duplicates()
+    sg_sub = sg_sub.sort_values(["struct_group_id", "cell_id"])
+    sg_arr   = sg_sub["struct_group_id"].to_numpy()
+    cell_arr = sg_sub["cell_id"].to_numpy()
+
+    parent: dict[int, int] = {}
+
+    def find(x: int) -> int:
+        while parent.get(x, x) != x:
+            parent[x] = parent.get(parent.get(x, x), parent.get(x, x))
+            x = parent.get(x, x)
+        return x
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            if ra > rb:
+                ra, rb = rb, ra
+            parent[rb] = ra
+
+    prev_sg   = None
+    root_cell = None
+    for i in range(len(sg_arr)):
+        sg   = sg_arr[i]
+        cell = int(cell_arr[i])
+        if sg != prev_sg:
+            root_cell = cell
+            prev_sg   = sg
+        else:
+            union(root_cell, cell)
+
+    if not parent:
+        return df
+
+    df = df.copy()
+    df["cell_id"] = df["cell_id"].map(find)
+    return df
+
+
+# ================================================================================
+# 6. CELL-LEVEL SCRIPT DETECTION
+# ================================================================================
+
+def _detect_cell_level_scripts(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Within each cell, detect sub/superscript words not already tagged by the
+    word extractor (they arrived as separate pdfium words).
+
+    A word qualifies if it is untagged and:
+      - font_size < _SCRIPT_DETECT_SIZE_RATIO * cell reference size
+      - |y_bottom - cell reference baseline| > _SCRIPT_DETECT_Y_FACTOR * ref size
+
+    Reference size     = max font_size in the cell (all words, matching original).
+    Reference baseline = median y_bottom of normal-sized untagged words.
+    """
+    if "cell_id" not in df.columns or "font_size" not in df.columns:
+        return df
+
+    df = df.copy()
+    if "script_type" not in df.columns:
+        df["script_type"] = None
+
+    untagged = df["script_type"].isna()
+    if not untagged.any():
+        return df
+
+    font_size = pd.to_numeric(df["font_size"], errors="coerce")
+    y_bottom  = pd.to_numeric(df["y_bottom"],  errors="coerce")
+    cell_id   = df["cell_id"]
+
+    # Per-cell max font_size (all words, matching original logic)
+    ref_size = font_size.groupby(cell_id).transform("max")
+    valid    = ref_size > 0
+
+    # Normal words: untagged and font_size >= 0.88 * ref_size
+    normal = untagged & valid & (font_size >= 0.88 * ref_size)
+
+    # Per-cell median y_bottom of normal words
+    ref_baseline = y_bottom.where(normal).groupby(cell_id).transform("median")
+
+    threshold = _SCRIPT_DETECT_Y_FACTOR * ref_size
+    shift     = ref_baseline - y_bottom
+    small     = untagged & valid & (font_size < _SCRIPT_DETECT_SIZE_RATIO * ref_size)
+    has_ref   = ref_baseline.notna()
+
+    df.loc[small & has_ref & (shift >  threshold), "script_type"] = "superscript"
+    df.loc[small & has_ref & (shift < -threshold), "script_type"] = "subscript"
+
+    return df
+
+
+# ================================================================================
+# 7. CELL AGGREGATION  (words → cells)
+# ================================================================================
+
+def _join_texts(texts: list[str]) -> str:
+    """Join word texts with a space; script-notation tokens ([^ / [_) attach without space."""
+    # TODO: After strikethrough detection, merge in words with ~~word~~
+    result = ""
+    for t in texts:
+        t = str(t)
+        if not t.strip():
+            continue
+        if not result:
+            result = t
+        elif result.endswith("-"):
+            result = result + t
+        elif t.startswith(("[^", "[_")):
+            result = result + t
+        else:
+            result = result + " " + t
+    return result
+
+
+def _build_cells_df(df_words: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate words into cells via the shared hierarchical aggregator."""
+    df = df_words.copy()
+    df["_fmt_text"] = df["text"].astype(str)
+    if "script_type" in df.columns:
+        sup = df["script_type"] == "superscript"
+        sub = df["script_type"] == "subscript"
+        df.loc[sup, "_fmt_text"] = "[^" + df.loc[sup, "_fmt_text"] + "]"
+        df.loc[sub, "_fmt_text"] = "[_" + df.loc[sub, "_fmt_text"] + "]"
+
+    agg_spec = build_standard_agg_spec(
+        identity_cols=[
+            "page_number",
+            "page_width",
+            "page_height",
+            "reading_column",
+            "gutter_id_left",
+            "gutter_id_right",
+            # line-level features (useful for downstream debug / table detection)
+            "line_class",
+            "line_score",
+            "line_em_threshold",
+            "line_is_bimodal",
+        ],
+        include_geometry=True,
+        include_style=True,
+        include_counts=True,
+        include_metadata=False,
+        include_hierarchy=False,
+        include_table=False,
+        extra_agg={
+            "_fmt_text": lambda s: _join_texts(s.tolist()),
+            "word_id":   list,
+            "line_id":   lambda s: sorted(s.unique().tolist()),
+        },
+    )
+
+    df_cells = aggregate_hierarchical(
+        df,
+        group_col="cell_id",
+        agg_spec=agg_spec,
+        rename_count_col={"word_id": "word_ids", "line_id": "line_ids"},
+    )
+    df_cells = df_cells.rename(columns={"_fmt_text": "text"})
+    # Scalar line_id for downstream consumers that expect a single value per cell.
+    # Equals the minimum (first) line_id in the cell.
+    if "line_ids" in df_cells.columns:
+        df_cells["line_id"] = df_cells["line_ids"].apply(lambda ids: ids[0] if ids else None)
+    return df_cells
+
+
+# ================================================================================
+# 7. VERTICAL WORD PROCESSING
+# ================================================================================
+
+def _process_vertical_words(
+    df_vert: pd.DataFrame,
+    cell_id_offset: int,
+    config: CellBuildConfig = CONFIG,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Build cells from vertical (TTB/BTT) words via coordinate-swap.
+
+    Step 07 already assigned globally unique line_ids to vertical words (using
+    the same x↔y swap trick to group words sharing the same x-band). Here we
+    only need the swap to make _assign_cell_ids_horiz operate along the y-axis
+    (merging by y-gap within each line_id group). Cell IDs are offset above the
+    horizontal ceiling so they remain globally unique.
+    """
+    if df_vert.empty:
+        return pd.DataFrame(), df_vert.copy()
+
+    df = df_vert.copy()
+
+    orig_xl = df["x_left"].to_numpy(dtype=float)
+    orig_xr = df["x_right"].to_numpy(dtype=float)
+    orig_yt = df["y_top"].to_numpy(dtype=float)
+    orig_yb = df["y_bottom"].to_numpy(dtype=float)
+
+    df["y_top"]    = orig_xl
+    df["y_bottom"] = orig_xr
+    df["x_left"]   = orig_yt
+    df["x_right"]  = orig_yb
+
+    # BTT words read bottom→top: negate swapped x so ascending sort gives correct order.
+    # Stash pre-negation values so they survive sort+reset_index inside _assign_cell_ids_horiz.
+    df["_x_left_pre_neg"]  = df["x_left"]
+    df["_x_right_pre_neg"] = df["x_right"]
+    if "text_orientation" in df.columns:
+        btt_mask = df["text_orientation"] == "BTT"
+        if btt_mask.any():
+            btt_xl = df.loc[btt_mask, "x_left"].to_numpy(dtype=float)
+            btt_xr = df.loc[btt_mask, "x_right"].to_numpy(dtype=float)
+            df.loc[btt_mask, "x_left"]  = -btt_xr
+            df.loc[btt_mask, "x_right"] = -btt_xl
+
+    # Annotate lines with em features in swapped space (skip classification — use undetermined threshold).
+    # Pre-sort once so groups are already in x_left order.
+    df = df.sort_values(["line_id", "x_left"], kind="mergesort").reset_index(drop=True)
+
+    # Vectorised gap_em_right in swapped coordinate space.
+    xl  = df["x_left"].to_numpy(float)
+    xr  = df["x_right"].to_numpy(float)
+    fs  = df["font_size"].to_numpy(float)
+    lid_arr = df["line_id"].to_numpy()
+
+    nv = len(df)
+    same_next_v        = np.empty(nv, dtype=bool)
+    same_next_v[:-1]   = lid_arr[:-1] == lid_arr[1:]
+    same_next_v[-1]    = False
+    gap_pt_v           = np.empty(nv);  gap_pt_v[-1]  = np.nan
+    gap_pt_v[:-1]      = xl[1:] - xr[:-1]
+    fs_max_v           = np.empty(nv);  fs_max_v[-1]  = np.nan
+    fs_max_v[:-1]      = np.maximum(fs[:-1], fs[1:])
+    fs_max_v           = np.where((fs_max_v > 0) & np.isfinite(fs_max_v), fs_max_v, np.nan)
+    raw_gem_v          = gap_pt_v / fs_max_v
+    df["gap_em_right"] = np.where(same_next_v & np.isfinite(raw_gem_v), np.round(raw_gem_v, 4), np.nan)
+
+    feat_rows: list[dict] = []
+    for lid, grp in df.groupby("line_id", sort=False):
+        gs = _line_gap_stats(
+            grp["x_left"].to_numpy(float),
+            grp["x_right"].to_numpy(float),
+            grp["font_size"].to_numpy(float),
+            config,
+        )
+        feat_rows.append({
+            "line_id":           lid,
+            "line_class":        "undetermined",
+            "line_score":        0.0,
+            "line_em_threshold": config.em_undetermined,
+            "line_is_bimodal":   gs["is_bimodal"],
+        })
+
+    df_feat = pd.DataFrame(feat_rows)
+    df = df.merge(df_feat, on="line_id", how="left")
+
+    # Restore pre-negation x before cell assignment
+    df["x_left"]  = df["_x_left_pre_neg"]
+    df["x_right"] = df["_x_right_pre_neg"]
+    df.drop(columns=["_x_left_pre_neg", "_x_right_pre_neg"], inplace=True)
+
+    df, _ = _assign_cell_ids_horiz(df, config)
+    df = _detect_cell_level_scripts(df)
+
+    # Swap back to original coordinates
+    cur_xl = df["x_left"].to_numpy(dtype=float)
+    cur_xr = df["x_right"].to_numpy(dtype=float)
+    cur_yt = df["y_top"].to_numpy(dtype=float)
+    cur_yb = df["y_bottom"].to_numpy(dtype=float)
+    df["x_left"]   = cur_yt
+    df["x_right"]  = cur_yb
+    df["y_top"]    = cur_xl
+    df["y_bottom"] = cur_xr
+
+    df["cell_id"] = df["cell_id"] + cell_id_offset
+
+    df_vert_cells = _build_cells_df(df)
+    df_vert_cells["block_type"] = "vertical_text"
+
+    return df_vert_cells, df
+
+
+# ================================================================================
+# 8. ENTRY POINT
+# ================================================================================
+
+def _annotate_line_features(
+    df: pd.DataFrame,
+    config: CellBuildConfig = CONFIG,
+) -> pd.DataFrame:
+    """
+    Compute per-line gap statistics and classification, broadcast to every word.
+
+    Added columns:
+        gap_em_right, line_n_gaps, line_median_em, line_max_em, line_jump_ratio,
+        line_is_bimodal, line_split_em, line_class, line_score, line_em_threshold
+    """
+    # Pre-sort once so per-group rows are in x_left order — avoids re-sorting inside the loop.
+    df = df.sort_values(["line_id", "x_left"], kind="mergesort").reset_index(drop=True)
+
+    # Vectorised gap_em_right: for each word, gap to the right neighbour within the same line.
+    xl  = df["x_left"].to_numpy(float)
+    xr  = df["x_right"].to_numpy(float)
+    fs  = df["font_size"].to_numpy(float)
+    lid = df["line_id"].to_numpy()
+
+    n = len(df)
+    same_next          = np.empty(n, dtype=bool)
+    same_next[:-1]     = lid[:-1] == lid[1:]
+    same_next[-1]      = False
+
+    gap_pt             = np.empty(n);  gap_pt[-1]  = np.nan
+    gap_pt[:-1]        = xl[1:] - xr[:-1]
+
+    fs_max             = np.empty(n);  fs_max[-1]  = np.nan
+    fs_max[:-1]        = np.maximum(fs[:-1], fs[1:])
+    fs_max             = np.where((fs_max > 0) & np.isfinite(fs_max), fs_max, np.nan)
+
+    raw_gem            = gap_pt / fs_max
+    gap_em_col         = np.where(same_next & np.isfinite(raw_gem), np.round(raw_gem, 4), np.nan)
+    df["gap_em_right"] = gap_em_col
+
+    # Per-line stats and classification (must remain a Python loop; data is already sorted).
+    feat_rows: list[dict] = []
+    has_script = "script_type" in df.columns
+
+    for line_id, grp in df.groupby("line_id", sort=False):
+        x_left    = grp["x_left"].to_numpy(float)
+        x_right   = grp["x_right"].to_numpy(float)
+        font_size = grp["font_size"].to_numpy(float)
+        texts     = grp["text"].tolist()
+
+        if has_script:
+            untagged_mask = grp["script_type"].isna().to_numpy()
+            texts_content = [t for t, m in zip(texts, untagged_mask) if m]
+        else:
+            texts_content = texts
+
+        gs         = _line_gap_stats(x_left, x_right, font_size, config)
+        cs         = _content_stats(texts_content)
+        cls, score = classify_line(texts_content, gs)
+        thr        = em_threshold_for_class(cls, config)
+
+        feat_rows.append({
+            "line_id":            line_id,
+            "line_n_gaps":        gs["n_gaps"],
+            "line_median_em":     round(gs["median_em"], 4),
+            "line_max_em":        round(gs["max_em"], 4),
+            "line_jump_ratio":    round(gs["jump_ratio"], 4),
+            "line_is_bimodal":    gs["is_bimodal"],
+            "line_split_em":      round(gs["split_em"], 4) if np.isfinite(gs["split_em"]) else None,
+            "line_n_words":       cs["n"],
+            "line_alpha_ratio":   round(cs["alpha_ratio"], 4),
+            "line_numeric_ratio": round(cs["numeric_token_ratio"], 4),
+            "line_stopword_hits": cs["stopword_hits"],
+            "line_cap_ratio":     round(cs["cap_ratio"], 4),
+            "line_has_punct":     cs["has_punct"],
+            "line_score":         round(score, 2),
+            "line_class":         cls,
+            "line_em_threshold":  thr,
+        })
+
+    df_feat = pd.DataFrame(feat_rows)
+    df = df.merge(df_feat, on="line_id", how="left")
+    return df
+
 
 def build_cells(
     df_words: pd.DataFrame,
@@ -318,72 +790,91 @@ def build_cells(
     """
     Words -> Cells.
 
-    Currently returns df_words annotated with per-line features so the
-    classification decisions can be inspected before cell splitting is wired up.
+    Pipeline:
+      1. Annotate words with per-line gap statistics and em threshold.
+      2. Assign cell_ids within each line using em-threshold gap merging,
+         with bullet and dollar/currency special-case overrides.
+      3. Merge cell_ids that share a struct_group_id (PDF logical structure).
+      4. Aggregate words into cell rows.
 
-    Added columns (one value per line_id, broadcast to every word in that line):
-        line_n_gaps, line_median_em, line_max_em, line_jump_ratio,
-        line_is_bimodal, line_split_em, line_class, line_em_threshold
+    Horizontal and vertical words are processed independently, with vertical
+    IDs offset above horizontal so the combined cell_id space is globally unique.
+
+    Returns
+    -------
+    df_cells  : one row per cell
+    df_words  : input words annotated with cell_id and line feature columns
     """
     if df_words is None or df_words.empty:
         return pd.DataFrame(), pd.DataFrame()
 
-    feat_rows: list[dict] = []
-    gap_em_right_series: dict[int, float | None] = {}  # word index -> gap to next word
+    df = df_words.copy()
 
-    for line_id, grp in df_words.groupby("line_id", sort=False):
-        grp_s     = grp.sort_values("x_left")
-        x_left    = grp_s["x_left"].to_numpy(float)
-        x_right   = grp_s["x_right"].to_numpy(float)
-        font_size = grp_s["font_size"].to_numpy(float)
-        texts     = grp_s["text"].tolist()
-        idx       = grp_s.index.tolist()
+    if "reading_column" not in df.columns:
+        df["reading_column"] = 1
+    df["reading_column"] = df["reading_column"].fillna(1).astype(int)
 
-        # Exclude super/subscripts from content scoring — footnote markers
-        # inflate word count and skew alpha/numeric ratios.
-        if "script_type" in grp_s.columns:
-            texts_content = grp_s.loc[grp_s["script_type"].isna(), "text"].tolist()
+    # Split horizontal vs vertical — vertical words use a coordinate-swap pipeline.
+    if "text_orientation" in df.columns:
+        vert_mask = df["text_orientation"].isin(["TTB", "BTT"])
+    else:
+        vert_mask = pd.Series(False, index=df.index)
+
+    df_vert  = df[vert_mask].copy()
+    df_horiz = df[~vert_mask].copy()
+
+    # ── Horizontal ────────────────────────────────────────────────────────────
+    pages           = sorted(df["page_number"].unique())
+    horiz_words_out: list[pd.DataFrame] = []
+    cells_out:       list[pd.DataFrame] = []
+    vert_cells_out:  list[pd.DataFrame] = []
+    vert_words_out:  list[pd.DataFrame] = []
+    running_cell = 0
+
+    for page_num in pages:
+        df_h = df_horiz[df_horiz["page_number"] == page_num].copy()
+        df_v = df_vert[df_vert["page_number"] == page_num].copy()
+
+        # line_id comes from step 07 and is already globally unique — leave it untouched.
+        if not df_h.empty:
+            df_h = _annotate_line_features(df_h, config)
+            df_h, _ = _assign_cell_ids_horiz(df_h, config)
+            df_h = _merge_struct_groups(df_h)
+            df_h = _detect_cell_level_scripts(df_h)
+            df_h["cell_id"] += running_cell
+
+        page_cell_max = int(df_h["cell_id"].max()) if not df_h.empty else running_cell
+
+        if not df_v.empty:
+            vc, vw = _process_vertical_words(df_v, page_cell_max, config)
+            vert_cells_out.append(vc)
+            vert_words_out.append(vw)
+            running_cell = int(vw["cell_id"].max()) if not vw.empty else page_cell_max
         else:
-            texts_content = texts
+            running_cell = page_cell_max
 
-        gs        = _line_gap_stats(x_left, x_right, font_size, config)
-        cs        = _content_stats(texts_content)
-        cls, score = classify_line(texts_content, gs)
-        thr       = em_threshold_for_class(cls, config)
+        if not df_h.empty:
+            horiz_words_out.append(df_h)
+            cells_out.append(_build_cells_df(df_h))
 
-        feat_rows.append({
-            "line_id":                line_id,
-            # gap stats
-            "line_n_gaps":            gs["n_gaps"],
-            "line_median_em":         round(gs["median_em"], 4),
-            "line_max_em":            round(gs["max_em"], 4),
-            "line_jump_ratio":        round(gs["jump_ratio"], 4),
-            "line_is_bimodal":        gs["is_bimodal"],
-            "line_split_em":          round(gs["split_em"], 4) if np.isfinite(gs["split_em"]) else None,
-            # content stats
-            "line_n_words":           cs["n"],
-            "line_alpha_ratio":       round(cs["alpha_ratio"], 4),
-            "line_numeric_ratio":     round(cs["numeric_token_ratio"], 4),
-            "line_stopword_hits":     cs["stopword_hits"],
-            "line_cap_ratio":         round(cs["cap_ratio"], 4),
-            "line_has_punct":         cs["has_punct"],
-            # decision
-            "line_score":             round(score, 2),
-            "line_class":             cls,
-            "line_em_threshold":      thr,
-        })
+    df_horiz_out = pd.concat(horiz_words_out, ignore_index=True) if horiz_words_out else pd.DataFrame()
+    df_cells     = pd.concat(cells_out,        ignore_index=True) if cells_out        else pd.DataFrame()
 
-        # per-word gap to the right: gaps_em[i] is between word i and word i+1
-        gaps_em = gs["gaps_em"]
-        for i, word_idx in enumerate(idx):
-            if i < len(gaps_em) and np.isfinite(gaps_em[i]):
-                gap_em_right_series[word_idx] = round(float(gaps_em[i]), 4)
-            else:
-                gap_em_right_series[word_idx] = None
+    if vert_words_out or vert_cells_out:
+        df_vert_out = pd.concat([w for w in vert_words_out if not w.empty], ignore_index=True)
+        df_vert_cells = pd.concat([c for c in vert_cells_out if not c.empty], ignore_index=True)
+        if not df_vert_cells.empty:
+            df_cells = pd.concat([df_cells, df_vert_cells], ignore_index=True)
+    else:
+        df_vert_out = pd.DataFrame()
 
-    df_feat  = pd.DataFrame(feat_rows)
-    df_words = df_words.merge(df_feat, on="line_id", how="left")
-    df_words["gap_em_right"] = df_words.index.map(gap_em_right_series)
+    df_words_out = (
+        pd.concat([df_horiz_out, df_vert_out], ignore_index=True)
+        .sort_values(["page_number", "y_top", "x_left"], kind="mergesort")
+        .reset_index(drop=True)
+    )
 
-    # TODO: split words into cells using gap stats; for now return annotated words as cells stub
-    return df_words.copy(), df_words
+    if not df_cells.empty and "cell_id" in df_cells.columns:
+        df_cells = df_cells.sort_values("cell_id", kind="mergesort").reset_index(drop=True)
+
+    return df_cells, df_words_out

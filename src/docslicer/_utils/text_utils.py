@@ -15,7 +15,7 @@ _BULLET_TOKENS: frozenset[str] = frozenset({
     "…",                    # ellipsis leader
     "+", "☒", "☐",
     "○", "◦", "►", "▸", "‣", "⁃",
-    "✓", "✔", "✗", "✘", "✖", "✕",
+    "✓", "✔", "✗", "✘", "✖", "✕", "o",
 })
 
 # Structured list-token regex — covers the hierarchy types from the yaml

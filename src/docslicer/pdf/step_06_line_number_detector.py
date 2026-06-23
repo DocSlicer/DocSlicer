@@ -27,6 +27,7 @@ _X_ALIGN_TOLERANCE: float = 7.0   # pt — max x_left spread within an x-cluster
 _MAX_NUMBER_WIDTH: float = 30.0   # pt — line-number token must be narrow
 _MAX_MISSING_NUMBERS_PER_PAGE: int = 1  # allow at most one skipped line number
 _FONT_SIZE_RATIO: float = 0.85    # line numbers may not be smaller than this × doc median, otherwise likely footnotes
+_MIN_PAGE_COVERAGE: float = 0.80  # line numbers must appear on at least this fraction of pages
 
 
 # =============================================================================
@@ -88,6 +89,14 @@ def detect_line_numbers(df_words: pd.DataFrame) -> pd.DataFrame:
         if flagged_ids:
             mask = (out["page_number"] == page_num) & (out["word_id"].isin(flagged_ids))
             out.loc[mask, "line_number_flag"] = True
+
+    # QC: line numbers must be present on at least _MIN_PAGE_COVERAGE of all pages.
+    # Sparse hits (e.g. a few lines starting with years like 2020/2021) are rejected.
+    if out["line_number_flag"].any():
+        total_pages = out["page_number"].nunique()
+        pages_with_flags = out.loc[out["line_number_flag"], "page_number"].nunique()
+        if pages_with_flags / total_pages < _MIN_PAGE_COVERAGE:
+            out["line_number_flag"] = False
 
     return out
 

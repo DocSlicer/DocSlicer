@@ -89,6 +89,7 @@ MASTER_COLUMN_ORDER: List[str] = [
 
     # Atomic-level IDs (raw extraction)
     "word_id",              # pdf, ocr, html
+    "text_object_id",       # native pdf's
     "box_id",               # html
     "run_id",               # docx, pptx
     "image_id",             # pdf, docx, pptx
@@ -98,9 +99,16 @@ MASTER_COLUMN_ORDER: List[str] = [
     "chart_id",             # pptx
     "placeholder_type",     # pptx        — title / body / subtitle / …
 
+    #Native PDF Stream Data
+    "struct_tag_id",
+    "struct_tag",
+    "mcid",
+    "marked_tag",
+
     # Mid-pipeline IDs (pdf + html)
     "gutter_id",
     "gutter_candidate_id",
+    "struct_group_id",
     "cell_id",
     "line_id",
     "temp_line_id",
@@ -113,6 +121,7 @@ MASTER_COLUMN_ORDER: List[str] = [
 
     # Aggregated hierarchical ID lists
     "word_ids",
+    "line_ids",
     "run_ids",              # docx, pptx  — list of run_id values aggregated here
     "paragraph_ids",        # docx, pptx  — list of paragraph_id values aggregated here
     "raw_shape_ids",

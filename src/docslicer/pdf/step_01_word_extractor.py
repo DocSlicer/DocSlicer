@@ -398,10 +398,10 @@ def _extract_words_for_page(
         word_last_box:  Optional[Tuple[float, float, float, float]] = None
         word_n_chars:   int  = 0
         # Script state
-        word_script_type: Optional[str] = None   # "superscript" | "subscript" | None
-        word_ref_size:    float         = 0.0    # normal font-size before entering script
-        word_ref_cy:      float         = 0.0    # normal y-centre before entering script
-        word_first_cy:    float         = 0.0    # y-centre of first char in current word
+        word_script_type:      Optional[str] = None   # "superscript" | "subscript" | None
+        word_ref_size:         float         = 0.0    # normal font-size before entering script
+        word_ref_cy:           float         = 0.0    # normal baseline before entering script
+        word_first_baseline:   float         = 0.0    # baseline of first char in current word
         # Text-object tracking via FPDFText_GetTextObject (works inside form XObjects)
         _ptr_to_obj_id: Dict[int, int] = {}
         _next_obj_id   = [0]              # list so closures can mutate without nonlocal
@@ -414,7 +414,7 @@ def _extract_words_for_page(
         def _flush() -> None:
             nonlocal word_first_box, word_last_box, word_n_chars
             nonlocal word_x_left, word_y_top, word_x_right, word_y_bottom
-            nonlocal word_script_type, word_first_cy
+            nonlocal word_script_type, word_first_baseline
             if not char_texts:
                 return
             orientation = (
@@ -444,7 +444,7 @@ def _extract_words_for_page(
             word_x_left    = word_y_top    = _INF
             word_x_right   = word_y_bottom = -_INF
             word_script_type = None
-            word_first_cy    = 0.0
+            word_first_baseline = 0.0
 
         def _start_word(
             i: int,
@@ -503,50 +503,50 @@ def _extract_words_for_page(
                 prev_x_right = -1.0
                 continue
 
-            screen_box = (l, page_height - t, r, page_height - b)
-            char_cy    = (screen_box[1] + screen_box[3]) * 0.5
+            screen_box      = (l, page_height - t, r, page_height - b)
+            char_baseline   = screen_box[3]   # screen-coord baseline (bottom of glyph)
 
             if not char_texts:
                 _start_word(i)
-                word_first_cy = char_cy
+                word_first_baseline = char_baseline
 
             elif prev_x_right >= 0:
                 gap = l - prev_x_right
                 if gap > _GAP_FACTOR * (word_size or 8.0):
                     _flush()
                     _start_word(i)
-                    word_first_cy = char_cy
+                    word_first_baseline = char_baseline
                 else:
                     # ── Script detection (fast-path: y-shift first) ───────────
-                    y_shift = abs(char_cy - word_first_cy)
+                    y_shift = abs(char_baseline - word_first_baseline)
                     if y_shift > _SCRIPT_Y_FACTOR * (word_size or 8.0):
                         char_size = _font_info(tp, i)[1]   # ctypes call – only here
 
                         if word_script_type is None:
                             if _SCRIPT_SIZE_MIN * word_size < char_size < _SCRIPT_SIZE_DOWN * word_size:
                                 # Forward entry: normal → script
-                                direction = "superscript" if char_cy < word_first_cy else "subscript"
+                                direction = "superscript" if char_baseline < word_first_baseline else "subscript"
                                 _ref_sz = word_size
-                                _ref_cy = word_first_cy
+                                _ref_cy = word_first_baseline
                                 _flush()
                                 _start_word(i, direction, _ref_sz, _ref_cy)
-                                word_first_cy = char_cy
+                                word_first_baseline = char_baseline
 
                             elif char_size > _SCRIPT_SIZE_INV * word_size:
                                 # Retroactive entry: word started with script char,
                                 # now a normal char arrives. Tag before flush.
-                                direction = "superscript" if word_first_cy < char_cy else "subscript"
+                                direction = "superscript" if word_first_baseline < char_baseline else "subscript"
                                 word_script_type = direction   # set before _flush reads it
                                 _flush()
                                 _start_word(i)
-                                word_first_cy = char_cy
+                                word_first_baseline = char_baseline
 
                         else:
                             # Exit: in script word, normal-sized char returns
                             if char_size >= word_ref_size * _SCRIPT_SIZE_UP:
                                 _flush()
                                 _start_word(i)
-                                word_first_cy = char_cy
+                                word_first_baseline = char_baseline
 
             _add_char(ch, screen_box)
             prev_x_right = r
