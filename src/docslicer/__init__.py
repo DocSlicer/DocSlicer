@@ -472,29 +472,69 @@ def parse_all(
 
 
 class DocumentParser:
-    """Reusable parser that holds a fixed ParseConfig across multiple documents."""
+    """Reusable parser that holds a fixed ParseConfig across multiple documents.
+
+    Also holds a single Playwright browser open across documents for the HTML
+    pipeline, so a batch of HTML/URL inputs launches Chromium once instead of
+    once per document. The browser launches lazily on the first HTML extraction
+    (PDF/DOCX/PPTX parses never start one) and is released by :meth:`close`.
+    Use as a context manager to guarantee cleanup::
+
+        with DocumentParser(config) as parser:
+            for path, result in parser.parse_all(paths):
+                ...
+    """
 
     def __init__(self, config: ParseConfig | None = None) -> None:
         self.config = config or ParseConfig()
+        self._session = None
+
+    def _get_session(self):
+        """Lazily create the reusable browser session shared across parses.
+
+        Returns ``None`` when Playwright is not installed; the HTML pipeline then
+        raises its usual install hint. The session object is created eagerly but
+        the browser itself launches lazily on first HTML extraction.
+        """
+        if self._session is None:
+            try:
+                from .html.step_01_box_extractor import BrowserSession
+            except ImportError:
+                return None
+            self._session = BrowserSession()
+        return self._session
+
+    def close(self) -> None:
+        """Close the reusable browser session, if one was started."""
+        if self._session is not None:
+            self._session.close()
+            self._session = None
+
+    def __enter__(self) -> "DocumentParser":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
 
     def parse(self, source: _Source, source_url: str | None = None) -> ParseResult:
-        """Parse a single document, reusing this instance's config."""
-        config = self.config
+        """Parse a single document, reusing this instance's config and browser."""
+        from functools import partial
+        _run = partial(_run_pipeline, config=self.config, session=self._get_session())
 
         if isinstance(source, bytes):
             if source[:4] == b"%PDF":
-                return _run_pipeline(source, "pdf", source_url=None, config=config)
+                return _run(source, "pdf", source_url=None)
             openxml_type = _detect_openxml_type(source)
             if openxml_type == "docx":
-                return _run_pipeline(source, "docx", source_url=None, config=config)
+                return _run(source, "docx", source_url=None)
             if openxml_type == "pptx":
-                return _run_pipeline(source, "pptx", source_url=None, config=config)
-            return _run_pipeline(source.decode("utf-8", errors="replace"), "html", source_url=source_url, config=config)
+                return _run(source, "pptx", source_url=None)
+            return _run(source.decode("utf-8", errors="replace"), "html", source_url=source_url)
 
         if isinstance(source, io.IOBase):
             data = source.read()
             if isinstance(data, str):
-                return _run_pipeline(data, "html", source_url=source_url, config=config)
+                return _run(data, "html", source_url=source_url)
             return self.parse(data, source_url=source_url)
 
         if isinstance(source, str) and _is_url(source):
@@ -503,55 +543,57 @@ class DocumentParser:
             raw = scraped.raw_bytes
             ct = scraped.content_type or ""
             if _looks_like_pdf(raw, ct):
-                return _run_pipeline(raw, "pdf", source_url=None, config=config)
+                return _run(raw, "pdf", source_url=None)
             openxml_type = _detect_openxml_type(raw)
             if openxml_type == "docx":
-                return _run_pipeline(raw, "docx", source_url=None, config=config)
+                return _run(raw, "docx", source_url=None)
             if openxml_type == "pptx":
-                return _run_pipeline(raw, "pptx", source_url=None, config=config)
+                return _run(raw, "pptx", source_url=None)
             final_url = scraped.final_url
             if not _is_sec_url(final_url):
-                return _run_pipeline(None, "html", source_url=final_url, config=config)
+                return _run(None, "html", source_url=final_url)
             html = raw.decode(scraped.encoding or "utf-8", errors="replace")
-            return _run_pipeline(html, "html", source_url=final_url, config=config)
+            return _run(html, "html", source_url=final_url)
 
         if isinstance(source, str) and _looks_like_raw_html(source):
-            return _run_pipeline(source, "html", source_url=source_url, config=config)
+            return _run(source, "html", source_url=source_url)
 
         try:
             path = Path(source)
         except OSError:
-            return _run_pipeline(str(source), "html", source_url=source_url, config=config)
+            return _run(str(source), "html", source_url=source_url)
 
         if path.exists():
             suffix = path.suffix.lower()
             if suffix == ".pdf":
-                return _run_pipeline(path.read_bytes(), "pdf", source_url=None, config=config)
+                return _run(path.read_bytes(), "pdf", source_url=None)
             if suffix == ".docx":
-                return _run_pipeline(path.read_bytes(), "docx", source_url=None, config=config)
+                return _run(path.read_bytes(), "docx", source_url=None)
             if suffix == ".pptx":
-                return _run_pipeline(path.read_bytes(), "pptx", source_url=None, config=config)
+                return _run(path.read_bytes(), "pptx", source_url=None)
             if suffix in (".html", ".htm", ".xhtml"):
-                return _run_pipeline(path.read_text(encoding="utf-8"), "html", source_url=source_url, config=config)
+                return _run(path.read_text(encoding="utf-8"), "html", source_url=source_url)
             data = path.read_bytes()
             if data[:4] == b"%PDF":
-                return _run_pipeline(data, "pdf", source_url=None, config=config)
+                return _run(data, "pdf", source_url=None)
             openxml_type = _detect_openxml_type(data)
             if openxml_type == "docx":
-                return _run_pipeline(data, "docx", source_url=None, config=config)
+                return _run(data, "docx", source_url=None)
             if openxml_type == "pptx":
-                return _run_pipeline(data, "pptx", source_url=None, config=config)
+                return _run(data, "pptx", source_url=None)
             if suffix in (".ppt", ".doc"):
                 raise ValueError(f"Unsupported legacy Office format: {suffix}. Use .pptx/.docx.")
-            return _run_pipeline(path.read_text(encoding="utf-8"), "html", source_url=source_url, config=config)
+            return _run(path.read_text(encoding="utf-8"), "html", source_url=source_url)
 
-        return _run_pipeline(str(source), "html", source_url=source_url, config=config)
+        return _run(str(source), "html", source_url=source_url)
 
     def parse_all(self, sources: list[_Source], /) -> "Iterator[tuple[_Source, ParseResult | Exception]]":
-        """Parse multiple documents lazily, reusing this instance's config.
+        """Parse multiple documents lazily, reusing this instance's config and browser.
 
         Yields ``(source, ParseResult)`` on success, ``(source, Exception)`` on
-        failure — a failed file never aborts the batch.
+        failure — a failed file never aborts the batch. The browser is reused
+        across all sources; call :meth:`close` (or use the parser as a context
+        manager) when done to release it.
         """
         for source in sources:
             try:

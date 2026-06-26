@@ -44,8 +44,6 @@ Document-zone classification of a page. Set in `shared/step_04_section_classifie
 | Value | Detection method | Description |
 |---|---|---|
 | `coverpage` | Blank page labels / TOC anchor / layout scoring / SEC heuristics | Leading cover page(s) before body content |
-| `toc` | Inherited from `block_type` (`toc`, `toc_heading`) | Pages containing the table of contents |
-| `exhibits` | Inherited from `block_type` (`exhibits`, `exhibit_heading`) | Pages containing exhibit content |
 | `front_matter` | Roman page labels before body; blank pages before first TOC | Preface, foreword, executive summary |
 | `body` | Longest contiguous run of arabic-numbered pages | Main document body |
 | `back_matter` | Roman page labels after body; trailing blank-labeled pages | Appendices using roman numbering |
@@ -53,3 +51,7 @@ Document-zone classification of a page. Set in `shared/step_04_section_classifie
 | `financials` | Alpha-prefixed labels with prefix `F` (e.g. "F-1") | Financial statement annexes |
 | `schedules` | Alpha-prefixed labels with prefix `S` (e.g. "S-1") | Schedule annexes |
 | `last_page` | Blank label / low density / contact info signals | Standalone closing page (contact, disclaimer, colophon) |
+
+
+| `toc` | Inherited from `block_type` (`toc`, `toc_heading`) | Pages containing the table of contents |
+| `exhibits` | Inherited from `block_type` (`exhibits`, `exhibit_heading`) | Pages containing exhibit content |

@@ -54,6 +54,7 @@ def run_pipeline(
     source_url: str | None,
     on_stage: Optional[Callable[[str], None]] = None,
     debug: bool = False,
+    session: "Any | None" = None,
 ) -> Tuple[Dict[str, Any], pd.DataFrame, Optional[pd.DataFrame], Dict[str, pd.DataFrame]]:
     """
     Run HTML-specific document processing steps.
@@ -106,7 +107,7 @@ def run_pipeline(
     # Try Playwright first; if not installed, fall back to static extractor.
     tried_networkidle = False
     try:
-        from .step_01_box_extractor import extract_boxes_with_playwright
+        from .step_01_box_extractor import BrowserSession, extract_boxes_with_playwright
         _playwright_available = True
     except ImportError:
         logger.warning(
@@ -116,60 +117,75 @@ def run_pipeline(
         )
         _playwright_available = False
 
-    if _playwright_available:
-        # For non-SEC URLs: Playwright navigates directly. If that fails, fall back to
-        # fetching bytes via http_fetcher and rendering with set_content.
-        try:
-            boxes, rendered_html = extract_boxes_with_playwright(html, source_url, wait_until="domcontentloaded")
-        except Exception as e:
-            if source_url:
-                logger.warning(f"Playwright navigation failed for {source_url}, falling back to http_fetcher: {e}")
-                scraped = fetch_url(source_url)
-                html = scraped.raw_bytes.decode(scraped.encoding or "utf-8", errors="replace")
-                html = _inject_base_url(html, scraped.final_url)
-                boxes, rendered_html = extract_boxes_with_playwright(html, source_url=None)
-            else:
-                raise
-    else:
-        if html is None:
-            # No Playwright to navigate, must have HTML content to proceed.
-            raise ValueError("Playwright is not installed and no HTML content was provided — cannot extract boxes.")
-        from .step_01_static_box_extractor import extract_boxes_static
-        boxes = extract_boxes_static(html)
-        rendered_html = html
+    # Reuse one browser across the (up to 3) extraction attempts below. When a
+    # caller (e.g. DocumentParser) supplies a session, reuse it across documents
+    # too and leave closing to the caller; otherwise own a session scoped to this
+    # call so even a single parse only launches the browser once.
+    _owns_session = False
+    if _playwright_available and session is None:
+        session = BrowserSession()
+        _owns_session = True
 
-    df_boxes = pd.DataFrame(boxes)
-    logger.info(f"Step 01 - Box extraction complete, {len(df_boxes)} boxes")
+    try:
+        if _playwright_available:
+            # For non-SEC URLs: Playwright navigates directly. If that fails, fall back to
+            # fetching bytes via http_fetcher and rendering with set_content.
+            try:
+                boxes, rendered_html = extract_boxes_with_playwright(html, source_url, wait_until="domcontentloaded", session=session)
+            except Exception as e:
+                if source_url:
+                    logger.warning(f"Playwright navigation failed for {source_url}, falling back to http_fetcher: {e}")
+                    scraped = fetch_url(source_url)
+                    html = scraped.raw_bytes.decode(scraped.encoding or "utf-8", errors="replace")
+                    html = _inject_base_url(html, scraped.final_url)
+                    boxes, rendered_html = extract_boxes_with_playwright(html, source_url=None, session=session)
+                else:
+                    raise
+        else:
+            if html is None:
+                # No Playwright to navigate, must have HTML content to proceed.
+                raise ValueError("Playwright is not installed and no HTML content was provided — cannot extract boxes.")
+            from .step_01_static_box_extractor import extract_boxes_static
+            boxes = extract_boxes_static(html)
+            rendered_html = html
 
-    # Retry with networkidle if domcontentloaded produced no extractable boxes.
-    if df_boxes.empty and source_url and _playwright_available:
-        logger.info("No boxes after domcontentloaded extraction — retrying with networkidle")
-        boxes, rendered_html = extract_boxes_with_playwright(html, source_url, wait_until="networkidle")
-        tried_networkidle = True
         df_boxes = pd.DataFrame(boxes)
+        logger.info(f"Step 01 - Box extraction complete, {len(df_boxes)} boxes")
 
-    if df_boxes.empty:
-        logger.warning("Empty DataFrame after box extraction, returning early")
-        return {}, df_boxes, None, {}
+        # Retry with networkidle if domcontentloaded produced no extractable boxes.
+        if df_boxes.empty and source_url and _playwright_available:
+            logger.info("No boxes after domcontentloaded extraction — retrying with networkidle")
+            boxes, rendered_html = extract_boxes_with_playwright(html, source_url, wait_until="networkidle", session=session)
+            tried_networkidle = True
+            df_boxes = pd.DataFrame(boxes)
 
-    # Step 02 - Box Cleaning
-    # Static extraction: hr/img are already in DOM order, skip y_top-based reordering
-    df_boxes = clean_boxes(df_boxes, keep_debug_cols=False, dry_run=False, reorder_by_coordinates=_playwright_available)
-
-    # Retry with networkidle if cleaning wiped everything (e.g. only a footer survived domcontentloaded).
-    if df_boxes.empty and source_url and _playwright_available and not tried_networkidle:
-        logger.info("No boxes after cleaning — retrying extraction with networkidle")
-        boxes, rendered_html = extract_boxes_with_playwright(html, source_url, wait_until="networkidle")
-        tried_networkidle = True
-        df_boxes = pd.DataFrame(boxes)
         if df_boxes.empty:
-            logger.warning("Still empty after networkidle retry, returning early")
+            logger.warning("Empty DataFrame after box extraction, returning early")
             return {}, df_boxes, None, {}
+
+        # Step 02 - Box Cleaning
+        # Static extraction: hr/img are already in DOM order, skip y_top-based reordering
         df_boxes = clean_boxes(df_boxes, keep_debug_cols=False, dry_run=False, reorder_by_coordinates=_playwright_available)
 
-    if df_boxes.empty:
-        logger.warning("Empty DataFrame after box cleaning, returning early")
-        return {}, df_boxes, None, {}
+        # Retry with networkidle if cleaning wiped everything (e.g. only a footer survived domcontentloaded).
+        if df_boxes.empty and source_url and _playwright_available and not tried_networkidle:
+            logger.info("No boxes after cleaning — retrying extraction with networkidle")
+            boxes, rendered_html = extract_boxes_with_playwright(html, source_url, wait_until="networkidle", session=session)
+            tried_networkidle = True
+            df_boxes = pd.DataFrame(boxes)
+            if df_boxes.empty:
+                logger.warning("Still empty after networkidle retry, returning early")
+                return {}, df_boxes, None, {}
+            df_boxes = clean_boxes(df_boxes, keep_debug_cols=False, dry_run=False, reorder_by_coordinates=_playwright_available)
+
+        if df_boxes.empty:
+            logger.warning("Empty DataFrame after box cleaning, returning early")
+            return {}, df_boxes, None, {}
+    finally:
+        # The browser is only needed for box extraction above; release it (when we
+        # own it) before the heavier downstream processing runs.
+        if _owns_session and session is not None:
+            session.close()
 
     # Step 03 - Page Labels (runs on boxes — needs box_id)
     df_boxes, page_labels, page_label_groups = assign_page_labels(

@@ -99,20 +99,14 @@ MASTER_COLUMN_ORDER: List[str] = [
     "chart_id",             # pptx
     "placeholder_type",     # pptx        — title / body / subtitle / …
 
-    #Native PDF Stream Data
-    "struct_tag_id",
-    "struct_tag",
-    "mcid",
-    "marked_tag",
-
     # Mid-pipeline IDs (pdf + html)
-    "gutter_id",
-    "gutter_candidate_id",
-    "struct_group_id",
     "cell_id",
     "line_id",
     "temp_line_id",
     "paragraph_id",
+    "gutter_id",
+    "gutter_candidate_id",
+    "struct_group_id",
 
     # Shared-pipeline IDs
     "block_id",
@@ -125,6 +119,12 @@ MASTER_COLUMN_ORDER: List[str] = [
     "run_ids",              # docx, pptx  — list of run_id values aggregated here
     "paragraph_ids",        # docx, pptx  — list of paragraph_id values aggregated here
     "raw_shape_ids",
+
+    #Native PDF Stream Data
+    "struct_tag_id",
+    "struct_tag",
+    "mcid",
+    "marked_tag",
 
     # Aggregated hierarchical counts
     "run_count",            # docx, pptx  — runs collapsed into this paragraph

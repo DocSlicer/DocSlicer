@@ -20,6 +20,63 @@ HEADLESS = True  # set False to debug visually
 PIPELINE_DIR = Path(__file__).parent
 EXTRACTOR_JS_PATH = PIPELINE_DIR / "extract_boxes.js"
 
+
+# ----------------------------
+# Browser session (reusable across documents and across retries)
+# ----------------------------
+class BrowserSession:
+    """Owns a single Playwright browser process, reused across extractions.
+
+    Launching Chromium is the dominant fixed cost of HTML extraction, so a
+    long-lived session amortizes it across many documents (when held by a
+    DocumentParser) and across the retry attempts within a single document.
+    A fresh browser *context* is created per extraction, preserving the
+    per-document isolation (cookies, stealth init script) that a brand-new
+    browser used to provide. The browser launches lazily on first extraction,
+    so holding a session that is never used for HTML costs nothing.
+    """
+
+    def __init__(self) -> None:
+        self._pw = None
+        self._browser = None
+
+    def _ensure_browser(self):
+        if self._browser is None:
+            self._pw = sync_playwright().start()
+            # Prefer real Chrome (less detectable) and fall back to bundled Chromium.
+            try:
+                self._browser = self._pw.chromium.launch(headless=HEADLESS, channel="chrome", args=BROWSER_ARGS)
+            except Exception:
+                self._browser = self._pw.chromium.launch(headless=HEADLESS, args=BROWSER_ARGS)
+        return self._browser
+
+    def extract(
+        self,
+        html: str | None,
+        source_url: str | None = None,
+        wait_until: str = "domcontentloaded",
+    ) -> tuple[List[Dict[str, Any]], str]:
+        return _extract_with_browser(self._ensure_browser(), html, source_url, wait_until)
+
+    def close(self) -> None:
+        if self._browser is not None:
+            try:
+                self._browser.close()
+            finally:
+                self._browser = None
+        if self._pw is not None:
+            try:
+                self._pw.stop()
+            finally:
+                self._pw = None
+
+    def __enter__(self) -> "BrowserSession":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+
 # ----------------------------
 # Public API
 # ----------------------------
@@ -27,6 +84,7 @@ def extract_boxes_with_playwright(
     html: str,
     source_url: str = None,
     wait_until: str = "domcontentloaded",
+    session: "BrowserSession | None" = None,
 ) -> tuple[List[Dict[str, Any]], str]:
     """
     Extract boxes from HTML using Playwright + in-page JS extractor.
@@ -35,13 +93,39 @@ def extract_boxes_with_playwright(
         html: Raw HTML string, or None when source_url is provided.
         source_url: URL to navigate to, or None when html is provided.
         wait_until: Playwright navigation wait strategy ("domcontentloaded" or "networkidle").
+        session: Optional reusable BrowserSession. When provided, its browser is
+            reused (a fresh context is created per call). When None, a temporary
+            browser is launched and closed for this single extraction — preserving
+            the original standalone behavior.
 
     Returns:
         Tuple of (boxes list, rendered_html string)
     """
+    if session is not None:
+        return session.extract(html, source_url, wait_until)
+
+    session = BrowserSession()
+    try:
+        return session.extract(html, source_url, wait_until)
+    finally:
+        session.close()
+
+
+def _extract_with_browser(
+    browser,
+    html: str | None,
+    source_url: str | None,
+    wait_until: str,
+) -> tuple[List[Dict[str, Any]], str]:
+    """Run one extraction on an already-launched browser.
+
+    Creates a fresh context/page, performs navigation + in-page JS extraction,
+    and tears down the *context* (but not the browser) before returning, so the
+    browser can be reused for the next extraction.
+    """
     if (html is None and source_url is None) or (html is not None and source_url is not None):
         raise ValueError("Exactly one of 'html' or 'url' must be provided")
-    
+
     js_code = EXTRACTOR_JS_PATH.read_text(encoding="utf-8")
     cookie_consent_js = COOKIE_CONSENT_JS_PATH.read_text(encoding="utf-8")
     stealth_init_js = STEALTH_INIT_JS_PATH.read_text(encoding="utf-8")
@@ -50,19 +134,14 @@ def extract_boxes_with_playwright(
     # Use consistent viewport width for coordinate alignment
     VIEWPORT_WIDTH = 1280
     VIEWPORT_HEIGHT = 800
-    
-    with sync_playwright() as p:
-        # Prefer real Chrome (less detectable) and fall back to bundled Chromium.
-        try:
-            browser = p.chromium.launch(headless=HEADLESS, channel="chrome", args=BROWSER_ARGS)
-        except Exception:
-            browser = p.chromium.launch(headless=HEADLESS, args=BROWSER_ARGS)
-        context = browser.new_context(
-            user_agent=BROWSER_USER_AGENT,
-            viewport={"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
-            extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
-            bypass_csp=True,
-        )
+
+    context = browser.new_context(
+        user_agent=BROWSER_USER_AGENT,
+        viewport={"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
+        extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
+        bypass_csp=True,
+    )
+    try:
         context.add_init_script(stealth_init_js)
         page = context.new_page()
 
@@ -101,7 +180,7 @@ def extract_boxes_with_playwright(
             ::-webkit-scrollbar { display: none; }
             html { scrollbar-width: none; }
         """)
-        
+
         # Run extraction. The JS also annotates every <table> with
         # data-docslicer-table-id so Python can look up tables by their JS
         # table_id rather than by document-order position (which diverges for
@@ -120,8 +199,8 @@ def extract_boxes_with_playwright(
 
         # Pause to inspect the rendered page (press Enter to continue)
         #input("⏸️  Browser window open - Press Enter to close and continue...")
-
-        browser.close()
+    finally:
+        context.close()
 
     # Defensive: ensure plain python primitives
     if not isinstance(boxes, list):
@@ -131,13 +210,13 @@ def extract_boxes_with_playwright(
     valid_boxes = []
     for box in boxes:
         box.pop('style', None)
-        
+
         # Get coordinates (with defaults)
         x_left = box.get('x_left', 0)
         y_top = box.get('y_top', 0)
         x_right = box.get('x_right', 0)
         y_bottom = box.get('y_bottom', 0)
-        
+
         # Skip boxes with invalid coordinates (hidden elements, off-screen, etc.)
         if x_left < 0 or y_top < 0:
             continue
@@ -145,7 +224,7 @@ def extract_boxes_with_playwright(
             continue
         if x_right > VIEWPORT_WIDTH * 2:  # Way off screen
             continue
-            
+
         # Store the actual page dimensions (not viewport - actual rendered size)
         box['page_width'] = page_dimensions['width']
         box['page_height'] = page_dimensions['height']

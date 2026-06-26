@@ -412,6 +412,7 @@ def _run_pipeline(
     source_url: str | None,
     config: ParseConfig,
     source_filename: str | None = None,
+    session=None,
 ) -> ParseResult:
     _t0 = time.perf_counter()
 
@@ -492,7 +493,7 @@ def _run_pipeline(
             )
         from .html.html_orchestrator import run_pipeline as _run_html_pipeline
         discovered_metadata, df_lines, df_table_cells, html_steps = _run_html_pipeline(
-            html=content, source_url=source_url, debug=config.debug
+            html=content, source_url=source_url, debug=config.debug, session=session
         )
         discovered_metadata["content_type"] = "html"
         if config.debug:
