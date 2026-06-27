@@ -48,7 +48,7 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-from .._utils.text_utils import _BULLET_TOKENS
+from .._utils.text_utils import _BULLET_TOKENS, _CURRENCY_SYMBOLS, is_list_marker
 from .._utils.hierarchical_aggregator import aggregate_hierarchical, build_standard_agg_spec
 
 
@@ -64,12 +64,12 @@ class CellBuildConfig:
     em_table:        float = 0.40   # tight: avoid bridging columns
 
     # --- Special-case override thresholds ---
-    # Max gap (em) to still merge a bullet/dollar token into the same cell.
+    # Max gap (em) to still merge a bullet/currency token into the same cell.
     # Derived from old pt constants at reference font size 10:
-    #   bullet: 30pt / 10 = 3.0em
-    #   dollar: 60pt / 10 = 6.0em
-    bullet_max_gap_em: float = 3.0
-    dollar_max_gap_em: float = 6.0
+    #   bullet:   30pt / 10 = 3.0em
+    #   currency: 60pt / 10 = 6.0em
+    bullet_max_gap_em:   float = 3.0
+    currency_max_gap_em: float = 6.0
 
     # --- Overlap tolerance ---
     # Overlaps up to this many pt are treated as zero (superscript positioning,
@@ -316,7 +316,92 @@ def em_threshold_for_class(cls: str, config: CellBuildConfig = CONFIG) -> float:
 
 
 # ================================================================================
-# 4. CELL ID ASSIGNMENT  (horizontal words)
+# 4. LINE FEATURE ANNOTATION  (pipeline step 1: combines sections 1-3)
+# ================================================================================
+
+def _annotate_line_features(
+    df: pd.DataFrame,
+    config: CellBuildConfig = CONFIG,
+) -> pd.DataFrame:
+    """
+    Compute per-line gap statistics and classification, broadcast to every word.
+
+    Added columns:
+        gap_em_right, line_n_gaps, line_median_em, line_max_em, line_jump_ratio,
+        line_is_bimodal, line_split_em, line_class, line_score, line_em_threshold
+    """
+    # Pre-sort once so per-group rows are in x_left order — avoids re-sorting inside the loop.
+    df = df.sort_values(["line_id", "x_left"], kind="mergesort").reset_index(drop=True)
+
+    # Vectorised gap_em_right: for each word, gap to the right neighbour within the same line.
+    xl  = df["x_left"].to_numpy(float)
+    xr  = df["x_right"].to_numpy(float)
+    fs  = df["font_size"].to_numpy(float)
+    lid = df["line_id"].to_numpy()
+
+    n = len(df)
+    same_next          = np.empty(n, dtype=bool)
+    same_next[:-1]     = lid[:-1] == lid[1:]
+    same_next[-1]      = False
+
+    gap_pt             = np.empty(n);  gap_pt[-1]  = np.nan
+    gap_pt[:-1]        = xl[1:] - xr[:-1]
+
+    fs_max             = np.empty(n);  fs_max[-1]  = np.nan
+    fs_max[:-1]        = np.maximum(fs[:-1], fs[1:])
+    fs_max             = np.where((fs_max > 0) & np.isfinite(fs_max), fs_max, np.nan)
+
+    raw_gem            = gap_pt / fs_max
+    gap_em_col         = np.where(same_next & np.isfinite(raw_gem), np.round(raw_gem, 4), np.nan)
+    df["gap_em_right"] = gap_em_col
+
+    # Per-line stats and classification (must remain a Python loop; data is already sorted).
+    feat_rows: list[dict] = []
+    has_script = "script_type" in df.columns
+
+    for line_id, grp in df.groupby("line_id", sort=False):
+        x_left    = grp["x_left"].to_numpy(float)
+        x_right   = grp["x_right"].to_numpy(float)
+        font_size = grp["font_size"].to_numpy(float)
+        texts     = grp["text"].tolist()
+
+        if has_script:
+            untagged_mask = grp["script_type"].isna().to_numpy()
+            texts_content = [t for t, m in zip(texts, untagged_mask) if m]
+        else:
+            texts_content = texts
+
+        gs         = _line_gap_stats(x_left, x_right, font_size, config)
+        cs         = _content_stats(texts_content)
+        cls, score = classify_line(texts_content, gs)
+        thr        = em_threshold_for_class(cls, config)
+
+        feat_rows.append({
+            "line_id":            line_id,
+            "line_n_gaps":        gs["n_gaps"],
+            "line_median_em":     round(gs["median_em"], 4),
+            "line_max_em":        round(gs["max_em"], 4),
+            "line_jump_ratio":    round(gs["jump_ratio"], 4),
+            "line_is_bimodal":    gs["is_bimodal"],
+            "line_split_em":      round(gs["split_em"], 4) if np.isfinite(gs["split_em"]) else None,
+            "line_n_words":       cs["n"],
+            "line_alpha_ratio":   round(cs["alpha_ratio"], 4),
+            "line_numeric_ratio": round(cs["numeric_token_ratio"], 4),
+            "line_stopword_hits": cs["stopword_hits"],
+            "line_cap_ratio":     round(cs["cap_ratio"], 4),
+            "line_has_punct":     cs["has_punct"],
+            "line_score":         round(score, 2),
+            "line_class":         cls,
+            "line_em_threshold":  thr,
+        })
+
+    df_feat = pd.DataFrame(feat_rows)
+    df = df.merge(df_feat, on="line_id", how="left")
+    return df
+
+
+# ================================================================================
+# 5. CELL ID ASSIGNMENT  (horizontal words)
 # ================================================================================
 
 def _is_numeric_like(text: str) -> bool:
@@ -342,10 +427,43 @@ def _assign_cell_ids_horiz(df: pd.DataFrame, config: CellBuildConfig = CONFIG) -
 
     stripped       = pd.Series(text_arr).str.strip()
     bullet_flags   = stripped.isin(_BULLET_TOKENS).to_numpy()
-    dollar_flags   = (stripped == "$").to_numpy()
+    currency_flags = stripped.isin(_CURRENCY_SYMBOLS).to_numpy()
     numeric_flags  = stripped.apply(_is_numeric_like).to_numpy()
 
     n        = len(df)
+
+    # List markers ((1), 1., (a), [1], iv. …) merge into the following word like
+    # bullets, but only when the marker isn't a sub/superscript reference. The
+    # regex is only consulted for line-leading words (the merge requires k == i),
+    # so restrict the per-word apply to those positions.
+    is_line_first = np.zeros(n, dtype=bool)
+    if n:
+        is_line_first[0]  = True
+        is_line_first[1:] = line_arr[1:] != line_arr[:-1]
+    list_marker_flags = np.zeros(n, dtype=bool)
+    first_idx = np.where(is_line_first)[0]
+    if first_idx.size:
+        list_marker_flags[first_idx] = stripped.iloc[first_idx].apply(is_list_marker).to_numpy()
+
+    # Script status is resolved later (per-cell), so check it locally here: a real
+    # list marker sits at the body baseline and a comparable size; a raised footnote
+    # ref is smaller and baseline-shifted relative to the word it precedes.
+    has_geom   = {"font_size", "y_bottom"}.issubset(df.columns)
+    fs_arr     = pd.to_numeric(df["font_size"], errors="coerce").to_numpy(float) if has_geom else None
+    yb_arr     = pd.to_numeric(df["y_bottom"],  errors="coerce").to_numpy(float) if has_geom else None
+    pre_script = df["script_type"].notna().to_numpy() if "script_type" in df.columns else np.zeros(n, dtype=bool)
+
+    def _looks_like_script(a: int, b: int) -> bool:
+        """True if word *a* reads as a raised/smaller script relative to body word *b*."""
+        if not has_geom:
+            return False
+        ref = fs_arr[b]
+        if not (ref > 0) or not np.isfinite(ref):
+            return False
+        smaller = fs_arr[a] < _SCRIPT_DETECT_SIZE_RATIO * ref
+        raised  = abs(yb_arr[a] - yb_arr[b]) > _SCRIPT_DETECT_Y_FACTOR * ref
+        return bool(smaller and raised)
+
     cell_ids = np.empty(n, dtype=np.int64)
 
     next_id = 1
@@ -375,16 +493,24 @@ def _assign_cell_ids_horiz(df: pd.DataFrame, config: CellBuildConfig = CONFIG) -
                 and np.isfinite(gap_em)
                 and gap_em <= config.bullet_max_gap_em
             )
-            is_dollar_merge = (
-                dollar_flags[k]
+            is_list_marker_merge = (
+                list_marker_flags[k] and k == i
+                and bool(text_arr[k + 1].strip())
+                and not pre_script[k]                 # already tagged a script upstream
+                and not _looks_like_script(k, k + 1)  # raised/smaller ref, not a marker
+                and np.isfinite(gap_em)
+                and gap_em <= config.bullet_max_gap_em
+            )
+            is_currency_merge = (
+                currency_flags[k]
                 and numeric_flags[k + 1]
                 and np.isfinite(gap_em)
-                and gap_em <= config.dollar_max_gap_em
+                and gap_em <= config.currency_max_gap_em
             )
             thr = thr_arr[k] if np.isfinite(thr_arr[k]) else config.em_undetermined
             is_normal_merge = np.isfinite(gap_em) and gap_em <= thr
 
-            if is_bullet_merge or is_dollar_merge or is_normal_merge:
+            if is_bullet_merge or is_list_marker_merge or is_currency_merge or is_normal_merge:
                 cell_ids[k + 1] = cur_cell
             else:
                 next_id  += 1
@@ -400,7 +526,63 @@ def _assign_cell_ids_horiz(df: pd.DataFrame, config: CellBuildConfig = CONFIG) -
 
 
 # ================================================================================
-# 5. STRUCT GROUP MERGE  (cross-line merging via PDF logical structure)
+# 5b. POST-MERGE TABLE REFINEMENT  (re-split multi-cell lines at the tight threshold)
+# ================================================================================
+
+def _refine_multi_cell_lines(df: pd.DataFrame, config: CellBuildConfig = CONFIG) -> pd.DataFrame:
+    """
+    Re-split lines that survived the first merge pass holding more than one cell.
+
+    A line that still carries multiple cells after merging is, by construction, a
+    table row: real prose always collapses to a single cell. Yet some such lines
+    were classified "text"/"undetermined" and merged at the loose em threshold,
+    which can bridge two narrow columns into one cell while a third column stays
+    separate (the "Cash" | flow" | "Acquisitions" | "Non-cash" header case, where 
+    the loose pass fuses "Cash flow" and "Acquisitions").
+
+    Such a line is almost impossible to label "table" in the classify_line pass:
+    it is short, all-alpha, and proper-cased, so the only signal pushing it toward
+    table is the caps ratio — and bumping that up enough to catch it would also
+    drag legitimate proper-cased prose (legal headings, defined terms) into table
+    territory. The post-merge cell count is the unambiguous signal classify_line
+    lacks, so we defer the decision to here: only for these lines do we drop the
+    threshold to em_table and re-run the per-line merge, tightening every gap so
+    the bridged columns split apart.
+
+    Cost is one groupby over the page; the actual re-merge touches only the
+    suspect rows (typically a handful of header lines), so the common case where
+    no line needs refining adds just that single pass.
+    """
+    if df.empty or "cell_id" not in df.columns:
+        return df
+
+    # Lines with >1 surviving cell whose threshold is still above the tight table
+    # cutoff. Lines already at em_table (classified table) can't tighten further.
+    cells_per_line = df.groupby("line_id")["cell_id"].transform("nunique")
+    thr            = pd.to_numeric(df["line_em_threshold"], errors="coerce")
+    suspect        = (cells_per_line > 1) & (thr > config.em_table)
+    if not suspect.any():
+        return df
+
+    df = df.copy()
+    mask = df["line_id"].isin(df.loc[suspect, "line_id"].unique())
+
+    df.loc[mask, "line_class"]        = "table"
+    df.loc[mask, "line_em_threshold"] = config.em_table
+
+    # Re-merge only the suspect rows at the tight threshold, then map the fresh
+    # cell_ids back by word_id (stable across the internal sort). Offset above the
+    # current max so re-split lines never collide with the kept lines' ids.
+    offset      = int(df["cell_id"].max())
+    resplit, _  = _assign_cell_ids_horiz(df.loc[mask].copy(), config)
+    id_map      = dict(zip(resplit["word_id"].to_numpy(), resplit["cell_id"].to_numpy() + offset))
+    df.loc[mask, "cell_id"] = df.loc[mask, "word_id"].map(id_map).astype(np.int64)
+
+    return df
+
+
+# ================================================================================
+# 6. STRUCT GROUP MERGE  (cross-line merging via PDF logical structure)
 # ================================================================================
 
 def _merge_struct_groups(df: pd.DataFrame) -> pd.DataFrame:
@@ -459,7 +641,7 @@ def _merge_struct_groups(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ================================================================================
-# 6. CELL-LEVEL SCRIPT DETECTION
+# 7. CELL-LEVEL SCRIPT DETECTION
 # ================================================================================
 
 def _detect_cell_level_scripts(df: pd.DataFrame) -> pd.DataFrame:
@@ -511,7 +693,7 @@ def _detect_cell_level_scripts(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ================================================================================
-# 7. CELL AGGREGATION  (words → cells)
+# 8. CELL AGGREGATION  (words → cells)
 # ================================================================================
 
 def _join_texts(texts: list[str]) -> str:
@@ -585,7 +767,7 @@ def _build_cells_df(df_words: pd.DataFrame) -> pd.DataFrame:
 
 
 # ================================================================================
-# 7. VERTICAL WORD PROCESSING
+# 9. VERTICAL WORD PROCESSING
 # ================================================================================
 
 def _process_vertical_words(
@@ -697,89 +879,8 @@ def _process_vertical_words(
 
 
 # ================================================================================
-# 8. ENTRY POINT
+# 10. ENTRY POINT  (public API)
 # ================================================================================
-
-def _annotate_line_features(
-    df: pd.DataFrame,
-    config: CellBuildConfig = CONFIG,
-) -> pd.DataFrame:
-    """
-    Compute per-line gap statistics and classification, broadcast to every word.
-
-    Added columns:
-        gap_em_right, line_n_gaps, line_median_em, line_max_em, line_jump_ratio,
-        line_is_bimodal, line_split_em, line_class, line_score, line_em_threshold
-    """
-    # Pre-sort once so per-group rows are in x_left order — avoids re-sorting inside the loop.
-    df = df.sort_values(["line_id", "x_left"], kind="mergesort").reset_index(drop=True)
-
-    # Vectorised gap_em_right: for each word, gap to the right neighbour within the same line.
-    xl  = df["x_left"].to_numpy(float)
-    xr  = df["x_right"].to_numpy(float)
-    fs  = df["font_size"].to_numpy(float)
-    lid = df["line_id"].to_numpy()
-
-    n = len(df)
-    same_next          = np.empty(n, dtype=bool)
-    same_next[:-1]     = lid[:-1] == lid[1:]
-    same_next[-1]      = False
-
-    gap_pt             = np.empty(n);  gap_pt[-1]  = np.nan
-    gap_pt[:-1]        = xl[1:] - xr[:-1]
-
-    fs_max             = np.empty(n);  fs_max[-1]  = np.nan
-    fs_max[:-1]        = np.maximum(fs[:-1], fs[1:])
-    fs_max             = np.where((fs_max > 0) & np.isfinite(fs_max), fs_max, np.nan)
-
-    raw_gem            = gap_pt / fs_max
-    gap_em_col         = np.where(same_next & np.isfinite(raw_gem), np.round(raw_gem, 4), np.nan)
-    df["gap_em_right"] = gap_em_col
-
-    # Per-line stats and classification (must remain a Python loop; data is already sorted).
-    feat_rows: list[dict] = []
-    has_script = "script_type" in df.columns
-
-    for line_id, grp in df.groupby("line_id", sort=False):
-        x_left    = grp["x_left"].to_numpy(float)
-        x_right   = grp["x_right"].to_numpy(float)
-        font_size = grp["font_size"].to_numpy(float)
-        texts     = grp["text"].tolist()
-
-        if has_script:
-            untagged_mask = grp["script_type"].isna().to_numpy()
-            texts_content = [t for t, m in zip(texts, untagged_mask) if m]
-        else:
-            texts_content = texts
-
-        gs         = _line_gap_stats(x_left, x_right, font_size, config)
-        cs         = _content_stats(texts_content)
-        cls, score = classify_line(texts_content, gs)
-        thr        = em_threshold_for_class(cls, config)
-
-        feat_rows.append({
-            "line_id":            line_id,
-            "line_n_gaps":        gs["n_gaps"],
-            "line_median_em":     round(gs["median_em"], 4),
-            "line_max_em":        round(gs["max_em"], 4),
-            "line_jump_ratio":    round(gs["jump_ratio"], 4),
-            "line_is_bimodal":    gs["is_bimodal"],
-            "line_split_em":      round(gs["split_em"], 4) if np.isfinite(gs["split_em"]) else None,
-            "line_n_words":       cs["n"],
-            "line_alpha_ratio":   round(cs["alpha_ratio"], 4),
-            "line_numeric_ratio": round(cs["numeric_token_ratio"], 4),
-            "line_stopword_hits": cs["stopword_hits"],
-            "line_cap_ratio":     round(cs["cap_ratio"], 4),
-            "line_has_punct":     cs["has_punct"],
-            "line_score":         round(score, 2),
-            "line_class":         cls,
-            "line_em_threshold":  thr,
-        })
-
-    df_feat = pd.DataFrame(feat_rows)
-    df = df.merge(df_feat, on="line_id", how="left")
-    return df
-
 
 def build_cells(
     df_words: pd.DataFrame,
@@ -793,7 +894,7 @@ def build_cells(
     Pipeline:
       1. Annotate words with per-line gap statistics and em threshold.
       2. Assign cell_ids within each line using em-threshold gap merging,
-         with bullet and dollar/currency special-case overrides.
+         with bullet, list-marker, and currency special-case overrides.
       3. Merge cell_ids that share a struct_group_id (PDF logical structure).
       4. Aggregate words into cell rows.
 
@@ -839,6 +940,7 @@ def build_cells(
         if not df_h.empty:
             df_h = _annotate_line_features(df_h, config)
             df_h, _ = _assign_cell_ids_horiz(df_h, config)
+            df_h = _refine_multi_cell_lines(df_h, config)
             df_h = _merge_struct_groups(df_h)
             df_h = _detect_cell_level_scripts(df_h)
             df_h["cell_id"] += running_cell

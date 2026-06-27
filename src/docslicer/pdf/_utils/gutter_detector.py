@@ -9,7 +9,7 @@ import re
 import numpy as np
 import pandas as pd
 
-from ..._utils.text_utils import is_list_marker
+from ..._utils.text_utils import _CURRENCY_SYM_CLASS, is_list_marker
 
 # =======================================================================================================================
 # CONFIG
@@ -962,7 +962,7 @@ def promote_gutter_candidates_to_gutters(gutters_df: pd.DataFrame, words_df: pd.
 
 # Numeric value: optional currency prefix, number body (123 / 1,23 / 1.23 / (123)), optional % or currency suffix
 _NUMERIC_VALUE_RE = re.compile(
-    r'^[\$€£¥₹₩₪₫₭₮₯₰₱₲₳₴₵₶₷₸₹₺₻₼₽₾]?\(?\d[\d,\.]*\)?[\$€£¥₹₩₪₫₭₮₯₰₱₲₳₴₵₶₷₸₹₺₻₼₽₾%]?$'
+    rf'^{_CURRENCY_SYM_CLASS}?\(?\d[\d,\.]*\)?(?:{_CURRENCY_SYM_CLASS}|%)?$'
 )
 _DASH_TOKENS = {"-", "–", "—", "−"}
 

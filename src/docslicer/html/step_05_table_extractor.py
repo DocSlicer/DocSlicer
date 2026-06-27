@@ -35,6 +35,7 @@ import pandas as pd
 from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 
 from .._utils.table_utils import detect_cell_roles
+from .._utils.text_utils import _CURRENCY_SYMBOLS
 
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
@@ -44,7 +45,7 @@ warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
 _WS_RE = re.compile(r"\s+")
 _PAREN_INNER_RE = re.compile(r"\(\s+|\s+\)")
-_CURRENCY_TOKENS = frozenset({"$", "€", "£", "¥", "₹", "₽", "₩", "₪", "₺"})
+_CURRENCY_TOKENS = _CURRENCY_SYMBOLS  # canonical set (single source of truth in text_utils)
 _LPAREN_CHARS = frozenset({"(", "[", "{"})
 _RPAREN_CHARS = frozenset({")", "]", "}", "%"})
 # Matches a fully-parenthesized expression with no nested parens, optional trailing %.

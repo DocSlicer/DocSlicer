@@ -8,6 +8,8 @@ import re
 
 import pandas as pd
 
+from .text_utils import _CURRENCY_SYM_CLASS
+
 
 _YEAR_PAT = re.compile(r"\b20\d{2}\b")
 _DATE_PAT = re.compile(
@@ -47,7 +49,7 @@ _NUMBER_RE = re.compile(r"^[\(\-]?\$?[\d,]+(\.\d+)?\)?$")
 # Currency/unit indicator patterns — matches cells like "$m", "(€bn)", "k£", "(%)", etc.
 # Scale abbreviations: m/mm (millions), b/bn (billions), tr/trn (trillions), k (thousands),
 # '000 / 000 (thousands).  Word forms: millions, billions, thousands, trillions.
-_CUR_SYM = r"[£€$¥₹₽₩₪₺¢]"
+_CUR_SYM = _CURRENCY_SYM_CLASS
 _CUR_CODE = r"(?:USD|EUR|GBP|JPY|CHF|AUD|CAD|CNY|HKD|SEK|NOK|DKK|NZD|ZAR|MXN|BRL|INR|RUB|KRW|TRY|THB|SGD|MYR)"
 _SCALE = r"(?:trillions?|billions?|millions?|thousands?|trn?|bn?|mm?|k|'?0{3})"
 _CURRENCY_UNIT_RE = re.compile(

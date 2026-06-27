@@ -7,16 +7,43 @@ import pandas as pd
 # BULLET & LIST MARKER DETECTION
 # ==================================================
 
-# Symbol bullets — frozenset for O(1) lookup
+# Symbol bullets — frozenset for O(1) lookup.
+# Canonical union of every bullet glyph the pipeline recognised in scattered
+# local sets (was duplicated/diverged across block_merger and the line builders).
+# Keep this the single source of truth.
 _BULLET_TOKENS: frozenset[str] = frozenset({
-    "-", "–", "—",          # hyphen / en-dash / em-dash
-    "•", "·",               # classic bullets
-    "■", "▪", "",          # squares / special bullet glyphs
-    "…",                    # ellipsis leader
-    "+", "☒", "☐",
-    "○", "◦", "►", "▸", "‣", "⁃",
-    "✓", "✔", "✗", "✘", "✖", "✕", "o",
+    "-", "–", "—",                      # hyphen / en-dash / em-dash
+    "•", "·", "∙",                      # classic bullets / bullet operator
+    "○", "◦",                           # white bullets
+    "●",                                # black circle
+    "■", "▪", "□",                      # squares
+    "◆", "◇",                           # diamonds
+    "►", "▸", "▶",                      # triangles
+    "➤", "➢",                           # arrows
+    "‣", "⁃",                           # triangular / hyphen bullet
+    "",                                # private-use bullet glyph
+    "…",                                # ellipsis leader
+    "+", "*",                           # plus / asterisk markers
+    "☒", "☐",                           # ballot boxes
+    "✓", "✔", "✗", "✘", "✖", "✕",       # check / cross marks
+    "o",                                # lowercase-o OCR bullet (exact match only)
 })
+
+# Subset safe to match as a *leading* character (e.g. "•Item", "- item").
+# Alphanumeric tokens like "o" are excluded: valid as a standalone bullet ("o"
+# on its own) but matching them as a first char would flag ordinary words
+# ("October") as bullets. Derived so the glyph list has one source of truth.
+_BULLET_PREFIX_CHARS: frozenset[str] = frozenset(
+    t for t in _BULLET_TOKENS if not t.isalnum()
+)
+
+# Strict roman-numeral core — validates roman *structure*, not just roman letters,
+# so English words built from i/v/x/l/c/d/m ("mild", "did", "mill") are rejected.
+# The leading lookahead forces ≥1 character, since the value groups are all optional.
+_ROMAN = (
+    r'(?=[MDCLXVI])'
+    r'M?(?:CM|CD|D?C{0,3})(?:XC|XL|L?X{0,3})(?:IX|IV|V?I{0,3})'
+)
 
 # Structured list-token regex — covers the hierarchy types from the yaml
 # (numbered, roman, parenthetical, alpha) as *standalone* tokens.
@@ -25,8 +52,11 @@ _LIST_MARKER_RE = re.compile(
     r'^(?:'
     r'\d+(?:\.\d+)*\.?'         # numbered:      1.  1.1.  2.3.1
     r'|\([A-Za-z0-9]{1,4}\)'    # parens alpha/numeric/roman: (a) (iv) (28) (aa)
+    r'|\d{1,2}\)'               # half-open numbered:  1)  9)  28)
+    r'|[A-Za-z]\)'              # half-open single alpha:  a)  A)
+    rf'|{_ROMAN}\)'             # half-open roman:  ii)  iv)  viii)
     r'|\[\d+\]'                 # bracketed numeric: [1]
-    r'|[ivxlcdm]+\.?'           # roman numeral standalone: iv.  viii  XIV.
+    rf'|{_ROMAN}\.?'            # roman numeral standalone: iv.  viii  XIV.
     r'|[A-Za-z]\.'              # single alpha with dot: A.  B.
     r')$',
     re.IGNORECASE,
@@ -51,6 +81,7 @@ def is_list_marker(text: object) -> bool:
       - Symbol bullets  (•, ■, –, …)
       - Numbered tokens (1.  1.1.  2.3.1)
       - Parenthetical   ((a)  (iv)  (28)  (aa))
+      - Half-open paren (1)  a)  iv)  28))
       - Bracketed       ([1])
       - Roman numerals  (iv.  viii  XIV.)
       - Single alpha    (A.  B.)
@@ -63,6 +94,63 @@ def is_list_marker(text: object) -> bool:
     if not t:
         return False
     return t in _BULLET_TOKENS or bool(_LIST_MARKER_RE.match(t))
+
+
+def is_bullet_line(text: object) -> bool:
+    """
+    True if *text* is a bullet line: either a standalone bullet glyph, or a line
+    whose first non-space character is an (unambiguous) bullet glyph.
+
+    O(1): one frozenset membership test for the standalone case and one for the
+    leading character — no regex, no per-token loop, so it stays cheap when run
+    per fragment inside a join.
+    """
+    if text is None:
+        return False
+    if isinstance(text, float) and pd.isna(text):
+        return False
+    s = str(text).strip()
+    if not s:
+        return False
+    if s in _BULLET_TOKENS:
+        return True
+    return s[0] in _BULLET_PREFIX_CHARS
+
+
+def bullet_line_mask(series: pd.Series) -> pd.Series:
+    """
+    Vectorized :func:`is_bullet_line` for a whole text column → boolean Series.
+    Pure C-level string ops (strip / isin / str[0]); safe on full columns.
+    """
+    s = series.fillna("").astype(str).str.strip()
+    return s.isin(_BULLET_TOKENS) | s.str[0].isin(_BULLET_PREFIX_CHARS)
+
+
+# ==================================================
+# CURRENCY SYMBOLS
+# ==================================================
+
+# Canonical currency-symbol set — single source of truth, consolidated from the
+# per-module copies that had diverged across the repo (table_utils._CUR_SYM,
+# gutter_detector._NUMERIC_VALUE_RE, html step_05._CURRENCY_TOKENS, toc_detector).
+# Covers the Latin-1 currency signs ($ ¢ £ ¤ ¥) plus the entire Unicode
+# "Currency Symbols" block U+20A0–U+20BF (€ ₹ ₽ ₩ ₪ ₺ … and the rest).
+_CURRENCY_SYMBOLS_STR: str = "$¢£¤¥" + "".join(chr(c) for c in range(0x20A0, 0x20C0))
+_CURRENCY_SYMBOLS: frozenset[str] = frozenset(_CURRENCY_SYMBOLS_STR)
+
+# Same set as a regex character-class body, e.g. rf"{_CURRENCY_SYM_CLASS}?\d+".
+# All members are literal inside a character class (none are ^ ] - \), so the
+# raw string drops straight in.
+_CURRENCY_SYM_CLASS: str = f"[{_CURRENCY_SYMBOLS_STR}]"
+
+
+def is_currency_symbol(text: object) -> bool:
+    """True if *text* is a standalone currency symbol ($, €, £, ¥, ₹, …)."""
+    if text is None:
+        return False
+    if isinstance(text, float) and pd.isna(text):
+        return False
+    return str(text).strip() in _CURRENCY_SYMBOLS
 
 
 # ==================================================

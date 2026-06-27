@@ -66,13 +66,9 @@ from .._utils.text_utils import add_calculated_text_features
 
 _WHITESPACE = frozenset(' \t\r\n\x0c\xa0​‌‍﻿')
 
-# PDFium emits a sentinel char as a line-break marker in place of a soft hyphen.
+# PDFium emits U+FFFE as a line-break marker in place of a soft hyphen.
 # When its tight bbox has non-zero width the hyphen is visually rendered in the PDF.
-# The sentinel's value depends on the extraction API: FPDFText_GetText (used by
-# pypdfium2's get_text_range) maps it to U+FFFE, but the per-index
-# FPDFText_GetUnicode we build all_chars from reports U+0002. We read per-index,
-# so the loop matches U+0002.
-_HYPHEN_BREAK = '\x02'
+_FFFE = '￾'
 
 _BYREF = ctypes.byref
 
@@ -292,8 +288,7 @@ def _extract_struct_info(
 def _annotate_words(
     df: pd.DataFrame,
     page,
-    crop_left: float,
-    crop_top: float,
+    page_height: float,
 ) -> None:
     """
     Enrich *df* in-place with marked-content and struct-tree columns.
@@ -311,10 +306,8 @@ def _annotate_words(
     matched_arr = np.zeros(n, dtype=bool)   # guard: each word claimed by at most one obj
 
     if obj_marks and n > 0:
-        # Word coords are CropBox-relative; object marks are MediaBox-space
-        # (y-up). Shift word centers back into MediaBox space to compare.
-        cx     = (df["x_left"].to_numpy(float) + df["x_right"].to_numpy(float)) * 0.5 + crop_left
-        cy_pdf = crop_top - (df["y_top"].to_numpy(float) + df["y_bottom"].to_numpy(float)) * 0.5
+        cx     = (df["x_left"].to_numpy(float) + df["x_right"].to_numpy(float)) * 0.5
+        cy_pdf = page_height - (df["y_top"].to_numpy(float) + df["y_bottom"].to_numpy(float)) * 0.5
         TOL = 1.5
 
         for l, b, r, t, mc, tag in obj_marks:
@@ -371,30 +364,6 @@ def _annotate_words(
 
 # ── Per-page extraction ───────────────────────────────────────────────────────
 
-def _crop_origin(page, page_height: float) -> Tuple[float, float]:
-    """Return (crop_left, crop_top) in MediaBox space.
-
-    pdfium glyph boxes are reported in MediaBox coordinates, so we subtract this
-    origin to land in CropBox-relative space. When the page has no CropBox (or
-    the query fails) we fall back to the MediaBox origin: left = 0 and
-    top = page_height, which leaves coordinates unchanged for the common case.
-    """
-    left = ctypes.c_float()
-    bottom = ctypes.c_float()
-    right = ctypes.c_float()
-    top = ctypes.c_float()
-    ok = pdfium_c.FPDFPage_GetCropBox(
-        page.raw,
-        ctypes.byref(left),
-        ctypes.byref(bottom),
-        ctypes.byref(right),
-        ctypes.byref(top),
-    )
-    if ok:
-        return float(left.value), float(top.value)
-    return 0.0, page_height
-
-
 def _extract_words_for_page(
     page,
     page_number: int,
@@ -404,14 +373,6 @@ def _extract_words_for_page(
     page_width  = float(page.get_width())
     page_height = float(page.get_height())
 
-    # pdfium's get_charbox returns glyph coords in MediaBox space, but
-    # get_width/get_height return the (possibly offset) CropBox size. When a page
-    # has a CropBox whose origin is not (0, 0), we must shift glyphs into
-    # crop-relative space, otherwise x is un-offset and the y-flip mixes spaces
-    # (producing negative / misaligned boxes). Fall back to the MediaBox origin
-    # when no CropBox is present, which reproduces the previous behaviour.
-    crop_left, crop_top = _crop_origin(page, page_height)
-
     tp = page.get_textpage()
     try:
         n = tp.count_chars()
@@ -419,10 +380,7 @@ def _extract_words_for_page(
             return pd.DataFrame(), start_word_id
 
         rows: List[Dict[str, Any]] = []
-        # Build per-index to stay aligned with get_charbox(i) etc. A bulk
-        # get_text_range desyncs when non-BMP glyphs (e.g. math symbols) are
-        # present, since the decoded string length no longer matches n.
-        all_chars = "".join(chr(pdfium_c.FPDFText_GetUnicode(tp, i)) for i in range(n))
+        all_chars = tp.get_text_range(0, n)
 
         # ── Word accumulators ─────────────────────────────────────────────────
         char_texts:  List[str]              = []
@@ -440,10 +398,10 @@ def _extract_words_for_page(
         word_last_box:  Optional[Tuple[float, float, float, float]] = None
         word_n_chars:   int  = 0
         # Script state
-        word_script_type:      Optional[str] = None   # "superscript" | "subscript" | None
-        word_ref_size:         float         = 0.0    # normal font-size before entering script
-        word_ref_cy:           float         = 0.0    # normal baseline before entering script
-        word_first_baseline:   float         = 0.0    # baseline of first char in current word
+        word_script_type: Optional[str] = None   # "superscript" | "subscript" | None
+        word_ref_size:    float         = 0.0    # normal font-size before entering script
+        word_ref_cy:      float         = 0.0    # normal y-centre before entering script
+        word_first_cy:    float         = 0.0    # y-centre of first char in current word
         # Text-object tracking via FPDFText_GetTextObject (works inside form XObjects)
         _ptr_to_obj_id: Dict[int, int] = {}
         _next_obj_id   = [0]              # list so closures can mutate without nonlocal
@@ -456,7 +414,7 @@ def _extract_words_for_page(
         def _flush() -> None:
             nonlocal word_first_box, word_last_box, word_n_chars
             nonlocal word_x_left, word_y_top, word_x_right, word_y_bottom
-            nonlocal word_script_type, word_first_baseline
+            nonlocal word_script_type, word_first_cy
             if not char_texts:
                 return
             orientation = (
@@ -486,7 +444,7 @@ def _extract_words_for_page(
             word_x_left    = word_y_top    = _INF
             word_x_right   = word_y_bottom = -_INF
             word_script_type = None
-            word_first_baseline = 0.0
+            word_first_cy    = 0.0
 
         def _start_word(
             i: int,
@@ -531,13 +489,11 @@ def _extract_words_for_page(
         for i in range(n):
             ch = all_chars[i]
             l, b, r, t = tp.get_charbox(i, loose=True)
-            l -= crop_left
-            r -= crop_left
 
-            if ch == _HYPHEN_BREAK:
+            if ch == _FFFE:
                 tl, _, tr, _ = tp.get_charbox(i, loose=False)
                 if tr - tl > 0.5 and char_texts:
-                    _add_char('-', (l, crop_top - t, r, crop_top - b))
+                    _add_char('-', (l, page_height - t, r, page_height - b))
                 _flush()
                 prev_x_right = -1.0
                 continue
@@ -547,50 +503,50 @@ def _extract_words_for_page(
                 prev_x_right = -1.0
                 continue
 
-            screen_box      = (l, crop_top - t, r, crop_top - b)
-            char_baseline   = screen_box[3]   # screen-coord baseline (bottom of glyph)
+            screen_box = (l, page_height - t, r, page_height - b)
+            char_cy    = (screen_box[1] + screen_box[3]) * 0.5
 
             if not char_texts:
                 _start_word(i)
-                word_first_baseline = char_baseline
+                word_first_cy = char_cy
 
             elif prev_x_right >= 0:
                 gap = l - prev_x_right
                 if gap > _GAP_FACTOR * (word_size or 8.0):
                     _flush()
                     _start_word(i)
-                    word_first_baseline = char_baseline
+                    word_first_cy = char_cy
                 else:
                     # ── Script detection (fast-path: y-shift first) ───────────
-                    y_shift = abs(char_baseline - word_first_baseline)
+                    y_shift = abs(char_cy - word_first_cy)
                     if y_shift > _SCRIPT_Y_FACTOR * (word_size or 8.0):
                         char_size = _font_info(tp, i)[1]   # ctypes call – only here
 
                         if word_script_type is None:
                             if _SCRIPT_SIZE_MIN * word_size < char_size < _SCRIPT_SIZE_DOWN * word_size:
                                 # Forward entry: normal → script
-                                direction = "superscript" if char_baseline < word_first_baseline else "subscript"
+                                direction = "superscript" if char_cy < word_first_cy else "subscript"
                                 _ref_sz = word_size
-                                _ref_cy = word_first_baseline
+                                _ref_cy = word_first_cy
                                 _flush()
                                 _start_word(i, direction, _ref_sz, _ref_cy)
-                                word_first_baseline = char_baseline
+                                word_first_cy = char_cy
 
                             elif char_size > _SCRIPT_SIZE_INV * word_size:
                                 # Retroactive entry: word started with script char,
                                 # now a normal char arrives. Tag before flush.
-                                direction = "superscript" if word_first_baseline < char_baseline else "subscript"
+                                direction = "superscript" if word_first_cy < char_cy else "subscript"
                                 word_script_type = direction   # set before _flush reads it
                                 _flush()
                                 _start_word(i)
-                                word_first_baseline = char_baseline
+                                word_first_cy = char_cy
 
                         else:
                             # Exit: in script word, normal-sized char returns
                             if char_size >= word_ref_size * _SCRIPT_SIZE_UP:
                                 _flush()
                                 _start_word(i)
-                                word_first_baseline = char_baseline
+                                word_first_cy = char_cy
 
             _add_char(ch, screen_box)
             prev_x_right = r
@@ -612,7 +568,7 @@ def _extract_words_for_page(
     df["page_width"]  = page_width
     df["page_height"] = page_height
 
-    _annotate_words(df, page, crop_left, crop_top)
+    _annotate_words(df, page, page_height)
 
     return df, start_word_id + n_words
 
