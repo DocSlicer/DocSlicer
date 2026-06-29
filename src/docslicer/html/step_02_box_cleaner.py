@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 
 from docslicer._utils.text_utils import add_calculated_text_features
-from docslicer._utils.hierarchical_aggregator import (
+from docslicer._utils.df_aggregation.hierarchical_aggregator import (
     build_standard_agg_spec,
     aggregate_hierarchical,
 )

@@ -36,7 +36,7 @@ import re
 import numpy as np
 import pandas as pd
 
-from docslicer._utils.hierarchical_aggregator import (
+from docslicer._utils.df_aggregation.hierarchical_aggregator import (
     aggregate_hierarchical,
     build_standard_agg_spec,
     _collect_unique_list,

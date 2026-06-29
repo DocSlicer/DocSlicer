@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from .._utils.line_merger import assign_line_id
+from .line_merger import assign_line_id
 
 
 # =============================================================================
@@ -28,6 +28,10 @@ _MAX_NUMBER_WIDTH: float = 30.0   # pt — line-number token must be narrow
 _MAX_MISSING_NUMBERS_PER_PAGE: int = 1  # allow at most one skipped line number
 _FONT_SIZE_RATIO: float = 0.85    # line numbers may not be smaller than this × doc median, otherwise likely footnotes
 _MIN_PAGE_COVERAGE: float = 0.80  # line numbers must appear on at least this fraction of pages
+
+# NOTE: for OCR PDF, the config should be looser, 
+# 2-3 missing (may output some numbers as text, like 9 -> S or 44 -> 4A) 
+# and ~50% page coverage, possibly feed in as args (tesseract turns line number column into BTT garbled text on some pages)
 
 
 # =============================================================================

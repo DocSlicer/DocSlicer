@@ -29,7 +29,7 @@ from typing import Iterable
 
 import pandas as pd
 
-from .text_utils import is_bullet_line
+from ..text_utils import is_bullet_line
 
 # Script tokens emitted by apply_inline_markup that attach to the previous
 # fragment with no intervening space.

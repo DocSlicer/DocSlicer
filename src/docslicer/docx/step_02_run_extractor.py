@@ -17,7 +17,7 @@ import pandas as pd
 from lxml import etree
 
 from .step_01_package_reader import DocxPackage
-from .._utils.yaml_compilers.page_label_patterns import PageLabelPatternConfig
+from .._utils.io.yaml_compilers.page_label_patterns import PageLabelPatternConfig
 from .._utils.text_utils import add_calculated_text_features
 
 

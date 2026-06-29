@@ -1,6 +1,8 @@
 # ocr/step_02_word_colorizer.py
 from __future__ import annotations
 
+import os
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from typing import Optional, Tuple, List
 
@@ -66,11 +68,27 @@ def _safe_median_bgr(pixels_bgr: np.ndarray) -> Optional[Tuple[float, float, flo
     """
     Median is much more stable than mean for scanned/compressed pages.
     pixels_bgr: (N, 3) uint8/float
+
+    For uint8 input (the common case) this uses a per-channel histogram
+    (np.bincount) which is O(N) and avoids both the full sort that np.median
+    performs and the float32 copy of the whole pixel array. The histogram
+    returns the lower median, which after rounding + quantization is
+    indistinguishable from np.median for our purposes.
     """
     if pixels_bgr is None or len(pixels_bgr) == 0:
         return None
-    med = np.median(pixels_bgr.astype(np.float32), axis=0)
-    return (float(med[0]), float(med[1]), float(med[2]))
+
+    if pixels_bgr.dtype != np.uint8:
+        med = np.median(pixels_bgr, axis=0)
+        return (float(med[0]), float(med[1]), float(med[2]))
+
+    n = pixels_bgr.shape[0]
+    target = (n - 1) // 2  # 0-based index of the lower median in sorted order
+    med = []
+    for c in range(3):
+        counts = np.bincount(pixels_bgr[:, c], minlength=256)
+        med.append(float(np.searchsorted(np.cumsum(counts), target + 1)))
+    return (med[0], med[1], med[2])
 
 
 def _bgr_tuple_to_rgb_int(bgr: Optional[Tuple[float, float, float]]) -> Optional[Tuple[int, int, int]]:
@@ -180,25 +198,39 @@ def _sample_background_color_bgr_median(
     rx2 = min(x2 + ring_px, W - 1)
     ry2 = min(y2 + ring_px, H - 1)
 
-    # ring mask
-    mask = np.zeros((ry2 - ry1 + 1, rx2 - rx1 + 1), dtype=np.uint8)
-    cv2.rectangle(mask, (0, 0), (rx2 - rx1, ry2 - ry1), 255, thickness=-1)
-    cv2.rectangle(mask, (x1 - rx1, y1 - ry1), (x2 - rx1, y2 - ry1), 0, thickness=-1)
+    # Gather the ring as the 4 border bands around the inner box directly via
+    # slicing, instead of allocating a mask + drawing two rectangles + boolean
+    # fancy-indexing per word. The bands are disjoint and cover exactly the
+    # outer-rect-minus-inner-box region (corners go to the top/bottom bands).
+    parts = []
+    if y1 > ry1:  # top band (full width)
+        parts.append(img_bgr[ry1:y1, rx1 : rx2 + 1].reshape(-1, 3))
+    if y2 < ry2:  # bottom band (full width)
+        parts.append(img_bgr[y2 + 1 : ry2 + 1, rx1 : rx2 + 1].reshape(-1, 3))
+    if x1 > rx1:  # left band (inner rows only)
+        parts.append(img_bgr[y1 : y2 + 1, rx1:x1].reshape(-1, 3))
+    if x2 < rx2:  # right band (inner rows only)
+        parts.append(img_bgr[y1 : y2 + 1, x2 + 1 : rx2 + 1].reshape(-1, 3))
 
-    patch = img_bgr[ry1 : ry2 + 1, rx1 : rx2 + 1]
-    ring_pixels = patch[mask == 255]
-    if ring_pixels is None or len(ring_pixels) == 0:
+    if not parts:
+        return None
+    ring_pixels = np.concatenate(parts, axis=0)
+    if len(ring_pixels) == 0:
         return None
 
-    # exclude dark pixels to avoid border/ink bleed
-    gray = cv2.cvtColor(ring_pixels.reshape(-1, 1, 3), cv2.COLOR_BGR2GRAY).reshape(-1)
-    keep = gray >= int(exclude_dark_thr)
-    ring_pixels = ring_pixels[keep]
-    if ring_pixels is None or len(ring_pixels) == 0:
+    # exclude dark pixels to avoid border/ink bleed; vectorized luminance
+    # (cv2 BGR2GRAY weights) instead of a per-word cv2.cvtColor with reshape
+    gray = (
+        ring_pixels[:, 0].astype(np.float32) * 0.114
+        + ring_pixels[:, 1].astype(np.float32) * 0.587
+        + ring_pixels[:, 2].astype(np.float32) * 0.299
+    )
+    kept = ring_pixels[gray >= float(exclude_dark_thr)]
+    if len(kept) == 0:
         # fallback: median on all ring pixels
-        ring_pixels = patch[mask == 255]
+        kept = ring_pixels
 
-    return _safe_median_bgr(ring_pixels)
+    return _safe_median_bgr(kept)
 
 # ==================================================================================================
 # BOLDNESS ESTIMATOR
@@ -229,7 +261,7 @@ def _sample_ink_color_and_coverage_bgr_median(
 
     gray = _to_gray(patch)
     ink_mask = gray < int(ink_dark_thr)
-    ink_cov = float(ink_mask.mean())  # [0..1]
+    ink_cov = float(np.count_nonzero(ink_mask)) / ink_mask.size  # [0..1]
 
     ink_pixels = patch[ink_mask]
     if ink_pixels is None or len(ink_pixels) == 0:
@@ -278,6 +310,52 @@ def _sample_ink_color_and_coverage_bgr_median(
 # - goal is not perfect italic recovery, but a stable visual slant proxy
 
 # ==================================================================================================
+# WORKER (picklable — must be top-level)
+# ==================================================================================================
+
+def _colorize_page_worker(args):
+    """Colorize all words on a single page. Runs in a worker process or inline."""
+    indices, x_left, x_right, y_top, y_bottom, img_bgr, config = args
+
+    n = len(indices)
+    ink_hex_raw = np.empty(n, dtype=object)
+    bg_hex_raw = np.empty(n, dtype=object)
+    ink_hex_norm = np.empty(n, dtype=object)
+    bg_hex_norm = np.empty(n, dtype=object)
+    ink_cov = np.zeros(n, dtype=float)
+
+    pad = int(config.text_pad_px)
+    ring = int(config.bg_ring_px)
+
+    for i in range(n):
+        x1 = int(round(x_left[i])) - pad
+        y1 = int(round(y_top[i])) - pad
+        x2 = int(round(x_right[i])) + pad
+        y2 = int(round(y_bottom[i])) + pad
+
+        ink_bgr, cov = _sample_ink_color_and_coverage_bgr_median(
+            img_bgr, x1, y1, x2, y2, ink_dark_thr=int(config.ink_dark_thr),
+        )
+        bg_bgr = _sample_background_color_bgr_median(
+            img_bgr, x1, y1, x2, y2,
+            ring_px=ring, exclude_dark_thr=int(config.bg_exclude_dark_thr),
+        )
+
+        ink_rgb_raw = _bgr_tuple_to_rgb_int(ink_bgr)
+        bg_rgb_raw = _bgr_tuple_to_rgb_int(bg_bgr)
+        ink_hex_raw[i] = _rgb_to_hex(ink_rgb_raw)
+        bg_hex_raw[i] = _rgb_to_hex(bg_rgb_raw)
+        ink_cov[i] = float(cov)
+
+        ink_rgb_norm = _normalize_ink_rgb(ink_rgb_raw, config)
+        bg_rgb_norm = _normalize_bg_rgb(bg_rgb_raw, config)
+        ink_hex_norm[i] = _rgb_to_hex(ink_rgb_norm)
+        bg_hex_norm[i] = _rgb_to_hex(bg_rgb_norm)
+
+    return indices, ink_hex_raw, bg_hex_raw, ink_hex_norm, bg_hex_norm, ink_cov
+
+
+# ==================================================================================================
 # PUBLIC API
 # ==================================================================================================
 
@@ -286,15 +364,17 @@ def colorize_words_df(
     images_bgr: List[np.ndarray],
     *,
     config: WordColorizerConfig = WordColorizerConfig(),
+    max_workers: Optional[int] = None,
 ) -> pd.DataFrame:
     """
-    Adds *raw* and *normalized* color columns.
+    Adds *raw* and *normalized* color columns. Page-level parallel via a process
+    pool when max_workers > 1; falls back to serial for single-page or max_workers=1.
 
     Output columns added:
       - non_stroking_color_hex_raw
       - background_non_stroking_color_hex_raw
-      - non_stroking_color_hex
-      - background_non_stroking_color_hex
+      - non_stroking_color
+      - background_non_stroking_color
       - ink_coverage
     """
     if words_df is None or words_df.empty:
@@ -306,7 +386,6 @@ def colorize_words_df(
         raise ValueError(f"words_df missing required columns: {missing}")
 
     out = words_df.copy()
-
     n = len(out)
 
     ink_hex_raw = np.empty(n, dtype=object)
@@ -315,78 +394,55 @@ def colorize_words_df(
     bg_hex_norm = np.empty(n, dtype=object)
     ink_cov = np.zeros(n, dtype=float)
 
-    pad = int(config.text_pad_px)
-    ring = int(config.bg_ring_px)
-
-    page = out["page_number"].to_numpy()
+    page_arr = out["page_number"].to_numpy()
     x_left = out["x_left"].to_numpy(dtype=float)
     x_right = out["x_right"].to_numpy(dtype=float)
     y_top = out["y_top"].to_numpy(dtype=float)
     y_bottom = out["y_bottom"].to_numpy(dtype=float)
 
+    # Build one task per page; words with an out-of-range page stay as None/0.
+    page_to_indices: dict = {}
     for i in range(n):
-        p = int(page[i])
-        if p <= 0 or p > len(images_bgr):
-            ink_hex_raw[i] = None
-            bg_hex_raw[i] = None
-            ink_hex_norm[i] = None
-            bg_hex_norm[i] = None
-            ink_cov[i] = 0.0
+        p = int(page_arr[i])
+        if p <= 0 or p > len(images_bgr) or images_bgr[p - 1] is None:
             continue
+        page_to_indices.setdefault(p, []).append(i)
 
-        img_bgr = images_bgr[p - 1]
-        if img_bgr is None:
-            ink_hex_raw[i] = None
-            bg_hex_raw[i] = None
-            ink_hex_norm[i] = None
-            bg_hex_norm[i] = None
-            ink_cov[i] = 0.0
-            continue
+    tasks = []
+    for p, idxs in page_to_indices.items():
+        idx_arr = np.array(idxs, dtype=np.intp)
+        tasks.append((
+            idx_arr,
+            x_left[idx_arr],
+            x_right[idx_arr],
+            y_top[idx_arr],
+            y_bottom[idx_arr],
+            images_bgr[p - 1],
+            config,
+        ))
 
-        # Expand bbox for more stable sampling
-        x1 = int(round(x_left[i])) - pad
-        y1 = int(round(y_top[i])) - pad
-        x2 = int(round(x_right[i])) + pad
-        y2 = int(round(y_bottom[i])) + pad
+    n_pages = len(tasks)
+    if max_workers is None:
+        max_workers = min(n_pages, os.cpu_count() or 1)
+    max_workers = max(1, min(max_workers, n_pages))
 
-        ink_bgr, cov = _sample_ink_color_and_coverage_bgr_median(
-            img_bgr,
-            x1, y1, x2, y2,
-            ink_dark_thr=int(config.ink_dark_thr),
-        )
-        bg_bgr = _sample_background_color_bgr_median(
-            img_bgr,
-            x1, y1, x2, y2,
-            ring_px=ring,
-            exclude_dark_thr=int(config.bg_exclude_dark_thr),
-        )
+    if max_workers == 1 or n_pages <= 1:
+        results = [_colorize_page_worker(t) for t in tasks]
+    else:
+        with ProcessPoolExecutor(max_workers=max_workers) as ex:
+            results = list(ex.map(_colorize_page_worker, tasks))
 
-        # --- raw hex ---
-        ink_rgb_raw = _bgr_tuple_to_rgb_int(ink_bgr)
-        bg_rgb_raw = _bgr_tuple_to_rgb_int(bg_bgr)
-        ink_hex_raw[i] = _rgb_to_hex(ink_rgb_raw)
-        bg_hex_raw[i] = _rgb_to_hex(bg_rgb_raw)
-        ink_cov[i] = float(cov)
+    for idxs, ihr, bhr, ihn, bhn, ic in results:
+        ink_hex_raw[idxs] = ihr
+        bg_hex_raw[idxs] = bhr
+        ink_hex_norm[idxs] = ihn
+        bg_hex_norm[idxs] = bhn
+        ink_cov[idxs] = ic
 
-        # --- normalized hex ---
-        ink_rgb_norm = _normalize_ink_rgb(ink_rgb_raw, config)
-        bg_rgb_norm = _normalize_bg_rgb(bg_rgb_raw, config)
-        ink_hex_norm[i] = _rgb_to_hex(ink_rgb_norm)
-        bg_hex_norm[i] = _rgb_to_hex(bg_rgb_norm)
-
-    # keep both raw and normalized for debugging + stability
     out["non_stroking_color_hex_raw"] = ink_hex_raw
     out["background_non_stroking_color_hex_raw"] = bg_hex_raw
-
     out["non_stroking_color"] = ink_hex_norm
     out["background_non_stroking_color"] = bg_hex_norm
-
     out["ink_coverage"] = ink_cov
-
-    # Bold: compute the median ink_coverage across all words with any ink,
-    # then flag words whose coverage exceeds the median by the configured multiplier.
-    # Using the median (not mean) makes it robust to outliers like large black logos.
-    median_ink = float(np.median(ink_cov[ink_cov > 0])) if np.any(ink_cov > 0) else 0.0
-    out["bold_ratio"] = (ink_cov >= config.bold_ink_multiplier * median_ink).astype(int)
 
     return out

@@ -18,7 +18,7 @@ import json
 
 import pandas as pd
 
-from .._utils.hierarchical_aggregator import (
+from .._utils.df_aggregation.hierarchical_aggregator import (
     build_standard_agg_spec,
     aggregate_hierarchical,
 )

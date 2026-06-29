@@ -34,7 +34,7 @@ from .step_07_block_merger import merge_blocks
 from .step_08_chunk_builder import build_chunks
 
 # Config loaders
-from .._utils.yaml_loader import load_yamls
+from .._utils.io.yaml_loader import load_yamls
 
 # Settings schema
 from .._config import ParseConfig, DEFAULT_CONFIG

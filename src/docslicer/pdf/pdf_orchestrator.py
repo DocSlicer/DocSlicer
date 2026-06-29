@@ -38,15 +38,15 @@ from .step_01_word_extractor import extract_words
 from .step_02_image_extractor import extract_images
 from .step_03_shape_extractor import extract_shapes
 from .step_04_link_extractor import extract_links
-from .step_05_shape_merger import merge_shapes
-from .step_06_line_number_detector import detect_line_numbers
-from ._utils.gutter_detector import detect_and_annotate_gutters
+from .._utils.layout.shape_merger import merge_shapes
+from .._utils.layout.line_number_detector import detect_line_numbers
+from .._utils.layout.gutter_detector import detect_and_annotate_gutters
 from .step_08_cell_builder import build_cells
 from .step_09_page_label_detector import assign_pdf_page_labels
 from .step_10_line_builder import build_lines
 from .step_11_table_builder import build_tables
 
-from .._utils.yaml_loader import load_yamls
+from .._utils.io.yaml_loader import load_yamls
 from ..metadata import add_page_and_ocr_info, add_document_information
 
 
@@ -200,7 +200,7 @@ def run_pipeline(
 
         # OCR font size estimation (requires layout_id from step 10)
         if discovered_metadata.get("needs_ocr"):
-            from ..ocr.font_size_estimator import estimate_ocr_font_sizes
+            from ..ocr.step_05_font_size_estimator import estimate_ocr_font_sizes
             df_lines = estimate_ocr_font_sizes(df_lines)
 
         # ── Document Information ─────────────────────────────────────────────

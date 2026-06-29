@@ -3,24 +3,29 @@ from __future__ import annotations
 
 import warnings
 from dataclasses import dataclass
-from typing import Iterable, List, Tuple, Optional
+from typing import List, Tuple, Optional
 from time import perf_counter
 
 import pypdfium2 as pdfium
 import numpy as np
 import pandas as pd
-import cv2
 
 # Suppress MPS pin_memory warning
 warnings.filterwarnings("ignore", message=".*pin_memory.*MPS.*", category=UserWarning)
 warnings.filterwarnings("ignore", message=".*not supported on MPS.*", category=UserWarning)
 
-from .step_01_word_extractor import extract_words_from_images
-from .step_02_word_colorizer import colorize_words_df
+from .step_01_word_extractor import extract_words_from_images, TesserocrConfig
+from .step_02_word_colorizer import colorize_words_df, WordColorizerConfig
 from .step_03_shape_extractor import extract_shapes_df, ShapeExtractorConfig
 from .step_04_text_cleaner import clean_words_df
-from .._utils.line_merger import assign_line_id, LineMergerConfig
+from .step_05_font_size_estimator import estimate_ocr_font_sizes
+
+from .._utils.cpu import resolve_worker_count
 from .._utils.text_utils import add_calculated_text_features
+from .._utils.layout.line_number_detector import detect_line_numbers
+from .._utils.layout.reading_order import assign_reading_order
+from .._utils.layout.horizontal_bands import assign_horizontal_bands
+from .._utils.layout.shape_merger import merge_shapes
 
 
 # ==================================================================================================
@@ -30,19 +35,24 @@ from .._utils.text_utils import add_calculated_text_features
 @dataclass(frozen=True)
 class OCRPipelineConfig:
     # Rendering & coordinate conversion
-    # 2.0 ≈ ~144 DPI effective for typical 72 DPI PDF coords
+    # 4.0 ≈ ~288 DPI effective for typical 72 DPI PDF coords
     # Also used to convert final output from pixels (PX) to points (PT)
-    dpi_scale: float = 2.0
+    dpi_scale: float = 4.0 # ~50% faster on 2.0, but misses large headings, and small text, and produces less accurate bboxes
 
-    # EasyOCR
-    #easyocr: EasyOCRConfig = EasyOCRConfig(langs=("en",), use_gpu=True)
+    # OCR word extraction (tesserocr)
+    # ocr_workers: page-level parallel width. None -> performance-core count
+    #   (resolved at runtime via _utils.cpu); set explicitly to cap/override.
+    # ocr_tessdata_path: directory holding *.traineddata. None -> TESSDATA_PREFIX
+    #   env, else auto-detected from the installed `tesseract` CLI. Only set to
+    #   override a non-standard model location.
+    ocr_workers: Optional[int] = None
+    ocr_tessdata_path: Optional[str] = None
 
+    # Word colorization (ink color, background color, ink coverage)
+    colorizer: WordColorizerConfig = WordColorizerConfig()
 
     # Shape extraction (rule lines / borders)
     shapes: ShapeExtractorConfig = ShapeExtractorConfig()
-
-    # Temp line assignment (tolerances in PT)
-    temp_lines: LineMergerConfig = LineMergerConfig()
 
 
 # ==================================================================================================
@@ -86,10 +96,9 @@ def run_ocr_pipeline(
       - file_bytes: PDF bytes (scanned doc detector decides when to call this)
 
     Output:
-      - df_words: words-level dataframe, includes temp_line_id and is_line_start.
-                  temp_line_id is a provisional line grouping (assumes single-column layout;
-                  multi-column correction happens later in the PDF pipeline).
-                  is_line_start=1 flags the leftmost word per temp line, useful for
+      - df_words: words-level dataframe, includes line_id and is_line_start.
+                  line_id is assigned via gutter-aware reading order (multi-column aware).
+                  is_line_start=1 flags the leftmost word per line, useful for
                   correcting OCR noise on line-initial tokens (e.g. "m=" → bullet).
       - df_shapes: shapes dataframe (rule lines / borders)
       - timings: list of (step_name, duration_seconds) tuples
@@ -105,19 +114,32 @@ def run_ocr_pipeline(
     images_bgr = _render_pdf_bytes_to_images_bgr(file_bytes, dpi_scale=config.dpi_scale)
     timings.append(("PDF rendering", perf_counter() - t0))
 
-    # 1) Words (Tesseract)
+    # 1) Words (Tesseract, page-level parallel)
     t0 = perf_counter()
-    df_words = extract_words_from_images(images_bgr) # Pure Tesseract version
+    ocr_workers = resolve_worker_count(config.ocr_workers, n_items=len(images_bgr))
+    df_words = extract_words_from_images(
+        images_bgr,
+        ocr_config=TesserocrConfig(tessdata_path=config.ocr_tessdata_path),
+        max_workers=ocr_workers,
+    )
     timings.append(("STEP 1: OCR word extraction", perf_counter() - t0))
 
     # 2) Colorize words and add ink coverage
     t0 = perf_counter()
-    df_words = colorize_words_df(df_words, images_bgr)
+    df_words = colorize_words_df(df_words, images_bgr, config=config.colorizer, max_workers=ocr_workers)
+    ink_cov = df_words["ink_coverage"].to_numpy(dtype=float)
+    median_ink = float(np.median(ink_cov[ink_cov > 0])) if np.any(ink_cov > 0) else 0.0
+    df_words["bold_ratio"] = (ink_cov >= config.colorizer.bold_ink_multiplier * median_ink).astype(int)
+
+    # Drop words where the colorizer found no ink — these are Tesseract hallucinations
+    # in whitespace/gutter areas where no actual text pixels exist.
+    df_words = df_words[df_words["non_stroking_color"].notna()].reset_index(drop=True)
+
     timings.append(("STEP 2: Word colorization", perf_counter() - t0))
 
     # 3) Extract rule shapes (horizontal/vertical lines)
     t0 = perf_counter()
-    df_shapes = extract_shapes_df(images_bgr, words_df=df_words, config=config.shapes)
+    df_shapes = extract_shapes_df(images_bgr, config=config.shapes)
     timings.append(("STEP 3: Shape extraction", perf_counter() - t0))
 
     # --------------------
@@ -161,25 +183,40 @@ def run_ocr_pipeline(
     
     timings.append(("Conversion PX -> PT", perf_counter() - t0))
 
-    # 4) Assign provisional temp lines onto words
-    # Uses the shared line_merger utility. Called after PX→PT so tolerances are in PT.
-    # This is a single-column assumption; multi-column correction happens later in the PDF pipeline.
+    # Detect and remove line numbers
+    df_words = detect_line_numbers(df_words)
+
+    # Step 05c - Drop line-number words
+    # Line numbers are margin artefacts that must be removed entirely — unlike
+    # other annotations they cannot be represented as a meaningful block_type.
+    if "line_number_flag" in df_words.columns:
+        df_words = df_words[~df_words["line_number_flag"]].copy()
+
+
+    # Enrich df_shapes for the gutter detector
+    df_shapes = merge_shapes(df_shapes, merge_lines=True)
+
+    # 4) Assign reading order (gutter-aware)
     t0 = perf_counter()
-    df_words = assign_line_id(df_words, y_alignment="center", config=config.temp_lines)
-    df_words = df_words.rename(columns={"line_id": "temp_line_id"})
+    df_words = assign_reading_order(df_words, df_shapes)
     df_words = df_words.drop(columns=["center_bucket"], errors="ignore")
 
-    # Flag the leftmost word in each temp line (useful for OCR noise correction,
+    # Flag the leftmost word in each line (useful for OCR noise correction,
     # e.g. "m=" or "e" at line start may be a misread bullet)
-    min_x = df_words.groupby(["page_number", "temp_line_id"])["x_left"].transform("min")
+    min_x = df_words.groupby(["page_number", "line_id"])["x_left"].transform("min")
     df_words["is_line_start"] = (df_words["x_left"] == min_x).astype(int)
-    timings.append(("STEP 4: Temp line assignment", perf_counter() - t0))
+
+    timings.append(("STEP 4: Reading order", perf_counter() - t0))
 
     # 5) Text cleaning (runs after is_line_start is available for bullet detection)
     t0 = perf_counter()
     df_words = clean_words_df(df_words)
     df_words = add_calculated_text_features(df_words)
     timings.append(("STEP 5: Text cleaning", perf_counter() - t0))
+
+    # 6) Estimate font size (per horizontal band, too noisy on a line level)
+    df_words = assign_horizontal_bands(df_words)
+    df_words = estimate_ocr_font_sizes(df_words, method="word")
 
     return df_words, df_shapes, timings
 

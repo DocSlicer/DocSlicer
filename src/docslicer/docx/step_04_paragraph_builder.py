@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from docslicer._utils.hierarchical_aggregator import (
+from docslicer._utils.df_aggregation.hierarchical_aggregator import (
     ALPHA_WEIGHTED_STYLE,
     _collect_unique_list,
     aggregate_hierarchical,

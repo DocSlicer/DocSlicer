@@ -49,7 +49,7 @@ import numpy as np
 import pandas as pd
 
 from .._utils.text_utils import _BULLET_TOKENS, _CURRENCY_SYMBOLS, is_list_marker
-from .._utils.hierarchical_aggregator import aggregate_hierarchical, build_standard_agg_spec
+from .._utils.df_aggregation.hierarchical_aggregator import aggregate_hierarchical, build_standard_agg_spec
 
 
 # ================================================================================
@@ -879,6 +879,43 @@ def _process_vertical_words(
 
 
 # ================================================================================
+# 9b. CELL-ID RENUMBERING  (restore reading-order numbering)
+# ================================================================================
+
+def _renumber_cells_reading_order(
+    df_cells: pd.DataFrame,
+    df_words: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Renumber cell_id to count upward in reading order across the whole document.
+
+    Per-page assignment, the post-merge re-split (which parks fresh ids above the
+    page max) and the vertical offset all leave gaps and out-of-order ids. Here we
+    collapse them to a dense 1..N sequence ordered by first appearance in
+    (page_number, line_id, x_left) — i.e. line_id-ascending, left-to-right within
+    a line — so the numbering tracks reading order again. A cell spanning several
+    lines takes the slot of its earliest word.
+
+    Both frames are remapped with the same mapping so word↔cell ids stay aligned.
+    """
+    if df_words.empty or "cell_id" not in df_words.columns:
+        return df_cells, df_words
+
+    order  = df_words.sort_values(["page_number", "line_id", "x_left"], kind="mergesort")
+    codes  = pd.factorize(order["cell_id"].to_numpy())[0]          # 0-based, by first appearance
+    mapping = dict(zip(order["cell_id"].to_numpy(), codes + 1))    # dense 1..N
+
+    df_words = df_words.copy()
+    df_words["cell_id"] = df_words["cell_id"].map(mapping).astype(np.int64)
+
+    if not df_cells.empty and "cell_id" in df_cells.columns:
+        df_cells = df_cells.copy()
+        df_cells["cell_id"] = df_cells["cell_id"].map(mapping).astype(np.int64)
+
+    return df_cells, df_words
+
+
+# ================================================================================
 # 10. ENTRY POINT  (public API)
 # ================================================================================
 
@@ -975,6 +1012,10 @@ def build_cells(
         .sort_values(["page_number", "y_top", "x_left"], kind="mergesort")
         .reset_index(drop=True)
     )
+
+    # Renumber to a dense, reading-order cell_id sequence (the per-page offsets and
+    # the post-merge re-split otherwise leave gaps / out-of-order ids).
+    df_cells, df_words_out = _renumber_cells_reading_order(df_cells, df_words_out)
 
     if not df_cells.empty and "cell_id" in df_cells.columns:
         df_cells = df_cells.sort_values("cell_id", kind="mergesort").reset_index(drop=True)

@@ -26,11 +26,19 @@ _BULLET_TOKENS: Set[str] = {
     "*",    # asterisk
     "o",    # lowercase o (open bullet)
     "e",    # lowercase e (OCR of open bullet)
-    "s",    # lowercase s (OCR of open bullet)
-    "a",    # lowercase a (OCR of open bullet)
+            # removed "a" -> "a request for derogation is not left in doubt as to what"
+    "s",    # lowercase s (OCR of open bullet) 
     "]",    # right bracket
     "=\u201c",
     "=\"",
+    "¢",
+    "-—",
+    "=»",
+    "«=",
+    "«*",
+    '*"',
+
+
 }
 
 _BULLET = "•"
@@ -97,7 +105,7 @@ def _remove_table_rule_noise(text: str) -> str:
     return text
 
 
-def _normalize_superscript_parens(text: str) -> str:
+def _normalize_superscript_parens(text: str, line_open_excess: int = 0) -> str:
     """
     Strip unbalanced closing parentheses from superscript / footnote misreads.
 
@@ -105,23 +113,34 @@ def _normalize_superscript_parens(text: str) -> str:
         costs®)   ")   ?)   @)   (")   (')
     where a superscript number or symbol was rendered next to a closing paren.
 
-    Rule: if ')' count exceeds '(' count, strip each excess ')' from the right
-    along with any immediately preceding non-alphanumeric noise character.
+    Two guards prevent over-stripping:
+      1. line_open_excess: number of unmatched '(' from earlier words on the same line.
+         Callers compute this so that a closing paren belonging to an opening paren
+         elsewhere on the line is not counted as excess.
+      2. Only strips ')' that is immediately preceded by a non-alphanumeric character.
+         This protects real parentheses like "obligatory)" or "2014)." even when
+         line_open_excess cannot fully account for them.
     """
-    excess = text.count(')') - text.count('(')
+    excess = text.count(')') - text.count('(') - line_open_excess
     if excess <= 0:
         return text
 
     result = text
-    for _ in range(excess):
+    stripped = 0
+    while stripped < excess:
         idx = result.rfind(')')
         if idx == -1:
+            break
+        # Leave ')' alone when it directly follows an alphanumeric char —
+        # that is always a real closing paren, never a superscript artifact.
+        if idx > 0 and result[idx - 1].isalnum():
             break
         # Walk left over non-alphanumeric, non-opening-paren chars (the junk before the paren)
         start = idx
         while start > 0 and not result[start - 1].isalnum() and result[start - 1] != '(':
             start -= 1
         result = result[:start] + result[idx + 1:]
+        stripped += 1
 
     return result
 
@@ -176,12 +195,25 @@ def clean_words_df(words_df: pd.DataFrame) -> pd.DataFrame:
     # Preserve original for debugging / audit
     out['text_raw'] = out['text']
 
+    # Pre-compute per-line open-paren surplus so _normalize_superscript_parens can
+    # account for '(' that appear in earlier words on the same line.
+    # line_open_excess[i] = max(0, cumulative open-parens seen before word i on its line).
+    line_open_excess: list[int] = [0] * len(out)
+    if 'line_id' in out.columns:
+        texts = out['text'].astype(str).tolist()
+        line_ids = out['line_id'].tolist()
+        running: dict[object, int] = {}
+        for i, (lid, t) in enumerate(zip(line_ids, texts)):
+            surplus = running.get(lid, 0)
+            line_open_excess[i] = max(0, surplus)
+            running[lid] = surplus + t.count('(') - t.count(')')
+
     cleaned = []
-    for t in out['text'].astype(str).tolist():
+    for t, open_excess in zip(out['text'].astype(str).tolist(), line_open_excess):
         t = _strip_control_chars(t)
         t = _normalize_unicode(t)
         t = _remove_table_rule_noise(t)
-        t = _normalize_superscript_parens(t)
+        t = _normalize_superscript_parens(t, line_open_excess=open_excess)
         t = _dedupe_punctuation(t)
         t = _collapse_whitespace(t)
         cleaned.append(t)

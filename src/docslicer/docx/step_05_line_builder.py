@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from docslicer._utils.hierarchical_aggregator import (
+from docslicer._utils.df_aggregation.hierarchical_aggregator import (
     _collect_unique_list,
     aggregate_hierarchical,
     build_standard_agg_spec,

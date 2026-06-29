@@ -29,7 +29,7 @@ from .step_04_line_builder import merge_boxes_to_lines
 from .step_05_table_extractor import extract_table_cells
 
 # Config loaders
-from .._utils.yaml_loader import load_yamls
+from .._utils.io.yaml_loader import load_yamls
 
 # Metadata utilities
 from ..metadata import add_page_and_ocr_info, add_document_information

@@ -7,7 +7,7 @@ from typing import BinaryIO, NamedTuple
 
 import pandas as pd
 
-from .._utils.config import load_compiled_page_label_config
+from .._utils.io.config import load_compiled_page_label_config
 from .step_01_package_reader import DocxPackage, read_docx_package
 from .step_02_run_extractor import expand_header_footer_runs, extract_runs
 from .step_03_table_cell_builder import build_table_cells

@@ -3,8 +3,8 @@
 import re
 import pandas as pd
 
-from docslicer._utils.line_merger import assign_line_id, LineMergerConfig
-from docslicer._utils.hierarchical_aggregator import (
+from docslicer._utils.layout.line_merger import assign_line_id, LineMergerConfig
+from docslicer._utils.df_aggregation.hierarchical_aggregator import (
     aggregate_hierarchical,
     build_standard_agg_spec,
 )

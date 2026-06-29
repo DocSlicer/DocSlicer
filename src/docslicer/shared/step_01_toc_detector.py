@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Literal, Optional, Set, Tuple
 import numpy as np
 import pandas as pd
 
-from .._utils.yaml_compilers.page_label_patterns import PageLabelPatternConfig
+from .._utils.io.yaml_compilers.page_label_patterns import PageLabelPatternConfig
 
 # =========================
 # Config

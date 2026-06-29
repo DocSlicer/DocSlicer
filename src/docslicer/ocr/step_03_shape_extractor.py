@@ -1,10 +1,29 @@
-# ocr/shapes/step_03_line_extractor.py
+# ocr/step_03_shape_extractor.py
+#
+# Rule-line extractor for rendered (OCR) pages.
+#
+# Approach
+# --------
+# Detect axis-aligned rule lines directly with morphology + connected components:
+#
+#   gray -> binarize (adaptive threshold, ink=white)
+#     horizontal: open with a long (k,1) kernel -> bridge dashes with a short (k,1) close
+#     vertical:   open with a long (1,k) kernel -> bridge dashes with a short (1,k) close
+#   connectedComponentsWithStats on each mask  ->  each component is one rule
+#
+# Properties:
+#   * A component spans the whole rule, so detection is fragment-free.
+#   * Text strokes are shorter than the opening kernel and cannot survive it,
+#     so word edges do not produce false lines (no text-overlap filtering needed).
+#   * Cost is a threshold + a few morph ops + 2 CC calls per page, all in OpenCV C.
+#
+# A Python collinear-merge step rejoins rules split by threshold dropouts.
+
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
-import math
 import numpy as np
 import pandas as pd
 import cv2
@@ -16,256 +35,181 @@ import cv2
 
 @dataclass(frozen=True)
 class ShapeExtractorConfig:
-    # --- preprocessing ---
-    mask_words: bool = True
-    word_mask_pad_px: int = 2
+    # --- binarization ---
+    # Adaptive thresholding is local, so it recovers faint grey rules that a single
+    # global Otsu threshold drops. Otsu remains available for clean dark-on-white.
+    use_adaptive_threshold: bool = True
+    adaptive_block_size: int = 15      # odd; only used when use_adaptive_threshold
+    adaptive_C: int = 6                # only used when use_adaptive_threshold
 
-    # --- edge detection ---
-    canny_low: int = 50
-    canny_high: int = 150
+    # --- line isolation (in pixels, at the rendered scale) ---
+    # Minimum run length for a structure to be considered a rule. A structuring
+    # element of this length erases anything shorter (incl. glyph strokes).
+    min_absolute_len_px: int = 60
+    # Optionally also require a fraction of the page dimension. 0 disables.
+    min_rule_frac: float = 0.0
 
-    # --- Hough transform (more sensitive defaults) ---
-    hough_threshold: int = 80  # Lower to detect fainter shapes
-    hough_min_shape_len_px: int = 30  # Catch shorter table shapes
-    hough_max_shape_gap_px: int = 10  # Bridge gaps in dashed/faint shapes
+    # Bridge tiny gaps (anti-aliasing) in a real rule BEFORE opening. Keep this
+    # small: a value large enough to bridge inter-letter gaps will fuse text rows
+    # into false horizontal lines, so 0 (off) is the safe default.
+    gap_bridge_px: int = 0
+    # Bridge gaps between already-detected collinear segments AFTER opening
+    # (dashed rules). Safe because text is already removed by this point.
+    post_open_bridge_px: int = 12
 
-    # --- keep only long, axis-aligned rules ---
-    keep_horiz_deg_tol: float = 3.0
-    keep_vert_deg_tol: float = 3.0
-    min_rule_frac: float = 0.0  # Disabled: catch all shapes regardless of length
-    min_absolute_len_px: int = 30  # Minimum absolute length in pixels
+    # --- collinear merge (rejoin rules split by threshold dropouts) ---
+    # Two segments merge if they are nearly collinear (centers within
+    # merge_perp_tol_px on the perpendicular axis) and their along-axis gap is
+    # <= merge_gap_px. Keep merge_gap_px smaller than typical inter-column spacing
+    # so separate underlines stay separate.
+    #
+    # UNITS: all *_px values here are RENDER PIXELS, i.e. points * dpi_scale.
+    # With the default dpi_scale=2, a value of 40 bridges a 20pt gap. The exported
+    # CSV is in points, so a gap that reads as Npt in the CSV is 2*N px here.
+    merge_collinear: bool = True
+    merge_perp_tol_px: int = 3
+    merge_gap_px: int = 60
 
-    # --- optional: dedupe near-identical shapes ---
+    # --- block rejection ---
+    # A rule is thin in its short dimension. Reject components thicker than this
+    # (filled cells, shaded bands, image edges) so they don't become "lines".
+    max_line_thickness_px: int = 12
+    # Also reject components that aren't elongated enough (short side / long side).
+    max_thickness_ratio: float = 0.30
+
+    # --- dedupe near-identical shapes ---
     dedupe: bool = True
     dedupe_endpoint_tol_px: int = 3
-
-    # --- multi-pass detection ---
-    use_multipass: bool = True  # Try multiple detection strategies
-
-    # --- shape merging ---
-    merge_collinear: bool = True  # Merge collinear shape segments
-    merge_distance_tol_px: int = 10  # Max gap between segments to merge
-    merge_angle_tol_deg: float = 2.0  # Max angle difference for collinear
-
-    # --- text filter (reduce false positives from aligned text) ---
-    filter_text_shapes: bool = True  # Remove shapes that pass through too much text
-    text_intersection_max_ratio: float = 0.15  # Max ratio of shape covered by text (very strict)
-    text_intersection_min_words: int = 2  # Min words intersecting to reject (aligned text pattern)
 
 
 # ==================================================================================================
 # HELPERS
 # ==================================================================================================
 
-def _clip_box(x1: int, y1: int, x2: int, y2: int, W: int, H: int) -> Optional[Tuple[int, int, int, int]]:
-    x1 = max(int(x1), 0)
-    y1 = max(int(y1), 0)
-    x2 = min(int(x2), W - 1)
-    y2 = min(int(y2), H - 1)
-    if x2 <= x1 or y2 <= y1:
-        return None
-    return x1, y1, x2, y2
+def _binarize_ink(gray: np.ndarray, config: ShapeExtractorConfig) -> np.ndarray:
+    """Return a uint8 mask where ink (dark pixels) == 255, background == 0."""
+    if config.use_adaptive_threshold:
+        bs = config.adaptive_block_size
+        if bs % 2 == 0:
+            bs += 1
+        return cv2.adaptiveThreshold(
+            gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV,
+            blockSize=bs, C=config.adaptive_C,
+        )
+    _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    return bw
 
 
-def _mask_words(img_bgr: np.ndarray, words_df: pd.DataFrame, page_number: int, pad: int) -> np.ndarray:
+def _detect_axis_lines(
+    bw: np.ndarray,
+    *,
+    horizontal: bool,
+    min_len: int,
+    gap_bridge: int,
+    config: ShapeExtractorConfig,
+) -> List[Tuple[int, int, int, int]]:
     """
-    Remove word regions to prevent text strokes from becoming "shapes".
+    Isolate axis-aligned rules with morphology and return component bboxes
+    as (left, top, width, height) in pixels.
     """
-    out = img_bgr.copy()
-    if words_df is None or words_df.empty:
-        return out
+    if horizontal:
+        open_k = cv2.getStructuringElement(cv2.MORPH_RECT, (max(1, min_len), 1))
+        post_k = cv2.getStructuringElement(cv2.MORPH_RECT, (max(1, config.post_open_bridge_px), 1))
+        pre_k = cv2.getStructuringElement(cv2.MORPH_RECT, (max(1, gap_bridge), 1))
+    else:
+        open_k = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(1, min_len)))
+        post_k = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(1, config.post_open_bridge_px)))
+        pre_k = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(1, gap_bridge)))
 
-    w = words_df[words_df["page_number"].astype(int) == int(page_number)]
-    if w.empty:
-        return out
+    # 1) Optional tiny pre-bridge for anti-aliased solid rules (off by default;
+    #    larger values fuse text into false lines).
+    src = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, pre_k) if gap_bridge > 0 else bw
+    # 2) Open: erase anything without a continuous run of >= min_len. This is what
+    #    removes text (gaps between letters) while keeping real rules.
+    isolated = cv2.morphologyEx(src, cv2.MORPH_OPEN, open_k)
+    # 3) Optional post-bridge: reconnect collinear pieces of dashed rules. Safe now
+    #    that text is gone.
+    if config.post_open_bridge_px > 0:
+        isolated = cv2.morphologyEx(isolated, cv2.MORPH_CLOSE, post_k)
 
-    H, W = out.shape[:2]
+    n_labels, _labels, stats, _centroids = cv2.connectedComponentsWithStats(isolated, connectivity=8)
 
-    # Iterate rows: words_df is typically large; keep this simple and safe.
-    for _, r in w.iterrows():
-        x1 = int(round(float(r["x_left"]))) - pad
-        y1 = int(round(float(r["y_top"]))) - pad
-        x2 = int(round(float(r["x_right"]))) + pad
-        y2 = int(round(float(r["y_bottom"]))) + pad
-        clipped = _clip_box(x1, y1, x2, y2, W, H)
-        if clipped is None:
+    boxes: List[Tuple[int, int, int, int]] = []
+    for label in range(1, n_labels):  # skip background (0)
+        x = int(stats[label, cv2.CC_STAT_LEFT])
+        y = int(stats[label, cv2.CC_STAT_TOP])
+        w = int(stats[label, cv2.CC_STAT_WIDTH])
+        h = int(stats[label, cv2.CC_STAT_HEIGHT])
+
+        long_side = w if horizontal else h
+        short_side = h if horizontal else w
+
+        if long_side < min_len:
             continue
-        x1, y1, x2, y2 = clipped
-        cv2.rectangle(out, (x1, y1), (x2, y2), (255, 255, 255), thickness=-1)
+        # Block rejection: a rule is thin in its short dimension.
+        if short_side > config.max_line_thickness_px:
+            continue
+        if long_side > 0 and (short_side / long_side) > config.max_thickness_ratio:
+            continue
+
+        boxes.append((x, y, w, h))
+
+    return boxes
+
+
+def _merge_collinear_boxes(
+    boxes: List[Tuple[bool, float, float, float, float]],
+    perp_tol: float,
+    gap_tol: float,
+) -> List[Tuple[bool, float, float, float, float]]:
+    """
+    Merge nearly-collinear, axis-aligned segments that were split by mask dropouts.
+
+    Each box is (is_horizontal, x_left, y_top, x_right, y_bottom). Segments join when
+    their perpendicular-axis centers are within `perp_tol` and the along-axis gap is
+    <= `gap_tol`. Horizontal and vertical sets are merged independently.
+    """
+    out: List[Tuple[bool, float, float, float, float]] = []
+
+    for is_h in (True, False):
+        group = [b for b in boxes if b[0] == is_h]
+        if not group:
+            continue
+
+        # Sort by perpendicular center, then along-axis start, so collinear
+        # segments arrive left-to-right (or top-to-bottom) and adjacent.
+        def perp_center(b):
+            _, xl, yt, xr, yb = b
+            return (yt + yb) / 2.0 if is_h else (xl + xr) / 2.0
+
+        def along_start(b):
+            _, xl, yt, xr, yb = b
+            return xl if is_h else yt
+
+        group.sort(key=lambda b: (perp_center(b), along_start(b)))
+
+        merged: List[List[float]] = []  # [is_h, x_left, y_top, x_right, y_bottom]
+        for _, xl, yt, xr, yb in group:
+            c = (yt + yb) / 2.0 if is_h else (xl + xr) / 2.0
+            placed = False
+            for m in merged:
+                mc = (m[2] + m[4]) / 2.0 if is_h else (m[1] + m[3]) / 2.0
+                if abs(mc - c) > perp_tol:
+                    continue
+                gap = (xl - m[3]) if is_h else (yt - m[4])  # negative => overlap
+                if gap <= gap_tol:
+                    m[1] = min(m[1], xl)
+                    m[2] = min(m[2], yt)
+                    m[3] = max(m[3], xr)
+                    m[4] = max(m[4], yb)
+                    placed = True
+                    break
+            if not placed:
+                merged.append([is_h, xl, yt, xr, yb])
+
+        out.extend((bool(m[0]), m[1], m[2], m[3], m[4]) for m in merged)
 
     return out
-
-
-def _normalize_angle_deg(angle: float) -> float:
-    """
-    Normalize to [-90, 90] for easier horiz/vert checks.
-    """
-    while angle > 90:
-        angle -= 180
-    while angle < -90:
-        angle += 180
-    return float(angle)
-
-
-def _shape_key_axis_aligned(x1: int, y1: int, x2: int, y2: int, tol: int) -> Tuple[int, int, int, int]:
-    """
-    Quantize endpoints to allow cheap dedupe.
-    Sort endpoints so direction doesn't matter.
-    """
-    def q(v: int) -> int:
-        return int(round(v / max(1, tol))) * max(1, tol)
-
-    ax1, ay1, ax2, ay2 = q(x1), q(y1), q(x2), q(y2)
-    if (ax2, ay2) < (ax1, ay1):
-        ax1, ay1, ax2, ay2 = ax2, ay2, ax1, ay1
-    return ax1, ay1, ax2, ay2
-
-
-def _shapes_are_collinear(
-    x1_a: float, y1_a: float, x2_a: float, y2_a: float,
-    x1_b: float, y1_b: float, x2_b: float, y2_b: float,
-    angle_tol_deg: float,
-    distance_tol_px: float,
-) -> bool:
-    """
-    Check if two shape segments are collinear and close enough to merge.
-    """
-    import math
-
-    # Calculate angles
-    angle_a = math.atan2(y2_a - y1_a, x2_a - x1_a)
-    angle_b = math.atan2(y2_b - y1_b, x2_b - x1_b)
-
-    # Normalize angles to [0, pi]
-    angle_a = abs(angle_a)
-    angle_b = abs(angle_b)
-
-    # Check angle similarity
-    angle_diff_deg = abs(math.degrees(angle_a - angle_b))
-    if angle_diff_deg > 180:
-        angle_diff_deg = 360 - angle_diff_deg
-
-    if angle_diff_deg > angle_tol_deg:
-        return False
-
-    # Check if shapes are close to each other
-    # For horizontal shapes, check y-coordinate proximity
-    # For vertical shapes, check x-coordinate proximity
-
-    is_horizontal = abs(math.degrees(angle_a)) < 45 or abs(math.degrees(angle_a)) > 135
-
-    if is_horizontal:
-        # Check if y-coordinates are similar
-        y_a = (y1_a + y2_a) / 2
-        y_b = (y1_b + y2_b) / 2
-        if abs(y_a - y_b) > distance_tol_px:
-            return False
-
-        # Check if x-ranges overlap or are close
-        x_min_a, x_max_a = min(x1_a, x2_a), max(x1_a, x2_a)
-        x_min_b, x_max_b = min(x1_b, x2_b), max(x1_b, x2_b)
-
-        # Check overlap or gap
-        gap = max(x_min_a, x_min_b) - min(x_max_a, x_max_b)
-        return gap <= distance_tol_px
-    else:
-        # Vertical shape - check x-coordinates
-        x_a = (x1_a + x2_a) / 2
-        x_b = (x1_b + x2_b) / 2
-        if abs(x_a - x_b) > distance_tol_px:
-            return False
-
-        # Check if y-ranges overlap or are close
-        y_min_a, y_max_a = min(y1_a, y2_a), max(y1_a, y2_a)
-        y_min_b, y_max_b = min(y1_b, y2_b), max(y1_b, y2_b)
-
-        # Check overlap or gap
-        gap = max(y_min_a, y_min_b) - min(y_max_a, y_max_b)
-        return gap <= distance_tol_px
-
-
-def _merge_shape_segments(shapes: List[dict], config: ShapeExtractorConfig) -> List[dict]:
-    """
-    Merge collinear shape segments into longer shapes.
-    """
-    if not shapes or not config.merge_collinear:
-        return shapes
-
-    import math
-
-    merged = []
-    used = set()
-
-    for i, shape_a in enumerate(shapes):
-        if i in used:
-            continue
-
-        # Start with this shape
-        x1, y1 = shape_a["x1"], shape_a["y1"]
-        x2, y2 = shape_a["x2"], shape_a["y2"]
-
-        # Try to merge with other shapes
-        changed = True
-        while changed:
-            changed = False
-            for j, shape_b in enumerate(shapes):
-                if j == i or j in used:
-                    continue
-
-                # Check if collinear
-                if _shapes_are_collinear(
-                    x1, y1, x2, y2,
-                    shape_b["x1"], shape_b["y1"], shape_b["x2"], shape_b["y2"],
-                    angle_tol_deg=config.merge_angle_tol_deg,
-                    distance_tol_px=config.merge_distance_tol_px,
-                ):
-                    # Merge: extend to cover both shapes
-                    all_x = [x1, x2, shape_b["x1"], shape_b["x2"]]
-                    all_y = [y1, y2, shape_b["y1"], shape_b["y2"]]
-
-                    # For horizontal shapes, use min/max x
-                    # For vertical shapes, use min/max y
-                    angle = math.atan2(y2 - y1, x2 - x1)
-                    is_horizontal = abs(math.degrees(angle)) < 45 or abs(math.degrees(angle)) > 135
-
-                    if is_horizontal:
-                        idx_min = all_x.index(min(all_x))
-                        idx_max = all_x.index(max(all_x))
-                        x1, y1 = all_x[idx_min], all_y[idx_min]
-                        x2, y2 = all_x[idx_max], all_y[idx_max]
-                    else:
-                        idx_min = all_y.index(min(all_y))
-                        idx_max = all_y.index(max(all_y))
-                        x1, y1 = all_x[idx_min], all_y[idx_min]
-                        x2, y2 = all_x[idx_max], all_y[idx_max]
-
-                    used.add(j)
-                    changed = True
-
-        # Add merged shape
-        dx = x2 - x1
-        dy = y2 - y1
-        length = float(math.hypot(dx, dy))
-        angle = float(math.degrees(math.atan2(dy, dx)))
-        angle_n = _normalize_angle_deg(angle)
-
-        merged.append({
-            "page_number": shape_a["page_number"],
-            "x1": int(x1),
-            "y1": int(y1),
-            "x2": int(x2),
-            "y2": int(y2),
-            "x_left": float(min(x1, x2)),
-            "x_right": float(max(x1, x2)),
-            "y_top": float(min(y1, y2)),
-            "y_bottom": float(max(y1, y2)),
-            "length": length,
-            "angle_deg": angle_n,
-        })
-
-        used.add(i)
-
-    return merged
 
 
 def _sample_shape_color(
@@ -275,10 +219,7 @@ def _sample_shape_color(
     x_right: float,
     y_bottom: float,
 ) -> Optional[str]:
-    """
-    Sample the median pixel color inside the shape bbox, returned as a hex string.
-    For rule lines this captures the ink/line color rather than the background.
-    """
+    """Median pixel color inside the shape bbox as #RRGGBB (line ink color)."""
     H, W = img_bgr.shape[:2]
     x1 = max(int(round(x_left)), 0)
     y1 = max(int(round(y_top)), 0)
@@ -290,112 +231,20 @@ def _sample_shape_color(
     if patch.size == 0:
         return None
     pixels = patch.reshape(-1, 3).astype(np.float32)
-    med = np.median(pixels, axis=0)  # BGR order
+    med = np.median(pixels, axis=0)  # BGR
     b = max(0, min(255, int(round(float(med[0])))))
     g = max(0, min(255, int(round(float(med[1])))))
     r = max(0, min(255, int(round(float(med[2])))))
     return f"#{r:02X}{g:02X}{b:02X}"
 
 
-def _filter_text_overlapping_shapes(
-    shapes: List[dict],
-    words_df: Optional[pd.DataFrame],
-    page_number: int,
-    config: ShapeExtractorConfig,
-) -> List[dict]:
-    """
-    Filter out shapes that overlap heavily with text (likely false positives from aligned text).
-
-    This is particularly important for vertical shapes that might be detected from
-    aligned text columns in tables.
-    """
-    if not config.filter_text_shapes or words_df is None or words_df.empty:
-        return shapes
-
-    # Get words for this page
-    page_words = words_df[words_df["page_number"].astype(int) == int(page_number)]
-    if page_words.empty:
-        return shapes
-
-    filtered = []
-
-    for shape in shapes:
-        x1, y1, x2, y2 = shape["x1"], shape["y1"], shape["x2"], shape["y2"]
-        shape_len = shape["length"]
-
-        if shape_len == 0:
-            continue
-
-        # Calculate how much of the shape intersects with text bboxes
-        intersection_length = 0.0
-        intersecting_words = 0
-
-        # Tighter tolerance for intersection check
-        pad = 2
-
-        for _, word in page_words.iterrows():
-            wx1 = float(word["x_left"])
-            wy1 = float(word["y_top"])
-            wx2 = float(word["x_right"])
-            wy2 = float(word["y_bottom"])
-
-            word_intersects = False
-
-            # Check if shape intersects with word bbox
-            # For horizontal shapes
-            if abs(shape["angle_deg"]) < 45:
-                # Check y overlap
-                if not (y1 - pad <= wy2 and y2 + pad >= wy1):
-                    continue
-
-                # Check x overlap
-                x_overlap_start = max(min(x1, x2), wx1)
-                x_overlap_end = min(max(x1, x2), wx2)
-
-                if x_overlap_end > x_overlap_start:
-                    intersection_length += (x_overlap_end - x_overlap_start)
-                    word_intersects = True
-
-            # For vertical shapes (more strict - common false positive from aligned text)
-            else:
-                # Check x overlap (must be close to the shape)
-                shape_x = (x1 + x2) / 2
-                if not (shape_x - pad <= wx2 and shape_x + pad >= wx1):
-                    continue
-
-                # Check y overlap
-                y_overlap_start = max(min(y1, y2), wy1)
-                y_overlap_end = min(max(y1, y2), wy2)
-
-                if y_overlap_end > y_overlap_start:
-                    intersection_length += (y_overlap_end - y_overlap_start)
-                    word_intersects = True
-
-            if word_intersects:
-                intersecting_words += 1
-
-        # Calculate ratio of shape covered by text
-        text_ratio = intersection_length / shape_len if shape_len > 0 else 0
-
-        # Rejection criteria:
-        # 1. High text overlap ratio (>15%)
-        # 2. Multiple words intersecting (likely aligned text column)
-        reject = False
-
-        if text_ratio > config.text_intersection_max_ratio:
-            reject = True
-
-        # Special case for vertical shapes: if multiple words align, it's likely false positive
-        if abs(shape["angle_deg"]) > 45 and intersecting_words >= config.text_intersection_min_words:
-            # For vertical shapes, be even more strict
-            # If it passes through many words, it's almost certainly aligned text
-            if text_ratio > 0.08 or intersecting_words >= 3:  # Even stricter for vertical
-                reject = True
-
-        if not reject:
-            filtered.append(shape)
-
-    return filtered
+_OUTPUT_COLUMNS = [
+    "page_number", "raw_shape_id", "raw_shape_type",
+    "x1", "y1", "x2", "y2",
+    "x_left", "x_right", "y_top", "y_bottom",
+    "width", "height", "area", "linewidth", "non_stroking_color",
+    "length", "angle_deg",
+]
 
 
 # ==================================================================================================
@@ -405,15 +254,13 @@ def _filter_text_overlapping_shapes(
 def extract_shapes_df(
     images_bgr: List[np.ndarray],
     *,
-    words_df: Optional[pd.DataFrame] = None,
     config: ShapeExtractorConfig = ShapeExtractorConfig(),
 ) -> pd.DataFrame:
     """
-    Extract long axis-aligned rule shapes (horizontal/vertical lines) using HoughLinesP.
+    Extract axis-aligned rule lines via morphology + connected components.
 
     Inputs:
       - images_bgr: list of BGR uint8 images, page_number = idx + 1
-      - words_df: optional; used for masking text regions if config.mask_words=True
 
     Output schema:
       page_number, raw_shape_id, raw_shape_type,
@@ -423,28 +270,7 @@ def extract_shapes_df(
       length, angle_deg
     """
     if not images_bgr:
-        return pd.DataFrame(
-            columns=[
-                "page_number",
-                "raw_shape_id",
-                "raw_shape_type",
-                "x1",
-                "y1",
-                "x2",
-                "y2",
-                "x_left",
-                "x_right",
-                "y_top",
-                "y_bottom",
-                "width",
-                "height",
-                "area",
-                "linewidth",
-                "non_stroking_color",
-                "length",
-                "angle_deg",
-            ]
-        )
+        return pd.DataFrame(columns=_OUTPUT_COLUMNS)
 
     all_rows: List[dict] = []
 
@@ -455,186 +281,88 @@ def extract_shapes_df(
         page_number = int(page_idx + 1)
         H, W = img_bgr.shape[:2]
 
-        work = img_bgr
-        if config.mask_words and words_df is not None and not words_df.empty:
-            work = _mask_words(work, words_df, page_number=page_number, pad=int(config.word_mask_pad_px))
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+        bw = _binarize_ink(gray, config)
 
+        min_h_len = max(int(W * float(config.min_rule_frac)), int(config.min_absolute_len_px))
+        min_v_len = max(int(H * float(config.min_rule_frac)), int(config.min_absolute_len_px))
+
+        h_boxes = _detect_axis_lines(
+            bw, horizontal=True, min_len=min_h_len,
+            gap_bridge=int(config.gap_bridge_px), config=config,
+        )
+        v_boxes = _detect_axis_lines(
+            bw, horizontal=False, min_len=min_v_len,
+            gap_bridge=int(config.gap_bridge_px), config=config,
+        )
+
+        # Convert (left, top, w, h) -> (is_horizontal, x_left, y_top, x_right, y_bottom)
+        boxes: List[Tuple[bool, float, float, float, float]] = (
+            [(True, float(x), float(y), float(x + w - 1), float(y + h - 1)) for (x, y, w, h) in h_boxes]
+            + [(False, float(x), float(y), float(x + w - 1), float(y + h - 1)) for (x, y, w, h) in v_boxes]
+        )
+
+        # Rejoin segments split by mask dropouts (dense tables).
+        if config.merge_collinear:
+            boxes = _merge_collinear_boxes(
+                boxes,
+                perp_tol=float(config.merge_perp_tol_px),
+                gap_tol=float(config.merge_gap_px),
+            )
+
+        seen = set()
         page_rows: List[dict] = []
-        seen = set()  # dedupe keys per page
 
-        # Convert to grayscale
-        gray = cv2.cvtColor(work, cv2.COLOR_BGR2GRAY)
+        for is_horiz, x_left, y_top, x_right, y_bottom in boxes:
+            w = x_right - x_left + 1.0
+            h = y_bottom - y_top + 1.0
 
-        # Multi-pass detection for better coverage
-        all_hough_shapes = []
-
-        if config.use_multipass:
-            # Pass 1: Standard OTSU threshold
-            _, bw1 = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            edges1 = cv2.Canny(bw1, int(config.canny_low), int(config.canny_high))
-            shapes1 = cv2.HoughLinesP(
-                edges1, rho=1, theta=np.pi / 180.0,
-                threshold=int(config.hough_threshold),
-                minLineLength=int(config.hough_min_shape_len_px),
-                maxLineGap=int(config.hough_max_shape_gap_px),
-            )
-            if shapes1 is not None:
-                all_hough_shapes.extend(shapes1.reshape(-1, 4))
-
-            # Pass 2: Inverted for light-on-dark shapes
-            gray_inv = 255 - gray
-            _, bw2 = cv2.threshold(gray_inv, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            edges2 = cv2.Canny(bw2, int(config.canny_low), int(config.canny_high))
-            shapes2 = cv2.HoughLinesP(
-                edges2, rho=1, theta=np.pi / 180.0,
-                threshold=int(config.hough_threshold),
-                minLineLength=int(config.hough_min_shape_len_px),
-                maxLineGap=int(config.hough_max_shape_gap_px),
-            )
-            if shapes2 is not None:
-                all_hough_shapes.extend(shapes2.reshape(-1, 4))
-
-            # Pass 3: Morphological closing to connect broken shapes
-            _, bw3 = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            bw3_inv = 255 - bw3
-            # Horizontal kernel for horizontal shapes
-            h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 1))
-            h_closed = cv2.morphologyEx(bw3_inv, cv2.MORPH_CLOSE, h_kernel)
-            # Vertical kernel for vertical shapes
-            v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 15))
-            v_closed = cv2.morphologyEx(bw3_inv, cv2.MORPH_CLOSE, v_kernel)
-            # Combine
-            morph_combined = cv2.bitwise_or(h_closed, v_closed)
-            edges3 = cv2.Canny(morph_combined, int(config.canny_low), int(config.canny_high))
-            shapes3 = cv2.HoughLinesP(
-                edges3, rho=1, theta=np.pi / 180.0,
-                threshold=int(config.hough_threshold),
-                minLineLength=int(config.hough_min_shape_len_px),
-                maxLineGap=int(config.hough_max_shape_gap_px),
-            )
-            if shapes3 is not None:
-                all_hough_shapes.extend(shapes3.reshape(-1, 4))
-
-            # Pass 4: Direct edge detection on grayscale for very faint shapes
-            edges4 = cv2.Canny(gray, int(config.canny_low) // 2, int(config.canny_high) // 2)
-            shapes4 = cv2.HoughLinesP(
-                edges4, rho=1, theta=np.pi / 180.0,
-                threshold=max(50, int(config.hough_threshold) // 2),
-                minLineLength=int(config.hough_min_shape_len_px),
-                maxLineGap=int(config.hough_max_shape_gap_px) * 2,
-            )
-            if shapes4 is not None:
-                all_hough_shapes.extend(shapes4.reshape(-1, 4))
-        else:
-            # Single pass (original behavior)
-            _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            edges = cv2.Canny(bw, int(config.canny_low), int(config.canny_high))
-            shapes = cv2.HoughLinesP(
-                edges, rho=1, theta=np.pi / 180.0,
-                threshold=int(config.hough_threshold),
-                minLineLength=int(config.hough_min_shape_len_px),
-                maxLineGap=int(config.hough_max_shape_gap_px),
-            )
-            if shapes is not None:
-                all_hough_shapes.extend(shapes.reshape(-1, 4))
-
-        if not all_hough_shapes:
-            continue
-
-        # Calculate minimum lengths
-        min_horiz_len = max(int(W * float(config.min_rule_frac)), int(config.min_absolute_len_px))
-        min_vert_len = max(int(H * float(config.min_rule_frac)), int(config.min_absolute_len_px))
-
-        for (x1, y1, x2, y2) in all_hough_shapes:
-            x1 = int(x1); y1 = int(y1); x2 = int(x2); y2 = int(y2)
-
-            dx = x2 - x1
-            dy = y2 - y1
-            length = float(math.hypot(dx, dy))
-            angle = float(math.degrees(math.atan2(dy, dx)))
-            angle_n = _normalize_angle_deg(angle)
-
-            is_horiz = abs(angle_n) <= float(config.keep_horiz_deg_tol) and abs(x2 - x1) >= min_horiz_len
-            is_vert = abs(abs(angle_n) - 90.0) <= float(config.keep_vert_deg_tol) and abs(y2 - y1) >= min_vert_len
-
-            if not (is_horiz or is_vert):
-                continue
+            if is_horiz:
+                yc = (y_top + y_bottom) / 2.0
+                x1, y1, x2, y2 = int(x_left), int(round(yc)), int(x_right), int(round(yc))
+                length = x_right - x_left
+                linewidth = float(h)
+                angle_deg = 0.0
+            else:
+                xc = (x_left + x_right) / 2.0
+                x1, y1, x2, y2 = int(round(xc)), int(y_top), int(round(xc)), int(y_bottom)
+                length = y_bottom - y_top
+                linewidth = float(w)
+                angle_deg = 90.0
 
             if config.dedupe:
-                key = (page_number,) + _shape_key_axis_aligned(
-                    x1, y1, x2, y2, tol=int(config.dedupe_endpoint_tol_px)
+                tol = max(1, int(config.dedupe_endpoint_tol_px))
+                key = (
+                    page_number,
+                    int(round(x_left / tol)),
+                    int(round(y_top / tol)),
+                    int(round(x_right / tol)),
+                    int(round(y_bottom / tol)),
                 )
                 if key in seen:
                     continue
                 seen.add(key)
 
-            page_rows.append(
-                {
-                    "page_number": page_number,
-                    "x1": x1,
-                    "y1": y1,
-                    "x2": x2,
-                    "y2": y2,
-                    "x_left": float(min(x1, x2)),
-                    "x_right": float(max(x1, x2)),
-                    "y_top": float(min(y1, y2)),
-                    "y_bottom": float(max(y1, y2)),
-                    "length": float(length),
-                    "angle_deg": float(angle_n),
-                }
-            )
+            page_rows.append({
+                "page_number": page_number,
+                "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                "x_left": x_left, "x_right": x_right,
+                "y_top": y_top, "y_bottom": y_bottom,
+                "width": float(w), "height": float(h), "area": float(w * h),
+                "linewidth": linewidth,
+                "non_stroking_color": _sample_shape_color(img_bgr, x_left, y_top, x_right, y_bottom),
+                "length": float(length),
+                "angle_deg": angle_deg,
+            })
 
-        # Post-processing for this page
-        # 1. Merge collinear shape segments first (combines broken shapes)
-        page_rows = _merge_shape_segments(page_rows, config)
-
-        # 2. Filter out shapes that overlap heavily with text
-        # (do this after merging so we have complete shapes to evaluate)
-        page_rows = _filter_text_overlapping_shapes(page_rows, words_df, page_number, config)
-
-        # 3. Augment with derived fields required by the shape merger
-        for shape in page_rows:
-            w = shape["x_right"] - shape["x_left"]
-            h = shape["y_bottom"] - shape["y_top"]
-            shape["width"] = w
-            shape["height"] = h
-            shape["area"] = w * h
-            # linewidth = physical thickness of the rule
-            shape["linewidth"] = h if abs(shape.get("angle_deg", 0.0)) < 45 else w
-            shape["non_stroking_color"] = _sample_shape_color(
-                img_bgr, shape["x_left"], shape["y_top"], shape["x_right"], shape["y_bottom"]
-            )
-
-        # Add to all rows
         all_rows.extend(page_rows)
 
     df = pd.DataFrame(all_rows)
     if df.empty:
-        return pd.DataFrame(
-            columns=[
-                "page_number",
-                "raw_shape_id",
-                "raw_shape_type",
-                "x1",
-                "y1",
-                "x2",
-                "y2",
-                "x_left",
-                "x_right",
-                "y_top",
-                "y_bottom",
-                "width",
-                "height",
-                "area",
-                "linewidth",
-                "non_stroking_color",
-                "length",
-                "angle_deg",
-            ]
-        )
+        return pd.DataFrame(columns=_OUTPUT_COLUMNS)
 
     df = df.sort_values(["page_number", "y_top", "x_left"], kind="mergesort").reset_index(drop=True)
     df.insert(1, "raw_shape_id", np.arange(1, len(df) + 1, dtype=np.int64))
     df.insert(2, "raw_shape_type", "line")
 
-    return df
+    return df[_OUTPUT_COLUMNS]
