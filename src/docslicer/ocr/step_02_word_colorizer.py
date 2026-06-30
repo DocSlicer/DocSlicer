@@ -45,6 +45,12 @@ class WordColorizerConfig:
     # Bold detection: a word is bold if its ink_coverage >= this multiplier * median ink_coverage
     bold_ink_multiplier: float = 1.2
 
+    # Post-hoc color snapping: snap infrequent ink colors to the nearest high-frequency
+    # canonical within this RGB Euclidean distance. 0 = disabled.
+    # 30 collapses scan-noise variants (~1-2 channel steps apart) without merging
+    # visually distinct colors (e.g. dark-gray vs. near-black stay separate).
+    ink_snap_threshold: int = 30
+
 
 # ==================================================================================================
 # COLOR HELPERS
@@ -310,6 +316,61 @@ def _sample_ink_color_and_coverage_bgr_median(
 # - goal is not perfect italic recovery, but a stable visual slant proxy
 
 # ==================================================================================================
+# COLOR SNAPPING (post-hoc, document-level)
+# ==================================================================================================
+
+def _snap_similar_colors(series: pd.Series, threshold: int) -> pd.Series:
+    """
+    Snap scan-noise color variants to the nearest high-frequency canonical.
+
+    Algorithm: visit colors in descending frequency order. Each color either
+    joins the nearest already-established canonical (if within `threshold` RGB
+    Euclidean distance) or becomes a new canonical itself.
+
+    This runs after per-word quantization, so it collapses residual drift
+    (e.g. #404040 vs #405050) without touching truly distinct ink colors.
+    """
+    if threshold <= 0:
+        return series
+
+    freq = series.dropna().value_counts()
+    if freq.empty:
+        return series
+
+    def _parse(h: str):
+        h = h.lstrip("#")
+        return np.array([int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)], dtype=np.float32)
+
+    canon_rgbs: list = []   # np.array per canonical
+    canon_hexes: list = []  # corresponding hex string
+    mapping: dict = {}
+
+    for hex_color in freq.index:
+        try:
+            rgb = _parse(hex_color)
+        except (ValueError, IndexError):
+            mapping[hex_color] = hex_color
+            continue
+
+        best_dist = float("inf")
+        best_idx = -1
+        for i, can_rgb in enumerate(canon_rgbs):
+            d = float(np.linalg.norm(rgb - can_rgb))
+            if d < best_dist:
+                best_dist = d
+                best_idx = i
+
+        if best_dist <= threshold:
+            mapping[hex_color] = canon_hexes[best_idx]
+        else:
+            canon_rgbs.append(rgb)
+            canon_hexes.append(hex_color)
+            mapping[hex_color] = hex_color
+
+    return series.map(mapping)
+
+
+# ==================================================================================================
 # WORKER (picklable — must be top-level)
 # ==================================================================================================
 
@@ -444,5 +505,10 @@ def colorize_words_df(
     out["non_stroking_color"] = ink_hex_norm
     out["background_non_stroking_color"] = bg_hex_norm
     out["ink_coverage"] = ink_cov
+
+    if config.ink_snap_threshold > 0:
+        out["non_stroking_color"] = _snap_similar_colors(
+            out["non_stroking_color"], config.ink_snap_threshold
+        )
 
     return out

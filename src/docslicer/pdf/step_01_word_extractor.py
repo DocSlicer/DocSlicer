@@ -29,6 +29,10 @@ Output columns:
     struct_group_id    (int | None  — struct_tag_id > mcid+1e6 > text_object_id+2e6;
                         namespaced to prevent cross-tranche collisions; same value = same logical block),
     reading_rank       (int | None  — DFS position in struct tree; global reading-order key),
+    struct_ancestors   (list[str] | None  — ancestor tag names root→direct-parent,
+                        e.g. ["Document", "Table", "TR", "TD", "P"]),
+    struct_ancestor_ids (list[int] | None — parallel DFS elem_ids for each ancestor tag;
+                        same index as struct_ancestors; use to distinguish e.g. TD#3 from TD#7),
     text_object_id     (int | None  — 0-based sequential id per distinct PDFium text object,
                         assigned via FPDFText_GetTextObject during the character loop;
                         works inside form XObjects; increments on first encounter in
@@ -235,22 +239,28 @@ def _extract_text_obj_marks(
 
 def _extract_struct_info(
     page,
-) -> tuple[dict[int, str], dict[int, int], dict[int, int]]:
+) -> tuple[dict[int, str], dict[int, int], dict[int, int], dict[int, list[str]], dict[int, list[int]]]:
     """
     Walk the struct tree for *page* in DFS order.
 
     Returns:
-        mcid_to_struct_tag   – mcid → element type ("P", "Span", …)
-        mcid_to_struct_group – mcid → sequential element id (same id = same logical block)
-        mcid_to_rank         – mcid → DFS reading-order position
+        mcid_to_struct_tag    – mcid → element type ("P", "Span", …)
+        mcid_to_struct_group  – mcid → sequential element id (same id = same logical block)
+        mcid_to_rank          – mcid → DFS reading-order position
+        mcid_to_ancestors     – mcid → ancestor tag names root→direct-parent,
+                                e.g. ["Document", "Table", "TR", "TD", "P"]
+        mcid_to_ancestor_ids  – mcid → parallel elem_ids for each ancestor tag,
+                                e.g. [0, 2, 5, 6, 7]  (same indices as ancestor names)
     """
     tree = pdfium_c.FPDF_StructTree_GetForPage(page)
     if not tree:
-        return {}, {}, {}
+        return {}, {}, {}, {}, {}
 
-    mcid_to_tag:   dict[int, str] = {}
-    mcid_to_group: dict[int, int] = {}
-    mcid_to_rank:  dict[int, int] = {}
+    mcid_to_tag:          dict[int, str]       = {}
+    mcid_to_group:        dict[int, int]       = {}
+    mcid_to_rank:         dict[int, int]       = {}
+    mcid_to_ancestors:    dict[int, list[str]] = {}
+    mcid_to_ancestor_ids: dict[int, list[int]] = {}
     counters = [0, 0]  # [elem_id, rank]
     _type_buf = ctypes.create_string_buffer(_MARK_BUF_BYTES)
 
@@ -258,35 +268,43 @@ def _extract_struct_info(
         n = pdfium_c.FPDF_StructElement_GetType(elem, _type_buf, ctypes.c_ulong(_MARK_BUF_BYTES))
         return _decode_utf16le(_type_buf.raw[:n]) if n > 0 else None
 
-    def _walk(elem) -> None:
+    def _walk(elem, anc_tags: list[str], anc_ids: list[int]) -> None:
         etype   = _elem_type(elem)
         elem_id = counters[0]
         counters[0] += 1
+
+        # Extend the ancestor lists that children will inherit.
+        if etype:
+            child_tags = anc_tags + [etype]
+            child_ids  = anc_ids  + [elem_id]
+        else:
+            child_tags = anc_tags
+            child_ids  = anc_ids
 
         n_ch = pdfium_c.FPDF_StructElement_CountChildren(elem)
         for ci in range(n_ch):
             child = pdfium_c.FPDF_StructElement_GetChildAtIndex(elem, ci)
             if child:
-                # Struct-element child — recurse.
-                _walk(child)
+                _walk(child, child_tags, child_ids)
             else:
-                # Content-item child — get its MCID.
                 mc = pdfium_c.FPDF_StructElement_GetChildMarkedContentID(elem, ci)
                 if mc >= 0:
                     if etype:
                         mcid_to_tag[mc] = etype
-                    mcid_to_group[mc] = elem_id
-                    mcid_to_rank[mc]  = counters[1]
+                    mcid_to_group[mc]        = elem_id
+                    mcid_to_rank[mc]         = counters[1]
+                    mcid_to_ancestors[mc]    = child_tags
+                    mcid_to_ancestor_ids[mc] = child_ids
                     counters[1] += 1
 
     n_root = pdfium_c.FPDF_StructTree_CountChildren(tree)
     for ri in range(n_root):
         root = pdfium_c.FPDF_StructTree_GetChildAtIndex(tree, ri)
         if root:
-            _walk(root)
+            _walk(root, [], [])
 
     pdfium_c.FPDF_StructTree_Close(tree)
-    return mcid_to_tag, mcid_to_group, mcid_to_rank
+    return mcid_to_tag, mcid_to_group, mcid_to_rank, mcid_to_ancestors, mcid_to_ancestor_ids
 
 
 def _annotate_words(
@@ -329,20 +347,28 @@ def _annotate_words(
                 matched_arr[mask] = True
 
     # ── Struct tree ────────────────────────────────────────────────────────────
-    mcid_to_stag, mcid_to_group, mcid_to_rank = _extract_struct_info(page)
+    mcid_to_stag, mcid_to_group, mcid_to_rank, mcid_to_ancestors, mcid_to_ancestor_ids = (
+        _extract_struct_info(page)
+    )
 
-    stag_arr   = np.empty(n, dtype=object); stag_arr[:]   = None
-    sgroup_arr = np.empty(n, dtype=object); sgroup_arr[:] = None
-    srank_arr  = np.empty(n, dtype=object); srank_arr[:]  = None
+    stag_arr    = np.empty(n, dtype=object); stag_arr[:]    = None
+    sgroup_arr  = np.empty(n, dtype=object); sgroup_arr[:]  = None
+    srank_arr   = np.empty(n, dtype=object); srank_arr[:]   = None
+    sanc_arr    = np.empty(n, dtype=object); sanc_arr[:]    = None
+    sancid_arr  = np.empty(n, dtype=object); sancid_arr[:]  = None
 
     for i, mc in enumerate(mcid_arr):
         if mc is not None:
-            stag  = mcid_to_stag.get(mc)
-            sgrp  = mcid_to_group.get(mc)
-            srank = mcid_to_rank.get(mc)
-            if stag  is not None: stag_arr[i]   = stag
-            if sgrp  is not None: sgroup_arr[i] = sgrp
-            if srank is not None: srank_arr[i]  = srank
+            stag   = mcid_to_stag.get(mc)
+            sgrp   = mcid_to_group.get(mc)
+            srank  = mcid_to_rank.get(mc)
+            sanc   = mcid_to_ancestors.get(mc)
+            sancid = mcid_to_ancestor_ids.get(mc)
+            if stag   is not None: stag_arr[i]   = stag
+            if sgrp   is not None: sgroup_arr[i] = sgrp
+            if srank  is not None: srank_arr[i]  = srank
+            if sanc   is not None: sanc_arr[i]   = sanc
+            if sancid is not None: sancid_arr[i] = sancid
 
     # ── struct_group_id: struct_tag_id > mcid+1e6 > text_object_id+2e6 ──────
     # Each tranche gets its own integer range to prevent cross-tranche collisions.
@@ -361,12 +387,14 @@ def _annotate_words(
             sg_arr[i] = _TXOBJ_OFFSET + int(txobj_arr[i])
 
     # ── Write columns ──────────────────────────────────────────────────────────
-    df["mcid"]           = mcid_arr
-    df["marked_tag"]     = tag_arr
-    df["struct_tag"]     = stag_arr
-    df["struct_tag_id"]  = sgroup_arr  # raw DFS counter; two P's with different ids are different blocks
-    df["struct_group_id"] = sg_arr
-    df["reading_rank"]   = srank_arr
+    df["mcid"]                = mcid_arr
+    df["marked_tag"]          = tag_arr
+    df["struct_tag"]          = stag_arr
+    df["struct_tag_id"]       = sgroup_arr  # raw DFS counter; two P's with different ids are different blocks
+    df["struct_group_id"]     = sg_arr
+    df["reading_rank"]        = srank_arr
+    df["struct_ancestors"]    = sanc_arr    # list[str] root→direct-parent, e.g. ["Document","Table","TD","P"]
+    df["struct_ancestor_ids"] = sancid_arr  # list[int] parallel elem_ids for each ancestor tag
 
 
 # ── Per-page extraction ───────────────────────────────────────────────────────

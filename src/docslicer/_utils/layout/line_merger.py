@@ -165,6 +165,29 @@ def assign_line_id(
 
 
 # -----------------------
+# Line comparison
+# -----------------------
+
+def same_line(
+    y_top_a: float,
+    y_bottom_a: float,
+    y_top_b: float,
+    y_bottom_b: float,
+    config: LineMergerConfig = LineMergerConfig(),
+) -> bool:
+    """Return True if two bboxes belong on the same text line."""
+    yc_a = (y_top_a + y_bottom_a) / 2.0
+    yc_b = (y_top_b + y_bottom_b) / 2.0
+    dy = abs(yc_a - yc_b)
+    if dy <= config.TOL_BASE:
+        return True
+    overlap = min(y_bottom_a, y_bottom_b) - max(y_top_a, y_top_b)
+    if dy <= config.TOL_EXPANDED and overlap >= config.MIN_VERTICAL_OVERLAP:
+        return True
+    return False
+
+
+# -----------------------
 # Internal helpers
 # -----------------------
 

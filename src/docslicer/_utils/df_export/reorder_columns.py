@@ -100,6 +100,8 @@ MASTER_COLUMN_ORDER: List[str] = [
     "placeholder_type",     # pptx        — title / body / subtitle / …
 
     # Mid-pipeline IDs (pdf + html)
+    "stream_group_id",
+    "stream_group_trigger",
     "cell_id",
     "line_id",
     "temp_line_id",

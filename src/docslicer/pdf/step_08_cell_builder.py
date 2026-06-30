@@ -749,6 +749,8 @@ def _build_cells_df(df_words: pd.DataFrame) -> pd.DataFrame:
             "_fmt_text": lambda s: _join_texts(s.tolist()),
             "word_id":   list,
             "line_id":   lambda s: sorted(s.unique().tolist()),
+            "stream_group_id": "first",
+            #"stream_group_trigger": "first",
         },
     )
 

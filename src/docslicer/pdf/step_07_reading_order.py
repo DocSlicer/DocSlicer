@@ -27,7 +27,7 @@ from .._utils.layout.reading_order import _sort_by_gutters, assign_vertical_line
 # STREAM GROUP DETECTION  (text_object_id path only)
 # ================================================================================
 
-_STREAM_GROUP_Y_JUMP: float = 200.0  # pt — forward jump that starts a new group
+_STREAM_GROUP_Y_JUMP: float = 60.0  # pt — forward jump that starts a new group
 
 
 def _assign_stream_groups(df: pd.DataFrame) -> pd.DataFrame:
@@ -87,7 +87,7 @@ def _assign_stream_groups(df: pd.DataFrame) -> pd.DataFrame:
 # ================================================================================
 
 _RESHUFFLE_MAX_LINES = 3      # groups with ≤ this many distinct line_ids are candidates
-_RESHUFFLE_MIN_JUMP  = 100.0  # pt — min absolute y-jump from prior group to trigger reshuffle
+_RESHUFFLE_MIN_JUMP  = 50.0  # pt — min absolute y-jump from prior group to trigger reshuffle
 
 
 def _reshuffle_stream_groups(df: pd.DataFrame) -> pd.DataFrame:
