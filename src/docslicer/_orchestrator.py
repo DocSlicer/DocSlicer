@@ -430,17 +430,30 @@ def _run_pipeline(
         if not isinstance(content, bytes):
             raise TypeError("PDF content must be bytes")
         discovered_metadata, df_lines, df_table_cells, early_steps = _run_pdf_pipeline(
-            pdf_bytes=content, source_url=source_url, debug=config.debug
+            pdf_bytes=content, source_url=source_url, debug=config.debug,
+            password=config.password, source_filename=source_filename,
         )
         discovered_metadata["content_type"] = "pdf"
     elif content_type == "docx":
         if not isinstance(content, bytes):
             raise TypeError("DOCX content must be bytes")
+        import zipfile
         from .docx.docx_orchestrator import run_pipeline as _run_docx_pipeline
         from .docx.step_00_metadata import extract_core_properties
         from .metadata import add_document_information
-        package, df_runs, df_table_cells, df_paragraphs, df_lines = _run_docx_pipeline(content)
+        from ._utils.password import decrypt_office, is_encrypted_office
+        _was_encrypted = False
+        try:
+            package, df_runs, df_table_cells, df_paragraphs, df_lines = _run_docx_pipeline(content)
+        except zipfile.BadZipFile:
+            if not is_encrypted_office(content):
+                raise
+            content = decrypt_office(content, config.password, source_filename)
+            package, df_runs, df_table_cells, df_paragraphs, df_lines = _run_docx_pipeline(content)
+            _was_encrypted = True
         discovered_metadata = extract_core_properties(package)
+        if _was_encrypted:
+            discovered_metadata["is_password_protected"] = True
         discovered_metadata["has_ocr"] = False
         discovered_metadata["content_type"] = "docx"
         if not discovered_metadata["page_count"]:
@@ -459,12 +472,23 @@ def _run_pipeline(
     elif content_type == "pptx":
         if not isinstance(content, bytes):
             raise TypeError("PPTX content must be bytes")
+        import zipfile
         from .metadata import add_document_information
         from .pptx.pptx_orchestrator import run_pipeline as _run_pptx_pipeline
         from .pptx.step_00_metadata import extract_core_properties
-
-        package, df_runs, df_chart_points, df_table_cells, df_paragraphs, df_lines = _run_pptx_pipeline(content)
+        from ._utils.password import decrypt_office, is_encrypted_office
+        _was_encrypted = False
+        try:
+            package, df_runs, df_chart_points, df_table_cells, df_paragraphs, df_lines = _run_pptx_pipeline(content)
+        except zipfile.BadZipFile:
+            if not is_encrypted_office(content):
+                raise
+            content = decrypt_office(content, config.password, source_filename)
+            package, df_runs, df_chart_points, df_table_cells, df_paragraphs, df_lines = _run_pptx_pipeline(content)
+            _was_encrypted = True
         discovered_metadata = extract_core_properties(package)
+        if _was_encrypted:
+            discovered_metadata["is_password_protected"] = True
         discovered_metadata["has_ocr"] = False
         discovered_metadata["content_type"] = "pptx"
         if not discovered_metadata["page_count"]:

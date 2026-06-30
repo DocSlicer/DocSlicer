@@ -27,6 +27,7 @@ dependencies = [
     "pandas>=2.0",
     "numpy>=1.26",
     "pypdfium2>=5.0",
+    "pikepdf>=8.0",
     "pyyaml>=6.0",
     "langdetect>=1.0",
     "beautifulsoup4>=4.12",
@@ -44,6 +45,9 @@ html = [
 ocr = [
     "pytesseract>=0.3",
     "opencv-python>=4.8",
+]
+crypto = [
+    "msoffcrypto-tool>=5.0",
 ]
 parquet = [
     "pyarrow>=18.0",

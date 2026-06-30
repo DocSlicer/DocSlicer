@@ -361,6 +361,113 @@ def _annotate_words(
     df["struct_headers"]      = shdr_arr    # list[str] | None — header-cell ID references
 
 
+_SKIP_WIDGET_TYPES = {"pushbutton"}
+
+# Struct/font columns cloned from the last label word into each injected row.
+_TEMPLATE_COLS = (
+    "struct_tag", "struct_raw_tag", "struct_tag_id", "struct_group_id",
+    "reading_rank", "struct_ancestors", "struct_ancestor_ids",
+    "struct_col_span", "struct_row_span", "struct_scope", "struct_headers",
+    "font_name", "font_size", "non_stroking_color", "stroking_color",
+    "text_object_id", "mcid", "marked_tag",
+)
+
+
+def _normalize_form_text(widget_type: str, value: Optional[str], is_empty: bool) -> str:
+    if widget_type in ("checkbox", "radio"):
+        return "[Unchecked]" if is_empty else "[Checked]"
+    if is_empty or value is None:
+        return "[blank]"
+    return value
+
+
+def _inject_form_value_rows(
+    df: pd.DataFrame,
+    form_fields: List[FormField],
+    crop_left: float,
+    crop_top: float,
+    page_number: int,
+    page_width: float,
+    page_height: float,
+) -> List[Dict[str, Any]]:
+    """
+    Build one synthetic row per form field, carrying the field's value (or an
+    empty/checked marker) as ``text``, positioned at the widget's bbox.
+
+    Each injected row inherits struct and font metadata from the *last* label
+    word for that field (the bottommost/rightmost word in the spatial sort),
+    so downstream block/chunk assembly rolls the value up into the same group
+    as its label. Fields with no label word in *df* get struct columns as None.
+
+    Pushbuttons are skipped. Fields whose value is already present as a
+    content-stream word at the widget position (overlap > 30% of widget area)
+    are also skipped to avoid duplication on flattened or XFA-rendered forms.
+    """
+    if not form_fields or df.empty:
+        return []
+
+    # last label word per field_name (spatial sort order → bottommost/rightmost)
+    last_label: Dict[str, Any] = {}
+    if "form_field_name" in df.columns:
+        for fn, grp in df[df["form_field_name"].notna()].groupby(
+            "form_field_name", sort=False
+        ):
+            last_label[str(fn)] = grp.iloc[-1].to_dict()
+
+    word_xl = df["x_left"].to_numpy(float)
+    word_xr = df["x_right"].to_numpy(float)
+    word_yt = df["y_top"].to_numpy(float)
+    word_yb = df["y_bottom"].to_numpy(float)
+
+    rows: List[Dict[str, Any]] = []
+    for fld in form_fields:
+        if fld.widget_type in _SKIP_WIDGET_TYPES:
+            continue
+
+        llx, lly, urx, ury = fld.pdf_rect
+        fx_left   = llx - crop_left
+        fx_right  = urx - crop_left
+        fy_top    = crop_top - ury
+        fy_bottom = crop_top - lly
+        fw        = fx_right - fx_left
+        fh        = fy_bottom - fy_top
+
+        # Skip if any content-stream word already covers the widget bbox.
+        widget_area = max(fw * fh, 1.0)
+        ox = np.minimum(word_xr, fx_right) - np.maximum(word_xl, fx_left)
+        oy = np.minimum(word_yb, fy_bottom) - np.maximum(word_yt, fy_top)
+        if (np.maximum(ox, 0) * np.maximum(oy, 0) / widget_area).max() > 0.30:
+            continue
+
+        tmpl = last_label.get(fld.field_name)
+        row: Dict[str, Any] = {
+            "text":            _normalize_form_text(fld.widget_type, fld.value, fld.is_empty),
+            "x_left":          fx_left,
+            "y_top":           fy_top,
+            "x_right":         fx_right,
+            "y_bottom":        fy_bottom,
+            "width":           fw,
+            "height":          fh,
+            "page_number":     page_number,
+            "page_width":      page_width,
+            "page_height":     page_height,
+            "text_orientation":"LTR",
+            "script_type":     None,
+            "word_source":     "form_value",
+            "form_widget":     fld.widget_type,
+            "form_value":      None if fld.is_empty else fld.value,
+            "form_is_empty":   fld.is_empty,
+            "form_field_name": fld.field_name,
+            "form_tooltip":    fld.label,
+        }
+        for col in _TEMPLATE_COLS:
+            row[col] = tmpl.get(col) if tmpl is not None else None
+
+        rows.append(row)
+
+    return rows
+
+
 def _annotate_form_fields(
     df: pd.DataFrame,
     form_fields: List[FormField],
@@ -758,18 +865,26 @@ def _extract_words_for_page(
     df = pd.DataFrame(rows)
     df = df.sort_values(["y_top", "x_left"], kind="mergesort").reset_index(drop=True)
 
-    n_words = len(df)
-    df["word_id"]     = range(start_word_id + 1, start_word_id + 1 + n_words)
-    df["page_number"] = page_number
-    df["page_width"]  = page_width
-    df["page_height"] = page_height
+    df["page_number"]  = page_number
+    df["page_width"]   = page_width
+    df["page_height"]  = page_height
+    df["word_source"]  = "content_stream"
 
     _annotate_words(df, page, crop_left, crop_top, struct_index, page_number - 1)
     _annotate_form_fields(
         df, form_fields, crop_left, crop_top, form_label_index, page_number - 1
     )
+    value_rows = _inject_form_value_rows(
+        df, form_fields, crop_left, crop_top, page_number, page_width, page_height
+    )
+    if value_rows:
+        df = pd.concat([df, pd.DataFrame(value_rows)], ignore_index=True)
+        df = df.sort_values(["y_top", "x_left"], kind="mergesort").reset_index(drop=True)
 
-    return df, start_word_id + n_words
+    # Assign word_ids after inject+sort so synthetic rows get sequential ids.
+    df["word_id"] = range(start_word_id + 1, start_word_id + 1 + len(df))
+
+    return df, start_word_id + len(df)
 
 
 # ── Public API ────────────────────────────────────────────────────────────────

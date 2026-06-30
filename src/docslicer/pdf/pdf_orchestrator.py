@@ -85,6 +85,8 @@ def run_pipeline(
     source_url: str = None,
     on_stage: Optional[Callable[[str], None]] = None,
     debug: bool = False,
+    password: str | None = None,
+    source_filename: str | None = None,
 ) -> Tuple[Dict[str, Any], pd.DataFrame, Optional[pd.DataFrame], Dict[str, pd.DataFrame]]:
     """
     Run PDF-specific document processing steps.
@@ -111,7 +113,32 @@ def run_pipeline(
             on_stage("parsing")
 
         # Step 01 - Word Extraction (pypdfium2)
-        df_words = extract_words(pdf_path)
+        # If a password is supplied, pre-decrypt before the main pipeline so
+        # every downstream tool (pypdfium2, pikepdf struct-tree) sees plain bytes.
+        _is_password_protected = False
+        if password is not None:
+            from .._utils.password import decrypt_pdf
+            pdf_bytes = decrypt_pdf(pdf_bytes, password, source_filename)
+            pdf_path.write_bytes(pdf_bytes)
+            _is_password_protected = True
+
+        try:
+            df_words = extract_words(pdf_path)
+        except Exception as _exc:
+            import pypdfium2 as _pdfium
+            import pypdfium2.raw as _pdfium_c
+            _pw_code = getattr(_pdfium_c, "FPDF_ERR_PASSWORD", 4)
+            _is_pw_err = (
+                isinstance(_exc, _pdfium.PdfiumError)
+                and getattr(_exc, "err_code", None) == _pw_code
+            ) or "password" in str(_exc).lower()
+            if not _is_pw_err:
+                raise
+            from .._utils.password import decrypt_pdf
+            pdf_bytes = decrypt_pdf(pdf_bytes, None, source_filename)
+            pdf_path.write_bytes(pdf_bytes)
+            df_words = extract_words(pdf_path)
+            _is_password_protected = True
 
         # Step 02 - Image Extraction
         df_images = extract_images(pdf_path)
@@ -214,7 +241,7 @@ def run_pipeline(
             discovered_metadata.setdefault("title_text", None)
             discovered_metadata.setdefault("language", "unknown")
 
-        discovered_metadata["is_password_protected"] = False
+        discovered_metadata["is_password_protected"] = _is_password_protected
 
         debug_steps: Dict[str, pd.DataFrame] = {}
         if debug:

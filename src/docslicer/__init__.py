@@ -154,6 +154,7 @@ def parse_pdf(
     exact_tokens: bool = False,
     debug: bool = False,
     extra_fields: list[str] | None = None,
+    password: str | None = None,
 ) -> ParseResult:
     """Parse a PDF document and return a ParseResult.
 
@@ -189,6 +190,7 @@ def parse_pdf(
         exact_tokens=exact_tokens,
         debug=debug,
         extra_fields=extra_fields or [],
+        password=password,
     )
     source_filename = _extract_filename(source)
     content = _load_bytes(source)
@@ -206,6 +208,7 @@ def parse_docx(
     exact_tokens: bool = False,
     debug: bool = False,
     extra_fields: list[str] | None = None,
+    password: str | None = None,
 ) -> ParseResult:
     """Parse a DOCX document and return a ParseResult.
 
@@ -236,6 +239,7 @@ def parse_docx(
         exact_tokens=exact_tokens,
         debug=debug,
         extra_fields=extra_fields or [],
+        password=password,
     )
     source_filename = _extract_filename(source)
     content = _load_bytes(source)
@@ -253,6 +257,7 @@ def parse_pptx(
     exact_tokens: bool = False,
     debug: bool = False,
     extra_fields: list[str] | None = None,
+    password: str | None = None,
 ) -> ParseResult:
     """Parse a PPTX document and return a ParseResult.
 
@@ -283,6 +288,7 @@ def parse_pptx(
         exact_tokens=exact_tokens,
         debug=debug,
         extra_fields=extra_fields or [],
+        password=password,
     )
     source_filename = _extract_filename(source)
     content = _load_bytes(source)

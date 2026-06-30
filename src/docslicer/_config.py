@@ -16,6 +16,7 @@ class ParseConfig:
     debug: bool = False
     extra_fields: list[str] = field(default_factory=list)
     run_id: str = field(default_factory=lambda: str(_uuid.uuid4()))
+    password: str | None = None
 
 
 DEFAULT_CONFIG = ParseConfig()
