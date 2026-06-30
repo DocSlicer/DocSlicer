@@ -125,6 +125,11 @@ MASTER_COLUMN_ORDER: List[str] = [
     #Native PDF Stream Data
     "struct_tag_id",
     "struct_tag",
+    "struct_raw_tag",
+    "struct_col_span",
+    "struct_row_span",
+    "struct_scope",
+    "struct_headers",
     "mcid",
     "marked_tag",
 

@@ -8,7 +8,8 @@ Responsibilities:
     - Derive text_orientation from first→last char centre direction within the word
     - Convert all color values to hex format (#rrggbb)
     - Detect superscript and subscript characters and emit them as separate words
-    - Annotate each word with marked-content and struct-tree signals (separate page-object pass)
+    - Annotate each word with marked-content (pdfium page-object pass) and
+      struct-tree signals (pikepdf, via _utils.struct_tree.build_struct_index_with_links)
     - NO high-level features (no bold/italic guesses, no ratios, etc.)
 
 Output columns:
@@ -22,17 +23,23 @@ Output columns:
     script_type        (None | "superscript" | "subscript"),
     mcid               (int | None  — marked-content ID from enclosing BDC),
     marked_tag         (str | None  — mark name: "Span", "P", "Artifact", …),
-    struct_tag         (str | None  — struct-tree element type: "P", "Span", …),
-    struct_tag_id     (int | None  — DFS counter of the struct-tree element owning this word;
+    struct_tag         (str | None  — RoleMap-resolved struct-tree type: "P", "H1", "TD", …),
+    struct_raw_tag     (str | None  — original /S before RoleMap resolution; equals struct_tag
+                        for standard tags, preserves custom tags e.g. "CorporateHeader"),
+    struct_tag_id     (int | None  — global DFS counter of the struct-tree element owning this word;
                         two words with different ids are in different struct elements even if
                         both have struct_tag == "P"),
     struct_group_id    (int | None  — struct_tag_id > mcid+1e6 > text_object_id+2e6;
                         namespaced to prevent cross-tranche collisions; same value = same logical block),
-    reading_rank       (int | None  — DFS position in struct tree; global reading-order key),
+    reading_rank       (int | None  — global DFS position in struct tree; reading-order key),
     struct_ancestors   (list[str] | None  — ancestor tag names root→direct-parent,
                         e.g. ["Document", "Table", "TR", "TD", "P"]),
     struct_ancestor_ids (list[int] | None — parallel DFS elem_ids for each ancestor tag;
                         same index as struct_ancestors; use to distinguish e.g. TD#3 from TD#7),
+    struct_col_span    (int | None  — owning TD/TH ColSpan; None outside a table cell),
+    struct_row_span    (int | None  — owning TD/TH RowSpan; None outside a table cell),
+    struct_scope       (str | None  — TH Scope: "Row" | "Column" | "Both"),
+    struct_headers     (list[str] | None — header-cell ID references for this cell),
     text_object_id     (int | None  — 0-based sequential id per distinct PDFium text object,
                         assigned via FPDFText_GetTextObject during the character loop;
                         works inside form XObjects; increments on first encounter in
@@ -61,11 +68,15 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
+import pikepdf
 import pypdfium2 as pdfium
 import pypdfium2.raw as pdfium_c
 import pandas as pd
 
 from .._utils.text_utils import add_calculated_text_features
+from ._utils.struct_tree import StructInfo, build_struct_index_with_links
+from ._utils.form_fields import FormField, build_form_index
+from ._utils.form_label_link import build_form_label_index
 
 
 _WHITESPACE = frozenset(' \t\r\n\x0c\xa0​‌‍﻿')
@@ -237,87 +248,26 @@ def _extract_text_obj_marks(
     return results
 
 
-def _extract_struct_info(
-    page,
-) -> tuple[dict[int, str], dict[int, int], dict[int, int], dict[int, list[str]], dict[int, list[int]]]:
-    """
-    Walk the struct tree for *page* in DFS order.
-
-    Returns:
-        mcid_to_struct_tag    – mcid → element type ("P", "Span", …)
-        mcid_to_struct_group  – mcid → sequential element id (same id = same logical block)
-        mcid_to_rank          – mcid → DFS reading-order position
-        mcid_to_ancestors     – mcid → ancestor tag names root→direct-parent,
-                                e.g. ["Document", "Table", "TR", "TD", "P"]
-        mcid_to_ancestor_ids  – mcid → parallel elem_ids for each ancestor tag,
-                                e.g. [0, 2, 5, 6, 7]  (same indices as ancestor names)
-    """
-    tree = pdfium_c.FPDF_StructTree_GetForPage(page)
-    if not tree:
-        return {}, {}, {}, {}, {}
-
-    mcid_to_tag:          dict[int, str]       = {}
-    mcid_to_group:        dict[int, int]       = {}
-    mcid_to_rank:         dict[int, int]       = {}
-    mcid_to_ancestors:    dict[int, list[str]] = {}
-    mcid_to_ancestor_ids: dict[int, list[int]] = {}
-    counters = [0, 0]  # [elem_id, rank]
-    _type_buf = ctypes.create_string_buffer(_MARK_BUF_BYTES)
-
-    def _elem_type(elem) -> str | None:
-        n = pdfium_c.FPDF_StructElement_GetType(elem, _type_buf, ctypes.c_ulong(_MARK_BUF_BYTES))
-        return _decode_utf16le(_type_buf.raw[:n]) if n > 0 else None
-
-    def _walk(elem, anc_tags: list[str], anc_ids: list[int]) -> None:
-        etype   = _elem_type(elem)
-        elem_id = counters[0]
-        counters[0] += 1
-
-        # Extend the ancestor lists that children will inherit.
-        if etype:
-            child_tags = anc_tags + [etype]
-            child_ids  = anc_ids  + [elem_id]
-        else:
-            child_tags = anc_tags
-            child_ids  = anc_ids
-
-        n_ch = pdfium_c.FPDF_StructElement_CountChildren(elem)
-        for ci in range(n_ch):
-            child = pdfium_c.FPDF_StructElement_GetChildAtIndex(elem, ci)
-            if child:
-                _walk(child, child_tags, child_ids)
-            else:
-                mc = pdfium_c.FPDF_StructElement_GetChildMarkedContentID(elem, ci)
-                if mc >= 0:
-                    if etype:
-                        mcid_to_tag[mc] = etype
-                    mcid_to_group[mc]        = elem_id
-                    mcid_to_rank[mc]         = counters[1]
-                    mcid_to_ancestors[mc]    = child_tags
-                    mcid_to_ancestor_ids[mc] = child_ids
-                    counters[1] += 1
-
-    n_root = pdfium_c.FPDF_StructTree_CountChildren(tree)
-    for ri in range(n_root):
-        root = pdfium_c.FPDF_StructTree_GetChildAtIndex(tree, ri)
-        if root:
-            _walk(root, [], [])
-
-    pdfium_c.FPDF_StructTree_Close(tree)
-    return mcid_to_tag, mcid_to_group, mcid_to_rank, mcid_to_ancestors, mcid_to_ancestor_ids
-
-
 def _annotate_words(
     df: pd.DataFrame,
     page,
     crop_left: float,
     crop_top: float,
+    struct_index: Dict[Tuple[Optional[int], int], StructInfo],
+    page_index: int,
 ) -> None:
     """
     Enrich *df* in-place with marked-content and struct-tree columns.
 
-    Adds: mcid, marked_tag, struct_tag, struct_tag_id,
-          struct_group_id, reading_rank.
+    Marked-content (mcid, marked_tag) is read from pdfium page objects. The
+    struct-tree columns are looked up in *struct_index* — a doc-level
+    ``{(page_index, mcid): StructInfo}`` map built once by the pikepdf-backed
+    parser in ``_utils.struct_tree`` (pikepdf resolves /RoleMap, /ClassMap and
+    attribute objects such as ColSpan/RowSpan that pdfium's struct API cannot).
+
+    Adds: mcid, marked_tag, struct_tag, struct_raw_tag, struct_tag_id,
+          struct_group_id, reading_rank, struct_ancestors, struct_ancestor_ids,
+          struct_col_span, struct_row_span, struct_scope, struct_headers.
     text_object_id is already set by the character loop before this is called.
     """
     n = len(df)
@@ -346,29 +296,38 @@ def _annotate_words(
                 tag_arr[mask]     = tag
                 matched_arr[mask] = True
 
-    # ── Struct tree ────────────────────────────────────────────────────────────
-    mcid_to_stag, mcid_to_group, mcid_to_rank, mcid_to_ancestors, mcid_to_ancestor_ids = (
-        _extract_struct_info(page)
-    )
-
+    # ── Struct tree (pikepdf index, keyed by (page_index, mcid)) ────────────────
     stag_arr    = np.empty(n, dtype=object); stag_arr[:]    = None
+    sraw_arr    = np.empty(n, dtype=object); sraw_arr[:]    = None
     sgroup_arr  = np.empty(n, dtype=object); sgroup_arr[:]  = None
     srank_arr   = np.empty(n, dtype=object); srank_arr[:]   = None
     sanc_arr    = np.empty(n, dtype=object); sanc_arr[:]    = None
     sancid_arr  = np.empty(n, dtype=object); sancid_arr[:]  = None
+    scol_arr    = np.empty(n, dtype=object); scol_arr[:]    = None
+    srow_arr    = np.empty(n, dtype=object); srow_arr[:]    = None
+    sscope_arr  = np.empty(n, dtype=object); sscope_arr[:]  = None
+    shdr_arr    = np.empty(n, dtype=object); shdr_arr[:]    = None
 
     for i, mc in enumerate(mcid_arr):
-        if mc is not None:
-            stag   = mcid_to_stag.get(mc)
-            sgrp   = mcid_to_group.get(mc)
-            srank  = mcid_to_rank.get(mc)
-            sanc   = mcid_to_ancestors.get(mc)
-            sancid = mcid_to_ancestor_ids.get(mc)
-            if stag   is not None: stag_arr[i]   = stag
-            if sgrp   is not None: sgroup_arr[i] = sgrp
-            if srank  is not None: srank_arr[i]  = srank
-            if sanc   is not None: sanc_arr[i]   = sanc
-            if sancid is not None: sancid_arr[i] = sancid
+        if mc is None:
+            continue
+        # Elements with no resolvable /Pg are stored under page key None.
+        info = struct_index.get((page_index, mc)) or struct_index.get((None, mc))
+        if info is None:
+            continue
+        if info.tag      is not None: stag_arr[i]   = info.tag
+        if info.raw_tag  is not None: sraw_arr[i]   = info.raw_tag
+        sgroup_arr[i] = info.elem_id
+        srank_arr[i]  = info.rank
+        if info.ancestors:    sanc_arr[i]   = info.ancestors
+        if info.ancestor_ids: sancid_arr[i] = info.ancestor_ids
+        # ColSpan/RowSpan only carry meaning inside a table cell; leave None
+        # elsewhere so non-table words stay clean.
+        if "TD" in info.ancestors or "TH" in info.ancestors:
+            scol_arr[i] = info.col_span
+            srow_arr[i] = info.row_span
+        if info.scope:   sscope_arr[i] = info.scope
+        if info.headers: shdr_arr[i]   = info.headers
 
     # ── struct_group_id: struct_tag_id > mcid+1e6 > text_object_id+2e6 ──────
     # Each tranche gets its own integer range to prevent cross-tranche collisions.
@@ -390,11 +349,173 @@ def _annotate_words(
     df["mcid"]                = mcid_arr
     df["marked_tag"]          = tag_arr
     df["struct_tag"]          = stag_arr
+    df["struct_raw_tag"]      = sraw_arr    # original /S before RoleMap (custom tags), e.g. "CorporateHeader"
     df["struct_tag_id"]       = sgroup_arr  # raw DFS counter; two P's with different ids are different blocks
     df["struct_group_id"]     = sg_arr
     df["reading_rank"]        = srank_arr
     df["struct_ancestors"]    = sanc_arr    # list[str] root→direct-parent, e.g. ["Document","Table","TD","P"]
     df["struct_ancestor_ids"] = sancid_arr  # list[int] parallel elem_ids for each ancestor tag
+    df["struct_col_span"]     = scol_arr    # int | None — TD/TH ColSpan (None outside a table cell)
+    df["struct_row_span"]     = srow_arr    # int | None — TD/TH RowSpan (None outside a table cell)
+    df["struct_scope"]        = sscope_arr  # "Row"|"Column"|"Both" | None — TH scope
+    df["struct_headers"]      = shdr_arr    # list[str] | None — header-cell ID references
+
+
+def _annotate_form_fields(
+    df: pd.DataFrame,
+    form_fields: List[FormField],
+    crop_left: float,
+    crop_top: float,
+    form_label_index: Dict[Tuple[Optional[int], int], FormField],
+    page_index: int,
+) -> None:
+    """
+    Enrich *df* in-place with AcroForm field metadata on the label words that
+    describe each field.
+
+    Widget values live in /AcroForm annotations, not in the content stream, so
+    pdfium never returns them as text. Rather than injecting synthetic rows, we
+    find the PDF text words that serve as visible labels for each field and
+    annotate them directly. This keeps the label–value relationship explicit for
+    downstream RAG / LLM use without disturbing the word count or spatial sort.
+
+    Two passes, structural first:
+
+      1. STRUCT — for tagged PDFs, *form_label_index* maps (page, mcid) to the
+         owning field via the structure tree (widget /OBJR ↔ label MCID). Words
+         carrying such an mcid are labelled unambiguously; no geometry involved.
+         This resolves cases spatial matching cannot, e.g. two side-by-side
+         Yes/No checkboxes, or a label that happens to sit nearer another field.
+
+      2. SPATIAL fallback — only for fields with no structural label (untagged
+         PDFs, or widgets absent from the struct tree). Label candidates:
+           • LEFT  — words whose right edge is within _MAX_LEFT_GAP left of the
+                      field's left edge, vertical centre inside its height band.
+           • ABOVE — words whose bottom edge is within _MAX_ABOVE_GAP above the
+                      field's top edge, overlapping horizontally.
+         When several fields map to one word, the horizontally closer one wins.
+         Words already claimed structurally are never overridden.
+
+    Adds columns: form_widget, form_value, form_is_empty, form_field_name,
+    form_tooltip (the field's /TU authored label/question — the most reliable,
+    verbatim label text; present on both struct- and spatially-matched words).
+    All are None on words that don't serve as a label for any field.
+    """
+    n = len(df)
+    fw_arr  = np.empty(n, dtype=object); fw_arr[:]  = None  # widget type
+    fv_arr  = np.empty(n, dtype=object); fv_arr[:]  = None  # filled value
+    fe_arr  = np.empty(n, dtype=object); fe_arr[:]  = None  # is_empty bool
+    fn_arr  = np.empty(n, dtype=object); fn_arr[:]  = None  # field_name
+    ft_arr  = np.empty(n, dtype=object); ft_arr[:]  = None  # /TU tooltip / authored label
+    # Track closest-field distance per word for the multi-field conflict rule.
+    dist_arr = np.full(n, np.inf)
+    # Words labelled by the structure tree are locked against the spatial pass.
+    struct_claimed = np.zeros(n, dtype=bool)
+
+    def _write() -> None:
+        df["form_widget"]     = fw_arr
+        df["form_value"]      = fv_arr
+        df["form_is_empty"]   = fe_arr
+        df["form_field_name"] = fn_arr
+        df["form_tooltip"]    = ft_arr
+
+    if n == 0:
+        _write()
+        return
+
+    # ── Pass 1: structural label assignment via (page, mcid) ──────────────────
+    if form_label_index and "mcid" in df.columns:
+        mcids = df["mcid"].to_numpy(dtype=object)
+        for i in range(n):
+            mc = mcids[i]
+            if mc is None:
+                continue
+            # Elements with no resolvable /Pg are keyed under page None.
+            fld = (form_label_index.get((page_index, int(mc)))
+                   or form_label_index.get((None, int(mc))))
+            if fld is None:
+                continue
+            fw_arr[i] = fld.widget_type
+            fv_arr[i] = None if fld.is_empty else fld.value
+            fe_arr[i] = fld.is_empty
+            fn_arr[i] = fld.field_name
+            ft_arr[i] = fld.label
+            struct_claimed[i] = True
+
+    # ── Pass 2: spatial fallback for fields without a structural label ────────
+    # Fields whose label was already placed structurally are skipped entirely so
+    # the brittle geometry heuristic only runs where nothing better exists.
+    struct_field_names = {
+        fld.field_name for fld in form_label_index.values()
+    } if form_label_index else set()
+    spatial_fields = [
+        f for f in form_fields if f.field_name not in struct_field_names
+    ]
+
+    if not spatial_fields:
+        _write()
+        return
+
+    wx_left   = df["x_left"].to_numpy(float)
+    wx_right  = df["x_right"].to_numpy(float)
+    wy_top    = df["y_top"].to_numpy(float)
+    wy_bottom = df["y_bottom"].to_numpy(float)
+    wy_center = (wy_top + wy_bottom) * 0.5
+
+    _MAX_LEFT_GAP  = 100.0   # max horizontal distance from word right-edge to field left
+    _MAX_ABOVE_GAP =  18.0   # max vertical distance from word bottom to field top
+    # Widget types whose label is to the RIGHT (option text) — skip left/above matching.
+    _NO_LABEL_TYPES = {"checkbox", "radio", "pushbutton"}
+
+    for fld in spatial_fields:
+        if fld.widget_type in _NO_LABEL_TYPES:
+            continue
+
+        llx, lly, urx, ury = fld.pdf_rect
+        # PDF-space (y-up) → screen-space (y-down, CropBox-relative)
+        fx_left   = llx - crop_left
+        fx_right  = urx - crop_left
+        fy_top    = crop_top - ury
+        fy_bottom = crop_top - lly
+        fheight   = fy_bottom - fy_top
+
+        # Words to the LEFT: end before field starts, centre within the field's
+        # vertical band (±20% of height to stay on the same visual row).
+        left_mask = (
+            (wx_right <= fx_left + 2.0) &
+            (wx_right >= fx_left - _MAX_LEFT_GAP) &
+            (wy_center >= fy_top    - fheight * 0.2) &
+            (wy_center <= fy_bottom + fheight * 0.2)
+        )
+        # Words ABOVE: bottom within gap above field top, horizontally overlapping.
+        above_mask = (
+            (wy_bottom >= fy_top - _MAX_ABOVE_GAP) &
+            (wy_bottom <= fy_top + 2.0) &
+            (wx_right  >= fx_left  - 5.0) &
+            (wx_left   <= fx_right + 5.0)
+        )
+
+        candidate = left_mask | above_mask
+        if not candidate.any():
+            continue
+
+        # Proximity = horizontal gap for left-labels; 0 for above-labels (treat
+        # above as same priority as touching-left).
+        horiz_gap = np.where(left_mask, fx_left - wx_right, 0.0)
+
+        idxs = np.where(candidate)[0]
+        for i in idxs:
+            if struct_claimed[i]:
+                continue  # never override a structurally-assigned label
+            if horiz_gap[i] < dist_arr[i]:
+                dist_arr[i]  = horiz_gap[i]
+                fw_arr[i]    = fld.widget_type
+                fv_arr[i]    = None if fld.is_empty else fld.value
+                fe_arr[i]    = fld.is_empty
+                fn_arr[i]    = fld.field_name
+                ft_arr[i]    = fld.label
+
+    _write()
 
 
 # ── Per-page extraction ───────────────────────────────────────────────────────
@@ -428,6 +549,9 @@ def _extract_words_for_page(
     page_number: int,
     *,
     start_word_id: int,
+    struct_index: Dict[Tuple[Optional[int], int], StructInfo],
+    form_fields: List[FormField],
+    form_label_index: Dict[Tuple[Optional[int], int], FormField],
 ) -> Tuple[pd.DataFrame, int]:
     page_width  = float(page.get_width())
     page_height = float(page.get_height())
@@ -640,7 +764,10 @@ def _extract_words_for_page(
     df["page_width"]  = page_width
     df["page_height"] = page_height
 
-    _annotate_words(df, page, crop_left, crop_top)
+    _annotate_words(df, page, crop_left, crop_top, struct_index, page_number - 1)
+    _annotate_form_fields(
+        df, form_fields, crop_left, crop_top, form_label_index, page_number - 1
+    )
 
     return df, start_word_id + n_words
 
@@ -659,14 +786,47 @@ def extract_words(
     x_left, x_right, y_top, y_bottom, width, height, font_name, font_size,
     non_stroking_color, stroking_color (both as hex #rrggbb or None),
     text_orientation, script_type,
-    mcid, marked_tag, struct_tag, struct_group_id,
-    reading_rank, text_matrix_id, text_object_id,
+    mcid, marked_tag, struct_tag, struct_raw_tag, struct_tag_id, struct_group_id,
+    reading_rank, struct_ancestors, struct_ancestor_ids,
+    struct_col_span, struct_row_span, struct_scope, struct_headers,
+    text_object_id,
+    form_widget, form_value, form_is_empty, form_field_name, form_tooltip,
     plus calculated text features.
     """
     pdf_path = Path(pdf_path).expanduser().resolve()
 
     all_dfs: List[pd.DataFrame] = []
     next_word_id = 0
+
+    # Parse structure tree and AcroForm once per document (single pikepdf open).
+    # Each step degrades gracefully: failures produce empty dicts, not exceptions.
+    #   struct_index  : {(page, mcid): StructInfo}        — struct-tree leaves
+    #   form_index    : {page_index: [FormField]}         — AcroForm fields
+    #   form_label_index : {(page, mcid): FormField}      — robust struct-tree
+    #                      widget→label join; words at these MCIDs are the field's
+    #                      visible label. Empty for untagged PDFs (spatial fallback).
+    struct_index: Dict[Tuple[Optional[int], int], StructInfo] = {}
+    widget_links = {}
+    form_index: Dict[int, List[FormField]] = {}
+    form_label_index: Dict[Tuple[Optional[int], int], FormField] = {}
+    try:
+        with pikepdf.open(str(pdf_path)) as pk:
+            try:
+                struct_index, widget_links = build_struct_index_with_links(pk)
+            except Exception:
+                struct_index, widget_links = {}, {}
+            try:
+                form_index = build_form_index(pk)
+            except Exception:
+                form_index = {}
+            try:
+                form_label_index = build_form_label_index(
+                    struct_index, widget_links, form_index
+                )
+            except Exception:
+                form_label_index = {}
+    except Exception:
+        pass
 
     with pdfium.PdfDocument(pdf_path) as doc:
         total_pages = len(doc)
@@ -684,6 +844,9 @@ def extract_words(
                     page,
                     page_number=page_number,
                     start_word_id=next_word_id,
+                    struct_index=struct_index,
+                    form_fields=form_index.get(page_number - 1, []),
+                    form_label_index=form_label_index,
                 )
             finally:
                 page.close()

@@ -28,7 +28,7 @@ Classification of a block's content role. Set progressively through the shared p
 | `watermark` | _(reserved)_ | Watermark / background text overlay |
 | `signature_block` | _(reserved)_ | Signature block at end of legal document |
 
-- Add: Comments, Footnote, Math, 
+- Add: Comments, Footnote, Math, FormField
 - Maybe change navigation to bookmark
 
 **Noise types** (stripped before chunking): `hr`, `page_label`, `image`, `suppressed_repeated_heading`, `navigation`, `watermark`
