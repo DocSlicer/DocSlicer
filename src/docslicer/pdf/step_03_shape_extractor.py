@@ -225,7 +225,10 @@ def extract_shapes(
             if page_number < 1 or page_number > total_pages:
                 continue
 
-            page = doc[page_number - 1]
+            try:
+                page = doc[page_number - 1]
+            except Exception:
+                continue
             all_shapes.extend(
                 _extract_raw_shapes_for_page(
                     page,

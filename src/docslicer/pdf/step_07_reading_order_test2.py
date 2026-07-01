@@ -23,6 +23,34 @@ import pandas as pd
 from .._utils.layout.line_merger import assign_line_id, same_line
 from .._utils.layout.reading_order import _sort_by_gutters, assign_vertical_line_ids
 
+""""
+flowchart TD
+
+    A([Start: Compare obj x with obj x+1])
+
+    A --> B{Same line? - add function def same_line}
+
+    B -- Yes --> C{Objects in between horizontally? - add function def object in between args horizontal or vertical}
+    C -- Yes --> G[Increment group_id += 1]
+    C -- No --> H[Continue with current group]
+
+    B -- No --> D{Y center decreases?}
+    D -- Yes --> G
+    D -- No --> E{Gap larger than jump threshold?}
+
+    E -- Yes --> G
+    E -- No --> F{obj x+1 is Shifted to the left outside of the current group x range?}
+
+    F -- Yes --> G
+    F -- No --> I{Objects between them vertically?}
+
+    I -- Yes --> G
+    I -- No --> H
+
+    G --> J([Next object pair])
+    H --> J
+"""
+
 
 # ================================================================================
 # STREAM GROUP DETECTION  (text_object_id path only)

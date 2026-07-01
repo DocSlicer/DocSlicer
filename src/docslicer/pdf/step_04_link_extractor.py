@@ -148,7 +148,10 @@ def extract_links(
             if page_number < 1 or page_number > total_pages:
                 continue
 
-            page = doc[page_number - 1]
+            try:
+                page = doc[page_number - 1]
+            except Exception:
+                continue
             page_records, next_link_id = _extract_links_for_page(
                 doc, page, page_number, start_link_id=next_link_id
             )

@@ -229,7 +229,10 @@ def extract_images(
             if page_number < 1 or page_number > total_pages:
                 continue
 
-            page = doc[page_number - 1]
+            try:
+                page = doc[page_number - 1]
+            except Exception:
+                continue
             page_images, next_image_id = _extract_images_for_page(
                 page,
                 page_number,

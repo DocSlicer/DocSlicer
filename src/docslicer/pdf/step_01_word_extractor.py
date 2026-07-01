@@ -63,7 +63,9 @@ Super/subscript detection:
 from __future__ import annotations
 
 import ctypes
+import io
 import math
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -73,6 +75,7 @@ import pypdfium2 as pdfium
 import pypdfium2.raw as pdfium_c
 import pandas as pd
 
+from .._utils.cpu import resolve_worker_count
 from .._utils.text_utils import add_calculated_text_features
 from ._utils.struct_tree import StructInfo, build_struct_index_with_links
 from ._utils.form_fields import FormField, build_form_index
@@ -887,6 +890,63 @@ def _extract_words_for_page(
     return df, start_word_id + len(df)
 
 
+# ── Parallel helpers ──────────────────────────────────────────────────────────
+
+_PARALLEL_PAGE_THRESHOLD = 50
+
+
+def _chunk_pages(page_numbers: List[int], n_chunks: int) -> List[List[int]]:
+    k, rem = divmod(len(page_numbers), n_chunks)
+    chunks, start = [], 0
+    for i in range(n_chunks):
+        end = start + k + (1 if i < rem else 0)
+        if start < end:
+            chunks.append(page_numbers[start:end])
+        start = end
+    return chunks
+
+
+def _extract_words_chunk(
+    pdf_bytes: bytes,
+    page_numbers: List[int],
+    struct_index: Dict[Tuple[Optional[int], int], StructInfo],
+    form_index: Dict[int, List[FormField]],
+    form_label_index: Dict[Tuple[Optional[int], int], FormField],
+) -> List[pd.DataFrame]:
+    """Worker: opens its own in-memory PdfDocument and processes a chunk of pages.
+
+    Runs in a separate *process* (PDFium is not thread-safe — concurrent document
+    loads/parses race on shared C state). Accepts bytes (read once by the caller,
+    pickled to each worker) so it uses FPDF_LoadMemDocument rather than
+    FPDF_LoadDocument. word_id values are page-local (start_word_id=0); the caller
+    reassigns them globally after merging all chunks.
+    """
+    dfs: List[pd.DataFrame] = []
+    with pdfium.PdfDocument(io.BytesIO(pdf_bytes)) as doc:
+        total_pages = len(doc)
+        for page_number in page_numbers:
+            if page_number < 1 or page_number > total_pages:
+                continue
+            try:
+                page = doc[page_number - 1]
+            except Exception:
+                continue
+            try:
+                page_df, _ = _extract_words_for_page(
+                    page,
+                    page_number=page_number,
+                    start_word_id=0,
+                    struct_index=struct_index,
+                    form_fields=form_index.get(page_number - 1, []),
+                    form_label_index=form_label_index,
+                )
+            finally:
+                page.close()
+            if not page_df.empty:
+                dfs.append(page_df)
+    return dfs
+
+
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def extract_words(
@@ -909,9 +969,6 @@ def extract_words(
     plus calculated text features.
     """
     pdf_path = Path(pdf_path).expanduser().resolve()
-
-    all_dfs: List[pd.DataFrame] = []
-    next_word_id = 0
 
     # Parse structure tree and AcroForm once per document (single pikepdf open).
     # Each step degrades gracefully: failures produce empty dicts, not exceptions.
@@ -945,32 +1002,65 @@ def extract_words(
 
     with pdfium.PdfDocument(pdf_path) as doc:
         total_pages = len(doc)
-        page_numbers = (
+        page_numbers_list: List[int] = list(
             range(1, total_pages + 1)
             if pages_to_process is None
             else pages_to_process
         )
-        for page_number in page_numbers:
-            if page_number < 1 or page_number > total_pages:
-                continue
-            page = doc[page_number - 1]
-            try:
-                page_df, next_word_id = _extract_words_for_page(
-                    page,
-                    page_number=page_number,
-                    start_word_id=next_word_id,
-                    struct_index=struct_index,
-                    form_fields=form_index.get(page_number - 1, []),
-                    form_label_index=form_label_index,
+
+    n_workers = 1
+    if len(page_numbers_list) >= _PARALLEL_PAGE_THRESHOLD:
+        n_workers = resolve_worker_count(None, n_items=len(page_numbers_list))
+
+    all_dfs: List[pd.DataFrame] = []
+
+    if n_workers > 1:
+        pdf_bytes = pdf_path.read_bytes()
+        chunks = _chunk_pages(page_numbers_list, n_workers)
+        with ProcessPoolExecutor(max_workers=n_workers) as ex:
+            futures = [
+                ex.submit(
+                    _extract_words_chunk,
+                    pdf_bytes, chunk, struct_index, form_index, form_label_index,
                 )
-            finally:
-                page.close()
-            if not page_df.empty:
-                all_dfs.append(page_df)
+                for chunk in chunks
+            ]
+            for f in futures:
+                all_dfs.extend(f.result())
+    else:
+        next_word_id = 0
+        with pdfium.PdfDocument(pdf_path) as doc:
+            total_pages = len(doc)
+            for page_number in page_numbers_list:
+                if page_number < 1 or page_number > total_pages:
+                    continue
+                try:
+                    page = doc[page_number - 1]
+                except Exception:
+                    continue
+                try:
+                    page_df, next_word_id = _extract_words_for_page(
+                        page,
+                        page_number=page_number,
+                        start_word_id=next_word_id,
+                        struct_index=struct_index,
+                        form_fields=form_index.get(page_number - 1, []),
+                        form_label_index=form_label_index,
+                    )
+                finally:
+                    page.close()
+                if not page_df.empty:
+                    all_dfs.append(page_df)
 
     if not all_dfs:
         return pd.DataFrame()
 
     df = pd.concat(all_dfs, ignore_index=True)
+
+    if n_workers > 1:
+        # Chunks arrive out of order; restore reading order then assign global ids.
+        df = df.sort_values(["page_number", "word_id"], kind="mergesort").reset_index(drop=True)
+        df["word_id"] = range(1, len(df) + 1)
+
     df = add_calculated_text_features(df)
     return df
