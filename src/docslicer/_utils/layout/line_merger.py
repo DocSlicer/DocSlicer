@@ -187,6 +187,39 @@ def same_line(
     return False
 
 
+def same_line_pairwise(
+    y_top_a: np.ndarray,
+    y_bottom_a: np.ndarray,
+    y_top_b: np.ndarray,
+    y_bottom_b: np.ndarray,
+    config: LineMergerConfig = LineMergerConfig(),
+) -> np.ndarray:
+    """Vectorized :func:`same_line`.
+
+    Element-wise equivalent of ``same_line`` for equal-length arrays of bbox
+    edges, returning a boolean mask. Use this instead of calling ``same_line``
+    in a Python loop — it evaluates every pair in a handful of NumPy ops.
+
+    All four inputs must be float arrays of the same length. ``y_top`` is the
+    smaller (upper) edge and ``y_bottom`` the larger (lower) edge, matching the
+    screen-space convention used across the pipeline (y increases downward).
+    """
+    y_top_a    = np.asarray(y_top_a,    dtype=float)
+    y_bottom_a = np.asarray(y_bottom_a, dtype=float)
+    y_top_b    = np.asarray(y_top_b,    dtype=float)
+    y_bottom_b = np.asarray(y_bottom_b, dtype=float)
+
+    yc_a = (y_top_a + y_bottom_a) * 0.5
+    yc_b = (y_top_b + y_bottom_b) * 0.5
+    dy   = np.abs(yc_a - yc_b)
+
+    overlap = np.minimum(y_bottom_a, y_bottom_b) - np.maximum(y_top_a, y_top_b)
+
+    return (dy <= config.TOL_BASE) | (
+        (dy <= config.TOL_EXPANDED) & (overlap >= config.MIN_VERTICAL_OVERLAP)
+    )
+
+
 # -----------------------
 # Internal helpers
 # -----------------------

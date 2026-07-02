@@ -182,6 +182,7 @@ class StructInfo:
     elem_id: int                     # global DFS id of the owning element
     rank: int                        # global DFS reading-order position
     ancestors: List[str]             # resolved tags root -> direct parent
+    raw_ancestors: List[str]         # original /S values root -> direct parent (pre-RoleMap)
     ancestor_ids: List[int]          # parallel DFS elem_ids for each ancestor
     attrs: Dict[str, Any]            # merged own attributes (/C classes then /A)
     chain_attrs: List[Dict[str, Any]] = field(default_factory=list)  # per-ancestor attrs
@@ -420,6 +421,7 @@ class _StructTreeParser:
         self,
         elem: pikepdf.Dictionary,
         anc_tags: List[str],
+        anc_raw_tags: List[str],
         anc_ids: List[int],
         anc_attrs: List[Dict[str, Any]],
         inherited_pg: Any,
@@ -443,27 +445,30 @@ class _StructTreeParser:
         pg = elem.get("/Pg") or inherited_pg
         attrs = self._collect_attrs(elem)
 
-        child_tags = anc_tags + [tag] if tag else anc_tags
-        child_ids = anc_ids + [elem_id] if tag else anc_ids
-        child_attrs = anc_attrs + [attrs] if tag else anc_attrs
+        child_tags     = anc_tags     + [tag] if tag else anc_tags
+        child_raw_tags = anc_raw_tags + [raw] if raw else anc_raw_tags
+        child_ids      = anc_ids      + [elem_id] if tag else anc_ids
+        child_attrs    = anc_attrs    + [attrs] if tag else anc_attrs
 
         leaf_template = dict(
             tag=tag, raw_tag=raw, ns=ns_uri, elem_id=elem_id,
-            ancestors=child_tags, ancestor_ids=child_ids, attrs=attrs,
+            ancestors=child_tags, raw_ancestors=child_raw_tags,
+            ancestor_ids=child_ids, attrs=attrs,
             chain_attrs=child_attrs,
             actual_text=_text(elem.get("/ActualText")),
             alt=_text(elem.get("/Alt")),
             lang=_text(elem.get("/Lang")),
         )
 
-        self._process_k(elem.get("/K"), leaf_template, child_tags, child_ids,
-                        child_attrs, pg, path)
+        self._process_k(elem.get("/K"), leaf_template, child_tags, child_raw_tags,
+                        child_ids, child_attrs, pg, path)
 
     def _process_k(
         self,
         k: Any,
         leaf_template: dict,
         child_tags: List[str],
+        child_raw_tags: List[str],
         child_ids: List[int],
         child_attrs: List[Dict[str, Any]],
         pg: Any,
@@ -473,8 +478,8 @@ class _StructTreeParser:
             return
         if isinstance(k, pikepdf.Array):
             for item in k:
-                self._process_k(item, leaf_template, child_tags, child_ids,
-                                child_attrs, pg, path)
+                self._process_k(item, leaf_template, child_tags, child_raw_tags,
+                                child_ids, child_attrs, pg, path)
             return
 
         # bare MCID integer -> leaf content of the current element
@@ -487,7 +492,9 @@ class _StructTreeParser:
 
         if isinstance(k, pikepdf.Dictionary):
             t = _name(k.get("/Type"))
-            if t == "MCR":  # marked-content reference
+            # Treat as MCR when /Type is explicit, or when /Type is absent but
+            # /MCID is present — many generators omit /Type on MCR dicts.
+            if t == "MCR" or (t is None and k.get("/MCID") is not None):
                 mcid = _as_int(k.get("/MCID"))
                 if mcid is not None:
                     self._record(mcid, k.get("/Pg") or pg,
@@ -518,7 +525,7 @@ class _StructTreeParser:
                 # Nested structure element. child_tags already includes the
                 # current element, which is exactly the ancestor chain the child
                 # inherits; _walk appends the child's own tag on top.
-                self._walk(k, child_tags, child_ids, child_attrs, pg, path)
+                self._walk(k, child_tags, child_raw_tags, child_ids, child_attrs, pg, path)
 
     def parse(self) -> Dict[Tuple[Optional[int], int], StructInfo]:
         if self.root is None:
@@ -529,7 +536,7 @@ class _StructTreeParser:
         items = top if isinstance(top, pikepdf.Array) else [top]
         for item in items:
             if isinstance(item, pikepdf.Dictionary):
-                self._walk(item, [], [], [], None, set())
+                self._walk(item, [], [], [], [], None, set())
         return self.index
 
 

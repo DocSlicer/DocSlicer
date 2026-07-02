@@ -8,8 +8,10 @@ Output columns:
     fill, stroke, paint_op
 
 Coordinate system: FPDFPageObj_GetBounds returns (left, bottom, right, top) in
-PDF space (y increases upward). We convert to screen space (y increases downward):
-y_top = page_height - pdf_top.
+raw, unrotated PDF space (y increases upward). We convert to screen space
+(y increases downward, in the page's *displayed* orientation) via
+_utils.page_rotation.make_rotation_transform, which also accounts for the
+page's /Rotate entry — see that module's docstring for why this is needed.
 """
 
 from __future__ import annotations
@@ -21,6 +23,8 @@ from typing import Any, Dict, List, Optional, Sequence
 import pypdfium2 as pdfium
 import pypdfium2.raw as pdfium_c
 import pandas as pd
+
+from ._utils.page_rotation import make_rotation_transform
 
 
 # ── Module-level function references (avoid attribute lookup in tight loops) ──
@@ -92,7 +96,9 @@ def _extract_raw_shapes_for_page(
 ) -> List[Dict[str, Any]]:
     raw_shapes: List[Dict[str, Any]] = []
     seen_hashes: set = set()
-    page_height = page.get_height()
+    page_width  = float(page.get_width())
+    page_height = float(page.get_height())
+    to_screen, _rotation = make_rotation_transform(page, page_width, page_height)
 
     # Pre-allocate all ctypes slots once — reused for every shape on this page.
     _l = c_float(); _b = c_float(); _r = c_float(); _t = c_float()
@@ -108,15 +114,7 @@ def _extract_raw_shapes_for_page(
 
         # ── Bounds ──────────────────────────────────────────────────────────
         _get_bounds(raw_obj, _l, _b, _r, _t)
-        pdf_l = _l.value; pdf_b = _b.value
-        pdf_r = _r.value; pdf_t = _t.value
-
-        x_left  = min(pdf_l, pdf_r)
-        x_right = max(pdf_l, pdf_r)
-        y_top    = page_height - pdf_t
-        y_bottom = page_height - pdf_b
-        if y_top > y_bottom:
-            y_top, y_bottom = y_bottom, y_top
+        x_left, y_top, x_right, y_bottom = to_screen(_l.value, _b.value, _r.value, _t.value)
 
         width  = x_right - x_left
         height = y_bottom - y_top

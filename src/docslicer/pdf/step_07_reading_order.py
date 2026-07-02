@@ -1,330 +1,540 @@
 """
 step_07_reading_order.py
 
-Assign line_id to every word in df_words.
+# ==============================================================================
+# NATIVE PDF STREAMING-ORDER ASSIGNMENT
+# ==============================================================================
+#
+# Goal
+# ----
+# 1. Derive an approximate reading order for native PDFs from the PDF content
+#    stream (`text_object_id`) instead of relying primarily on geometric
+#    heuristics such as XY-cut.
+#
+# 2. Partition consecutive text objects into `stream_group_id`s representing
+#    logical reading segments (typically lines or contiguous reading runs).
+#
+# 3. Leverage tagged-PDF metadata (`struct_group_id`, `table_id`, `textbox_id`)
+#    when available to improve grouping accuracy.
+#
+# 4. Assign `line_id`s to all words based on the resulting streaming groups.
+#
+# Background
+# ----------
+# This module is only used for native PDFs.
+#
+# PDFium exposes text objects in the order they appear in a page's content
+# stream (`text_object_id`, numbered 1..N per page). This native PDF streaming
+# order generally follows the intended reading order much more closely than
+# geometric layout heuristics, although occasional outliers exist (e.g. page
+# labels, headers/footers, or other content emitted earlier or later in the
+# content stream).
+#
+# Scanned PDFs are handled by the OCR pipeline, which derives reading order from
+# the page image using layout analysis (e.g. gutter detection), and therefore do
+# not use this algorithm.
+#
+# A later pipeline stage may reposition isolated streaming groups to produce the
+# final human reading order.
+# ==============================================================================
 
-Strategy:
-  1. Check whether text_object_id is populated (PDF byte-stream order, most accurate).
-  2. If YES  → sort horizontal words by (page_number, text_object_id), call assign_line_id.
-  3. If NO   → run gutter detection (if not already done), sort via gutter-aware heuristic,
-               call assign_line_id.
-  4. Vertical words (TTB / BTT) are processed separately after horizontal words and receive
-     line_ids offset above the highest horizontal line_id so they sort to the end of each page.
-
-Public API:
-    df_words = assign_reading_order(df_words, df_shapes)
 """
 
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 
-from .._utils.layout.line_merger import assign_line_id
-from .._utils.layout.reading_order import _sort_by_gutters, assign_vertical_line_ids
+from .._utils.layout.line_merger import assign_line_id, same_line, same_line_pairwise
+
+""""
+flowchart TD
+
+    A([Start: Compare obj x with obj x+1])
+
+    A --> T{Tagged PDF relationship?}
+
+    T -->|Same struct_group_id| H[Continue current streaming group]
+    T -->|Same table_id| H
+    T -->|Different textbox_id| G[Increment group_id += 1]
+    T -->|No tagged relationship| B{Same line?}
+
+    B -->|Yes| O
+    B -->|No| D{Y center decreases?}
+
+    D -->|Yes| G
+    D -->|No| E{Gap larger than jump threshold?}
+
+    E -->|Yes| G
+    E -->|No| F{Shifted left outside current group x-range?}
+
+    F -->|Yes| G
+    F -->|No| O
+
+    O{Objects in between?}
+
+    O -->|Yes| G
+    O -->|No| H
+
+    G --> J([Next object pair])
+    H --> J
+    J --> A
+"""
 
 
 # ================================================================================
 # STREAM GROUP DETECTION  (text_object_id path only)
 # ================================================================================
 
-_STREAM_GROUP_Y_JUMP: float = 60.0  # pt — forward jump that starts a new group
+_STREAM_GROUP_Y_JUMP: float = 50.0  # pt — forward jump that starts a new group
+_Y_DECREASE_TOL: float = 5.0        # pt — upward jump must exceed this to count
 
+# objects_between: two objects are "far apart" (and thus worth scanning between)
+# when the gap on either axis reaches this many points; a third object counts as
+# "in between" when more than this fraction of its area lies inside the pair's
+# collective bbox.
+_OBJECTS_BETWEEN_GAP: float = 15.0
+_OBJECTS_BETWEEN_AREA_FRAC: float = 0.5
 
-def _assign_stream_groups(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Add stream_group_id to words after text_object_id-based line assignment.
-
-    Within each page, line_ids are in PDF stream order.  Most of the time that
-    matches top-to-bottom reading order, but artifacts (page numbers, running
-    titles, footnotes) can appear anywhere in the stream.
-
-    A new group starts when moving from one line_id to the next (in stream order):
-      - y_center decreases  (stream jumped back up the page)
-      - y_center increases by more than _STREAM_GROUP_Y_JUMP  (large spatial gap)
-
-    group_id is globally unique across the document (cumulative across pages).
-    """
-    df = df.copy()
-
-    # Per-word y center, then mean per (page, line_id)
-    word_yc = (df["y_top"] + df["y_bottom"]) / 2.0
-    line_yc = (
-        word_yc.groupby([df["page_number"], df["line_id"]])
-        .mean()
-        .rename("y_center")
-        .reset_index()
-    )
-
-    # Sort by (page, line_id) — line_id already encodes stream order within each page
-    line_yc = line_yc.sort_values(["page_number", "line_id"], kind="mergesort").reset_index(drop=True)
-
-    # Detect breaks vectorized
-    prev_yc   = line_yc["y_center"].shift(1)
-    prev_page = line_yc["page_number"].shift(1)
-    delta     = line_yc["y_center"] - prev_yc
-
-    is_break = (
-        line_yc["page_number"].ne(prev_page)   # new page
-        | prev_yc.isna()                        # first row overall
-        | delta.lt(0)                           # y went backwards
-        | delta.gt(_STREAM_GROUP_Y_JUMP)        # large forward gap
-    )
-
-    line_yc["stream_group_id"] = is_break.cumsum().astype("int64")
-    line_yc["line_y_center"]   = line_yc["y_center"].round(2)
-
-    # Map back to words
-    mapping = line_yc.set_index(["page_number", "line_id"])[["stream_group_id", "line_y_center"]]
-    idx = pd.MultiIndex.from_arrays([df["page_number"], df["line_id"]])
-    df["stream_group_id"] = mapping["stream_group_id"].reindex(idx).values
-    df["line_y_center"]   = mapping["line_y_center"].reindex(idx).values
-
-    return df
+# shifted_left: obj_b lies entirely to the LEFT of the current streaming group's
+# accumulated x-range — its right edge is at/left of the group's x_min (within
+# this much overlap slack) → it has "shifted left" out of the group's x-range and
+# begins a new group. An object that overlaps the group's x-span in any
+# meaningful way instead widens the group and does NOT count as shifted.
+_SHIFT_LEFT_TOL: float = 2.0
 
 
 # ================================================================================
-# STREAM GROUP RESHUFFLING  (text_object_id path only)
+# OBJECT-LEVEL COLLAPSE
 # ================================================================================
+#
+# The pairwise algorithm reasons about *text objects*, not words. A single
+# PDFium text object (one content-stream Tj run) usually spans several words,
+# so we first collapse ``df_words`` down to one row per ``(page_number,
+# text_object_id)``. The object bbox is the union of its word bboxes; tagged
+# fields (struct_group_id / table_id / textbox_id) are constant within a text
+# object (they are resolved per ``(page, text_object_id)`` upstream), so we take
+# the first value.
+#
+# Words with a null ``text_object_id`` (rare — PDFium could not attribute them
+# to a content-stream object) have no known stream position. Each is given its
+# own synthetic object (so they never merge with unrelated words) with a large
+# id (>= _SYNTH_OBJ_BASE) that parks them, in their original row order, at the
+# END of the page's stream — the least-disruptive spot, since it makes them
+# trailing objects rather than injecting a bogus leading pair.
+#   NOTE: where null-id words truly belong is a genuine open question — see the
+#   caveats returned to the caller.
+_SYNTH_OBJ_BASE: int = 1_000_000
 
-_RESHUFFLE_MAX_LINES = 3      # groups with ≤ this many distinct line_ids are candidates
-_RESHUFFLE_MIN_JUMP  = 50.0  # pt — min absolute y-jump from prior group to trigger reshuffle
+# Columns carried through to the object level, if present on df_words.
+_OBJ_TAG_COLS: tuple[str, ...] = (
+    "struct_group_id",
+    "table_id",
+    "table_row_id",
+    "textbox_id",
+    "block_type",
+)
 
 
-def _reshuffle_stream_groups(df: pd.DataFrame) -> pd.DataFrame:
+def _object_key(df_words: pd.DataFrame) -> np.ndarray:
+    """Return a null-safe int64 object key aligned to ``df_words`` rows.
+
+    The key is the row's ``text_object_id`` where present; null ids get a unique
+    synthetic id (``>= _SYNTH_OBJ_BASE``, in row order) so groupby keeps them
+    separate instead of dropping or merging them, and so they sort to the end of
+    their page. The result is deterministic for a given row order, so the same
+    key can be recomputed later to merge object-level results back onto words.
     """
-    Reposition small stream groups that make large jumps (page numbers, running
-    headers/footers) into their correct spatial position among the backbone of
-    large groups (columns, body text) which stay in stream order.
+    obj_ids = df_words["text_object_id"].to_numpy(dtype=object)
+    null_mask = df_words["text_object_id"].isna().to_numpy()
+    if null_mask.any():
+        obj_ids = obj_ids.copy()
+        obj_ids[null_mask] = _SYNTH_OBJ_BASE + np.arange(null_mask.sum(), dtype=np.int64)
+    return np.asarray(obj_ids, dtype=np.int64)
 
-    Rules
-    -----
-    - Candidate: ≤ _RESHUFFLE_MAX_LINES distinct line_ids AND jump from prior
-      group's last line y_center > _RESHUFFLE_MIN_JUMP pt (forward or backward).
-    - Candidates are inserted into the keep-group backbone ordered by their first
-      line's y_center.  Tiebreaker: smaller line_id first.
-    - After reshuffling, line_id is reindexed sequentially across the document.
+
+def _collapse_to_objects(df_words: pd.DataFrame) -> pd.DataFrame:
+    """Collapse word rows to one row per ``(page_number, text_object_id)``.
+
+    Returns a frame sorted by ``(page_number, text_object_id)`` — i.e. content
+    stream order within each page — with a union bbox and the object's tagged
+    fields. The bbox columns are ``x_left, y_top, x_right, y_bottom``. The
+    ``text_object_id`` column holds the null-safe key from :func:`_object_key`.
     """
-    # ── One row per distinct line_id in each group ────────────────────────────
-    per_line = (
-        df.groupby(["page_number", "stream_group_id", "line_id"])["line_y_center"]
-        .first()
-        .reset_index()
-        .sort_values(["page_number", "stream_group_id", "line_id"])
-        .reset_index(drop=True)
-    )
+    required = ["page_number", "text_object_id", "x_left", "y_top", "x_right", "y_bottom"]
+    missing = [c for c in required if c not in df_words.columns]
+    if missing:
+        raise KeyError(f"_collapse_to_objects: missing required columns: {missing}")
 
-    # ── Mark groups that contain any vertical word (never reshuffle those) ────
-    if "text_orientation" in df.columns:
-        vert_groups = (
-            df.loc[df["text_orientation"].isin(["TTB", "BTT"]), "stream_group_id"]
-            .unique()
+    df = df_words.copy()
+    df["text_object_id"] = _object_key(df_words)
+
+    agg: dict[str, tuple[str, str]] = {
+        "x_left":   ("x_left",   "min"),
+        "y_top":    ("y_top",    "min"),
+        "x_right":  ("x_right",  "max"),
+        "y_bottom": ("y_bottom", "max"),
+    }
+    for col in _OBJ_TAG_COLS:
+        if col in df.columns:
+            agg[col] = (col, "first")
+
+    df_objs = (
+        df.groupby(["page_number", "text_object_id"], sort=True, dropna=False)
+          .agg(**agg)
+          .reset_index()
+    )
+    return df_objs
+
+
+# ================================================================================
+# PAIRWISE FEATURES
+# ================================================================================
+#
+# Each row of the returned frame is an adjacent pair (obj_a, obj_b) where obj_b
+# is the immediately following text object *on the same page*. Features are
+# fully vectorized. The last object of every page has no successor and so
+# produces no pair row.
+#
+# NOT computed here (requires streaming state):
+#   - shifted_left    : depends on the cumulative x-span of the *current*
+#                       streaming group, so it can only be evaluated while
+#                       streaming groups are being built, not as a static
+#                       pairwise column.
+
+def build_pair_features(df_words: pd.DataFrame) -> pd.DataFrame:
+    """Compute the vectorized pairwise feature table for reading-order grouping.
+
+    One row per adjacent same-page text-object pair, with columns:
+
+        page_number   the page both objects live on
+        obj_a, obj_b  text_object_id of the earlier / later object
+        same_line     obj_b sits on the same text line as obj_a
+        y_decreases   obj_b's y-center is above obj_a's (jumped back up the page)
+        large_gap     forward y-center jump exceeds the group-break threshold
+        same_struct   both objects share a (non-null) struct_group_id
+        same_table    both objects share a (non-null) table_id
+        new_textbox   the two objects have different textbox_id values
+        objects_between  a third object sits inside the pair's collective bbox
+
+    ``shifted_left`` is intentionally omitted (see the module notes above).
+    """
+    df_objs = _collapse_to_objects(df_words)
+    arr = _pairwise_arrays(df_objs)
+
+    # Pairs are (row i, row i+1). A pair is valid only when both rows are on the
+    # same page, so we drop the boundary rows where the page changes.
+    page = df_objs["page_number"].to_numpy()
+    same_page = page[:-1] == page[1:]
+
+    obj_id = df_objs["text_object_id"].to_numpy()
+    feats = pd.DataFrame({
+        "page_number": page[:-1][same_page],
+        "obj_a":       obj_id[:-1][same_page],
+        "obj_b":       obj_id[1:][same_page],
+        **{name: col[same_page] for name, col in arr.items()},
+    })
+    return feats
+
+
+# The vectorized pair features, in the order the group-walk consults them.
+_VECTOR_FEATURE_COLS: tuple[str, ...] = (
+    "same_line",
+    "y_decreases",
+    "large_gap",
+    "same_struct",
+    "same_table",
+    "new_textbox",
+    "objects_between",
+)
+
+
+def _pairwise_arrays(df_objs: pd.DataFrame) -> dict[str, np.ndarray]:
+    """Compute the vectorized pair features over *every* consecutive row pair.
+
+    Returns one boolean array per feature in ``_VECTOR_FEATURE_COLS``, each of
+    length ``len(df_objs) - 1`` and indexed by gap ``i`` (between row ``i`` and
+    row ``i + 1``). Cross-page gaps are included here (callers mask them out as
+    needed); ``objects_between`` already forces them ``False``.
+    """
+    n = len(df_objs)
+    if n < 2:
+        return {name: np.zeros(0, dtype=bool) for name in _VECTOR_FEATURE_COLS}
+
+    a = df_objs.iloc[:-1].reset_index(drop=True)
+    b = df_objs.iloc[1:].reset_index(drop=True)
+
+    yt_a, yb_a = a["y_top"].to_numpy(float), a["y_bottom"].to_numpy(float)
+    yt_b, yb_b = b["y_top"].to_numpy(float), b["y_bottom"].to_numpy(float)
+
+    # Forward vertical delta of the center: positive = obj_b is further down.
+    dy_center = (yt_b + yb_b) * 0.5 - (yt_a + yb_a) * 0.5
+
+    return {
+        "same_line":       same_line_pairwise(yt_a, yb_a, yt_b, yb_b),
+        "y_decreases":     dy_center < -_Y_DECREASE_TOL,
+        "large_gap":       dy_center > _STREAM_GROUP_Y_JUMP,
+        "same_struct":     _same_nonnull(a, b, "struct_group_id"),
+        "same_table":      _same_nonnull(a, b, "table_id"),
+        "new_textbox":     _differs(a, b, "textbox_id"),
+        "objects_between": _compute_objects_between(df_objs),
+    }
+
+
+def _compute_objects_between(df_objs: pd.DataFrame) -> np.ndarray:
+    """Flag adjacent object pairs that have a third object sitting between them.
+
+    Operates on the object-level frame (sorted by ``(page_number,
+    text_object_id)``) and returns a boolean array of length ``len(df_objs) - 1``
+    where entry ``i`` describes the gap between row ``i`` and row ``i + 1``.
+    Cross-page gaps are always ``False``.
+
+    A pair qualifies when BOTH:
+      1. the two objects are "far apart" — the horizontal gap
+         (``b.x_left - a.x_right``) or the vertical gap
+         (``b.y_top - a.y_bottom``) is at least ``_OBJECTS_BETWEEN_GAP`` pt; and
+      2. some *other* object on the page has more than
+         ``_OBJECTS_BETWEEN_AREA_FRAC`` of its own area inside the pair's
+         collective (union) bbox.
+
+    Within each page this is a vectorized ``(pairs x objects)`` broadcast, so the
+    transient cost is O(M²) in the object count M of the busiest page.
+    """
+    n = len(df_objs)
+    out = np.zeros(max(n - 1, 0), dtype=bool)
+    if n < 3:
+        return out  # need at least one object besides a pair
+
+    page = df_objs["page_number"].to_numpy()
+    xl = df_objs["x_left"].to_numpy(float)
+    yt = df_objs["y_top"].to_numpy(float)
+    xr = df_objs["x_right"].to_numpy(float)
+    yb = df_objs["y_bottom"].to_numpy(float)
+
+    # Contiguous per-page blocks (rows are already grouped by page after the sort).
+    change = np.flatnonzero(page[1:] != page[:-1]) + 1
+    starts = np.concatenate(([0], change))
+    ends   = np.concatenate((change, [n]))
+
+    for s, e in zip(starts, ends):
+        m = e - s
+        if m < 3:
+            continue  # only the two pair members exist — nothing can be between
+
+        pxl, pyt, pxr, pyb = xl[s:e], yt[s:e], xr[s:e], yb[s:e]
+
+        # Collective bbox of each consecutive pair (p = 0 .. m-2).
+        cxl = np.minimum(pxl[:-1], pxl[1:])
+        cyt = np.minimum(pyt[:-1], pyt[1:])
+        cxr = np.maximum(pxr[:-1], pxr[1:])
+        cyb = np.maximum(pyb[:-1], pyb[1:])
+
+        # Precondition: far apart on either axis.
+        far = (
+            (pxl[1:] - pxr[:-1] >= _OBJECTS_BETWEEN_GAP)
+            | (pyt[1:] - pyb[:-1] >= _OBJECTS_BETWEEN_GAP)
         )
-        vert_group_set: set = set(vert_groups)
-    else:
-        vert_group_set = set()
 
-    # ── Per-group stats ───────────────────────────────────────────────────────
-    grp = (
-        per_line
-        .groupby(["page_number", "stream_group_id"], sort=True)
-        .agg(
-            n_lines      =("line_id",       "nunique"),
-            first_line_y =("line_y_center", "first"),
-            last_line_y  =("line_y_center", "last"),
-            first_line_id=("line_id",       "min"),
+        # Intersection area of every object (columns) with every pair bbox (rows).
+        inter_w = np.clip(
+            np.minimum(cxr[:, None], pxr[None, :]) - np.maximum(cxl[:, None], pxl[None, :]),
+            0.0, None,
         )
-        .reset_index()
-        .sort_values(["page_number", "stream_group_id"])
-        .reset_index(drop=True)
-    )
-
-    grp["prev_last_y"] = grp.groupby("page_number")["last_line_y"].shift(1)
-    grp["jump"]        = grp["first_line_y"] - grp["prev_last_y"]
-    grp["is_reshuffle"] = (
-        (grp["n_lines"] <= _RESHUFFLE_MAX_LINES)
-        & (grp["jump"].abs() > _RESHUFFLE_MIN_JUMP)
-        & grp["prev_last_y"].notna()   # never reshuffle the first group on a page
-        & ~grp["stream_group_id"].isin(vert_group_set)   # never reshuffle vertical text groups
-    )
-
-    # ── Per page: merge candidates into backbone by first_line_y ──────────────
-    new_order_rows: list[dict] = []
-    for _, pg in grp.groupby("page_number"):
-        pg = pg.reset_index(drop=True)
-
-        keep_list = pg.loc[~pg["is_reshuffle"], ["stream_group_id", "first_line_y"]].values.tolist()
-        resh_list = (
-            pg[pg["is_reshuffle"]]
-            .sort_values(["first_line_y", "first_line_id"])
-            [["stream_group_id", "first_line_y"]]
-            .values.tolist()
+        inter_h = np.clip(
+            np.minimum(cyb[:, None], pyb[None, :]) - np.maximum(cyt[:, None], pyt[None, :]),
+            0.0, None,
         )
+        inter_area = inter_w * inter_h
 
-        final: list[int] = []
-        ri = 0
-        for k_sgid, k_fy in keep_list:
-            while ri < len(resh_list) and resh_list[ri][1] <= k_fy:
-                final.append(int(resh_list[ri][0]))
-                ri += 1
-            final.append(int(k_sgid))
-        while ri < len(resh_list):
-            final.append(int(resh_list[ri][0]))
-            ri += 1
+        obj_area = (pxr - pxl) * (pyb - pyt)
+        obj_area_safe = np.where(obj_area > 0.0, obj_area, np.inf)  # zero-area → frac 0
+        inside = inter_area / obj_area_safe[None, :] > _OBJECTS_BETWEEN_AREA_FRAC
 
-        for rank, sgid in enumerate(final):
-            new_order_rows.append({"stream_group_id": sgid, "new_group_rank": rank})  # noqa: PERF401
+        # A pair's two own members must not count as "between".
+        rows = np.arange(m - 1)
+        inside[rows, rows] = False       # obj_a (local index p)
+        inside[rows, rows + 1] = False   # obj_b (local index p+1)
 
-    new_order_df = pd.DataFrame(new_order_rows)
+        out[s : s + (m - 1)] = far & inside.any(axis=1)
 
-    # ── Within-group line rank (preserves stream order inside each group) ─────
-    per_line["within_group_rank"] = (
-        per_line.groupby(["page_number", "stream_group_id"])["line_id"]
-        .rank(method="dense")
-        .astype(int)
-    )
-
-    # ── Sort all lines into final order and assign new sequential line_id ──────
-    per_line = (
-        per_line
-        .merge(new_order_df, on="stream_group_id", how="left")
-        .sort_values(
-            ["page_number", "new_group_rank", "within_group_rank"],
-            kind="mergesort",
-        )
-        .reset_index(drop=True)
-    )
-    per_line["new_line_id"] = range(1, len(per_line) + 1)
-
-    line_id_map = dict(zip(per_line["line_id"], per_line["new_line_id"]))
-    out = df.copy()
-    out["line_id"] = out["line_id"].map(line_id_map)
     return out
 
 
-# ================================================================================
-# PUBLIC API
-# ================================================================================
+def _same_nonnull(a: pd.DataFrame, b: pd.DataFrame, col: str) -> np.ndarray:
+    """True where a[col] == b[col] and neither side is null.
 
-def assign_reading_order(
-    df_words: pd.DataFrame,
-    df_shapes: pd.DataFrame | None = None,
-) -> pd.DataFrame:
+    Missing column → all False (the relationship cannot hold without the data).
     """
-    Add line_id to every word in df_words.
+    if col not in a.columns or col not in b.columns:
+        return np.zeros(len(a), dtype=bool)
+    va, vb = a[col], b[col]
+    return (va.notna() & vb.notna() & (va == vb)).to_numpy()
 
-    Processes page by page so vertical words on each page receive IDs
-    immediately after that page's horizontal words, keeping the global
-    line_id sequence logically contiguous across the document.
 
-    Parameters
-    ----------
-    df_words  : word-level DataFrame (output of step_01 through step_06).
-    df_shapes : shape DataFrame, only needed if gutter detection has not yet run.
+def _differs(a: pd.DataFrame, b: pd.DataFrame, col: str) -> np.ndarray:
+    """True where a[col] != b[col], treating two nulls as equal (not a change).
 
-    Returns
-    -------
-    df_words with line_id (and center_bucket) populated.
+    A transition null→value or value→null counts as a difference. Missing
+    column → all False.
+    """
+    if col not in a.columns or col not in b.columns:
+        return np.zeros(len(a), dtype=bool)
+    va, vb = a[col], b[col]
+    both_null = va.isna() & vb.isna()
+    return (~both_null & (va != vb)).to_numpy()
+
+
+# ================================================================================
+# STREAMING-GROUP WALK
+# ================================================================================
+#
+# The final step walks objects in content-stream order, deciding for each
+# adjacent pair whether obj_b CONTINUES the current streaming group or STARTS a
+# new one, per the flowchart at the top of this module. It is an O(objects)
+# Python loop rather than a vectorized op because ``shifted_left`` depends on the
+# group's *accumulated* x-span, which only exists once earlier continue/split
+# decisions are known.
+#
+# The current group keeps a running x-span [x_min, x_max]: every object that
+# continues the group widens it (union of x-edges). obj_b has "shifted left" when
+# its left edge sits left of the group's accumulated x_min — e.g. a group grown
+# to [100, 350] followed by an object at [20, 80] starts a new group.
+
+# Per-word output columns added by assign_reading_order (all transition-into,
+# keyed to obj_b) plus the running-state shifted_left.
+_PAIR_FEATURE_COLS: tuple[str, ...] = (*_VECTOR_FEATURE_COLS, "shifted_left")
+
+
+def _decide_new_group(arr: dict[str, np.ndarray], i: int, shifted_left: bool) -> bool:
+    """Apply the flowchart to pair ``i``. True = start a new group; False = continue.
+
+    ``arr`` holds the vectorized pair features; ``shifted_left`` is supplied by
+    the caller because it depends on the current group's running x-span.
+    """
+    # Tagged-PDF relationship (highest priority, in flowchart order).
+    if arr["same_struct"][i]:
+        return False          # same struct_group_id → continue
+    if arr["same_table"][i]:
+        return False          # same table_id → continue
+    if arr["new_textbox"][i]:
+        return True           # different textbox_id → new group
+
+    # No tagged relationship → geometry.
+    if arr["same_line"][i]:
+        return bool(arr["objects_between"][i])   # same line → only split if something's between
+    if arr["y_decreases"][i]:
+        return True
+    if arr["large_gap"][i]:
+        return True
+    if shifted_left:
+        return True
+    return bool(arr["objects_between"][i])
+
+
+def _walk_streaming_groups(
+    df_objs: pd.DataFrame, arr: dict[str, np.ndarray]
+) -> tuple[np.ndarray, np.ndarray]:
+    """Assign a stream_group_id to every object row and compute shifted_left.
+
+    Returns ``(group_id, shifted_left)``, both length ``len(df_objs)``:
+      - ``group_id``: int64, monotonically increasing; each page boundary starts
+        a fresh group (there is no pair across pages).
+      - ``shifted_left``: object array, ``None`` at every page-start object (no
+        predecessor), else a Python bool.
+    """
+    n = len(df_objs)
+    group_id = np.zeros(n, dtype=np.int64)
+    shifted_left = np.empty(n, dtype=object)
+    shifted_left[:] = None
+    if n == 0:
+        return group_id, shifted_left
+
+    page = df_objs["page_number"].to_numpy()
+    xl = df_objs["x_left"].to_numpy(float)
+    xr = df_objs["x_right"].to_numpy(float)
+
+    gid = 0
+    cur_xmin = cur_xmax = 0.0
+    for j in range(n):
+        if j == 0 or page[j] != page[j - 1]:
+            # First object on the page → new group, seed the running x-span.
+            gid += 1
+            cur_xmin, cur_xmax = xl[j], xr[j]
+            group_id[j] = gid
+            continue
+
+        i = j - 1  # pair (obj i, obj j) → feature index i
+        # Shifted left only if obj_b sits entirely left of the group's x-range
+        # (its right edge is at/left of x_min); any real x-overlap would just
+        # widen the group, so it does not count.
+        sl = bool(xr[j] <= cur_xmin + _SHIFT_LEFT_TOL)
+        shifted_left[j] = sl
+
+        if _decide_new_group(arr, i, sl):
+            gid += 1
+            cur_xmin, cur_xmax = xl[j], xr[j]
+        else:
+            cur_xmin = min(cur_xmin, xl[j])
+            cur_xmax = max(cur_xmax, xr[j])
+        group_id[j] = gid
+
+    return group_id, shifted_left
+
+
+def assign_reading_order(df_words: pd.DataFrame) -> pd.DataFrame:
+    """Assign ``stream_group_id`` to every word and attach its pair features.
+
+    Collapses words to text objects, runs the vectorized pair analysis and the
+    streaming-group walk, then broadcasts the per-object results back to words on
+    ``(page_number, text_object_id)``. Added columns:
+
+        stream_group_id  Int64 — the reading-order segment the word belongs to
+        shifted_left        boolean — obj_b started left of the group's x-span
+        <pair features>     boolean — same_line, y_decreases, large_gap,
+                            same_struct, same_table, new_textbox, objects_between
+
+    Every feature/shifted_left value describes the transition *into* the word's
+    text object; the first object on each page has no predecessor, so those words
+    get ``<NA>`` (a handy page-start marker). ``stream_group_id`` is always set.
     """
     if df_words is None or df_words.empty:
-        out = (df_words.copy() if df_words is not None else pd.DataFrame())
-        out["line_id"] = pd.Series(dtype="Int64")
+        out = df_words.copy() if df_words is not None else pd.DataFrame()
+        out["stream_group_id"] = pd.Series(dtype="Int64")
+        for col in _PAIR_FEATURE_COLS:
+            out[col] = pd.Series(dtype="boolean")
         return out
 
-    df = df_words.copy()
+    df_objs = _collapse_to_objects(df_words)
+    arr = _pairwise_arrays(df_objs)
+    group_id, shifted_left = _walk_streaming_groups(df_objs, arr)
 
-    # Determine whether PDF stream order is available
-    has_text_object_id = (
-        "text_object_id" in df.columns
-        and df["text_object_id"].notna().any()
-    )
+    # Build a per-object result keyed by the null-safe object key. Pair features
+    # (length n-1, indexed by gap i) attach to obj_b (object i+1); page-start
+    # objects have no incoming pair and stay None.
+    n = len(df_objs)
+    page = df_objs["page_number"].to_numpy()
+    page_start = np.ones(n, dtype=bool)
+    page_start[1:] = page[1:] != page[:-1]
 
-    # Ensure gutter columns are present for the fallback path (do once, up front)
-    if not has_text_object_id:
-        gutter_cols_present = (
-            "gutter_id_right" in df.columns
-            and df["gutter_id_right"].notna().any()
-        )
-        if not gutter_cols_present:
-            from .._utils.layout.gutter_detector import detect_and_annotate_gutters
-            df, _, _ = detect_and_annotate_gutters(
-                df, df_shapes if df_shapes is not None else pd.DataFrame()
-            )
+    result = pd.DataFrame({
+        "page_number": page,
+        "__obj_key": df_objs["text_object_id"].to_numpy(),
+        "stream_group_id": group_id,
+        "shifted_left": shifted_left,
+    })
+    for name in _VECTOR_FEATURE_COLS:
+        col = np.empty(n, dtype=object)
+        col[:] = None
+        col[1:] = arr[name]          # gap i → object i+1
+        col[page_start] = None       # drop cross-page / first-object values
+        result[name] = col
 
-    # Split horizontal vs vertical
-    if "text_orientation" in df.columns:
-        vert_mask = df["text_orientation"].isin(["TTB", "BTT"])
-    else:
-        vert_mask = pd.Series(False, index=df.index)
+    words = df_words.copy()
+    words["__obj_key"] = _object_key(df_words)
+    out = words.merge(result, on=["page_number", "__obj_key"], how="left").drop(columns="__obj_key")
 
-    # ── Process page by page so vertical IDs slot right after horizontal on same page ──
-    pages = sorted(df["page_number"].unique())
-    horiz_pages: list[pd.DataFrame] = []
-    vert_pages:  list[pd.DataFrame] = []
-    running_line = 0
+    out["stream_group_id"] = out["stream_group_id"].astype("Int64")
+    for col in _PAIR_FEATURE_COLS:
+        out[col] = out[col].astype("boolean")
 
-    for page_num in pages:
-        page_mask = df["page_number"] == page_num
-        df_h = df[page_mask & ~vert_mask].copy()
-        df_v = df[page_mask & vert_mask].copy()
-
-        # -- Horizontal --
-        if not df_h.empty:
-            if has_text_object_id:
-                df_h = df_h.sort_values("text_object_id", kind="mergesort").reset_index(drop=True)
-            else:
-                df_h = _sort_by_gutters(df_h)
-
-            df_h = assign_line_id(df_h)
-            df_h["line_id"] = df_h["line_id"] + running_line
-            running_line = int(df_h["line_id"].max())
-
-        horiz_pages.append(df_h)
-
-        # -- Vertical (offset above this page's horizontal ceiling) --
-        if not df_v.empty:
-            df_v = assign_vertical_line_ids(df_v, line_id_offset=running_line)
-            running_line = int(df_v["line_id"].max())
-
-        vert_pages.append(df_v)
-
-    # ── Recombine ───────────────────────────────────────────────────────────────
-    all_parts = horiz_pages + vert_pages
-    non_empty = [p for p in all_parts if not p.empty]
-    if not non_empty:
-        df["line_id"] = pd.Series(dtype="Int64")
-        return df
-
-    result = (
-        pd.concat(non_empty, ignore_index=True)
-        .sort_values(["page_number", "y_top", "x_left"], kind="mergesort")
-        .reset_index(drop=True)
-    )
-
-    if has_text_object_id:
-        result = _assign_stream_groups(result)
-        result = _reshuffle_stream_groups(result)
-
-    # TODO: slide reading order
-    # When page_format is a slide format (SLIDE_16_9, SLIDE_4_3, US_LETTER_LANDSCAPE etc.),
-    # the current stream-group reshuffling is not sufficient. Slide content is laid out as a
-    # collection of independent text boxes rather than flowing text, so stream order is
-    # essentially arbitrary. A slide-aware pass should:
-    #   1. Detect slide pages via page_format metadata (available on df_words or passed in).
-    #   2. Classify the slide layout: a few columns read top-to-bottom, a few rows read
-    #      left-to-right, or a mixed grid (e.g. the IPO workstreams 6-column table or the
-    #      AZ 2×2 stats boxes). Layout type could be inferred from the spatial distribution
-    #      of stream_group bounding boxes on the page.
-    #   3. For column-dominant layouts: sort stream_groups by (x_band, y_center) so groups
-    #      in the leftmost x-band come first, top to bottom, then the next band, etc.
-    #   4. For row-dominant layouts: sort by (y_band, x_center).
-    #   5. For mixed/grid layouts: assign (row_band, col_band) to each group and sort by
-    #      (row_band, col_band).
-    #   Bands can be derived from clustering the group centroids (e.g. simple gap-based
-    #   1D clustering on x or y, similar to how gutter_detector finds column gaps).
-    #   This pass should run instead of (not in addition to) the current reshuffle for
-    #   slide pages, since the stream-group backbone assumption breaks down entirely.
-    #   Note: pptx/step_06_line_builder.py has some early logic for slide reading order
-    #   that is not optimal yet — the slide layout detection here could potentially be
-    #   extracted into a shared utility and reused there.
-
-    return result
+    return out

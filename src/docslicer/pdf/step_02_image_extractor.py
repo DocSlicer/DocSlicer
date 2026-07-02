@@ -9,8 +9,10 @@ Output columns:
     dpi_x, dpi_y
 
 Coordinate system: FPDFPageObj_GetBounds returns (left, bottom, right, top) in
-PDF space (y increases upward). We convert to screen space (y increases downward):
-y_top = page_height - pdf_top.
+raw, unrotated PDF space (y increases upward). We convert to screen space
+(y increases downward, in the page's *displayed* orientation) via
+_utils.page_rotation.make_rotation_transform, which also accounts for the
+page's /Rotate entry — see that module's docstring for why this is needed.
 """
 
 from __future__ import annotations
@@ -22,6 +24,8 @@ import pypdfium2 as pdfium
 import pypdfium2.raw as pdfium_c
 from pypdfium2._helpers.pageobjects import PdfImage
 import pandas as pd
+
+from ._utils.page_rotation import make_rotation_transform
 
 
 # FPDF_COLORSPACE_* integer → human name
@@ -88,7 +92,7 @@ def _extract_image_metadata(
     *,
     page_number: int,
     image_id: int,
-    page_height: float,
+    to_screen,
     min_width: int,
     min_height: int,
 ) -> Optional[Dict[str, Any]]:
@@ -118,12 +122,9 @@ def _extract_image_metadata(
         img_filter = filters[0] if filters else None
         ext = _ext_from_filters(filters)
 
-        # Display bbox: PDF coords (y upward) → screen coords (y downward)
+        # Display bbox: raw PDF-space bounds → rotation-aware screen coords
         l, b, r, t = img.get_bounds()
-        x_left = float(l)
-        x_right = float(r)
-        y_top = page_height - float(t)
-        y_bottom = page_height - float(b)
+        x_left, y_top, x_right, y_bottom = to_screen(float(l), float(b), float(r), float(t))
 
         display_width = x_right - x_left
         display_height = y_bottom - y_top
@@ -173,7 +174,9 @@ def _extract_images_for_page(
     min_height: int,
 ) -> Tuple[List[Dict[str, Any]], int]:
     images: List[Dict[str, Any]] = []
-    page_height = page.get_height()
+    page_width  = float(page.get_width())
+    page_height = float(page.get_height())
+    to_screen, _rotation = make_rotation_transform(page, page_width, page_height)
     next_image_id = start_image_id
 
     for obj_index, obj in enumerate(
@@ -185,7 +188,7 @@ def _extract_images_for_page(
             obj_index,
             page_number=page_number,
             image_id=next_image_id + 1,
-            page_height=page_height,
+            to_screen=to_screen,
             min_width=min_width,
             min_height=min_height,
         )

@@ -100,15 +100,16 @@ MASTER_COLUMN_ORDER: List[str] = [
     "placeholder_type",     # pptx        — title / body / subtitle / …
 
     # Mid-pipeline IDs (pdf + html)
-    "stream_group_id",
-    "stream_group_trigger",
     "cell_id",
     "line_id",
     "temp_line_id",
     "paragraph_id",
     "gutter_id",
     "gutter_candidate_id",
+
     "struct_group_id",
+    "stream_group_id",
+    "stream_group_trigger",
 
     # Shared-pipeline IDs
     "block_id",
@@ -123,15 +124,11 @@ MASTER_COLUMN_ORDER: List[str] = [
     "raw_shape_ids",
 
     #Native PDF Stream Data
-    "struct_tag_id",
-    "struct_tag",
-    "struct_raw_tag",
-    "struct_col_span",
-    "struct_row_span",
-    "struct_scope",
-    "struct_headers",
-    "mcid",
-    "marked_tag",
+    
+    "reading_rank",	
+    "struct_ancestors",	
+    "struct_raw_ancestors",	
+    "struct_ancestor_ids",
 
     # Aggregated hierarchical counts
     "run_count",            # docx, pptx  — runs collapsed into this paragraph
@@ -153,6 +150,7 @@ MASTER_COLUMN_ORDER: List[str] = [
     "table_row_id",
     "table_cell_id",
     "table_header_flag",
+    "textbox_id",
 
     # Shape core
     "raw_shape_type",
@@ -320,6 +318,17 @@ MASTER_COLUMN_ORDER: List[str] = [
     "background_non_stroking_color",
     "background_stroking_color",
     "shape_id_container",       # pdf — shape acting as a bounding rectangle
+
+    # ===== 11. PDF Struct Tree provenance =====
+    "struct_tag_id",
+    "struct_tag",
+    "struct_raw_tag",
+    "struct_col_span",
+    "struct_row_span",
+    "struct_scope",
+    "struct_headers",
+    "mcid",
+    "marked_tag",
 
     # ===== 11. HTML DOM provenance =====
     "dom_id",

@@ -29,11 +29,12 @@ Output columns:
     struct_tag_id     (int | None  — global DFS counter of the struct-tree element owning this word;
                         two words with different ids are in different struct elements even if
                         both have struct_tag == "P"),
-    struct_group_id    (int | None  — struct_tag_id > mcid+1e6 > text_object_id+2e6;
-                        namespaced to prevent cross-tranche collisions; same value = same logical block),
     reading_rank       (int | None  — global DFS position in struct tree; reading-order key),
-    struct_ancestors   (list[str] | None  — ancestor tag names root→direct-parent,
+    struct_ancestors   (list[str] | None  — resolved ancestor tag names root→direct-parent,
                         e.g. ["Document", "Table", "TR", "TD", "P"]),
+    struct_raw_ancestors (list[str] | None — original /S values root→direct-parent before
+                        RoleMap resolution, e.g. ["Document", "Header", "P"]; parallel to
+                        struct_ancestors; use when custom container tags matter),
     struct_ancestor_ids (list[int] | None — parallel DFS elem_ids for each ancestor tag;
                         same index as struct_ancestors; use to distinguish e.g. TD#3 from TD#7),
     struct_col_span    (int | None  — owning TD/TH ColSpan; None outside a table cell),
@@ -80,6 +81,7 @@ from .._utils.text_utils import add_calculated_text_features
 from ._utils.struct_tree import StructInfo, build_struct_index_with_links
 from ._utils.form_fields import FormField, build_form_index
 from ._utils.form_label_link import build_form_label_index
+from ._utils.page_rotation import make_rotation_transform
 
 
 _WHITESPACE = frozenset(' \t\r\n\x0c\xa0​‌‍﻿')
@@ -254,8 +256,7 @@ def _extract_text_obj_marks(
 def _annotate_words(
     df: pd.DataFrame,
     page,
-    crop_left: float,
-    crop_top: float,
+    to_screen,
     struct_index: Dict[Tuple[Optional[int], int], StructInfo],
     page_index: int,
 ) -> None:
@@ -269,7 +270,7 @@ def _annotate_words(
     attribute objects such as ColSpan/RowSpan that pdfium's struct API cannot).
 
     Adds: mcid, marked_tag, struct_tag, struct_raw_tag, struct_tag_id,
-          struct_group_id, reading_rank, struct_ancestors, struct_ancestor_ids,
+          reading_rank, struct_ancestors, struct_ancestor_ids,
           struct_col_span, struct_row_span, struct_scope, struct_headers.
     text_object_id is already set by the character loop before this is called.
     """
@@ -282,16 +283,18 @@ def _annotate_words(
     matched_arr = np.zeros(n, dtype=bool)   # guard: each word claimed by at most one obj
 
     if obj_marks and n > 0:
-        # Word coords are CropBox-relative; object marks are MediaBox-space
-        # (y-up). Shift word centers back into MediaBox space to compare.
-        cx     = (df["x_left"].to_numpy(float) + df["x_right"].to_numpy(float)) * 0.5 + crop_left
-        cy_pdf = crop_top - (df["y_top"].to_numpy(float) + df["y_bottom"].to_numpy(float)) * 0.5
+        # Word coords are already screen-space (post-rotation). Object marks
+        # come back in raw pdfium bounds space, so run them through the same
+        # to_screen transform used for glyph boxes before comparing.
+        cx = (df["x_left"].to_numpy(float) + df["x_right"].to_numpy(float)) * 0.5
+        cy = (df["y_top"].to_numpy(float) + df["y_bottom"].to_numpy(float)) * 0.5
         TOL = 1.5
 
         for l, b, r, t, mc, tag in obj_marks:
+            sl, st, sr, sb = to_screen(l, b, r, t)
             mask = (
-                (cx     >= l - TOL) & (cx     <= r + TOL) &
-                (cy_pdf >= b - TOL) & (cy_pdf <= t + TOL) &
+                (cx >= sl - TOL) & (cx <= sr + TOL) &
+                (cy >= st - TOL) & (cy <= sb + TOL) &
                 ~matched_arr
             )
             if mask.any():
@@ -305,6 +308,7 @@ def _annotate_words(
     sgroup_arr  = np.empty(n, dtype=object); sgroup_arr[:]  = None
     srank_arr   = np.empty(n, dtype=object); srank_arr[:]   = None
     sanc_arr    = np.empty(n, dtype=object); sanc_arr[:]    = None
+    srancanc_arr = np.empty(n, dtype=object); srancanc_arr[:] = None
     sancid_arr  = np.empty(n, dtype=object); sancid_arr[:]  = None
     scol_arr    = np.empty(n, dtype=object); scol_arr[:]    = None
     srow_arr    = np.empty(n, dtype=object); srow_arr[:]    = None
@@ -322,8 +326,9 @@ def _annotate_words(
         if info.raw_tag  is not None: sraw_arr[i]   = info.raw_tag
         sgroup_arr[i] = info.elem_id
         srank_arr[i]  = info.rank
-        if info.ancestors:    sanc_arr[i]   = info.ancestors
-        if info.ancestor_ids: sancid_arr[i] = info.ancestor_ids
+        if info.ancestors:     sanc_arr[i]    = info.ancestors
+        if info.raw_ancestors: srancanc_arr[i] = info.raw_ancestors
+        if info.ancestor_ids:  sancid_arr[i]  = info.ancestor_ids
         # ColSpan/RowSpan only carry meaning inside a table cell; leave None
         # elsewhere so non-table words stay clean.
         if "TD" in info.ancestors or "TH" in info.ancestors:
@@ -332,32 +337,16 @@ def _annotate_words(
         if info.scope:   sscope_arr[i] = info.scope
         if info.headers: shdr_arr[i]   = info.headers
 
-    # ── struct_group_id: struct_tag_id > mcid+1e6 > text_object_id+2e6 ──────
-    # Each tranche gets its own integer range to prevent cross-tranche collisions.
-    _MCID_OFFSET  = 1_000_000
-    _TXOBJ_OFFSET = 2_000_000
-
-    txobj_arr = df["text_object_id"].to_numpy(dtype=object)
-
-    sg_arr = np.empty(n, dtype=object); sg_arr[:] = None
-    for i in range(n):
-        if sgroup_arr[i] is not None:
-            sg_arr[i] = int(sgroup_arr[i])
-        elif mcid_arr[i] is not None:
-            sg_arr[i] = _MCID_OFFSET + int(mcid_arr[i])
-        elif txobj_arr[i] is not None:
-            sg_arr[i] = _TXOBJ_OFFSET + int(txobj_arr[i])
-
     # ── Write columns ──────────────────────────────────────────────────────────
     df["mcid"]                = mcid_arr
     df["marked_tag"]          = tag_arr
     df["struct_tag"]          = stag_arr
     df["struct_raw_tag"]      = sraw_arr    # original /S before RoleMap (custom tags), e.g. "CorporateHeader"
     df["struct_tag_id"]       = sgroup_arr  # raw DFS counter; two P's with different ids are different blocks
-    df["struct_group_id"]     = sg_arr
     df["reading_rank"]        = srank_arr
-    df["struct_ancestors"]    = sanc_arr    # list[str] root→direct-parent, e.g. ["Document","Table","TD","P"]
-    df["struct_ancestor_ids"] = sancid_arr  # list[int] parallel elem_ids for each ancestor tag
+    df["struct_ancestors"]     = sanc_arr     # list[str] resolved root→direct-parent
+    df["struct_raw_ancestors"] = srancanc_arr # list[str] raw /S values root→direct-parent (pre-RoleMap)
+    df["struct_ancestor_ids"]  = sancid_arr   # list[int] parallel elem_ids for each ancestor tag
     df["struct_col_span"]     = scol_arr    # int | None — TD/TH ColSpan (None outside a table cell)
     df["struct_row_span"]     = srow_arr    # int | None — TD/TH RowSpan (None outside a table cell)
     df["struct_scope"]        = sscope_arr  # "Row"|"Column"|"Both" | None — TH scope
@@ -368,7 +357,7 @@ _SKIP_WIDGET_TYPES = {"pushbutton"}
 
 # Struct/font columns cloned from the last label word into each injected row.
 _TEMPLATE_COLS = (
-    "struct_tag", "struct_raw_tag", "struct_tag_id", "struct_group_id",
+    "struct_tag", "struct_raw_tag", "struct_tag_id",
     "reading_rank", "struct_ancestors", "struct_ancestor_ids",
     "struct_col_span", "struct_row_span", "struct_scope", "struct_headers",
     "font_name", "font_size", "non_stroking_color", "stroking_color",
@@ -387,8 +376,7 @@ def _normalize_form_text(widget_type: str, value: Optional[str], is_empty: bool)
 def _inject_form_value_rows(
     df: pd.DataFrame,
     form_fields: List[FormField],
-    crop_left: float,
-    crop_top: float,
+    to_screen,
     page_number: int,
     page_width: float,
     page_height: float,
@@ -428,10 +416,7 @@ def _inject_form_value_rows(
             continue
 
         llx, lly, urx, ury = fld.pdf_rect
-        fx_left   = llx - crop_left
-        fx_right  = urx - crop_left
-        fy_top    = crop_top - ury
-        fy_bottom = crop_top - lly
+        fx_left, fy_top, fx_right, fy_bottom = to_screen(llx, lly, urx, ury)
         fw        = fx_right - fx_left
         fh        = fy_bottom - fy_top
 
@@ -474,8 +459,7 @@ def _inject_form_value_rows(
 def _annotate_form_fields(
     df: pd.DataFrame,
     form_fields: List[FormField],
-    crop_left: float,
-    crop_top: float,
+    to_screen,
     form_label_index: Dict[Tuple[Optional[int], int], FormField],
     page_index: int,
 ) -> None:
@@ -582,11 +566,7 @@ def _annotate_form_fields(
             continue
 
         llx, lly, urx, ury = fld.pdf_rect
-        # PDF-space (y-up) → screen-space (y-down, CropBox-relative)
-        fx_left   = llx - crop_left
-        fx_right  = urx - crop_left
-        fy_top    = crop_top - ury
-        fy_bottom = crop_top - lly
+        fx_left, fy_top, fx_right, fy_bottom = to_screen(llx, lly, urx, ury)
         fheight   = fy_bottom - fy_top
 
         # Words to the LEFT: end before field starts, centre within the field's
@@ -630,30 +610,6 @@ def _annotate_form_fields(
 
 # ── Per-page extraction ───────────────────────────────────────────────────────
 
-def _crop_origin(page, page_height: float) -> Tuple[float, float]:
-    """Return (crop_left, crop_top) in MediaBox space.
-
-    pdfium glyph boxes are reported in MediaBox coordinates, so we subtract this
-    origin to land in CropBox-relative space. When the page has no CropBox (or
-    the query fails) we fall back to the MediaBox origin: left = 0 and
-    top = page_height, which leaves coordinates unchanged for the common case.
-    """
-    left = ctypes.c_float()
-    bottom = ctypes.c_float()
-    right = ctypes.c_float()
-    top = ctypes.c_float()
-    ok = pdfium_c.FPDFPage_GetCropBox(
-        page.raw,
-        ctypes.byref(left),
-        ctypes.byref(bottom),
-        ctypes.byref(right),
-        ctypes.byref(top),
-    )
-    if ok:
-        return float(left.value), float(top.value)
-    return 0.0, page_height
-
-
 def _extract_words_for_page(
     page,
     page_number: int,
@@ -666,13 +622,12 @@ def _extract_words_for_page(
     page_width  = float(page.get_width())
     page_height = float(page.get_height())
 
-    # pdfium's get_charbox returns glyph coords in MediaBox space, but
-    # get_width/get_height return the (possibly offset) CropBox size. When a page
-    # has a CropBox whose origin is not (0, 0), we must shift glyphs into
-    # crop-relative space, otherwise x is un-offset and the y-flip mixes spaces
-    # (producing negative / misaligned boxes). Fall back to the MediaBox origin
-    # when no CropBox is present, which reproduces the previous behaviour.
-    crop_left, crop_top = _crop_origin(page, page_height)
+    # pdfium's get_charbox/GetBounds return coordinates in raw, unrotated page
+    # space (CropBox-space before /Rotate), while get_width/get_height already
+    # reflect /Rotate. to_screen folds crop-offset + rotation + the y-flip into
+    # one step so every raw box lands in the displayed page's screen space.
+    to_screen, rotation = make_rotation_transform(page, page_width, page_height)
+    _rotation_rad = math.radians(rotation)
 
     tp = page.get_textpage()
     try:
@@ -761,7 +716,9 @@ def _extract_words_for_page(
             word_font, word_size = _font_info(tp, i)
             word_fill            = _fill_color(tp, i)
             word_stroke          = _stroke_color(tp, i)
-            first_angle          = float(pdfium_c.FPDFText_GetCharAngle(tp, i))
+            # GetCharAngle is in raw (unrotated) space like GetCharBox; rotate
+            # it into displayed space to match screen_box orientation below.
+            first_angle          = float(pdfium_c.FPDFText_GetCharAngle(tp, i)) - _rotation_rad
             word_script_type     = script_type
             word_ref_size        = ref_size
             word_ref_cy          = ref_cy
@@ -793,13 +750,11 @@ def _extract_words_for_page(
         for i in range(n):
             ch = all_chars[i]
             l, b, r, t = tp.get_charbox(i, loose=True)
-            l -= crop_left
-            r -= crop_left
 
             if ch == _HYPHEN_BREAK:
                 tl, _, tr, _ = tp.get_charbox(i, loose=False)
                 if tr - tl > 0.5 and char_texts:
-                    _add_char('-', (l, crop_top - t, r, crop_top - b))
+                    _add_char('-', to_screen(l, b, r, t))
                 _flush()
                 prev_x_right = -1.0
                 continue
@@ -809,7 +764,7 @@ def _extract_words_for_page(
                 prev_x_right = -1.0
                 continue
 
-            screen_box      = (l, crop_top - t, r, crop_top - b)
+            screen_box      = to_screen(l, b, r, t)
             char_baseline   = screen_box[3]   # screen-coord baseline (bottom of glyph)
 
             if not char_texts:
@@ -817,7 +772,10 @@ def _extract_words_for_page(
                 word_first_baseline = char_baseline
 
             elif prev_x_right >= 0:
-                gap = l - prev_x_right
+                # Gap/baseline both read off screen_box (post-rotation) so word-
+                # break detection tracks the reading direction as displayed, not
+                # the raw content-stream axis (which is swapped under rotation).
+                gap = screen_box[0] - prev_x_right
                 if gap > _GAP_FACTOR * (word_size or 8.0):
                     _flush()
                     _start_word(i)
@@ -855,7 +813,7 @@ def _extract_words_for_page(
                                 word_first_baseline = char_baseline
 
             _add_char(ch, screen_box)
-            prev_x_right = r
+            prev_x_right = screen_box[2]
 
         _flush()
 
@@ -873,12 +831,12 @@ def _extract_words_for_page(
     df["page_height"]  = page_height
     df["word_source"]  = "content_stream"
 
-    _annotate_words(df, page, crop_left, crop_top, struct_index, page_number - 1)
+    _annotate_words(df, page, to_screen, struct_index, page_number - 1)
     _annotate_form_fields(
-        df, form_fields, crop_left, crop_top, form_label_index, page_number - 1
+        df, form_fields, to_screen, form_label_index, page_number - 1
     )
     value_rows = _inject_form_value_rows(
-        df, form_fields, crop_left, crop_top, page_number, page_width, page_height
+        df, form_fields, to_screen, page_number, page_width, page_height
     )
     if value_rows:
         df = pd.concat([df, pd.DataFrame(value_rows)], ignore_index=True)
@@ -961,7 +919,7 @@ def extract_words(
     x_left, x_right, y_top, y_bottom, width, height, font_name, font_size,
     non_stroking_color, stroking_color (both as hex #rrggbb or None),
     text_orientation, script_type,
-    mcid, marked_tag, struct_tag, struct_raw_tag, struct_tag_id, struct_group_id,
+    mcid, marked_tag, struct_tag, struct_raw_tag, struct_tag_id,
     reading_rank, struct_ancestors, struct_ancestor_ids,
     struct_col_span, struct_row_span, struct_scope, struct_headers,
     text_object_id,

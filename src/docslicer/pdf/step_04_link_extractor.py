@@ -6,9 +6,11 @@ Output columns:
     x_left, y_top, x_right, y_bottom,
     link_url, link_dest, link_type
 
-Coordinate system: FPDFLink_GetAnnotRect returns an FS_RECTF in PDF space
-(y increases upward). We convert to screen space (y increases downward):
-y_top = page_height - rect.top.
+Coordinate system: FPDFLink_GetAnnotRect returns an FS_RECTF in raw, unrotated
+PDF space (y increases upward). We convert to screen space (y increases
+downward, in the page's *displayed* orientation) via
+_utils.page_rotation.make_rotation_transform, which also accounts for the
+page's /Rotate entry — see that module's docstring for why this is needed.
 """
 
 from __future__ import annotations
@@ -22,6 +24,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import pypdfium2 as pdfium
 import pypdfium2.raw as pdfium_c
 import pandas as pd
+
+from ._utils.page_rotation import make_rotation_transform
 
 
 # ── Module-level raw API references ──────────────────────────────────────────
@@ -70,7 +74,9 @@ def _extract_links_for_page(
 ) -> Tuple[List[Dict[str, Any]], int]:
     records: List[Dict[str, Any]] = []
     next_link_id = start_link_id
-    page_height = page.get_height()
+    page_width  = float(page.get_width())
+    page_height = float(page.get_height())
+    to_screen, _rotation = make_rotation_transform(page, page_width, page_height)
 
     start_pos = c_int(0)
     link = pdfium_c.FPDF_LINK()
@@ -79,14 +85,13 @@ def _extract_links_for_page(
     while _link_enumerate(page, byref(start_pos), byref(link)):
         _link_get_rect(link, byref(rect))
 
-        # PDF coords (y upward) → screen coords (y downward).
-        # Normalize x and y because some PDFs store rects with swapped corners.
-        x_left   = min(rect.left, rect.right)
-        x_right  = max(rect.left, rect.right)
-        sy1 = page_height - rect.top
-        sy2 = page_height - rect.bottom
-        y_top    = min(sy1, sy2)
-        y_bottom = max(sy1, sy2)
+        # Normalize corners (some PDFs store rects with swapped corners),
+        # then convert raw PDF-space bounds → rotation-aware screen space.
+        raw_l = min(rect.left, rect.right)
+        raw_r = max(rect.left, rect.right)
+        raw_b = min(rect.top, rect.bottom)
+        raw_t = max(rect.top, rect.bottom)
+        x_left, y_top, x_right, y_bottom = to_screen(raw_l, raw_b, raw_r, raw_t)
 
         # Determine URL / dest
         uri: Optional[str] = None

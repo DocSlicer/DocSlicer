@@ -23,7 +23,7 @@ from .line_merger import assign_line_id
 # =============================================================================
 
 _MIN_SERIES_LENGTH: int = 3       # minimum candidates to qualify as line numbers
-_X_ALIGN_TOLERANCE: float = 7.0   # pt — max x_left spread within an x-cluster
+_X_ALIGN_TOLERANCE: float = 7.0   # pt — max x_right spread within an x-cluster (line numbers tend to be right-aligned)
 _MAX_NUMBER_WIDTH: float = 30.0   # pt — line-number token must be narrow
 _MAX_MISSING_NUMBERS_PER_PAGE: int = 1  # allow at most one skipped line number
 _FONT_SIZE_RATIO: float = 0.85    # line numbers may not be smaller than this × doc median, otherwise likely footnotes
@@ -33,6 +33,8 @@ _MIN_PAGE_COVERAGE: float = 0.80  # line numbers must appear on at least this fr
 # 2-3 missing (may output some numbers as text, like 9 -> S or 44 -> 4A) 
 # and ~50% page coverage, possibly feed in as args (tesseract turns line number column into BTT garbled text on some pages)
 
+# NOTE: For ocr, font size detection is less accurate, add an extra KPI that min 10% of lines on a page should have a line number (otherwise hits on footnotes)
+#+ exclude rows where struct_raw_ancestors contains *note* Footnote, Note, Endnote, etc
 
 # =============================================================================
 # Public API
@@ -184,14 +186,14 @@ def _is_line_number_sequence(nums: list[int], *, max_missing: int) -> tuple[bool
 
 def _cluster_by_x(candidates: pd.DataFrame) -> list[pd.DataFrame]:
     """
-    Split candidates into groups where the total x_left spread stays within
-    _X_ALIGN_TOLERANCE.  Sorts by x_left before splitting.
+    Split candidates into groups where the total x_right spread stays within
+    _X_ALIGN_TOLERANCE.  Sorts by x_right before splitting.
     """
     if candidates.empty:
         return []
 
-    sorted_c = candidates.sort_values("x_left").reset_index(drop=True)
-    x_vals = sorted_c["x_left"].values
+    sorted_c = candidates.sort_values("x_right").reset_index(drop=True)
+    x_vals = sorted_c["x_right"].values
 
     clusters: list[pd.DataFrame] = []
     start = 0
