@@ -45,7 +45,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from .._utils.layout.line_merger import assign_line_id, same_line, same_line_pairwise
+from .._utils.layout.line_merger import same_line_pairwise
 
 """"
 flowchart TD
@@ -79,6 +79,8 @@ flowchart TD
     G --> J([Next object pair])
     H --> J
     J --> A
+
+# TODO: This script currently doesn't work for RTL arabic text -> make left | right a param (requires regression testing)
 """
 
 

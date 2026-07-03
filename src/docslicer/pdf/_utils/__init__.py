@@ -8,6 +8,12 @@ from .struct_tree import (
 )
 from .form_fields import FormField, build_form_index, has_acroform
 from .form_label_link import build_form_label_index
+from .shape_relationships import (
+    add_link_relationships,
+    add_rect_relationships,
+    add_vertical_line_relationships,
+    add_horizontal_line_relationships,
+)
 
 __all__ = [
     "StructInfo",
@@ -19,4 +25,8 @@ __all__ = [
     "build_form_index",
     "has_acroform",
     "build_form_label_index",
+    "add_link_relationships",
+    "add_rect_relationships",
+    "add_vertical_line_relationships",
+    "add_horizontal_line_relationships",
 ]

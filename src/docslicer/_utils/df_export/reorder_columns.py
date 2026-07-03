@@ -106,7 +106,7 @@ MASTER_COLUMN_ORDER: List[str] = [
     "paragraph_id",
     "gutter_id",
     "gutter_candidate_id",
-
+    "reading_order",
     "struct_group_id",
     "stream_group_id",
     "stream_group_trigger",
@@ -125,7 +125,7 @@ MASTER_COLUMN_ORDER: List[str] = [
 
     #Native PDF Stream Data
     
-    "reading_rank",	
+    
     "struct_ancestors",	
     "struct_raw_ancestors",	
     "struct_ancestor_ids",
@@ -328,7 +328,8 @@ MASTER_COLUMN_ORDER: List[str] = [
     "struct_scope",
     "struct_headers",
     "mcid",
-    "marked_tag",
+    "bdc_tag",
+    "dfs_position",	 # mostly inaccurate, even in well-tagged pdf's
 
     # ===== 11. HTML DOM provenance =====
     "dom_id",

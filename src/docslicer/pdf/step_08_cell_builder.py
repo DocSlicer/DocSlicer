@@ -655,6 +655,11 @@ def _detect_cell_level_scripts(df: pd.DataFrame) -> pd.DataFrame:
 
     Reference size     = max font_size in the cell (all words, matching original).
     Reference baseline = median y_bottom of normal-sized untagged words.
+
+    Cells whose words span more than one original line_id (e.g. cells merged
+    across visual lines by _merge_struct_groups) are skipped entirely: a size/
+    baseline difference there reflects separate stacked lines, not a sub/
+    superscript relationship.
     """
     if "cell_id" not in df.columns or "font_size" not in df.columns:
         return df
@@ -670,6 +675,12 @@ def _detect_cell_level_scripts(df: pd.DataFrame) -> pd.DataFrame:
     font_size = pd.to_numeric(df["font_size"], errors="coerce")
     y_bottom  = pd.to_numeric(df["y_bottom"],  errors="coerce")
     cell_id   = df["cell_id"]
+
+    if "line_id" in df.columns:
+        single_line_cell = df["line_id"].groupby(cell_id).transform("nunique") == 1
+        untagged = untagged & single_line_cell
+        if not untagged.any():
+            return df
 
     # Per-cell max font_size (all words, matching original logic)
     ref_size = font_size.groupby(cell_id).transform("max")
@@ -924,7 +935,6 @@ def _renumber_cells_reading_order(
 def build_cells(
     df_words: pd.DataFrame,
     df_shapes: pd.DataFrame | None = None,
-    df_links:  pd.DataFrame | None = None,
     config: CellBuildConfig = CONFIG,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """

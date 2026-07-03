@@ -91,7 +91,7 @@ TXOBJ_OFFSET = 2_000_000
 _REPAIR_FIELDS = (
     "struct_tag_id", "struct_tag", "struct_raw_tag",
     "struct_col_span", "struct_row_span", "struct_scope", "struct_headers",
-    "mcid", "marked_tag", "reading_rank",
+    "mcid", "bdc_tag", "dfs_position",
     "struct_ancestors", "struct_raw_ancestors", "struct_ancestor_ids",
 )
 

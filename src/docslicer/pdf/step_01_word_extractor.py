@@ -22,14 +22,14 @@ Output columns:
     text_orientation   (LTR | RTL | TTB | BTT | UNKNOWN),
     script_type        (None | "superscript" | "subscript"),
     mcid               (int | None  — marked-content ID from enclosing BDC),
-    marked_tag         (str | None  — mark name: "Span", "P", "Artifact", …),
+    bdc_tag            (str | None  — mark name: "Span", "P", "Artifact", …),
     struct_tag         (str | None  — RoleMap-resolved struct-tree type: "P", "H1", "TD", …),
     struct_raw_tag     (str | None  — original /S before RoleMap resolution; equals struct_tag
                         for standard tags, preserves custom tags e.g. "CorporateHeader"),
     struct_tag_id     (int | None  — global DFS counter of the struct-tree element owning this word;
                         two words with different ids are in different struct elements even if
                         both have struct_tag == "P"),
-    reading_rank       (int | None  — global DFS position in struct tree; reading-order key),
+    dfs_position       (int | None  — global DFS position in struct tree; reading-order key),
     struct_ancestors   (list[str] | None  — resolved ancestor tag names root→direct-parent,
                         e.g. ["Document", "Table", "TR", "TD", "P"]),
     struct_raw_ancestors (list[str] | None — original /S values root→direct-parent before
@@ -209,8 +209,8 @@ def _extract_text_obj_marks(
     """
     Iterate TEXT page objects in content-stream order.
 
-    Returns a list of (l, b, r, t, mcid, marked_tag) in PDF space (y-up).
-    Used only for mcid/marked_tag assignment; text_object_id is now derived
+    Returns a list of (l, b, r, t, mcid, bdc_tag) in PDF space (y-up).
+    Used only for mcid/bdc_tag assignment; text_object_id is now derived
     directly from FPDFText_GetTextObject during the character loop.
     """
     results: list[tuple[float, float, float, float, int | None, str | None]] = []
@@ -230,7 +230,7 @@ def _extract_text_obj_marks(
         mcid: int | None = raw_mcid if raw_mcid >= 0 else None
 
         # Walk marks: prefer the MCID-bearing mark's name; fall back to first mark.
-        marked_tag: str | None = None
+        bdc_tag: str | None = None
         fallback_tag: str | None = None
         n_marks = pdfium_c.FPDFPageObj_CountMarks(obj)
         for m in range(n_marks):
@@ -240,15 +240,15 @@ def _extract_text_obj_marks(
             tag = _get_mark_name(mark)
             has_mcid = pdfium_c.FPDFPageObjMark_GetParamIntValue(mark, b"MCID", _BYREF(_mcid_tmp))
             if has_mcid:
-                marked_tag = tag
+                bdc_tag = tag
                 break
             if fallback_tag is None:
                 fallback_tag = tag
 
-        if marked_tag is None:
-            marked_tag = fallback_tag
+        if bdc_tag is None:
+            bdc_tag = fallback_tag
 
-        results.append((_l.value, _b.value, _r.value, _t.value, mcid, marked_tag))
+        results.append((_l.value, _b.value, _r.value, _t.value, mcid, bdc_tag))
 
     return results
 
@@ -263,14 +263,14 @@ def _annotate_words(
     """
     Enrich *df* in-place with marked-content and struct-tree columns.
 
-    Marked-content (mcid, marked_tag) is read from pdfium page objects. The
+    Marked-content (mcid, bdc_tag) is read from pdfium page objects. The
     struct-tree columns are looked up in *struct_index* — a doc-level
     ``{(page_index, mcid): StructInfo}`` map built once by the pikepdf-backed
     parser in ``_utils.struct_tree`` (pikepdf resolves /RoleMap, /ClassMap and
     attribute objects such as ColSpan/RowSpan that pdfium's struct API cannot).
 
-    Adds: mcid, marked_tag, struct_tag, struct_raw_tag, struct_tag_id,
-          reading_rank, struct_ancestors, struct_ancestor_ids,
+    Adds: mcid, bdc_tag, struct_tag, struct_raw_tag, struct_tag_id,
+          dfs_position, struct_ancestors, struct_ancestor_ids,
           struct_col_span, struct_row_span, struct_scope, struct_headers.
     text_object_id is already set by the character loop before this is called.
     """
@@ -339,11 +339,11 @@ def _annotate_words(
 
     # ── Write columns ──────────────────────────────────────────────────────────
     df["mcid"]                = mcid_arr
-    df["marked_tag"]          = tag_arr
+    df["bdc_tag"]          = tag_arr
     df["struct_tag"]          = stag_arr
     df["struct_raw_tag"]      = sraw_arr    # original /S before RoleMap (custom tags), e.g. "CorporateHeader"
     df["struct_tag_id"]       = sgroup_arr  # raw DFS counter; two P's with different ids are different blocks
-    df["reading_rank"]        = srank_arr
+    df["dfs_position"]        = srank_arr
     df["struct_ancestors"]     = sanc_arr     # list[str] resolved root→direct-parent
     df["struct_raw_ancestors"] = srancanc_arr # list[str] raw /S values root→direct-parent (pre-RoleMap)
     df["struct_ancestor_ids"]  = sancid_arr   # list[int] parallel elem_ids for each ancestor tag
@@ -358,10 +358,10 @@ _SKIP_WIDGET_TYPES = {"pushbutton"}
 # Struct/font columns cloned from the last label word into each injected row.
 _TEMPLATE_COLS = (
     "struct_tag", "struct_raw_tag", "struct_tag_id",
-    "reading_rank", "struct_ancestors", "struct_ancestor_ids",
+    "dfs_position", "struct_ancestors", "struct_ancestor_ids",
     "struct_col_span", "struct_row_span", "struct_scope", "struct_headers",
     "font_name", "font_size", "non_stroking_color", "stroking_color",
-    "text_object_id", "mcid", "marked_tag",
+    "text_object_id", "mcid", "bdc_tag",
 )
 
 
@@ -919,8 +919,8 @@ def extract_words(
     x_left, x_right, y_top, y_bottom, width, height, font_name, font_size,
     non_stroking_color, stroking_color (both as hex #rrggbb or None),
     text_orientation, script_type,
-    mcid, marked_tag, struct_tag, struct_raw_tag, struct_tag_id,
-    reading_rank, struct_ancestors, struct_ancestor_ids,
+    mcid, bdc_tag, struct_tag, struct_raw_tag, struct_tag_id,
+    dfs_position, struct_ancestors, struct_ancestor_ids,
     struct_col_span, struct_row_span, struct_scope, struct_headers,
     text_object_id,
     form_widget, form_value, form_is_empty, form_field_name, form_tooltip,
