@@ -34,50 +34,30 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# PDF Pipeline Steps
 from .step_01_word_extractor import extract_words
 from .step_02_image_extractor import extract_images
 from .step_03_shape_extractor import extract_shapes
 from .step_04_link_extractor import extract_links
-from .._utils.layout.shape_merger import merge_shapes
-from .._utils.layout.line_number_detector import detect_line_numbers
-from .._utils.layout.gutter_detector import detect_and_annotate_gutters
-from .step_08_cell_builder import build_cells
-from .step_09_page_label_detector import assign_pdf_page_labels
-from .step_10_line_builder import build_lines
-from .step_11_table_builder import build_tables
+from .step_05_struct_group import assign_struct_group_id
+from .step_06_style_prefiller import prefill_styles
+from .step_07_stream_group import assign_stream_group_id
+from .step_08_reading_order import assign_reading_order
+from .step_09_cell_builder import build_cells
+from .step_10_page_label_detector import assign_pdf_page_labels
+from .step_12_line_builder import build_lines
+from .step_13_table_builder import build_tables
 
+# PDF Utils
+from ._utils.struct_context import build_struct_context
+from ._utils.coordinates import convert_to_global_y_coordinates
+
+# Global Utils
+from .._utils.layout.shape_merger import merge_shapes
+from .._utils.layout.reading_order import assign_reading_order as assign_reading_order_fallback
+from .._utils.layout.line_number_detector import detect_line_numbers
 from .._utils.io.yaml_loader import load_yamls
 from ..metadata import add_page_and_ocr_info, add_document_information
-
-
-def convert_to_global_y_coordinates(df_cells: pd.DataFrame) -> pd.DataFrame:
-    """
-    Convert page-relative Y coordinates to document-global Y coordinates.
-
-    For multi-page documents, Y coordinates reset to 0 on each page.
-    This causes issues when aggregating chunks that span page boundaries.
-
-    Saves original page-relative coords to y_top_local / y_bottom_local,
-    then overwrites y_top / y_bottom with global coordinates.
-    """
-    if df_cells.empty:
-        return df_cells
-
-    required_cols = ["page_number", "page_height", "y_top", "y_bottom"]
-    if not all(col in df_cells.columns for col in required_cols):
-        logger.warning("Missing columns for Y coordinate conversion, skipping")
-        return df_cells
-
-    df_cells["y_top_local"] = df_cells["y_top"]
-    df_cells["y_bottom_local"] = df_cells["y_bottom"]
-
-    page_heights = df_cells.groupby("page_number")["page_height"].first().sort_index()
-    cumulative_offsets = page_heights.shift(1, fill_value=0).cumsum()
-
-    df_cells["y_top"] = df_cells["y_top_local"] + df_cells["page_number"].map(cumulative_offsets)
-    df_cells["y_bottom"] = df_cells["y_bottom_local"] + df_cells["page_number"].map(cumulative_offsets)
-
-    return df_cells
 
 
 def run_pipeline(
@@ -112,41 +92,43 @@ def run_pipeline(
         if on_stage:
             on_stage("parsing")
 
-        # Step 01 - Word Extraction (pypdfium2)
-        # If a password is supplied, pre-decrypt before the main pipeline so
-        # every downstream tool (pypdfium2, pikepdf struct-tree) sees plain bytes.
+        # Step 00 - Structure context (single pikepdf open, before any pdfium call)
+        # Building it here means one pikepdf pass feeds words, images and shapes.
+        # pikepdf is now the first library to touch the bytes, so a missing/wrong
+        # password surfaces as a clean pikepdf.PasswordError we catch to decrypt —
+        # rather than as pdfium's untyped error deeper in extract_words.
+        #
+        # If a password is supplied, pre-decrypt first so every downstream tool
+        # (pikepdf struct-tree, pypdfium2) sees plain bytes.
+        import pikepdf
+        from .._utils.password import decrypt_pdf
+
         _is_password_protected = False
         if password is not None:
-            from .._utils.password import decrypt_pdf
             pdf_bytes = decrypt_pdf(pdf_bytes, password, source_filename)
             pdf_path.write_bytes(pdf_bytes)
             _is_password_protected = True
 
+        # Step 00 - Parse Struct Tree (pikepdf)
         try:
-            df_words = extract_words(pdf_path)
-        except Exception as _exc:
-            import pypdfium2 as _pdfium
-            import pypdfium2.raw as _pdfium_c
-            _pw_code = getattr(_pdfium_c, "FPDF_ERR_PASSWORD", 4)
-            _is_pw_err = (
-                isinstance(_exc, _pdfium.PdfiumError)
-                and getattr(_exc, "err_code", None) == _pw_code
-            ) or "password" in str(_exc).lower()
-            if not _is_pw_err:
-                raise
-            from .._utils.password import decrypt_pdf
+            struct_ctx = build_struct_context(pdf_path)
+        except pikepdf.PasswordError:
+            # Encrypted with no/other password — try the common-password candidates.
             pdf_bytes = decrypt_pdf(pdf_bytes, None, source_filename)
             pdf_path.write_bytes(pdf_bytes)
-            df_words = extract_words(pdf_path)
             _is_password_protected = True
+            struct_ctx = build_struct_context(pdf_path)
 
-        # Step 02 - Image Extraction
-        df_images = extract_images(pdf_path)
+        # Step 01 - Word Extraction (pypdfium2)
+        df_words = extract_words(pdf_path, struct_ctx=struct_ctx)
 
-        # Step 02b - Shape Extraction (pypdfium2)
-        df_shapes = extract_shapes(pdf_path)
+        # Step 02 - Image Extraction (struct-enriched by shared struct_index)
+        df_images = extract_images(pdf_path, struct_index=struct_ctx.struct_index)
 
-        # Step 03 - Link Extraction (pypdfium2)
+        # Step 03 - Shape Extraction (pypdfium2, struct-enriched)
+        df_shapes = extract_shapes(pdf_path, struct_index=struct_ctx.struct_index)
+
+        # Step 04 - Link Extraction (pypdfium2)
         df_links = extract_links(pdf_path)
 
         # ── OCR check (before enrichment, before cell construction) ─────────
@@ -220,15 +202,10 @@ def run_pipeline(
         df_cells = convert_to_global_y_coordinates(df_cells)
 
         # Step 09 - Line Builder
-        df_lines, df_cells = build_lines(df_cells)
+        #df_lines, df_cells = build_lines(df_cells)
 
         # Step 10 - Table Builder
-        df_lines, df_cells, df_table_cells = build_tables(df_lines, df_cells, df_shapes)
-
-        # OCR font size estimation (requires layout_id from step 10)
-        if discovered_metadata.get("needs_ocr"):
-            from ..ocr.step_05_font_size_estimator import estimate_ocr_font_sizes
-            df_lines = estimate_ocr_font_sizes(df_lines)
+        #df_lines, df_cells, df_table_cells = build_tables(df_lines, df_cells, df_shapes)
 
         # ── Document Information ─────────────────────────────────────────────
         try:
@@ -248,11 +225,11 @@ def run_pipeline(
             debug_steps["words"] = df_words
             debug_steps["shapes"] = df_shapes
             debug_steps["cells"] = df_cells
-            debug_steps["lines"] = df_lines
-            if df_table_cells is not None:
-                debug_steps["table_cells"] = df_table_cells
+            #debug_steps["lines"] = df_lines
+            #if df_table_cells is not None:
+            #    debug_steps["table_cells"] = df_table_cells
 
-        return discovered_metadata, df_lines, df_table_cells, debug_steps
+        return discovered_metadata, #df_lines, df_table_cells, debug_steps
 
     finally:
         try:

@@ -483,7 +483,7 @@ def _walk_streaming_groups(
     return group_id, shifted_left
 
 
-def assign_reading_order(df_words: pd.DataFrame) -> pd.DataFrame:
+def assign_stream_group_id(df_words: pd.DataFrame) -> pd.DataFrame:
     """Assign ``stream_group_id`` to every word and attach its pair features.
 
     Collapses words to text objects, runs the vectorized pair analysis and the

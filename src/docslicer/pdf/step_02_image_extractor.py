@@ -26,6 +26,7 @@ from pypdfium2._helpers.pageobjects import PdfImage
 import pandas as pd
 
 from ._utils.page_rotation import make_rotation_transform
+from ._utils.struct_tree import StructInfo, struct_info_to_columns
 
 
 # FPDF_COLORSPACE_* integer → human name
@@ -66,6 +67,25 @@ _FILTER_TO_EXT: Dict[str, str] = {
 }
 
 
+def _struct_for_object(
+    obj_raw: Any,
+    struct_index: Optional[Dict[Tuple[Optional[int], int], StructInfo]],
+    page_index: int,
+) -> Tuple[Optional[int], Optional[StructInfo]]:
+    """Resolve a page object's ``(mcid, StructInfo)`` via its marked-content id.
+
+    Returns ``(None, None)`` when no struct index is supplied, the object carries
+    no MCID, or nothing matches. Elements with no resolvable /Pg are keyed under
+    page ``None`` (same fallback the word join uses)."""
+    if struct_index is None:
+        return None, None
+    mcid = pdfium_c.FPDFPageObj_GetMarkedContentID(obj_raw)
+    if mcid < 0:
+        return None, None
+    info = struct_index.get((page_index, mcid)) or struct_index.get((None, mcid))
+    return mcid, info
+
+
 def _colorspace_to_name(cs_int: int) -> str:
     return _COLORSPACE_NAMES.get(cs_int, f"Colorspace({cs_int})")
 
@@ -95,6 +115,7 @@ def _extract_image_metadata(
     to_screen,
     min_width: int,
     min_height: int,
+    struct_index: Optional[Dict[Tuple[Optional[int], int], StructInfo]] = None,
 ) -> Optional[Dict[str, Any]]:
     try:
         # Wrap as PdfImage to access image-specific methods.
@@ -132,7 +153,7 @@ def _extract_image_metadata(
 
         has_transparency = ext in ("png", "jp2")
 
-        return {
+        result: Dict[str, Any] = {
             "page_number": page_number,
             "image_id": image_id,
             "obj_index": obj_index,
@@ -161,6 +182,18 @@ def _extract_image_metadata(
             "dpi_y": dpi_y,
         }
 
+        # Struct-tree enrichment (Figure tag, ancestors, alt text) — only when a
+        # struct index is supplied, so standalone extraction keeps its legacy schema.
+        if struct_index is not None:
+            mcid, info = _struct_for_object(obj.raw, struct_index, page_number - 1)
+            result["mcid"] = mcid
+            result.update(struct_info_to_columns(info))
+            # img_alt: authored alternative text for the figure (/Alt), falling back
+            # to /ActualText — the accessible description a tagged PDF gives an image.
+            result["img_alt"] = (info.alt or info.actual_text) if info is not None else None
+
+        return result
+
     except Exception:
         return None
 
@@ -172,6 +205,7 @@ def _extract_images_for_page(
     start_image_id: int,
     min_width: int,
     min_height: int,
+    struct_index: Optional[Dict[Tuple[Optional[int], int], StructInfo]] = None,
 ) -> Tuple[List[Dict[str, Any]], int]:
     images: List[Dict[str, Any]] = []
     page_width  = float(page.get_width())
@@ -191,6 +225,7 @@ def _extract_images_for_page(
             to_screen=to_screen,
             min_width=min_width,
             min_height=min_height,
+            struct_index=struct_index,
         )
         if img_metadata:
             next_image_id += 1
@@ -205,6 +240,7 @@ def extract_images(
     min_width: int = 0,
     min_height: int = 0,
     min_dpi: Optional[float] = None,
+    struct_index: Optional[Dict[Tuple[Optional[int], int], StructInfo]] = None,
 ) -> pd.DataFrame:
     """
     Extract all images from a PDF and return a DataFrame with one row per image.
@@ -215,6 +251,11 @@ def extract_images(
         min_width: Minimum image pixel width to include
         min_height: Minimum image pixel height to include
         min_dpi: Minimum DPI to include (applied after extraction)
+        struct_index: Optional ``{(page, mcid): StructInfo}`` from the shared
+            :class:`StructContext`. When supplied, each image is joined to its
+            struct-tree leaf by marked-content id, adding ``mcid``, the same
+            ``struct_*`` columns words carry, and ``img_alt`` (the figure's /Alt or
+            /ActualText). Omit it to keep the legacy image-only schema.
     """
     pdf_path = Path(pdf_path).expanduser().resolve()
 
@@ -242,6 +283,7 @@ def extract_images(
                 start_image_id=next_image_id,
                 min_width=min_width,
                 min_height=min_height,
+                struct_index=struct_index,
             )
             all_images.extend(page_images)
 

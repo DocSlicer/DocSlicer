@@ -44,7 +44,7 @@ import numpy as np
 # CONFIG
 # =====================
 
-_MAX_LINES_TOP = 2
+_MAX_LINES_TOP = 5
 _MAX_LINES_BOTTOM = 5
 _MAX_CELLS_PER_LINE = 4
 

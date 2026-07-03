@@ -208,7 +208,9 @@ class _PageSolver:
         # 1. leftmost group (x_left, then y_top as a deterministic tie-break)
         anchor = min(cands, key=lambda i: (self.xl[i], self.yt[i]))
         # 2. topmost group whose x-range overlaps the anchor's column
-        column = [i for i in cands if self._x_overlaps(i, anchor)]
+        #    (a group always "overlaps" itself, even if narrower than the
+        #    tolerance, so the anchor is never filtered out of its own column)
+        column = [i for i in cands if i == anchor or self._x_overlaps(i, anchor)]
         g = min(column, key=lambda i: (self.yt[i], self.xl[i]))
 
         # 3. top edge of g's horizontal band (g + everything it y-overlaps)
@@ -349,7 +351,7 @@ def _sort_into_reading_order(df: pd.DataFrame) -> pd.DataFrame:
     return df.sort_values(sort_cols, kind="mergesort", na_position="last").reset_index(drop=True)
 
 
-def assign_stream_group_order(df_words: pd.DataFrame) -> pd.DataFrame:
+def assign_reading_order(df_words: pd.DataFrame) -> pd.DataFrame:
     """Reshuffle words into reading order and assign ``reading_order`` + ``line_id``.
 
     Requires ``stream_group_id`` (from step_07). Steps:

@@ -18,13 +18,14 @@ from __future__ import annotations
 
 from ctypes import c_float, c_int, c_uint
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import pypdfium2 as pdfium
 import pypdfium2.raw as pdfium_c
 import pandas as pd
 
 from ._utils.page_rotation import make_rotation_transform
+from ._utils.struct_tree import StructInfo, struct_info_to_columns
 
 
 # ── Module-level function references (avoid attribute lookup in tight loops) ──
@@ -40,6 +41,7 @@ _get_width      = pdfium_c.FPDFPageObj_GetStrokeWidth
 _count_segs     = pdfium_c.FPDFPath_CountSegments
 _get_seg        = pdfium_c.FPDFPath_GetPathSegment
 _get_seg_type   = pdfium_c.FPDFPathSegment_GetType
+_get_mcid       = pdfium_c.FPDFPageObj_GetMarkedContentID
 
 _PATH_TYPE  = pdfium_c.FPDF_PAGEOBJ_PATH
 _SEG_LINE   = pdfium_c.FPDF_SEGMENT_LINETO    # 0
@@ -93,6 +95,7 @@ def _extract_raw_shapes_for_page(
     page_number: int,
     *,
     include_types: Optional[Sequence[str]] = None,
+    struct_index: Optional[Dict[Tuple[Optional[int], int], StructInfo]] = None,
 ) -> List[Dict[str, Any]]:
     raw_shapes: List[Dict[str, Any]] = []
     seen_hashes: set = set()
@@ -167,7 +170,7 @@ def _extract_raw_shapes_for_page(
             continue
         seen_hashes.add(h)
 
-        raw_shapes.append({
+        row: Dict[str, Any] = {
             "page_number":       page_number,
             "raw_shape_id":      0,  # assigned after sorting
             "raw_shape_type":    raw_shape_type,
@@ -184,7 +187,21 @@ def _extract_raw_shapes_for_page(
             "fill":              is_fill,
             "stroke":            is_stroke,
             "paint_op":          paint_op or None,
-        })
+        }
+
+        # Struct-tree enrichment by marked-content id (Figure/Artifact tag,
+        # ancestors, table spans). Only when a struct index is supplied, so
+        # standalone extraction keeps its legacy shape-only schema.
+        if struct_index is not None:
+            mcid = _get_mcid(raw_obj)
+            info = None
+            if mcid >= 0:
+                info = (struct_index.get((page_number - 1, mcid))
+                        or struct_index.get((None, mcid)))
+            row["mcid"] = mcid if mcid >= 0 else None
+            row.update(struct_info_to_columns(info))
+
+        raw_shapes.append(row)
 
     return raw_shapes
 
@@ -195,6 +212,7 @@ def extract_shapes(
     pdf_path: str | Path,
     pages_to_process: Optional[List[int]] = None,
     include_types: Optional[Sequence[str]] = None,
+    struct_index: Optional[Dict[Tuple[Optional[int], int], StructInfo]] = None,
 ) -> pd.DataFrame:
     """
     Extract all shapes from a PDF and return a DataFrame with one row per shape.
@@ -204,6 +222,10 @@ def extract_shapes(
         pages_to_process: Page numbers (1-indexed), or None for all pages
         include_types: Shape types to include — None for all, or a subset of
             ``['rect', 'line', 'curve']``
+        struct_index: Optional ``{(page, mcid): StructInfo}`` from the shared
+            :class:`StructContext`. When supplied, each shape is joined to its
+            struct-tree leaf by marked-content id, adding ``mcid`` and the same
+            ``struct_*`` columns words carry. Omit it to keep the legacy schema.
 
     Shapes are sorted by page_number → y_top → x_left.
     ``raw_shape_id`` is assigned sequentially (1-based) after sorting.
@@ -232,6 +254,7 @@ def extract_shapes(
                     page,
                     page_number,
                     include_types=include_types,
+                    struct_index=struct_index,
                 )
             )
 

@@ -225,6 +225,47 @@ class StructInfo:
         return _name(s) if s is not None else None
 
 
+# Struct-tree columns shared by every geometric leaf (word, image, shape). Kept in
+# one place so step_01 words and step_02/03 images/shapes carry an identical set.
+STRUCT_COLUMNS: Tuple[str, ...] = (
+    "struct_tag", "struct_raw_tag", "struct_tag_id", "dfs_position",
+    "struct_ancestors", "struct_raw_ancestors", "struct_ancestor_ids",
+    "struct_col_span", "struct_row_span", "struct_scope", "struct_headers",
+)
+
+
+def struct_info_to_columns(info: Optional[StructInfo]) -> Dict[str, Any]:
+    """Struct-tree column dict for one leaf given its resolved :class:`StructInfo`
+    (all-None when *info* is None).
+
+    Mirrors the per-word enrichment in ``step_01._annotate_words`` exactly, so
+    images/shapes joined by MCID carry the identical column set. ColSpan/RowSpan
+    are emitted only inside a table cell; the rest are copied straight through."""
+    cols: Dict[str, Any] = {c: None for c in STRUCT_COLUMNS}
+    if info is None:
+        return cols
+    if info.tag is not None:
+        cols["struct_tag"] = info.tag
+    if info.raw_tag is not None:
+        cols["struct_raw_tag"] = info.raw_tag
+    cols["struct_tag_id"] = info.elem_id
+    cols["dfs_position"] = info.rank
+    if info.ancestors:
+        cols["struct_ancestors"] = info.ancestors
+    if info.raw_ancestors:
+        cols["struct_raw_ancestors"] = info.raw_ancestors
+    if info.ancestor_ids:
+        cols["struct_ancestor_ids"] = info.ancestor_ids
+    if "TD" in info.ancestors or "TH" in info.ancestors:
+        cols["struct_col_span"] = info.col_span
+        cols["struct_row_span"] = info.row_span
+    if info.scope:
+        cols["struct_scope"] = info.scope
+    if info.headers:
+        cols["struct_headers"] = info.headers
+    return cols
+
+
 @dataclass
 class WidgetLink:
     """Structure-tree link to a form widget annotation (an /OBJR leaf).

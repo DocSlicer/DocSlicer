@@ -71,16 +71,15 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-import pikepdf
 import pypdfium2 as pdfium
 import pypdfium2.raw as pdfium_c
 import pandas as pd
 
 from .._utils.cpu import resolve_worker_count
 from .._utils.text_utils import add_calculated_text_features
-from ._utils.struct_tree import StructInfo, build_struct_index_with_links
-from ._utils.form_fields import FormField, build_form_index
-from ._utils.form_label_link import build_form_label_index
+from ._utils.struct_tree import StructInfo
+from ._utils.form_fields import FormField
+from ._utils.struct_context import StructContext, build_struct_context
 from ._utils.page_rotation import make_rotation_transform
 
 
@@ -910,6 +909,7 @@ def _extract_words_chunk(
 def extract_words(
     pdf_path: str | Path,
     pages_to_process: Optional[List[int]] = None,
+    struct_ctx: Optional[StructContext] = None,
 ) -> pd.DataFrame:
     """
     Extract all words from a PDF, emitting superscript and subscript characters as
@@ -928,35 +928,23 @@ def extract_words(
     """
     pdf_path = Path(pdf_path).expanduser().resolve()
 
-    # Parse structure tree and AcroForm once per document (single pikepdf open).
-    # Each step degrades gracefully: failures produce empty dicts, not exceptions.
-    #   struct_index  : {(page, mcid): StructInfo}        — struct-tree leaves
-    #   form_index    : {page_index: [FormField]}         — AcroForm fields
-    #   form_label_index : {(page, mcid): FormField}      — robust struct-tree
-    #                      widget→label join; words at these MCIDs are the field's
-    #                      visible label. Empty for untagged PDFs (spatial fallback).
-    struct_index: Dict[Tuple[Optional[int], int], StructInfo] = {}
-    widget_links = {}
-    form_index: Dict[int, List[FormField]] = {}
-    form_label_index: Dict[Tuple[Optional[int], int], FormField] = {}
-    try:
-        with pikepdf.open(str(pdf_path)) as pk:
-            try:
-                struct_index, widget_links = build_struct_index_with_links(pk)
-            except Exception:
-                struct_index, widget_links = {}, {}
-            try:
-                form_index = build_form_index(pk)
-            except Exception:
-                form_index = {}
-            try:
-                form_label_index = build_form_label_index(
-                    struct_index, widget_links, form_index
-                )
-            except Exception:
-                form_label_index = {}
-    except Exception:
-        pass
+    # The pikepdf-derived indices (struct tree + AcroForm) are normally built once
+    # by the orchestrator and passed in as *struct_ctx*, so a single pikepdf open
+    # serves words, images and shapes. When called standalone (tests, __main__) we
+    # build our own — degrading to an empty context on any failure so untagged /
+    # encrypted-without-context PDFs still extract text.
+    #   struct_index     : {(page, mcid): StructInfo}   — struct-tree leaves
+    #   form_index       : {page_index: [FormField]}    — AcroForm fields
+    #   form_label_index : {(page, mcid): FormField}    — struct-tree widget→label
+    #                      join; words at these MCIDs are the field's visible label.
+    if struct_ctx is None:
+        try:
+            struct_ctx = build_struct_context(pdf_path)
+        except Exception:
+            struct_ctx = StructContext()
+    struct_index = struct_ctx.struct_index
+    form_index = struct_ctx.form_index
+    form_label_index = struct_ctx.form_label_index
 
     with pdfium.PdfDocument(pdf_path) as doc:
         total_pages = len(doc)

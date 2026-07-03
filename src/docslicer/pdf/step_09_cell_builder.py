@@ -358,6 +358,7 @@ def _annotate_line_features(
     # Per-line stats and classification (must remain a Python loop; data is already sorted).
     feat_rows: list[dict] = []
     has_script = "script_type" in df.columns
+    has_table  = "table_id" in df.columns
 
     for line_id, grp in df.groupby("line_id", sort=False):
         x_left    = grp["x_left"].to_numpy(float)
@@ -371,10 +372,17 @@ def _annotate_line_features(
         else:
             texts_content = texts
 
-        gs         = _line_gap_stats(x_left, x_right, font_size, config)
-        cs         = _content_stats(texts_content)
-        cls, score = classify_line(texts_content, gs)
-        thr        = em_threshold_for_class(cls, config)
+        gs = _line_gap_stats(x_left, x_right, font_size, config)
+        cs = _content_stats(texts_content)
+
+        # Struct-table lines bypass the classification channel: their cells are cut
+        # at TD/TH boundaries downstream, so the em threshold is never consulted.
+        if has_table and grp["table_id"].notna().any():
+            cls, score = "table", 0.0
+            thr        = config.em_table
+        else:
+            cls, score = classify_line(texts_content, gs)
+            thr        = em_threshold_for_class(cls, config)
 
         feat_rows.append({
             "line_id":            line_id,
@@ -453,6 +461,21 @@ def _assign_cell_ids_horiz(df: pd.DataFrame, config: CellBuildConfig = CONFIG) -
     yb_arr     = pd.to_numeric(df["y_bottom"],  errors="coerce").to_numpy(float) if has_geom else None
     pre_script = df["script_type"].notna().to_numpy() if "script_type" in df.columns else np.zeros(n, dtype=bool)
 
+    # Struct-table bypass: words inside a tagged table (nonblank table_id) skip the
+    # gap channel entirely. Their cells are cut only at struct_group_id (TD/TH)
+    # boundaries so one table cell → one docslicer cell, and no gap heuristic can
+    # bridge two identified TDs. _merge_struct_groups later unifies a TD/TH that
+    # spans multiple visual lines.
+    has_struct_table = {"table_id", "struct_group_id"}.issubset(df.columns)
+    if has_struct_table:
+        table_word = df["table_id"].notna().to_numpy()
+        sg_valid   = df["struct_group_id"].notna().to_numpy()
+        sg_arr     = df["struct_group_id"].to_numpy(dtype=object)
+    else:
+        table_word = np.zeros(n, dtype=bool)
+        sg_valid   = np.zeros(n, dtype=bool)
+        sg_arr     = np.empty(n, dtype=object)
+
     def _looks_like_script(a: int, b: int) -> bool:
         """True if word *a* reads as a raised/smaller script relative to body word *b*."""
         if not has_geom:
@@ -473,6 +496,26 @@ def _assign_cell_ids_horiz(df: pd.DataFrame, config: CellBuildConfig = CONFIG) -
         j = i + 1
         while j < n and line_arr[j] == cur_line:
             j += 1
+
+        # Struct-table line: cut cells at TD/TH (struct_group_id) boundaries only,
+        # never at gaps. Two adjacent words share a cell iff they carry the same
+        # (nonblank) struct_group_id; untagged words each stand alone.
+        if table_word[i:j].any():
+            cur_cell    = next_id
+            cell_ids[i] = cur_cell
+            for k in range(i, j - 1):
+                same_group = bool(
+                    sg_valid[k] and sg_valid[k + 1] and sg_arr[k] == sg_arr[k + 1]
+                )
+                if same_group:
+                    cell_ids[k + 1] = cur_cell
+                else:
+                    next_id  += 1
+                    cur_cell  = next_id
+                    cell_ids[k + 1] = cur_cell
+            next_id += 1
+            i = j
+            continue
 
         cur_cell   = next_id
         cell_ids[i] = cur_cell
@@ -561,6 +604,13 @@ def _refine_multi_cell_lines(df: pd.DataFrame, config: CellBuildConfig = CONFIG)
     cells_per_line = df.groupby("line_id")["cell_id"].transform("nunique")
     thr            = pd.to_numeric(df["line_em_threshold"], errors="coerce")
     suspect        = (cells_per_line > 1) & (thr > config.em_table)
+
+    # Struct-table lines already have their cells cut at TD/TH boundaries; the
+    # gap-based re-merge inside _assign_cell_ids_horiz must never touch them.
+    if "table_id" in df.columns:
+        table_line = df.groupby("line_id")["table_id"].transform("count") > 0
+        suspect &= ~table_line
+
     if not suspect.any():
         return df
 
@@ -659,7 +709,8 @@ def _detect_cell_level_scripts(df: pd.DataFrame) -> pd.DataFrame:
     Cells whose words span more than one original line_id (e.g. cells merged
     across visual lines by _merge_struct_groups) are skipped entirely: a size/
     baseline difference there reflects separate stacked lines, not a sub/
-    superscript relationship.
+    superscript relationship. Words inside a tagged table (nonblank table_id) are
+    likewise never tagged, for the same stacked-row reason.
     """
     if "cell_id" not in df.columns or "font_size" not in df.columns:
         return df
@@ -669,6 +720,13 @@ def _detect_cell_level_scripts(df: pd.DataFrame) -> pd.DataFrame:
         df["script_type"] = None
 
     untagged = df["script_type"].isna()
+
+    # Struct-table cells often pack several visual rows under one line_id, so a
+    # size/baseline difference there is a stacked row, not a sub/superscript.
+    # Never script-tag words inside a tagged table.
+    if "table_id" in df.columns:
+        untagged &= df["table_id"].isna()
+
     if not untagged.any():
         return df
 
@@ -787,6 +845,7 @@ def _process_vertical_words(
     df_vert: pd.DataFrame,
     cell_id_offset: int,
     config: CellBuildConfig = CONFIG,
+    detect_scripts: bool = True,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Build cells from vertical (TTB/BTT) words via coordinate-swap.
@@ -871,7 +930,8 @@ def _process_vertical_words(
     df.drop(columns=["_x_left_pre_neg", "_x_right_pre_neg"], inplace=True)
 
     df, _ = _assign_cell_ids_horiz(df, config)
-    df = _detect_cell_level_scripts(df)
+    if detect_scripts:
+        df = _detect_cell_level_scripts(df)
 
     # Swap back to original coordinates
     cur_xl = df["x_left"].to_numpy(dtype=float)
@@ -936,6 +996,7 @@ def build_cells(
     df_words: pd.DataFrame,
     df_shapes: pd.DataFrame | None = None,
     config: CellBuildConfig = CONFIG,
+    detect_scripts: bool = True,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Words -> Cells.
@@ -944,11 +1005,19 @@ def build_cells(
       1. Annotate words with per-line gap statistics and em threshold.
       2. Assign cell_ids within each line using em-threshold gap merging,
          with bullet, list-marker, and currency special-case overrides.
+         Lines inside a tagged table (nonblank table_id) bypass this: their
+         cells are cut only at TD/TH (struct_group_id) boundaries, so the gap
+         heuristics can never merge two identified table cells.
       3. Merge cell_ids that share a struct_group_id (PDF logical structure).
       4. Aggregate words into cell rows.
 
     Horizontal and vertical words are processed independently, with vertical
     IDs offset above horizontal so the combined cell_id space is globally unique.
+
+    detect_scripts
+        When True (default), run per-cell sub/superscript detection. Callers on
+        shaky geometry (e.g. the OCR pipeline, where bboxes and font sizes are
+        unreliable) should pass False to suppress false script tags.
 
     Returns
     -------
@@ -991,13 +1060,14 @@ def build_cells(
             df_h, _ = _assign_cell_ids_horiz(df_h, config)
             df_h = _refine_multi_cell_lines(df_h, config)
             df_h = _merge_struct_groups(df_h)
-            df_h = _detect_cell_level_scripts(df_h)
+            if detect_scripts:
+                df_h = _detect_cell_level_scripts(df_h)
             df_h["cell_id"] += running_cell
 
         page_cell_max = int(df_h["cell_id"].max()) if not df_h.empty else running_cell
 
         if not df_v.empty:
-            vc, vw = _process_vertical_words(df_v, page_cell_max, config)
+            vc, vw = _process_vertical_words(df_v, page_cell_max, config, detect_scripts)
             vert_cells_out.append(vc)
             vert_words_out.append(vw)
             running_cell = int(vw["cell_id"].max()) if not vw.empty else page_cell_max
