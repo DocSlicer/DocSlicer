@@ -20,16 +20,27 @@ joining via :func:`apply_inline_markup`, which is fully vectorized so it can run
 on a whole column ahead of the groupby aggregation (the same pattern PDF's cell
 builder already uses with its ``_fmt_text`` column).
 
-Nothing here is wired into the pipeline yet — these are the building blocks.
+Each join exists in two forms with identical semantics:
+
+  * a scalar reference implementation (``join_fragments`` / ``join_table_row``
+    / ``join_lines``) that processes one group — readable, and the contract the
+    tests check against;
+  * a grouped vectorized form (``merge_fragments`` / ``merge_table_rows`` /
+    ``merge_lines``) that processes a whole column at once via
+    :func:`registry_aggregator.group_join` — no per-group Python, so it is the
+    one to use in pipelines. Returns a Series indexed by group key; ``.map`` it
+    onto the aggregated frame.
 """
 
 from __future__ import annotations
 
 from typing import Iterable
 
+import numpy as np
 import pandas as pd
 
-from ..text_utils import is_bullet_line
+from ..text_utils import is_bullet_line, is_strict_bullet, strict_bullet_mask
+from .registry_aggregator import group_join
 
 # Script tokens emitted by apply_inline_markup that attach to the previous
 # fragment with no intervening space.
@@ -93,36 +104,48 @@ def join_fragments(
     sep: str = " ",
     *,
     dehyphenate: bool = False,
+    bullet_sep: str | None = None,
 ) -> str:
     """
     Join sibling text fragments left-to-right into a single string.
 
     Rules:
       * Empty / whitespace-only fragments are skipped.
+      * ``bullet_sep`` (e.g. ``"\\n"``): a fragment starting with an
+        *unambiguous* bullet glyph (:func:`text_utils.is_strict_bullet` — ▪ •
+        ► …, deliberately narrower than the line-level bullet set) is prefixed
+        with ``bullet_sep`` instead of ``sep``. For cells that pack several
+        visual lines into one field (tagged-PDF TD/TH); mid-line ``+``/``-``
+        stay untouched ("+2y", "A-C").
       * Fragments wrapped as script tokens (``[^...]`` / ``[_...]``) attach to
         the previous fragment with no separator.
-      * ``dehyphenate=True``: when the running text ends with a hyphen, the next
-        fragment is joined directly with no space — a word split across lines,
-        e.g. ``"inter-" + "national" -> "inter-national"``. The hyphen is kept
-        (matching the current PDF ``_join_texts``). PDF will set this.
+      * ``dehyphenate=True``: when the previous fragment is a word ending in a
+        hyphen (more than just ``"-"``), the next fragment is joined directly
+        with no space — a word split across lines, e.g. ``"inter-" +
+        "national" -> "inter-national"``. The hyphen is kept; a standalone
+        ``"-"`` dash never glues. The PDF cell builder sets this.
 
     `texts` is typically a groupby column (Series/list) already in reading order.
     """
     result = ""
+    prev = ""
     for t in texts:
-        if t is None:
+        if t is None or t != t:  # skip None and NaN
             continue
         ts = str(t)
         if not ts.strip():
             continue
         if not result:
             result = ts
-        elif dehyphenate and result.endswith("-"):
+        elif bullet_sep is not None and is_strict_bullet(ts):
+            result = result + bullet_sep + ts
+        elif dehyphenate and len(prev) > 1 and prev.endswith("-"):
             result = result + ts
         elif ts[:2] in _SCRIPT_PREFIXES:
             result = result + ts
         else:
             result = result + sep + ts
+        prev = ts
     return result
 
 
@@ -139,7 +162,7 @@ def join_table_row(cell_texts: Iterable[object], sep: str = " | ") -> str:
     """
     cells = []
     for c in cell_texts:
-        if c is None:
+        if c is None or c != c:  # skip None and NaN
             continue
         cs = str(c).strip()
         if cs:
@@ -169,7 +192,7 @@ def join_lines(
     """
     parts: list[str] = []
     for t in texts:
-        if t is None:
+        if t is None or t != t:  # skip None and NaN
             continue
         ts = str(t).strip()
         if not ts:
@@ -183,9 +206,96 @@ def join_lines(
     return "".join(parts)
 
 
+# ==================================================
+# GROUPED VECTORIZED FORMS  (whole column at once)
+# ==================================================
+
+def _as_str(texts: pd.Series) -> pd.Series:
+    """None/NA → "", everything else → str (mirrors the scalar joins)."""
+    return texts.astype("string").fillna("").astype(str)
+
+
+def _fill_missing_groups(result: pd.Series, keys: pd.Series) -> pd.Series:
+    """Groups whose fragments were all blank yield "" (as the scalar joins do)."""
+    full = pd.Index(keys.dropna().unique(), name=keys.name)
+    if len(result) == len(full):
+        return result
+    return result.reindex(full, fill_value="")
+
+
+def merge_text_within_line(
+    texts: pd.Series,
+    keys: pd.Series,
+    sep: str = " ",
+    *,
+    dehyphenate: bool = False,
+    bullet_sep: str | None = None,
+) -> pd.Series:
+    """
+    Grouped, vectorized :func:`join_fragments`: one joined string per group key.
+
+    Apply :func:`apply_inline_markup` to the column first if script/strike
+    markup is wanted — script tokens then attach with no separator here.
+    """
+    s = _as_str(texts)
+    keep = (s.str.strip() != "").to_numpy(dtype=bool)
+    t, k = s[keep], keys[keep]
+
+    attach = t.str.startswith(_SCRIPT_PREFIXES)
+    if dehyphenate:
+        # Previous kept token within the same group (groups need not be
+        # contiguous in the frame); NaN at group starts → False. A standalone
+        # "-" never glues — only real words ending in a hyphen do.
+        prev = t.groupby(k, sort=False).shift(1)
+        attach = attach | (
+            prev.str.endswith("-") & (prev.str.len() > 1)
+        ).fillna(False).astype(bool)
+
+    seps: object = sep
+    if bullet_sep is not None:
+        bullet = strict_bullet_mask(t).to_numpy(dtype=bool)
+        attach = attach & ~bullet                # bullets always start fresh
+        seps = np.where(bullet, bullet_sep, sep)
+
+    return _fill_missing_groups(group_join(t, k, sep=seps, attach_mask=attach), keys)
+
+
+def merge_table_rows(
+    cell_texts: pd.Series,
+    keys: pd.Series,
+    sep: str = " | ",
+) -> pd.Series:
+    """Grouped, vectorized :func:`join_table_row`: one pipe-delimited row per key."""
+    s = _as_str(cell_texts).str.strip()
+    keep = (s != "").to_numpy(dtype=bool)
+    return _fill_missing_groups(group_join(s[keep], keys[keep], sep=sep), keys)
+
+
+def merge_text_across_lines(
+    texts: pd.Series,
+    keys: pd.Series,
+    sep: str = " ",
+    bullet_sep: str = "\n",
+) -> pd.Series:
+    """
+    Grouped, vectorized :func:`join_lines`: bullet lines start on a new line,
+    everything else joins with ``sep``. is_bullet_line runs once per row (cheap
+    frozenset checks), not once per group.
+    """
+    s = _as_str(texts).str.strip()
+    keep = (s != "").to_numpy(dtype=bool)
+    t, k = s[keep], keys[keep]
+
+    seps = np.where(t.map(is_bullet_line).to_numpy(dtype=bool), bullet_sep, sep)
+    return _fill_missing_groups(group_join(t, k, sep=seps), keys)
+
+
 __all__ = [
     "apply_inline_markup",
     "join_fragments",
     "join_table_row",
     "join_lines",
+    "merge_fragments",
+    "merge_table_rows",
+    "merge_lines",
 ]

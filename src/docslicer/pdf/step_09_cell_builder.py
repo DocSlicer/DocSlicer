@@ -49,7 +49,8 @@ import numpy as np
 import pandas as pd
 
 from .._utils.text_utils import _BULLET_TOKENS, _CURRENCY_SYMBOLS, is_list_marker
-from .._utils.df_aggregation.hierarchical_aggregator import aggregate_hierarchical, build_standard_agg_spec
+from .._utils.df_aggregation.registry_aggregator import Agg, aggregate_to
+from .._utils.df_aggregation.text_merge import apply_inline_markup, merge_text_within_line
 
 
 # ================================================================================
@@ -355,29 +356,38 @@ def _annotate_line_features(
     gap_em_col         = np.where(same_next & np.isfinite(raw_gem), np.round(raw_gem, 4), np.nan)
     df["gap_em_right"] = gap_em_col
 
-    # Per-line stats and classification (must remain a Python loop; data is already sorted).
+    # Per-line stats and classification (must remain a Python loop; data is already
+    # sorted). Iterate raw numpy slices via group boundaries rather than
+    # df.groupby(...): materialising a DataFrame + column lookups per line costs
+    # far more than the per-line math itself on document-scale inputs.
     feat_rows: list[dict] = []
     has_script = "script_type" in df.columns
     has_table  = "table_id" in df.columns
 
-    for line_id, grp in df.groupby("line_id", sort=False):
-        x_left    = grp["x_left"].to_numpy(float)
-        x_right   = grp["x_right"].to_numpy(float)
-        font_size = grp["font_size"].to_numpy(float)
-        texts     = grp["text"].tolist()
+    texts_all    = df["text"].tolist()
+    untagged_all = df["script_type"].isna().to_numpy() if has_script else None
+    table_all    = df["table_id"].notna().to_numpy() if has_table else None
+
+    bounds = np.flatnonzero(lid[1:] != lid[:-1]) + 1
+    starts = np.concatenate(([0], bounds))
+    ends   = np.concatenate((bounds, [n]))
+
+    for s, e in zip(starts, ends):
+        x_left    = xl[s:e]
+        x_right   = xr[s:e]
+        font_size = fs[s:e]
 
         if has_script:
-            untagged_mask = grp["script_type"].isna().to_numpy()
-            texts_content = [t for t, m in zip(texts, untagged_mask) if m]
+            texts_content = [t for t, m in zip(texts_all[s:e], untagged_all[s:e]) if m]
         else:
-            texts_content = texts
+            texts_content = texts_all[s:e]
 
         gs = _line_gap_stats(x_left, x_right, font_size, config)
         cs = _content_stats(texts_content)
 
         # Struct-table lines bypass the classification channel: their cells are cut
         # at TD/TH boundaries downstream, so the em threshold is never consulted.
-        if has_table and grp["table_id"].notna().any():
+        if has_table and table_all[s:e].any():
             cls, score = "table", 0.0
             thr        = config.em_table
         else:
@@ -385,7 +395,7 @@ def _annotate_line_features(
             thr        = em_threshold_for_class(cls, config)
 
         feat_rows.append({
-            "line_id":            line_id,
+            "line_id":            lid[s],
             "line_n_gaps":        gs["n_gaps"],
             "line_median_em":     round(gs["median_em"], 4),
             "line_max_em":        round(gs["max_em"], 4),
@@ -765,71 +775,28 @@ def _detect_cell_level_scripts(df: pd.DataFrame) -> pd.DataFrame:
 # 8. CELL AGGREGATION  (words → cells)
 # ================================================================================
 
-def _join_texts(texts: list[str]) -> str:
-    """Join word texts with a space; script-notation tokens ([^ / [_) attach without space."""
-    # TODO: After strikethrough detection, merge in words with ~~word~~
-    result = ""
-    for t in texts:
-        t = str(t)
-        if not t.strip():
-            continue
-        if not result:
-            result = t
-        elif result.endswith("-"):
-            result = result + t
-        elif t.startswith(("[^", "[_")):
-            result = result + t
-        else:
-            result = result + " " + t
-    return result
-
-
 def _build_cells_df(df_words: pd.DataFrame) -> pd.DataFrame:
-    """Aggregate words into cells via the shared hierarchical aggregator."""
-    df = df_words.copy()
-    df["_fmt_text"] = df["text"].astype(str)
-    if "script_type" in df.columns:
-        sup = df["script_type"] == "superscript"
-        sub = df["script_type"] == "subscript"
-        df.loc[sup, "_fmt_text"] = "[^" + df.loc[sup, "_fmt_text"] + "]"
-        df.loc[sub, "_fmt_text"] = "[_" + df.loc[sub, "_fmt_text"] + "]"
+    """Aggregate words into cells via the central column registry."""
+    # Super/subscript markers ("[^…]"/"[_…]") applied per word, then joined
+    # per cell with markers attaching to the previous token. dehyphenate keeps
+    # words split across fragments ("inter-" + "national") joined directly.
+    # bullet_sep breaks on unambiguous bullet glyphs (▪ • ► …) — tagged-PDF
+    # TD/TH cells often pack several visual lines into one cell/line_id.
+    fmt_text = apply_inline_markup(df_words)
+    cell_text = merge_text_within_line(
+        fmt_text, df_words["cell_id"], dehyphenate=True, bullet_sep="\n"
+    )
 
-    agg_spec = build_standard_agg_spec(
-        identity_cols=[
-            "page_number",
-            "page_width",
-            "page_height",
-            "reading_column",
-            "gutter_id_left",
-            "gutter_id_right",
-            # line-level features (useful for downstream debug / table detection)
-            "line_class",
-            "line_score",
-            "line_em_threshold",
-            "line_is_bimodal",
-        ],
-        include_geometry=True,
-        include_style=True,
-        include_counts=True,
-        include_metadata=False,
-        include_hierarchy=False,
-        include_table=False,
-        extra_agg={
-            "_fmt_text": lambda s: _join_texts(s.tolist()),
-            "word_id":   list,
-            "line_id":   lambda s: sorted(s.unique().tolist()),
-            "stream_group_id": "first",
-            #"stream_group_trigger": "first",
+    df_cells = aggregate_to(
+        df_words,
+        by="cell_id",
+        overrides={
+            "word_id": Agg.LIST,
+            "line_id": Agg.SORTED_UNIQUE_LIST,
         },
     )
-
-    df_cells = aggregate_hierarchical(
-        df,
-        group_col="cell_id",
-        agg_spec=agg_spec,
-        rename_count_col={"word_id": "word_ids", "line_id": "line_ids"},
-    )
-    df_cells = df_cells.rename(columns={"_fmt_text": "text"})
+    df_cells = df_cells.rename(columns={"word_id": "word_ids", "line_id": "line_ids"})
+    df_cells["text"] = df_cells["cell_id"].map(cell_text)
     # Scalar line_id for downstream consumers that expect a single value per cell.
     # Equals the minimum (first) line_id in the cell.
     if "line_ids" in df_cells.columns:
@@ -871,17 +838,22 @@ def _process_vertical_words(
     df["x_left"]   = orig_yt
     df["x_right"]  = orig_yb
 
-    # BTT words read bottom→top: negate swapped x so ascending sort gives correct order.
-    # Stash pre-negation values so they survive sort+reset_index inside _assign_cell_ids_horiz.
-    df["_x_left_pre_neg"]  = df["x_left"]
-    df["_x_right_pre_neg"] = df["x_right"]
+    # BTT words read bottom→top: negate swapped x so ascending sort gives correct
+    # reading order. Keep the negation all the way through cell assignment (which
+    # re-sorts by x_left internally): restoring the positive x here would flip BTT
+    # groups back to top→bottom, misaligning each row's precomputed gap_em_right
+    # with its real successor (orphaning the last word) and numbering cells in
+    # reverse. The swap-back below un-negates.
     if "text_orientation" in df.columns:
         btt_mask = df["text_orientation"] == "BTT"
         if btt_mask.any():
-            btt_xl = df.loc[btt_mask, "x_left"].to_numpy(dtype=float)
-            btt_xr = df.loc[btt_mask, "x_right"].to_numpy(dtype=float)
-            df.loc[btt_mask, "x_left"]  = -btt_xr
-            df.loc[btt_mask, "x_right"] = -btt_xl
+            # Compute both negated columns up front: .to_numpy() can alias df's
+            # underlying block, so assigning x_left first would corrupt the value
+            # x_right is derived from (leaving x_right un-negated).
+            new_xl = -df.loc[btt_mask, "x_right"].to_numpy(dtype=float)
+            new_xr = -df.loc[btt_mask, "x_left"].to_numpy(dtype=float)
+            df.loc[btt_mask, "x_left"]  = new_xl
+            df.loc[btt_mask, "x_right"] = new_xr
 
     # Annotate lines with em features in swapped space (skip classification — use undetermined threshold).
     # Pre-sort once so groups are already in x_left order.
@@ -924,24 +896,25 @@ def _process_vertical_words(
     df_feat = pd.DataFrame(feat_rows)
     df = df.merge(df_feat, on="line_id", how="left")
 
-    # Restore pre-negation x before cell assignment
-    df["x_left"]  = df["_x_left_pre_neg"]
-    df["x_right"] = df["_x_right_pre_neg"]
-    df.drop(columns=["_x_left_pre_neg", "_x_right_pre_neg"], inplace=True)
-
     df, _ = _assign_cell_ids_horiz(df, config)
     if detect_scripts:
         df = _detect_cell_level_scripts(df)
 
-    # Swap back to original coordinates
+    # Swap back to original coordinates (undo the x↔y swap). For BTT the swapped x
+    # is still negated: x_left/x_right hold -orig_y_bottom / -orig_y_top, so negate
+    # again to recover y_top/y_bottom.
     cur_xl = df["x_left"].to_numpy(dtype=float)
     cur_xr = df["x_right"].to_numpy(dtype=float)
     cur_yt = df["y_top"].to_numpy(dtype=float)
     cur_yb = df["y_bottom"].to_numpy(dtype=float)
+    if "text_orientation" in df.columns:
+        btt = (df["text_orientation"] == "BTT").to_numpy()
+    else:
+        btt = np.zeros(len(df), dtype=bool)
     df["x_left"]   = cur_yt
     df["x_right"]  = cur_yb
-    df["y_top"]    = cur_xl
-    df["y_bottom"] = cur_xr
+    df["y_top"]    = np.where(btt, -cur_xr, cur_xl)
+    df["y_bottom"] = np.where(btt, -cur_xl, cur_xr)
 
     df["cell_id"] = df["cell_id"] + cell_id_offset
 
@@ -974,7 +947,21 @@ def _renumber_cells_reading_order(
     if df_words.empty or "cell_id" not in df_words.columns:
         return df_cells, df_words
 
-    order  = df_words.sort_values(["page_number", "line_id", "x_left"], kind="mergesort")
+    # Intra-line reading key: left→right (x_left) for horizontal words. Vertical
+    # lines share one x-band, so x_left can't order them — read them along y
+    # instead (TTB top→bottom = ascending y_top; BTT bottom→top = descending
+    # y_bottom, encoded as -y_bottom so ascending sort still gives reading order).
+    x_left = pd.to_numeric(df_words["x_left"], errors="coerce").to_numpy(float)
+    if "text_orientation" in df_words.columns:
+        orient = df_words["text_orientation"].to_numpy()
+        yt = pd.to_numeric(df_words["y_top"],    errors="coerce").to_numpy(float)
+        yb = pd.to_numeric(df_words["y_bottom"], errors="coerce").to_numpy(float)
+        read_key = np.where(orient == "TTB", yt, np.where(orient == "BTT", -yb, x_left))
+    else:
+        read_key = x_left
+
+    order  = (df_words.assign(_read_key=read_key)
+                      .sort_values(["page_number", "line_id", "_read_key"], kind="mergesort"))
     codes  = pd.factorize(order["cell_id"].to_numpy())[0]          # 0-based, by first appearance
     mapping = dict(zip(order["cell_id"].to_numpy(), codes + 1))    # dense 1..N
 
@@ -1045,7 +1032,6 @@ def build_cells(
     # ── Horizontal ────────────────────────────────────────────────────────────
     pages           = sorted(df["page_number"].unique())
     horiz_words_out: list[pd.DataFrame] = []
-    cells_out:       list[pd.DataFrame] = []
     vert_cells_out:  list[pd.DataFrame] = []
     vert_words_out:  list[pd.DataFrame] = []
     running_cell = 0
@@ -1076,10 +1062,12 @@ def build_cells(
 
         if not df_h.empty:
             horiz_words_out.append(df_h)
-            cells_out.append(_build_cells_df(df_h))
 
     df_horiz_out = pd.concat(horiz_words_out, ignore_index=True) if horiz_words_out else pd.DataFrame()
-    df_cells     = pd.concat(cells_out,        ignore_index=True) if cells_out        else pd.DataFrame()
+    # Aggregate words → cells once over the whole document: cell_ids are already
+    # globally unique (offset per page above), and one aggregate_to call avoids
+    # paying its fixed per-call overhead once per page.
+    df_cells     = _build_cells_df(df_horiz_out) if not df_horiz_out.empty else pd.DataFrame()
 
     if vert_words_out or vert_cells_out:
         df_vert_out = pd.concat([w for w in vert_words_out if not w.empty], ignore_index=True)

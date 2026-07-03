@@ -126,6 +126,35 @@ def bullet_line_mask(series: pd.Series) -> pd.Series:
     return s.isin(_BULLET_TOKENS) | s.str[0].isin(_BULLET_PREFIX_CHARS)
 
 
+# Strict subset: glyphs that are practically always bullets even when they
+# appear *mid-line*. Excludes the ambiguous markers (- – — + * … ·), which are
+# usually math signs, numeric ranges, or dashes inside a sentence ("2-4y",
+# "+Evrysdi", "a · b") — those are only trustworthy at the start of a line
+# (is_bullet_line), never inside one. Derived from _BULLET_PREFIX_CHARS so the
+# glyph list keeps one source of truth.
+_AMBIGUOUS_BULLET_CHARS: frozenset[str] = frozenset({"-", "–", "—", "+", "*", "…", "·"})
+_STRICT_BULLET_CHARS: frozenset[str] = _BULLET_PREFIX_CHARS - _AMBIGUOUS_BULLET_CHARS
+
+
+def is_strict_bullet(text: object) -> bool:
+    """
+    True if *text* begins with an unambiguous bullet glyph (•, ▪, ►, ✓, …) —
+    safe to treat as a list marker even mid-line, unlike :func:`is_bullet_line`.
+    """
+    if text is None:
+        return False
+    if isinstance(text, float) and pd.isna(text):
+        return False
+    s = str(text).strip()
+    return bool(s) and s[0] in _STRICT_BULLET_CHARS
+
+
+def strict_bullet_mask(series: pd.Series) -> pd.Series:
+    """Vectorized :func:`is_strict_bullet` for a whole text column → boolean Series."""
+    s = series.fillna("").astype(str).str.strip()
+    return s.str[0].isin(_STRICT_BULLET_CHARS)
+
+
 # ==================================================
 # CURRENCY SYMBOLS
 # ==================================================

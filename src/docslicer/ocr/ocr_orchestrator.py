@@ -133,6 +133,7 @@ def run_ocr_pipeline(
 
     # Drop words where the colorizer found no ink — these are Tesseract hallucinations
     # in whitespace/gutter areas where no actual text pixels exist.
+    # NOTE: This operation removes rows from the df
     df_words = df_words[df_words["non_stroking_color"].notna()].reset_index(drop=True)
 
     timings.append(("STEP 2: Word colorization", perf_counter() - t0))
@@ -186,6 +187,7 @@ def run_ocr_pipeline(
     # Detect and remove line numbers
     df_words = detect_line_numbers(df_words)
 
+    # NOTE: This operation removes rows from the df
     # Step 05c - Drop line-number words
     # Line numbers are margin artefacts that must be removed entirely — unlike
     # other annotations they cannot be represented as a meaningful block_type.
@@ -194,7 +196,7 @@ def run_ocr_pipeline(
 
 
     # Enrich df_shapes for the gutter detector
-    df_shapes = merge_shapes(df_shapes, merge_lines=True)
+    df_shapes = merge_shapes(df_shapes)
 
     # 4) Assign reading order (gutter-aware)
     t0 = perf_counter()

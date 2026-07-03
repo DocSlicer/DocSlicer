@@ -73,6 +73,7 @@ import numpy as np
 import pandas as pd
 
 from .._utils.layout.line_merger import assign_line_id
+from .._utils.layout.reading_order import assign_vertical_line_ids
 
 # ================================================================================
 # TOLERANCES
@@ -361,8 +362,10 @@ def assign_reading_order(df_words: pd.DataFrame) -> pd.DataFrame:
        (Int64, globally sequential — all words in a group share it).
     2. Sort words into reading order: ``reading_order`` then ``text_object_id``
        within each group.
-    3. Assign ``line_id`` with :func:`assign_line_id`, then guarantee that words
-       sharing a ``table_row_id`` land on one line even across visual lines.
+    3. Assign ``line_id``: horizontal words via :func:`assign_line_id`, vertical
+       (TTB/BTT) words via :func:`assign_vertical_line_ids` (x-band grouping,
+       offset above the horizontal ceiling) since the plain y-proximity merge
+       is meaningless for text running down/up a column.
 
     The returned frame is sorted in reading order and carries ``reading_order``,
     ``line_id`` and ``center_bucket``.
@@ -385,6 +388,39 @@ def assign_reading_order(df_words: pd.DataFrame) -> pd.DataFrame:
     out["reading_order"] = out["reading_order"].astype("Int64")
 
     out = _sort_into_reading_order(out)
-    out = assign_line_id(out)
+
+    if "text_orientation" in out.columns:
+        vert_mask = out["text_orientation"].isin(["TTB", "BTT"])
+    else:
+        vert_mask = pd.Series(False, index=out.index)
+
+    if vert_mask.any():
+        # Assign line_id one page at a time so each page's vertical offset is
+        # relative to that page's own horizontal line count, not the
+        # document-wide total (which would make vertical line_ids jump to an
+        # arbitrary large number unrelated to the page they're on).
+        parts: list[pd.DataFrame] = []
+        running_line = 0
+        for _page, page_df in out.groupby("page_number", sort=True):
+            page_vert_mask = vert_mask.loc[page_df.index]
+            df_h = page_df[~page_vert_mask]
+            df_v = page_df[page_vert_mask]
+
+            if not df_h.empty:
+                df_h = assign_line_id(df_h)
+                df_h["line_id"] = df_h["line_id"] + running_line
+                running_line = int(df_h["line_id"].max())
+
+            if not df_v.empty:
+                df_v = assign_vertical_line_ids(df_v, line_id_offset=running_line)
+                running_line = int(df_v["line_id"].max())
+
+            parts.append(pd.concat([df_h, df_v]))
+
+        # assign_vertical_line_ids resets the index internally, so re-derive
+        # reading order by rank rather than relying on positional alignment.
+        out = _sort_into_reading_order(pd.concat(parts, ignore_index=True))
+    else:
+        out = assign_line_id(out)
 
     return out

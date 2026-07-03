@@ -44,13 +44,14 @@ from .step_06_style_prefiller import prefill_styles
 from .step_07_stream_group import assign_stream_group_id
 from .step_08_reading_order import assign_reading_order
 from .step_09_cell_builder import build_cells
-from .step_10_page_label_detector import assign_pdf_page_labels
+from .step_10_page_label_detector import detect_pdf_page_labels
 from .step_12_line_builder import build_lines
 from .step_13_table_builder import build_tables
 
 # PDF Utils
 from ._utils.struct_context import build_struct_context
 from ._utils.coordinates import convert_to_global_y_coordinates
+from ._utils.shape_relationships import add_link_relationships
 
 # Global Utils
 from .._utils.layout.shape_merger import merge_shapes
@@ -165,41 +166,87 @@ def run_pipeline(
             # No text even after OCR — nothing to parse
             return discovered_metadata, pd.DataFrame(), None, {}
 
-        # ── Stage: Enrichment ────────────────────────────────────────────────
-        if on_stage:
-            on_stage("enrichment")
+        
+        # The OCR pipeline already produces its own line_id via gutter-aware
+        # reading order and strips its own margin line numbers, so struct-tree-based
+        # enrichment is both unavailable (no struct tree for a scanned page) and
+        # redundant here.
+        if not discovered_metadata.get("has_ocr"):
 
-        # Step 04 - Shape Enhancement
-        df_shapes = merge_shapes(df_shapes, merge_lines=True)
+            # ── Stage: Raw df cleanups ────────────────────────────────────────────────
+            if on_stage:
+                on_stage("df cleanup")
 
-        # Step 05b - Line Number Detection
-        df_words = detect_line_numbers(df_words)
+            # Cleanup 1 - Shape Merging
+            df_shapes = merge_shapes(df_shapes)
 
-        # Step 05c - Drop line-number words
-        # Line numbers are margin artefacts that must be removed entirely — unlike
-        # other annotations they cannot be represented as a meaningful block_type.
-        if "line_number_flag" in df_words.columns:
-            n_removed = df_words["line_number_flag"].sum()
-            if n_removed:
-                logger.debug("Dropping %d line-number word(s) from df_words", n_removed)
-            df_words = df_words[~df_words["line_number_flag"]].copy()
+            # Cleanup 2 - Line Number Detection & Removal
+            # Line numbers are margin artefacts that must be removed entirely — unlike
+            # other annotations they cannot be represented as a meaningful block_type.
+            df_words = detect_line_numbers(df_words)
 
-        # Step 05d - Gutter Detection
-        df_words, _, _ = detect_and_annotate_gutters(df_words, df_shapes)
+            # NOTE: This operation removes rows from the df
+            if "line_number_flag" in df_words.columns:
+                n_removed = df_words["line_number_flag"].sum()
+                if n_removed:
+                    logger.debug("Dropping %d line-number word(s) from df_words", n_removed)
+                df_words = df_words[~df_words["line_number_flag"]].copy()
+
+            # Cleanup 3 - Merge links onto words
+            df_words = add_link_relationships(df_words, df_links)
+
+            # ── Stage: Reading Order ────────────────────────────────────────────────
+            if on_stage:
+                on_stage("reading order")
+
+            # Step 05 - Struct group assignment
+            df_words = assign_struct_group_id(df_words)
+
+            # If struct_group_id is blank across the whole df, structure-tree data
+            # wasn't available — skip stream grouping / reading order and fall
+            # back to spatial line ordering instead.
+            if "struct_group_id" not in df_words.columns or df_words["struct_group_id"].isna().all():
+                # Step 08(b) - Stream Group Assignment - Fallback
+                df_words = assign_reading_order_fallback(df_words, df_shapes)
+            else:
+                # Step 06 - Prefill Styles
+                df_words = prefill_styles(df_words)
+                # Step 07 - Stream Group Assignment
+                df_words = assign_stream_group_id(df_words)
+                # Step 08(a) - Stream Group Assignment
+                df_words = assign_reading_order(df_words)
 
         # ── Stage: Cell & Line Construction ─────────────────────────────────
         if on_stage:
             on_stage("layout")
 
-        # Step 06 - Cell Builder
+        # Step 09 - Cell Builder
         df_cells, df_words = build_cells(df_words, df_shapes, df_links)
 
-        # Step 07 - Page Labels
+        # Step 10 - Page Labels
         if page_label_config:
-            df_cells = assign_pdf_page_labels(df_cells, page_label_config)
+            df_cells = detect_pdf_page_labels(df_cells, page_label_config)
+
+        ###############################
+        # NOTE Next steps
+        ###############################
+
+
+        #if not discovered_metadata.get("has_ocr"):
+            # TODO: Group rows (multirow cells) and reindex line_id
+            # TODO: Add layout_id
+
+        # TODO: Table vs text per layout_id
+
+
+
+
+        ###############################
+        # NOTE Not yet used as of here
+        ###############################
 
         # Step 08 - Convert Y coordinates from page-relative to global
-        df_cells = convert_to_global_y_coordinates(df_cells)
+        #df_cells = convert_to_global_y_coordinates(df_cells)
 
         # Step 09 - Line Builder
         #df_lines, df_cells = build_lines(df_cells)

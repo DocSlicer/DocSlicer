@@ -479,8 +479,6 @@ def _run_merge(df: pd.DataFrame) -> pd.DataFrame:
 
 def merge_shapes(
     df_shapes: pd.DataFrame,
-    *,
-    merge_lines: bool = True,
 ) -> pd.DataFrame:
     """
     Merge raw shapes from extract_shapes into logical shape records.
@@ -514,7 +512,6 @@ def merge_shapes(
     _ensure_shape_columns(df)
     df["raw_shape_ids"] = df["raw_shape_id"].astype(int).map(lambda v: [v])
 
-    if merge_lines:
-        df = _run_merge(df)
+    df = _run_merge(df)
 
     return df

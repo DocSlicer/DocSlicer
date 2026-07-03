@@ -48,6 +48,11 @@ _MAX_LINES_TOP = 5
 _MAX_LINES_BOTTOM = 5
 _MAX_CELLS_PER_LINE = 4
 
+# Marked-content tag that tagged PDFs use for page furniture (running
+# headers/footers, pagination). When present, page numbers almost always
+# carry it, so we can find them without positional heuristics.
+_ARTIFACT_BDC_TAG = "artifact"
+
 
 # =====================
 # PAGE LABEL PATTERNS (EXPECTED SHAPE)
@@ -384,12 +389,55 @@ def _extract_candidate_tokens(raw_text: str, max_len: int, has_link: bool) -> li
 # Main Candidate Orchestrator
 # =====================
 
+def _resolve_candidate(
+    raw_text: str,
+    has_link: bool,
+    max_len: int,
+    cfg: PageLabelConfig,
+) -> Optional[Tuple[str, str, Optional[int], bool, str]]:
+    """
+    Resolve a single cell's best page-label candidate.
+
+    Returns (token_norm, label_type, value_int, cell_sharing, wrapper) or None.
+    Depends only on (raw_text, has_link, max_len, cfg), so callers memoize it on
+    the text — running headers/footers repeat verbatim across many pages, and the
+    regex work here is the dominant cost of candidate marking.
+    """
+    candidates = _extract_candidate_tokens(raw_text, max_len=max_len, has_link=has_link)
+    if not candidates:
+        return None
+
+    # Pick the best candidate by type preference, then extraction order.
+    # arabic/arabic_sub > alpha_numeric > roman_numeric > alpha_roman > roman
+    # This prevents a single-letter roman (e.g. "L" from "L 347/1") from
+    # winning over a later arabic_sub token ("347/1").
+    chosen = None
+    chosen_prio = 99
+    for token_norm, cell_sharing, wrapper in candidates:
+        label_type = _match_page_label_type(token_norm, cfg)
+        if label_type == "unknown":
+            continue
+
+        value_int = _parse_value_int(token_norm, label_type)
+        prio = _TYPE_PRIO.get(label_type, 99)
+        # Accept if: no candidate yet, OR this type is strictly better
+        # (only upgrade; don't downgrade to a worse type for a parseable value)
+        if chosen is None or (prio < chosen_prio and value_int is not None):
+            chosen = (token_norm, label_type, value_int, bool(cell_sharing), wrapper)
+            chosen_prio = prio
+            if label_type in ("arabic", "arabic_sub") and value_int is not None:
+                break
+
+    return chosen
+
+
 def mark_pdf_page_label_candidates(
     df_cells: pd.DataFrame,
     page_label_config: PageLabelConfig,
     max_lines_top: int = _MAX_LINES_TOP,
     max_lines_bottom: int = _MAX_LINES_BOTTOM,
     max_cells_per_line: int = _MAX_CELLS_PER_LINE,
+    artifact_only: bool = False,
 ) -> pd.DataFrame:
     """
     Phase (1): Mark candidates only.
@@ -399,6 +447,13 @@ def mark_pdf_page_label_candidates(
       - line_id
       - cell_id
       - text
+
+    artifact_only:
+      When True, restrict candidate extraction to cells whose ``bdc_tag`` is
+      ``"Artifact"`` and bypass the positional config (top/bottom lines,
+      max cells per line). Tagged PDFs mark page furniture as Artifacts, so
+      any page number living there can be found without those heuristics.
+      If the frame has no ``bdc_tag`` column, no candidates are marked.
 
     Adds/overwrites columns:
       - page_label_raw
@@ -430,89 +485,88 @@ def mark_pdf_page_label_candidates(
 
     max_len = int(page_label_config.max_length)
 
-    # Precompute cells per (page, line)
-    line_cell_counts = (
-        out.groupby(["page_number", "line_id"], sort=False)["cell_id"]
-        .size()
-        .rename("cells_in_line")
-        .reset_index()
-    )
+    # Artifact pre-pass: restrict to page-furniture cells and skip positional
+    # heuristics. If the frame lacks bdc_tag we can't run it — return with no
+    # candidates so the caller falls back to the positional pass.
+    if artifact_only:
+        if "bdc_tag" not in out.columns:
+            return out
+        artifact_mask = out["bdc_tag"].astype(str).str.strip().str.lower() == _ARTIFACT_BDC_TAG
+        if not artifact_mask.any():
+            return out
 
-    # Join counts back (fast enough; avoids per-page groupby sizes)
-    out = out.merge(line_cell_counts, on=["page_number", "line_id"], how="left")
+    # ---- Select candidate cells (focus set), fully vectorized ----
+    if artifact_only:
+        focus_mask = artifact_mask.to_numpy()
+    else:
+        # Cells per (page, line): a table-ish line has many cells.
+        cells_in_line = (
+            out.groupby(["page_number", "line_id"], sort=False)["cell_id"].transform("size")
+        )
 
-    # Process page by page
-    for page_val, g in out.groupby("page_number", sort=False):
-        # Determine top/bottom line_ids
-        # Assumes line_id increases top->bottom (typical if built that way).
-        line_ids = g["line_id"].dropna().unique()
-        if len(line_ids) == 0:
+        # Top/bottom line selection without a per-page Python loop. Dense rank
+        # over line_id within each page reproduces "first N / last N distinct
+        # line_ids": duplicate lines share a rank, and NaN line_ids rank NaN
+        # (never selected) — matching the previous dropna()+sorted() logic.
+        asc_rank = out.groupby("page_number")["line_id"].rank(method="dense", ascending=True)
+        desc_rank = out.groupby("page_number")["line_id"].rank(method="dense", ascending=False)
+        in_boundary = (asc_rank <= max_lines_top) | (desc_rank <= max_lines_bottom)
+
+        focus_mask = (
+            in_boundary.to_numpy()
+            & (cells_in_line.fillna(0).astype(int).to_numpy() <= int(max_cells_per_line))
+        )
+
+    focus_idx = out.index[focus_mask]
+    if len(focus_idx) == 0:
+        return out
+
+    # Extract candidates once per unique (text, has_link). The regex-heavy
+    # resolution is memoized because running headers/footers repeat verbatim
+    # across pages, so most cells hit the cache instead of re-running the regexes.
+    texts = out["text"].to_numpy(dtype=object)[focus_mask]
+    if "has_link" in out.columns:
+        links = out["has_link"].fillna(False).astype(bool).to_numpy()[focus_mask]
+    else:
+        links = np.zeros(len(focus_idx), dtype=bool)
+
+    _MISS = object()
+    cache: Dict[Tuple[str, bool], Optional[Tuple]] = {}
+    m_idx, m_raw, m_tok, m_typ, m_val, m_share, m_wrap = [], [], [], [], [], [], []
+
+    for pos, ridx in enumerate(focus_idx):
+        raw = texts[pos]
+        if raw is None:
+            continue
+        raw_s = str(raw)
+        if not raw_s.strip():
             continue
 
-        try:
-            line_ids_sorted = sorted(line_ids)
-        except Exception:
-            # If line_id isn't sortable, fall back to pandas sort
-            line_ids_sorted = sorted(list(line_ids), key=lambda x: str(x))
-
-        top_lines = set(line_ids_sorted[: max_lines_top])
-        bottom_lines = set(line_ids_sorted[max(0, len(line_ids_sorted) - max_lines_bottom) :])
-
-        candidate_lines = top_lines.union(bottom_lines)
-
-        # Exclude table-ish lines (too many cells)
-        g_focus = g[g["line_id"].isin(candidate_lines)]
-        g_focus = g_focus[g_focus["cells_in_line"].fillna(0).astype(int) <= int(max_cells_per_line)]
-
-        if g_focus.empty:
+        key = (raw_s, bool(links[pos]))
+        res = cache.get(key, _MISS)
+        if res is _MISS:
+            res = _resolve_candidate(raw_s, key[1], max_len, page_label_config)
+            cache[key] = res
+        if res is None:
             continue
 
-        # Mark candidates in selected cells
-        for idx, row in g_focus.iterrows():
-            raw_text = row["text"]
-            has_link = bool(row.get("has_link", False))
-            if raw_text is None or not str(raw_text).strip():
-                continue
+        token_norm, label_type, value_int, cell_sharing, wrapper = res
+        m_idx.append(ridx)
+        m_raw.append(raw_s)
+        m_tok.append(token_norm)
+        m_typ.append(label_type)
+        m_val.append(value_int)
+        m_share.append(cell_sharing)
+        m_wrap.append(wrapper)
 
-            candidates = _extract_candidate_tokens(str(raw_text), max_len=max_len, has_link=has_link)
-            if not candidates:
-                continue
-
-            # Pick the best candidate by type preference, then extraction order.
-            # arabic/arabic_sub > alpha_numeric > roman_numeric > alpha_roman > roman
-            # This prevents a single-letter roman (e.g. "L" from "L 347/1") from
-            # winning over a later arabic_sub token ("347/1").
-            chosen = None
-            chosen_prio = 99
-            for token_norm, cell_sharing, wrapper in candidates:
-                label_type = _match_page_label_type(token_norm, page_label_config)
-                if label_type == "unknown":
-                    continue
-
-                value_int = _parse_value_int(token_norm, label_type)
-                prio = _TYPE_PRIO.get(label_type, 99)
-                # Accept if: no candidate yet, OR this type is strictly better
-                # (only upgrade; don't downgrade to a worse type for a parseable value)
-                if chosen is None or (prio < chosen_prio and value_int is not None):
-                    chosen = (token_norm, label_type, value_int, cell_sharing, wrapper)
-                    chosen_prio = prio
-                    if label_type in ("arabic", "arabic_sub") and value_int is not None:
-                        break
-
-            if chosen is None:
-                continue
-
-            token_norm, label_type, value_int, cell_sharing, wrapper = chosen
-
-            out.at[idx, "page_label_raw"] = str(raw_text)
-            out.at[idx, "page_label_candidate"] = token_norm
-            out.at[idx, "page_label_type"] = label_type
-            out.at[idx, "page_label_value"] = value_int
-            out.at[idx, "page_label_cell_sharing"] = bool(cell_sharing)
-            out.at[idx, "page_label_wrapper"] = wrapper
-
-    # Drop helper col
-    out = out.drop(columns=["cells_in_line"], errors="ignore")
+    # Bulk-assign (one write per column) instead of scalar .at in a loop.
+    if m_idx:
+        out.loc[m_idx, "page_label_raw"] = m_raw
+        out.loc[m_idx, "page_label_candidate"] = m_tok
+        out.loc[m_idx, "page_label_type"] = m_typ
+        out.loc[m_idx, "page_label_value"] = m_val
+        out.loc[m_idx, "page_label_cell_sharing"] = m_share
+        out.loc[m_idx, "page_label_wrapper"] = m_wrap
 
     return out
 
@@ -643,50 +697,75 @@ def add_page_label_score(
     else:
         page_min = int(pages.min())
         page_max = int(pages.max())
-        page_axis = pd.DataFrame({"page_int": np.arange(page_min, page_max + 1, dtype=int)})
 
-        # For each page_int, gather candidate fps + chars (as lists) via groupby
+        # Vectorized window aggregation over a contiguous page axis.
+        # The window [p-w, p+w] in page-number space equals a ±w window in axis
+        # index space (axis is contiguous), so both the local fp-mode and the
+        # local median char are windowed sums over per-page histograms computed
+        # once via cumsum — no per-page Python/pandas work inside the loop.
         g = c[c["_page_int"].notna()].copy()
         g["_page_int"] = g["_page_int"].astype(int)
 
-        fp_list_by_page = g.groupby("_page_int")["_fp"].apply(list)
-        char_list_by_page = g.groupby("_page_int")["_char"].apply(list)
+        P = page_max - page_min + 1
+        w = int(window_pages)
+        axis_pos = g["_page_int"].to_numpy() - page_min  # axis row per candidate
 
-        # Helper: window slice
-        def _window_pages(p: int) -> tuple[int, int]:
-            return (p - int(window_pages), p + int(window_pages))
+        # Per-axis-row window bounds (clipped to the axis; pages outside it have
+        # no candidates, so clipping is equivalent to the old index-membership test).
+        idx = np.arange(P)
+        lo_i = np.maximum(idx - w, 0)
+        hi_i = np.minimum(idx + w, P - 1)
 
-        # Precompute local mode fp and local median char for each page in axis
-        local_mode_fp = {}
-        local_median_char = {}
+        def _window_sum(cumsum_2d: np.ndarray) -> np.ndarray:
+            """Rows lo_i..hi_i (inclusive) summed, from a cumsum along axis 0."""
+            upper = cumsum_2d[hi_i]
+            lower = np.where((lo_i > 0)[:, None], cumsum_2d[lo_i - 1], 0)
+            return upper - lower
 
-        for p in page_axis["page_int"].tolist():
-            lo, hi = _window_pages(p)
+        # --- Local fp mode (tie -> lexicographically smallest) ---
+        # Columns ordered by sorted fp so argmax's first-max rule yields the
+        # lexicographically smallest fingerprint on ties.
+        uniq_fps = sorted(g["_fp"].astype(str).unique().tolist())
+        fp_code = {fp: i for i, fp in enumerate(uniq_fps)}
+        codes = g["_fp"].astype(str).map(fp_code).to_numpy()
 
-            # Collect window fps/chars from pages that exist in group series
-            fps = []
-            chars = []
-            for pp in range(lo, hi + 1):
-                if pp in fp_list_by_page.index:
-                    fps.extend(fp_list_by_page.loc[pp])
-                if pp in char_list_by_page.index:
-                    chars.extend([x for x in char_list_by_page.loc[pp] if pd.notna(x)])
+        fp_hist = np.zeros((P, len(uniq_fps)), dtype=np.int64)
+        np.add.at(fp_hist, (axis_pos, codes), 1)
+        fp_win = _window_sum(np.cumsum(fp_hist, axis=0))
+        fp_totals = fp_win.sum(axis=1)
+        fp_arg = fp_win.argmax(axis=1)
 
-            # Local mode fp (tie -> lexicographically smallest)
-            if fps:
-                vc = pd.Series(fps).value_counts()
-                top = vc.iloc[0]
-                tied = vc[vc == top].index.tolist()
-                tied.sort()
-                local_mode_fp[p] = tied[0]
-            else:
-                local_mode_fp[p] = None
+        local_mode_fp = {
+            int(page_min + i): (uniq_fps[fp_arg[i]] if fp_totals[i] > 0 else None)
+            for i in range(P)
+        }
 
-            # Local median char
-            if chars:
-                local_median_char[p] = float(pd.Series(chars).median())
-            else:
-                local_median_char[p] = np.nan
+        # --- Local median char ---
+        char_vals = g["_char"].to_numpy()
+        finite = np.isfinite(char_vals)
+        if not finite.any():
+            local_median_char = {int(page_min + i): np.nan for i in range(P)}
+        else:
+            cv = char_vals[finite].astype(np.int64)
+            cpos = axis_pos[finite]
+            cmin = int(cv.min())
+            char_hist = np.zeros((P, int(cv.max()) - cmin + 1), dtype=np.int64)
+            np.add.at(char_hist, (cpos, cv - cmin), 1)
+            char_win = _window_sum(np.cumsum(char_hist, axis=0))
+            counts = char_win.sum(axis=1)
+            cum = np.cumsum(char_win, axis=1)
+
+            local_median_char = {}
+            for i in range(P):
+                n = int(counts[i])
+                if n == 0:
+                    local_median_char[int(page_min + i)] = np.nan
+                    continue
+                # Lower/upper middle order-statistics (0-indexed). pandas median
+                # averages the two middle values for even n; equal for odd n.
+                v1 = int(np.searchsorted(cum[i], (n - 1) // 2, side="right"))
+                v2 = int(np.searchsorted(cum[i], n // 2, side="right"))
+                local_median_char[int(page_min + i)] = (v1 + v2 + 2 * cmin) / 2.0
 
         # Apply local fp bonus
         g_page_int = c["_page_int"]
@@ -1403,17 +1482,49 @@ def spread_winner_page_label_across_page(
 # public API
 # ================================================================================
 
-def assign_pdf_page_labels(
+def _run_page_label_pipeline(
     df: pd.DataFrame,
     page_label_config: PageLabelConfig,
+    *,
+    artifact_only: bool,
     max_lines_top: int = _MAX_LINES_TOP,
     max_lines_bottom: int = _MAX_LINES_BOTTOM,
     max_cells_per_line: int = _MAX_CELLS_PER_LINE,
 ) -> pd.DataFrame:
-    out = mark_pdf_page_label_candidates(df, page_label_config, max_lines_top, max_lines_bottom, max_cells_per_line)
+    """Full candidate → score → winner → QC → spread pipeline for one pass."""
+    out = mark_pdf_page_label_candidates(
+        df, page_label_config, max_lines_top, max_lines_bottom, max_cells_per_line,
+        artifact_only=artifact_only,
+    )
     out = add_page_label_score(out)
     out = pick_pdf_page_label_winners_and_validate(out)
     out = qc_pdf_page_label_series(out, enforce_unit_step=True)
     out = drop_unreliable_prefix_labels(out)
     out = spread_winner_page_label_across_page(out)
     return out
+
+
+def detect_pdf_page_labels(
+    df: pd.DataFrame,
+    page_label_config: PageLabelConfig,
+    max_lines_top: int = _MAX_LINES_TOP,
+    max_lines_bottom: int = _MAX_LINES_BOTTOM,
+    max_cells_per_line: int = _MAX_CELLS_PER_LINE,
+) -> pd.DataFrame:
+    # Pre-pass: look for a valid series among Artifact-tagged cells only,
+    # bypassing the positional config. Tagged PDFs mark page furniture as
+    # Artifacts, so when a page-number series lives there it survives the same
+    # QC gates without the top/bottom-line + max-cells heuristics.
+    artifact_out = _run_page_label_pipeline(df, page_label_config, artifact_only=True)
+    if artifact_out["page_label"].notna().any():
+        return artifact_out
+
+    # Fallback: positional heuristic over all cells.
+    return _run_page_label_pipeline(
+        df,
+        page_label_config,
+        artifact_only=False,
+        max_lines_top=max_lines_top,
+        max_lines_bottom=max_lines_bottom,
+        max_cells_per_line=max_cells_per_line,
+    )
