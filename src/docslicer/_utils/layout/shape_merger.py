@@ -14,7 +14,7 @@ import pandas as pd
 
 _GAP_TOL_PX   = 1.5  # max y (or x) spread to group shapes into the same band
 _CHAIN_TOL_PX = 1.5  # max gap between segments in a run to merge into one shape
-LINE_HEIGHT_MAX_PX = 3  # max height (or width) to reclassify a rect/curve as a line
+LINE_HEIGHT_MAX_PX = 4.2  # max height (or width) to reclassify a rect/curve as a line (a double line is usually 4pt)
 _PAGE_BG_COVERAGE = 0.80  # min fraction of page width AND height for a rect to count as page_background
 
 

@@ -96,6 +96,15 @@ def is_list_marker(text: object) -> bool:
     return t in _BULLET_TOKENS or bool(_LIST_MARKER_RE.match(t))
 
 
+def list_marker_mask(series: pd.Series) -> pd.Series:
+    """
+    Vectorized :func:`is_list_marker` for a whole text column → boolean Series.
+    One isin + one pre-compiled regex match, both C-level; safe on full columns.
+    """
+    s = series.fillna("").astype(str).str.strip()
+    return s.isin(_BULLET_TOKENS) | s.str.match(_LIST_MARKER_RE)
+
+
 def is_bullet_line(text: object) -> bool:
     """
     True if *text* is a bullet line: either a standalone bullet glyph, or a line
@@ -180,6 +189,59 @@ def is_currency_symbol(text: object) -> bool:
     if isinstance(text, float) and pd.isna(text):
         return False
     return str(text).strip() in _CURRENCY_SYMBOLS
+
+
+# ==================================================
+# NUMERIC VALUE TOKENS
+# ==================================================
+
+# Numeric value token: number body with thousands/decimal separators, optional
+# currency prefix, optional % / currency suffix, the whole thing optionally
+# parenthesized (accounting negatives) — 123 / 1,234.5 / $5 / 12% / (123) /
+# (2%) / ($1.2).
+_NUMERIC_VALUE_RE = re.compile(
+    rf'^\(?{_CURRENCY_SYM_CLASS}?\s?\d[\d,\.]*\s?(?:{_CURRENCY_SYM_CLASS}|%)?\)?$'
+)
+
+# Dash placeholders used for "no value" cells in financial tables.
+_DASH_TOKENS: frozenset[str] = frozenset({"-", "–", "—", "−"})
+
+# Standalone unit tokens that flank numbers in table value columns: a detached
+# percent sign ("17 %" extracted as two words), same role as a detached
+# currency symbol.
+_UNIT_TOKENS: frozenset[str] = frozenset({"%"})
+
+
+def is_numeric_value(text: object) -> bool:
+    """
+    True if *text* is a numeric/currency table value: a numeric value token
+    (see _NUMERIC_VALUE_RE), a standalone currency symbol or percent sign, or
+    a dash placeholder.
+    """
+    if text is None:
+        return False
+    if isinstance(text, float) and pd.isna(text):
+        return False
+    t = str(text).strip()
+    if not t:
+        return False
+    return (
+        t in _DASH_TOKENS
+        or t in _CURRENCY_SYMBOLS
+        or t in _UNIT_TOKENS
+        or bool(_NUMERIC_VALUE_RE.match(t))
+    )
+
+
+def numeric_value_mask(series: pd.Series) -> pd.Series:
+    """Vectorized :func:`is_numeric_value` for a whole text column → boolean Series."""
+    s = series.fillna("").astype(str).str.strip()
+    return (
+        s.isin(_DASH_TOKENS)
+        | s.isin(_CURRENCY_SYMBOLS)
+        | s.isin(_UNIT_TOKENS)
+        | s.str.match(_NUMERIC_VALUE_RE)
+    )
 
 
 # ==================================================
