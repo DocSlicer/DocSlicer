@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Dict, Literal, Tuple, List, Set, Iterable
+from typing import Any, Dict, List, Literal, Iterable
 
 import numpy as np
 import pandas as pd
@@ -16,62 +15,23 @@ import pandas as pd
 _GAP_TOL_PX   = 1.5  # max y (or x) spread to group shapes into the same band
 _CHAIN_TOL_PX = 1.5  # max gap between segments in a run to merge into one shape
 LINE_HEIGHT_MAX_PX = 3  # max height (or width) to reclassify a rect/curve as a line
+_PAGE_BG_COVERAGE = 0.80  # min fraction of page width AND height for a rect to count as page_background
 
 
 # ==============================
 # Types
 # ==============================
 
-ShapeType     = Literal["rect", "line", "curve", "unknown"]
-ShapeSemantic = Literal["table_grid", "underline", "separator", "background_band", "other"]
-Orientation   = Literal["horizontal", "vertical", "unknown"]
+ShapeType   = Literal["rect", "line", "curve", "unknown"]
+ShapeRole   = Literal["page_background", "table_grid", "underline", "separator", "background_band", "other"]
+Orientation = Literal["horizontal", "vertical", "unknown"]
 
-
-@dataclass
-class CandidateGroup:
-    group_id: int
-    page_number: int
-    raw_shape_ids: List[int]
-    group_orientation: Literal["horizontal", "vertical"]
-
-    # Bounding box (union of all shapes in the group)
-    x_left: float
-    x_right: float
-    y_top: float
-    y_bottom: float
-
-    @property
-    def width(self) -> float:
-        return self.x_right - self.x_left
-
-    @property
-    def height(self) -> float:
-        return self.y_bottom - self.y_top
-
-    @property
-    def is_singleton(self) -> bool:
-        return len(self.raw_shape_ids) == 1
-
-    @classmethod
-    def from_shapes_df(
-        cls,
-        *,
-        group_id: int,
-        page_number: int,
-        shape_orientation: Literal["horizontal", "vertical"],
-        shapes_df: pd.DataFrame,
-    ) -> "CandidateGroup":
-        """Build a CandidateGroup from a subset of the shapes DataFrame."""
-        return cls(
-            group_id=group_id,
-            page_number=page_number,
-            raw_shape_ids=shapes_df["raw_shape_id"].astype(int).tolist(),
-            group_orientation=shape_orientation,
-            x_left=float(shapes_df["x_left"].min()),
-            x_right=float(shapes_df["x_right"].max()),
-            y_top=float(shapes_df["y_top"].min()),
-            y_bottom=float(shapes_df["y_bottom"].max()),
-        )
+# Drawing metadata copied onto merged records from the representative shape.
+# Optional columns (PDF-only) are emitted as None when absent from the input.
+_META_COLS = (
+    "raw_shape_type", "linewidth", "fill", "stroke", "paint_op",
+    "non_stroking_color", "stroking_color",
+)
 
 
 # ==============================
@@ -116,142 +76,66 @@ def _add_raw_orientation(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _extract_page_arrays(page_df: pd.DataFrame) -> Dict[str, Any]:
+    """
+    Pull everything the merge needs out of pandas once, as numpy arrays
+    sorted by raw_shape_id. All later work indexes these positionally.
+    """
+    page_df = page_df.sort_values("raw_shape_id")
+    arrays: Dict[str, Any] = {
+        "ids":             page_df["raw_shape_id"].to_numpy(dtype=np.int64),
+        "x_left":          page_df["x_left"].to_numpy(dtype=np.float64),
+        "x_right":         page_df["x_right"].to_numpy(dtype=np.float64),
+        "y_top":           page_df["y_top"].to_numpy(dtype=np.float64),
+        "y_bottom":        page_df["y_bottom"].to_numpy(dtype=np.float64),
+        "raw_orientation": page_df["raw_orientation"].to_numpy(),
+    }
+    for col in _META_COLS:
+        arrays[col] = page_df[col].to_numpy(dtype=object) if col in page_df.columns else None
+    # Page dimensions (optional — absent on the OCR path); constant per page.
+    for col in ("page_width", "page_height"):
+        arrays[col] = float(page_df[col].iloc[0]) if col in page_df.columns else None
+    return arrays
+
+
+def _meta(pa: Dict[str, Any], col: str, pos: int) -> Any:
+    arr = pa[col]
+    return arr[pos] if arr is not None else None
+
+
 # ==============================
 # Candidate Groups
 # ==============================
 
-def _make_horizontal_candidate_groups(
-    df: pd.DataFrame,
-    *,
-    start_group_id: int = 1,
-) -> Tuple[List[CandidateGroup], int]:
+def _band_groups(
+    sel: np.ndarray,
+    lo: np.ndarray,
+    hi: np.ndarray,
+) -> List[np.ndarray]:
     """
-    Group horizontal (and square) shapes that share the same y-band.
-    Returns (groups, next_group_id).
+    Seed-anchored banding: repeatedly take the first unused shape as seed and
+    group every unused shape whose lo/hi edges are both within _GAP_TOL_PX of
+    the seed's. Returns a list of position arrays (positions into the page
+    arrays). sel holds the candidate positions; lo/hi are aligned with sel.
     """
-    groups: List[CandidateGroup] = []
-    group_id = start_group_id
+    groups: List[np.ndarray] = []
+    used = np.zeros(sel.size, dtype=bool)
 
-    horiz = df[df["raw_orientation"].isin(["horizontal", "square"])]
+    while True:
+        remaining = np.flatnonzero(~used)
+        if remaining.size == 0:
+            break
+        i = remaining[0]
 
-    for page, page_df in horiz.groupby("page_number"):
-        page_df = page_df.sort_values("raw_shape_id")
+        mask = (
+            ~used
+            & (np.abs(lo - lo[i]) <= _GAP_TOL_PX)
+            & (np.abs(hi - hi[i]) <= _GAP_TOL_PX)
+        )
+        used |= mask
+        groups.append(sel[mask])
 
-        ids     = page_df["raw_shape_id"].to_numpy(dtype=np.int64)
-        y_top   = page_df["y_top"].to_numpy(dtype=np.float64)
-        y_bot   = page_df["y_bottom"].to_numpy(dtype=np.float64)
-        x_left  = page_df["x_left"].to_numpy(dtype=np.float64)
-        x_right = page_df["x_right"].to_numpy(dtype=np.float64)
-
-        used = np.zeros(len(ids), dtype=bool)
-
-        while True:
-            remaining_idx = np.where(~used)[0]
-            if len(remaining_idx) == 0:
-                break
-            i = remaining_idx[0]
-
-            mask = (
-                ~used
-                & (np.abs(y_top - y_top[i]) <= _GAP_TOL_PX)
-                & (np.abs(y_bot  - y_bot[i])  <= _GAP_TOL_PX)
-            )
-            used |= mask
-
-            groups.append(CandidateGroup(
-                group_id=group_id,
-                page_number=int(page),
-                raw_shape_ids=ids[mask].tolist(),
-                group_orientation="horizontal",
-                x_left=float(x_left[mask].min()),
-                x_right=float(x_right[mask].max()),
-                y_top=float(y_top[mask].min()),
-                y_bottom=float(y_bot[mask].max()),
-            ))
-            group_id += 1
-
-    return groups, group_id
-
-
-def _get_vertical_candidate_df(
-    df: pd.DataFrame,
-    horizontal_shapes: List[Dict[str, Any]],
-) -> pd.DataFrame:
-    """
-    Build the DataFrame for vertical grouping:
-      - all shapes with raw_orientation == 'vertical'
-      - plus square shapes that ended up as singletons in the horizontal pass
-    """
-    square_ids: Set[int] = set(
-        df.loc[df["raw_orientation"] == "square", "raw_shape_id"].astype(int)
-    )
-    singleton_ids: Set[int] = {
-        sid
-        for s in horizontal_shapes
-        if len(s["raw_shape_ids"]) == 1
-        for sid in s["raw_shape_ids"]
-    }
-    square_singletons = square_ids & singleton_ids
-
-    return df[
-        (df["raw_orientation"] == "vertical")
-        | (df["raw_shape_id"].isin(square_singletons))
-    ].copy()
-
-
-def _make_vertical_candidate_groups(
-    df: pd.DataFrame,
-    horizontal_shapes: List[Dict[str, Any]],
-    *,
-    start_group_id: int = 1,
-) -> Tuple[List[CandidateGroup], int]:
-    """
-    Group vertical shapes (and square singletons from the horizontal pass)
-    that share the same x-band.
-    Returns (groups, next_group_id).
-    """
-    vertical_df = _get_vertical_candidate_df(df, horizontal_shapes)
-
-    groups: List[CandidateGroup] = []
-    group_id = start_group_id
-
-    for page, page_df in vertical_df.groupby("page_number"):
-        page_df = page_df.sort_values("raw_shape_id")
-
-        ids     = page_df["raw_shape_id"].to_numpy(dtype=np.int64)
-        x_left  = page_df["x_left"].to_numpy(dtype=np.float64)
-        x_right = page_df["x_right"].to_numpy(dtype=np.float64)
-        y_top   = page_df["y_top"].to_numpy(dtype=np.float64)
-        y_bot   = page_df["y_bottom"].to_numpy(dtype=np.float64)
-
-        used = np.zeros(len(ids), dtype=bool)
-
-        while True:
-            remaining_idx = np.where(~used)[0]
-            if len(remaining_idx) == 0:
-                break
-            i = remaining_idx[0]
-
-            mask = (
-                ~used
-                & (np.abs(x_left  - x_left[i])  <= _GAP_TOL_PX)
-                & (np.abs(x_right - x_right[i]) <= _GAP_TOL_PX)
-            )
-            used |= mask
-
-            groups.append(CandidateGroup(
-                group_id=group_id,
-                page_number=int(page),
-                raw_shape_ids=ids[mask].tolist(),
-                group_orientation="vertical",
-                x_left=float(x_left[mask].min()),
-                x_right=float(x_right[mask].max()),
-                y_top=float(y_top[mask].min()),
-                y_bottom=float(y_bot[mask].max()),
-            ))
-            group_id += 1
-
-    return groups, group_id
+    return groups
 
 
 # ==============================
@@ -259,51 +143,71 @@ def _make_vertical_candidate_groups(
 # ==============================
 
 def _build_shape_record(
-    indexed_df: pd.DataFrame,
-    group: CandidateGroup,
-    raw_shape_ids: List[int],
+    pa: Dict[str, Any],
+    run_positions: List[int],
+    *,
+    page_number: int,
+    group_id: int,
     shape_id: int,
+    orientation: Literal["horizontal", "vertical"],
+    x_left: float,
+    x_right: float,
+    y_top: float,
+    y_bottom: float,
 ) -> Dict[str, Any]:
     """
-    Build a merged shape record from a run of raw shape IDs.
-    Geometry is the union bbox; drawing metadata is taken from the first shape.
-    indexed_df must be indexed by raw_shape_id.
+    Build a merged shape record from a run of positions into the page arrays.
+    Geometry is the union bbox (already tracked by the caller); drawing
+    metadata is taken from the shape with the lowest raw_shape_id.
     """
-    sub = indexed_df.loc[sorted(raw_shape_ids)]
-    rep = sub.iloc[0]
+    # Page arrays are sorted by raw_shape_id, so min position = min id.
+    rep_pos = min(run_positions)
 
-    x_left   = float(sub["x_left"].min())
-    x_right  = float(sub["x_right"].max())
-    y_top    = float(sub["y_top"].min())
-    y_bottom = float(sub["y_bottom"].max())
-    width    = x_right - x_left
-    height   = y_bottom - y_top
+    width  = x_right - x_left
+    height = y_bottom - y_top
 
-    shape_orientation: Orientation = (
-        group.group_orientation
-        if group.group_orientation in ("horizontal", "vertical")
-        else "unknown"
-    )
-
-    raw_shape_type: ShapeType = rep["raw_shape_type"]
+    raw_shape_type: ShapeType = pa["raw_shape_type"][rep_pos]
     shape_type: ShapeType = raw_shape_type
+    is_thin = (
+        (orientation == "horizontal" and height <= LINE_HEIGHT_MAX_PX)
+        or (orientation == "vertical" and width <= LINE_HEIGHT_MAX_PX)
+    )
     if shape_type in ("rect", "curve"):
-        if shape_orientation == "horizontal" and height <= LINE_HEIGHT_MAX_PX:
+        if is_thin:
             shape_type = "line"
-        elif shape_orientation == "vertical" and width <= LINE_HEIGHT_MAX_PX:
-            shape_type = "line"
+    elif shape_type == "line" and not is_thin:
+        # The raw extractor's path classifier can't always tell a genuine
+        # thin line stroke from a box outline drawn as several disjoint
+        # moveto+lineto edge segments in one path object (e.g. a page
+        # border drawn as 4 separate strokes rather than one closed
+        # rectangle subpath) -- both come back raw_shape_type "line". A
+        # "line" whose bbox isn't thin in either dimension is geometrically
+        # a box, not a line, so promote it to "rect" here.
+        shape_type = "rect"
 
-    linewidth = rep.get("linewidth")
-    fill      = rep.get("fill")
-    stroke    = rep.get("stroke")
-    paint_op  = rep.get("paint_op")
+    linewidth = _meta(pa, "linewidth", rep_pos)
+    fill      = _meta(pa, "fill", rep_pos)
+    stroke    = _meta(pa, "stroke", rep_pos)
+    paint_op  = _meta(pa, "paint_op", rep_pos)
+
+    # A rect covering (almost) the whole page is a slide/page background, not content.
+    shape_role: ShapeRole = "other"
+    page_w = pa["page_width"]
+    page_h = pa["page_height"]
+    if (
+        page_w is not None and page_h is not None
+        and shape_type == "rect"
+        and width  >= _PAGE_BG_COVERAGE * page_w
+        and height >= _PAGE_BG_COVERAGE * page_h
+    ):
+        shape_role = "page_background"
 
     return {
         # Identity
-        "page_number":        int(rep["page_number"]),
+        "page_number":        page_number,
         "shape_id":           shape_id,
-        "raw_shape_ids":      [int(sid) for sid in raw_shape_ids],
-        "candidate_group_id": group.group_id,
+        "raw_shape_ids":      [int(pa["ids"][p]) for p in run_positions],
+        "candidate_group_id": group_id,
         # Geometry
         "x_left":   x_left,
         "x_right":  x_right,
@@ -318,116 +222,94 @@ def _build_shape_record(
         "fill":               bool(fill)       if fill      is not None else None,
         "stroke":             bool(stroke)     if stroke    is not None else None,
         "paint_op":           str(paint_op)    if paint_op  is not None else None,
-        "non_stroking_color": rep.get("non_stroking_color"),
-        "stroking_color":     rep.get("stroking_color"),
+        "non_stroking_color": _meta(pa, "non_stroking_color", rep_pos),
+        "stroking_color":     _meta(pa, "stroking_color", rep_pos),
         # Derived
         "shape_type":        shape_type,
-        "shape_orientation": shape_orientation,
+        "shape_orientation": orientation,
         "table_id":          None,
-        "shape_semantic":    "other",
+        "shape_role":        shape_role,
         # Populated by later pipeline steps
         "has_intersection":      False,
         "intersection_count":    0,
         "intersecting_line_ids": [],
         "color_hex":             None,
         "color_label":           None,
+        "page_width": page_w,
+        "page_height": page_h,
     }
 
 
 def _split_candidate_group(
-    indexed_df: pd.DataFrame,
-    group: CandidateGroup,
+    pa: Dict[str, Any],
+    positions: np.ndarray,
     *,
+    page_number: int,
+    group_id: int,
+    orientation: Literal["horizontal", "vertical"],
     start_id: int,
-    sort_col: str,
-    gap_ref_col: str,
-    gap_to_col: str,
 ) -> List[Dict[str, Any]]:
     """
-    Split a CandidateGroup into one or more shape records by chaining segments
-    within _CHAIN_TOL_PX of each other along the primary axis.
-    indexed_df must be indexed by raw_shape_id.
+    Split a candidate group into one or more shape records by chaining
+    segments within _CHAIN_TOL_PX of each other along the primary axis.
+    positions are positions into the page arrays.
     """
-    sub = indexed_df.loc[group.raw_shape_ids].sort_values(sort_col)
+    horizontal = orientation == "horizontal"
+    sort_vals = pa["x_left"][positions] if horizontal else pa["y_top"][positions]
+    pos_sorted = positions[np.argsort(sort_vals, kind="stable")]
 
-    n = len(sub)
-    if n == 0:
-        return []
-
-    raw_ids     = sub.index.to_numpy(dtype=np.int64)
-    x_left_arr  = sub["x_left"].to_numpy(dtype=np.float64)
-    x_right_arr = sub["x_right"].to_numpy(dtype=np.float64)
-    y_top_arr   = sub["y_top"].to_numpy(dtype=np.float64)
-    y_bot_arr   = sub["y_bottom"].to_numpy(dtype=np.float64)
-    gap_ref_arr = sub[gap_ref_col].to_numpy(dtype=np.float64)
-    use_x_right = gap_to_col == "x_right"
+    x_left_arr  = pa["x_left"][pos_sorted]
+    x_right_arr = pa["x_right"][pos_sorted]
+    y_top_arr   = pa["y_top"][pos_sorted]
+    y_bot_arr   = pa["y_bottom"][pos_sorted]
+    gap_ref_arr = x_left_arr if horizontal else y_top_arr
 
     records: List[Dict[str, Any]] = []
-    current_ids: List[int] = []
+    current_positions: List[int] = []
     current_x0 = current_x1 = current_top = current_bottom = 0.0
     prev_gap_to: float | None = None
     next_id = start_id
 
-    for i in range(n):
-        sid       = int(raw_ids[i])
+    def _flush() -> None:
+        nonlocal next_id
+        records.append(_build_shape_record(
+            pa, current_positions,
+            page_number=page_number, group_id=group_id, shape_id=next_id,
+            orientation=orientation,
+            x_left=current_x0, x_right=current_x1,
+            y_top=current_top, y_bottom=current_bottom,
+        ))
+        next_id += 1
+
+    for i in range(len(pos_sorted)):
+        pos       = int(pos_sorted[i])
         sx0       = x_left_arr[i]
         sx1       = x_right_arr[i]
         sy_top    = y_top_arr[i]
         sy_bottom = y_bot_arr[i]
-        gap_ref   = gap_ref_arr[i]
 
-        if prev_gap_to is None:
-            current_ids    = [sid]
-            current_x0     = sx0
-            current_x1     = sx1
-            current_top    = sy_top
-            current_bottom = sy_bottom
-        elif gap_ref - prev_gap_to <= _CHAIN_TOL_PX:
-            current_ids.append(sid)
+        if prev_gap_to is not None and gap_ref_arr[i] - prev_gap_to <= _CHAIN_TOL_PX:
+            current_positions.append(pos)
             if sx0 < current_x0: current_x0 = sx0
             if sx1 > current_x1: current_x1 = sx1
             if sy_top < current_top: current_top = sy_top
             if sy_bottom > current_bottom: current_bottom = sy_bottom
         else:
-            records.append(_build_shape_record(indexed_df, group, current_ids, next_id))
-            next_id        += 1
-            current_ids    = [sid]
+            if current_positions:
+                _flush()
+            current_positions = [pos]
             current_x0     = sx0
             current_x1     = sx1
             current_top    = sy_top
             current_bottom = sy_bottom
 
         # Track the trailing edge of the current run (not just the current shape)
-        prev_gap_to = current_x1 if use_x_right else current_bottom
+        prev_gap_to = current_x1 if horizontal else current_bottom
 
-    if current_ids:
-        records.append(_build_shape_record(indexed_df, group, current_ids, next_id))
+    if current_positions:
+        _flush()
 
     return records
-
-
-def _shapes_from_horizontal_group(
-    indexed_df: pd.DataFrame,
-    group: CandidateGroup,
-    *,
-    start_id: int = 1,
-) -> List[Dict[str, Any]]:
-    return _split_candidate_group(
-        indexed_df, group, start_id=start_id,
-        sort_col="x_left", gap_ref_col="x_left", gap_to_col="x_right",
-    )
-
-
-def _shapes_from_vertical_group(
-    indexed_df: pd.DataFrame,
-    group: CandidateGroup,
-    *,
-    start_id: int = 1,
-) -> List[Dict[str, Any]]:
-    return _split_candidate_group(
-        indexed_df, group, start_id=start_id,
-        sort_col="y_top", gap_ref_col="y_top", gap_to_col="y_bottom",
-    )
 
 
 # ==============================
@@ -445,26 +327,43 @@ def _run_merge(df: pd.DataFrame) -> pd.DataFrame:
     next_group_id = 1
     next_shape_id = 1
 
-    for page_number in sorted(df["page_number"].unique()):
-        page_df = df[df["page_number"] == page_number]
-        indexed_page_df = page_df.set_index("raw_shape_id")
-
-        # Horizontal pass
-        h_groups, next_group_id = _make_horizontal_candidate_groups(
-            page_df, start_group_id=next_group_id
-        )
+    for page_number, page_df in df.groupby("page_number", sort=True):
+        page_number = int(page_number)
+        pa = _extract_page_arrays(page_df)
         page_shapes: List[Dict[str, Any]] = []
-        for g in h_groups:
-            shapes = _shapes_from_horizontal_group(indexed_page_df, g, start_id=next_shape_id)
+
+        # Horizontal pass (includes squares)
+        h_sel = np.flatnonzero(np.isin(pa["raw_orientation"], ("horizontal", "square")))
+        h_groups = _band_groups(h_sel, pa["y_top"][h_sel], pa["y_bottom"][h_sel])
+        for positions in h_groups:
+            shapes = _split_candidate_group(
+                pa, positions,
+                page_number=page_number, group_id=next_group_id,
+                orientation="horizontal", start_id=next_shape_id,
+            )
+            next_group_id += 1
             page_shapes.extend(shapes)
             next_shape_id += len(shapes)
 
-        # Vertical pass (includes square singletons from horizontal pass)
-        v_groups, next_group_id = _make_vertical_candidate_groups(
-            page_df, page_shapes, start_group_id=next_group_id
+        # Vertical pass (includes square singletons from the horizontal pass)
+        singleton_ids = [
+            sid
+            for s in page_shapes
+            if len(s["raw_shape_ids"]) == 1
+            for sid in s["raw_shape_ids"]
+        ]
+        v_mask = (pa["raw_orientation"] == "vertical") | (
+            (pa["raw_orientation"] == "square") & np.isin(pa["ids"], singleton_ids)
         )
-        for g in v_groups:
-            shapes = _shapes_from_vertical_group(indexed_page_df, g, start_id=next_shape_id)
+        v_sel = np.flatnonzero(v_mask)
+        v_groups = _band_groups(v_sel, pa["x_left"][v_sel], pa["x_right"][v_sel])
+        for positions in v_groups:
+            shapes = _split_candidate_group(
+                pa, positions,
+                page_number=page_number, group_id=next_group_id,
+                orientation="vertical", start_id=next_shape_id,
+            )
+            next_group_id += 1
             page_shapes.extend(shapes)
             next_shape_id += len(shapes)
 
@@ -495,23 +394,22 @@ def merge_shapes(
     Input columns (optional — PDF-only, pass through as None if absent):
         stroking_color, linewidth, fill, stroke, paint_op
 
+    Input columns (optional — enable page_background detection):
+        page_width, page_height
+
     Output columns (one row per logical shape):
         page_number, shape_id, raw_shape_ids, candidate_group_id,
         x_left, x_right, y_top, y_bottom, width, height, area,
         raw_shape_type, shape_type, shape_orientation,
         linewidth, fill, stroke, paint_op,
         non_stroking_color, stroking_color,
-        table_id, shape_semantic,
+        table_id, shape_role,
         has_intersection, intersection_count, intersecting_line_ids,
         color_hex, color_label
     """
     if df_shapes.empty:
         return df_shapes.copy()
 
-    df = df_shapes.copy()
-    _ensure_shape_columns(df)
-    df["raw_shape_ids"] = df["raw_shape_id"].astype(int).map(lambda v: [v])
+    _ensure_shape_columns(df_shapes)
 
-    df = _run_merge(df)
-
-    return df
+    return _run_merge(df_shapes)

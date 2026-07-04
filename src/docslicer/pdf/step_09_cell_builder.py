@@ -43,11 +43,14 @@ separates them -- only the within-line ratio does (0.47/0.25 ~= 1.9 vs
 
 from __future__ import annotations
 
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
 
+from .._utils.cpu import resolve_worker_count
+from .._utils.parallel import PARALLEL_PAGE_THRESHOLD, chunk_evenly
 from .._utils.text_utils import _BULLET_TOKENS, _CURRENCY_SYMBOLS, is_list_marker
 from .._utils.df_aggregation.registry_aggregator import Agg, aggregate_to
 from .._utils.df_aggregation.text_merge import apply_inline_markup, merge_text_within_line
@@ -976,6 +979,70 @@ def _renumber_cells_reading_order(
 
 
 # ================================================================================
+# 9c. PER-PAGE PIPELINE  (chunk worker; runs inline or in a process pool)
+# ================================================================================
+
+def _build_cells_pages(
+    df_horiz: pd.DataFrame,
+    df_vert: pd.DataFrame,
+    config: CellBuildConfig = CONFIG,
+    detect_scripts: bool = True,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Run the per-page cell pipeline over every page present in the two frames.
+
+    Returns (horiz_words, vert_words, vert_cells). cell_ids are unique only
+    within this call (they restart near 1), so a caller that fans pages out
+    over several calls must re-offset each result before concatenating. The
+    final _renumber_cells_reading_order pass then produces identical numbering
+    regardless of how pages were chunked.
+
+    Module-level (not a closure) so ProcessPoolExecutor can pickle it under
+    the spawn start method.
+    """
+    pages = sorted(
+        set(df_horiz["page_number"].unique()) | set(df_vert["page_number"].unique())
+    )
+    horiz_words_out: list[pd.DataFrame] = []
+    vert_cells_out:  list[pd.DataFrame] = []
+    vert_words_out:  list[pd.DataFrame] = []
+    running_cell = 0
+
+    for page_num in pages:
+        df_h = df_horiz[df_horiz["page_number"] == page_num].copy()
+        df_v = df_vert[df_vert["page_number"] == page_num].copy()
+
+        # line_id comes from step 07 and is already globally unique — leave it untouched.
+        if not df_h.empty:
+            df_h = _annotate_line_features(df_h, config)
+            df_h, _ = _assign_cell_ids_horiz(df_h, config)
+            df_h = _refine_multi_cell_lines(df_h, config)
+            df_h = _merge_struct_groups(df_h)
+            if detect_scripts:
+                df_h = _detect_cell_level_scripts(df_h)
+            df_h["cell_id"] += running_cell
+
+        page_cell_max = int(df_h["cell_id"].max()) if not df_h.empty else running_cell
+
+        if not df_v.empty:
+            vc, vw = _process_vertical_words(df_v, page_cell_max, config, detect_scripts)
+            vert_cells_out.append(vc)
+            vert_words_out.append(vw)
+            running_cell = int(vw["cell_id"].max()) if not vw.empty else page_cell_max
+        else:
+            running_cell = page_cell_max
+
+        if not df_h.empty:
+            horiz_words_out.append(df_h)
+
+    def _concat(parts: list[pd.DataFrame]) -> pd.DataFrame:
+        parts = [p for p in parts if not p.empty]
+        return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+
+    return _concat(horiz_words_out), _concat(vert_words_out), _concat(vert_cells_out)
+
+
+# ================================================================================
 # 10. ENTRY POINT  (public API)
 # ================================================================================
 
@@ -1029,53 +1096,65 @@ def build_cells(
     df_vert  = df[vert_mask].copy()
     df_horiz = df[~vert_mask].copy()
 
-    # ── Horizontal ────────────────────────────────────────────────────────────
-    pages           = sorted(df["page_number"].unique())
-    horiz_words_out: list[pd.DataFrame] = []
-    vert_cells_out:  list[pd.DataFrame] = []
-    vert_words_out:  list[pd.DataFrame] = []
-    running_cell = 0
+    # ── Per-page pipeline: inline for small documents, process pool above the
+    # page threshold. The pipeline is CPU-bound Python that holds the GIL, so
+    # threads don't help; pages are independent until the final renumber, so
+    # page-chunk processes parallelise cleanly. Chunk results carry chunk-local
+    # cell_ids and are re-offset here before concatenation; the reading-order
+    # renumber below makes the final ids identical to a serial run.
+    pages = sorted(df["page_number"].unique())
+    n_workers = 1
+    if len(pages) >= PARALLEL_PAGE_THRESHOLD:
+        n_workers = resolve_worker_count(None, n_items=len(pages))
 
-    for page_num in pages:
-        df_h = df_horiz[df_horiz["page_number"] == page_num].copy()
-        df_v = df_vert[df_vert["page_number"] == page_num].copy()
+    if n_workers > 1:
+        h_parts:  list[pd.DataFrame] = []
+        vw_parts: list[pd.DataFrame] = []
+        vc_parts: list[pd.DataFrame] = []
+        chunks = chunk_evenly(pages, n_workers)
+        with ProcessPoolExecutor(max_workers=n_workers) as ex:
+            futures = [
+                ex.submit(
+                    _build_cells_pages,
+                    df_horiz[df_horiz["page_number"].isin(chunk)],
+                    df_vert[df_vert["page_number"].isin(chunk)],
+                    config, detect_scripts,
+                )
+                for chunk in chunks
+            ]
+            running_cell = 0
+            for f in futures:                       # submit order == page order
+                h, vw, vc = f.result()
+                chunk_max = max(
+                    (int(p["cell_id"].max()) for p in (h, vw) if not p.empty),
+                    default=0,
+                )
+                for part, sink in ((h, h_parts), (vw, vw_parts), (vc, vc_parts)):
+                    if not part.empty:
+                        part["cell_id"] += running_cell
+                        sink.append(part)
+                running_cell += chunk_max
 
-        # line_id comes from step 07 and is already globally unique — leave it untouched.
-        if not df_h.empty:
-            df_h = _annotate_line_features(df_h, config)
-            df_h, _ = _assign_cell_ids_horiz(df_h, config)
-            df_h = _refine_multi_cell_lines(df_h, config)
-            df_h = _merge_struct_groups(df_h)
-            if detect_scripts:
-                df_h = _detect_cell_level_scripts(df_h)
-            df_h["cell_id"] += running_cell
+        def _concat(parts: list[pd.DataFrame]) -> pd.DataFrame:
+            return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
 
-        page_cell_max = int(df_h["cell_id"].max()) if not df_h.empty else running_cell
-
-        if not df_v.empty:
-            vc, vw = _process_vertical_words(df_v, page_cell_max, config, detect_scripts)
-            vert_cells_out.append(vc)
-            vert_words_out.append(vw)
-            running_cell = int(vw["cell_id"].max()) if not vw.empty else page_cell_max
-        else:
-            running_cell = page_cell_max
-
-        if not df_h.empty:
-            horiz_words_out.append(df_h)
-
-    df_horiz_out = pd.concat(horiz_words_out, ignore_index=True) if horiz_words_out else pd.DataFrame()
-    # Aggregate words → cells once over the whole document: cell_ids are already
-    # globally unique (offset per page above), and one aggregate_to call avoids
-    # paying its fixed per-call overhead once per page.
-    df_cells     = _build_cells_df(df_horiz_out) if not df_horiz_out.empty else pd.DataFrame()
-
-    if vert_words_out or vert_cells_out:
-        df_vert_out = pd.concat([w for w in vert_words_out if not w.empty], ignore_index=True)
-        df_vert_cells = pd.concat([c for c in vert_cells_out if not c.empty], ignore_index=True)
-        if not df_vert_cells.empty:
-            df_cells = pd.concat([df_cells, df_vert_cells], ignore_index=True)
+        df_horiz_out  = _concat(h_parts)
+        df_vert_out   = _concat(vw_parts)
+        df_vert_cells = _concat(vc_parts)
     else:
-        df_vert_out = pd.DataFrame()
+        df_horiz_out, df_vert_out, df_vert_cells = _build_cells_pages(
+            df_horiz, df_vert, config, detect_scripts
+        )
+
+    # Aggregate words → cells once over the whole document: cell_ids are already
+    # globally unique (offset per page/chunk above), and one aggregate_to call
+    # avoids paying its fixed per-call overhead once per page. Keeping this in
+    # the parent also pins font_size_ratio to the document median regardless of
+    # worker count.
+    df_cells = _build_cells_df(df_horiz_out) if not df_horiz_out.empty else pd.DataFrame()
+
+    if not df_vert_cells.empty:
+        df_cells = pd.concat([df_cells, df_vert_cells], ignore_index=True)
 
     df_words_out = (
         pd.concat([df_horiz_out, df_vert_out], ignore_index=True)

@@ -43,7 +43,7 @@ from collections import Counter
 import numpy as np
 import pandas as pd
 
-from ..text_utils import _CURRENCY_SYM_CLASS, is_list_marker
+from ...text_utils import _CURRENCY_SYM_CLASS, is_list_marker
 
 # =======================================================================================================================
 # CONFIG

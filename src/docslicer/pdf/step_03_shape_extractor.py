@@ -172,6 +172,8 @@ def _extract_raw_shapes_for_page(
 
         row: Dict[str, Any] = {
             "page_number":       page_number,
+            "page_width":        page_width,
+            "page_height":       page_height,
             "raw_shape_id":      0,  # assigned after sorting
             "raw_shape_type":    raw_shape_type,
             "x_left":            x_left,

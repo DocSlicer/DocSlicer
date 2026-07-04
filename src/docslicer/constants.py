@@ -87,7 +87,8 @@ ShapeOrientation = Literal[
 ]
 Orientation = ShapeOrientation  # backwards-compatible alias
 
-ShapeSemantic = Literal[
+ShapeRole = Literal[
+    "page_background",  # filled rect covering (almost) the entire page (ppt slides)
     "table_grid",       # grid line inside a table
     "underline",        # underline decoration under text
     "separator",        # horizontal rule separating content regions

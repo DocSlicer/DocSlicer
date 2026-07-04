@@ -378,7 +378,7 @@ MASTER_COLUMN_ORDER: List[str] = [
     # ===== 15. Shape internals (pdf) =====
     # Merger intermediate
     "candidate_group_id",       # grouping scratch ID during merge
-    "shape_semantic",           # table_grid / underline / separator / background_band / other
+    "shape_role",               # page_background / table_grid / underline / separator / background_band / other
     "has_intersection",
     "intersection_count",
     "intersecting_line_ids",

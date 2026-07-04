@@ -76,6 +76,7 @@ import pypdfium2.raw as pdfium_c
 import pandas as pd
 
 from .._utils.cpu import resolve_worker_count
+from .._utils.parallel import PARALLEL_PAGE_THRESHOLD, chunk_evenly
 from .._utils.text_utils import add_calculated_text_features
 from ._utils.struct_tree import StructInfo
 from ._utils.form_fields import FormField
@@ -849,20 +850,6 @@ def _extract_words_for_page(
 
 # ── Parallel helpers ──────────────────────────────────────────────────────────
 
-_PARALLEL_PAGE_THRESHOLD = 50
-
-
-def _chunk_pages(page_numbers: List[int], n_chunks: int) -> List[List[int]]:
-    k, rem = divmod(len(page_numbers), n_chunks)
-    chunks, start = [], 0
-    for i in range(n_chunks):
-        end = start + k + (1 if i < rem else 0)
-        if start < end:
-            chunks.append(page_numbers[start:end])
-        start = end
-    return chunks
-
-
 def _extract_words_chunk(
     pdf_bytes: bytes,
     page_numbers: List[int],
@@ -955,14 +942,14 @@ def extract_words(
         )
 
     n_workers = 1
-    if len(page_numbers_list) >= _PARALLEL_PAGE_THRESHOLD:
+    if len(page_numbers_list) >= PARALLEL_PAGE_THRESHOLD:
         n_workers = resolve_worker_count(None, n_items=len(page_numbers_list))
 
     all_dfs: List[pd.DataFrame] = []
 
     if n_workers > 1:
         pdf_bytes = pdf_path.read_bytes()
-        chunks = _chunk_pages(page_numbers_list, n_workers)
+        chunks = chunk_evenly(page_numbers_list, n_workers)
         with ProcessPoolExecutor(max_workers=n_workers) as ex:
             futures = [
                 ex.submit(
