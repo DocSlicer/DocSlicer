@@ -349,4 +349,4 @@ def assign_struct_group_id(df: pd.DataFrame) -> pd.DataFrame:
 
         df["struct_group_id"] = out
 
-    return df
+    return df #df_words

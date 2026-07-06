@@ -780,6 +780,23 @@ def _detect_cell_level_scripts(df: pd.DataFrame) -> pd.DataFrame:
 
 def _build_cells_df(df_words: pd.DataFrame) -> pd.DataFrame:
     """Aggregate words into cells via the central column registry."""
+    # Join words in content-stream order (text_object_id) when the native PDF
+    # provides it — that is the order the text was emitted, a truer reading order
+    # than geometry for reordered/overlapping glyphs. (line_id, x_left) tie-breaks
+    # equal/null ids back to the geometric order. Absent the column we leave the
+    # incoming order alone: horizontal words already arrive sorted (line_id,
+    # x_left) from the gap-split, and vertical words arrive in their swap-built
+    # top→bottom order where x_left is ~constant, so a geometric re-sort could
+    # only scramble them. This reorders only the text/word_ids join — aggregate_to
+    # geometry is order-independent, and the upstream x_left gap-split sorts that
+    # cell segmentation depends on are untouched.
+    if "text_object_id" in df_words.columns:
+        df_words = df_words.sort_values(
+            ["text_object_id", "line_id", "x_left"],
+            kind="mergesort",
+            na_position="last",
+        )
+
     # Super/subscript markers ("[^…]"/"[_…]") applied per word, then joined
     # per cell with markers attaching to the previous token. dehyphenate keeps
     # words split across fragments ("inter-" + "national") joined directly.

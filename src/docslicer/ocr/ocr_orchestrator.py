@@ -24,7 +24,7 @@ from .._utils.cpu import resolve_worker_count
 from .._utils.text_utils import add_calculated_text_features
 from .._utils.layout.line_number_detector import detect_line_numbers
 from .._utils.layout.reading_order import assign_reading_order
-from .._utils.layout.horizontal_bands import assign_horizontal_bands
+from .._utils.layout.layouts import assign_layouts
 from .._utils.layout.shape_merger import merge_shapes
 
 
@@ -217,7 +217,7 @@ def run_ocr_pipeline(
     timings.append(("STEP 5: Text cleaning", perf_counter() - t0))
 
     # 6) Estimate font size (per horizontal band, too noisy on a line level)
-    df_words = assign_horizontal_bands(df_words)
+    df_words = assign_layouts(df_words, line_level=False)
     df_words = estimate_ocr_font_sizes(df_words, method="word")
 
     return df_words, df_shapes, timings

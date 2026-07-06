@@ -423,4 +423,4 @@ def assign_reading_order(df_words: pd.DataFrame) -> pd.DataFrame:
     else:
         out = assign_line_id(out)
 
-    return out
+    return out # df_words

@@ -6,53 +6,49 @@ hierarchy_rules:
   # Named headings - these are case sensitive
   # =========================
 
-  # --- SEC Common Heading Types ---
+  # --- Doc Level ---
 
-  - hierarchy_type: item        # Example: "Item 1A. Risk Factors"
+  - hierarchy_type: schedule    # Example: "Schedule — The Criminal Code"
     patterns:
-      - regex: '^\s*(?:Item|ITEM)\s+'
+      - regex: '^\s*(?:Schedule|SCHEDULE)\s+'
+  
+  - hierarchy_type: form    # FORM 10-K
+    patterns:
+      - regex: '^\s*(?:Form|FORM)\s+'
 
-  - hierarchy_type: part        # Example: "Part II — Other Information"
+  - hierarchy_type: book       # Example: "Book Two - Real Rights"
     patterns:
-      - regex: '^\s*(?:Part|PART)\s+'
+      - regex: '^\s*(?:Book|BOOK)\s+'
 
-  - hierarchy_type: note        # Example: "Note 3 — Revenue Recognition"
+  - hierarchy_type: volume       # Example: "Volume 1: sections 1–5"
     patterns:
-      - regex: '^\s*(?:Note|NOTE)\s+'
+      - regex: '^\s*(?:Volume|VOLUME)\s+'
+
+  - hierarchy_type: appendix     # Appendix B: Methodology"
+    patterns:
+      - regex: '^\s*(?:Appendix|APPENDIX)\s+'
 
   - hierarchy_type: annex       # Example: "Annex A – Form of Agreement"
     patterns:
       - regex: '^\s*(?:Annex|ANNEX)\s+'
 
-  - hierarchy_type: article     # Example: "Article IV – Term"
+  - hierarchy_type: exhibit     # Exhibit A — Certificate of Incorporation"
     patterns:
-      - regex: '^\s*(?:Article|ARTICLE)\s+'
+      - regex: '^\s*(?:Exhibit|EXHIBIT)\s+'
 
-  - hierarchy_type: section     # Example: "Section 4.2(a) Indemnification"
+  - hierarchy_type: attachment     # Attachment 2 Frequency Chart
     patterns:
-      - regex: '^\s*(?:Section|SECTION)\s+'
+      - regex: '^\s*(?:Attachment|ATTACHMENT)\s+'
 
-  - hierarchy_type: subsection     # Example: "Subsection 1 Supply of services by intermediaries"
+  - hierarchy_type: amendment     # Example: "Amendment No  s. 5"
     patterns:
-      - regex: '^\s*(?:Subsection|SUBSECTION)\s+'
+      - regex: '^\s*(?:Amendment|AMENDMENT)\s+'
 
-  - hierarchy_type: proposal     # Example: "PROPOSAL 3: ADJOURNMENT OF THE SPECIAL MEETING"
+  - hierarchy_type: endnote     # Endnote 4 — Amendment history
     patterns:
-      - regex: '^\s*(?:Proposal|PROPOSAL)\s+'
+      - regex: '^\s*(?:Endnote|ENDNOTE)\s+'
 
-  # --- Government / Legal Structural Heading Types ---
-
-  - hierarchy_type: section_abbreviated   # Example: "Sec. 10033 — Filing Requirements"
-    patterns:
-      - regex: '^\s*(?:Sec\.|SEC\.)\s+'
-
-  - hierarchy_type: section_symbol   # § 1.101 Definitions
-    patterns:
-      - regex: '^\s*§+\s*'
-
-  - hierarchy_type: schedule    # Example: "Schedule 1 — Closing Deliverables"
-    patterns:
-      - regex: '^\s*(?:Schedule|SCHEDULE)\s+'
+  # --- Within - doc Level ---
 
   - hierarchy_type: title       # Example: "Title 26 — Internal Revenue Code"
     patterns:
@@ -61,6 +57,10 @@ hierarchy_rules:
   - hierarchy_type: subtitle     # Example: "SUBTITLE I — INCOME TAXES"
     patterns:
       - regex: '^\s*(?:Subtitle|SUBTITLE)\s+'
+
+  - hierarchy_type: part        # Example: "Part II — Other Information"
+    patterns:
+      - regex: '^\s*(?:Part|PART)\s+'
 
   - hierarchy_type: subpart     # Example: "Subpart B — Procedures"
     patterns:
@@ -74,13 +74,51 @@ hierarchy_rules:
     patterns:
       - regex: '^\s*(?:Subchapter|SUBCHAPTER)\s+'
 
-  - hierarchy_type: amendment     # Example: "Amendment No. 5"
+  - hierarchy_type: division     # Example: "Division 301 — Serious drugs and precursors"
     patterns:
-      - regex: '^\s*(?:Amendment|AMENDMENT)\s+'
+      - regex: '^\s*(?:Division|DIVISION)\s+'
+
+  - hierarchy_type: subdivision     # Example: "Subdivision B — Interference with telecommunications"
+    patterns:
+      - regex: '^\s*(?:Subdivision|SUBDIVISION)\s+'
+
+  - hierarchy_type: section     # Example: "Section 4.2(a) Indemnification"
+    patterns:
+      - regex: '^\s*(?:Section|SECTION)\s+'
+
+  - hierarchy_type: subsection     # Example: "Subsection 1 Supply of services by intermediaries"
+    patterns:
+      - regex: '^\s*(?:Subsection|SUBSECTION)\s+'
+
+  - hierarchy_type: section_abbreviated   # Example: "Sec. 10033 — Filing Requirements"
+    patterns:
+      - regex: '^\s*(?:Sec\.|SEC\.)\s+'
+
+  - hierarchy_type: section_symbol   # § 1.101 Definitions
+    patterns:
+      - regex: '^\s*§+\s*'
+
+  - hierarchy_type: item        # Example: "Item 1A. Risk Factors"
+    patterns:
+      - regex: '^\s*(?:Item|ITEM)\s+'
+
+  - hierarchy_type: note        # Example: "Note 3 — Revenue Recognition"
+    patterns:
+      - regex: '^\s*(?:Note|NOTE)\s+'
+
+  - hierarchy_type: article     # Example: "Article IV – Term"
+    patterns:
+      - regex: '^\s*(?:Article|ARTICLE)\s+'
+
+  - hierarchy_type: proposal     # Example: "PROPOSAL 3: ADJOURNMENT OF THE SPECIAL MEETING"
+    patterns:
+      - regex: '^\s*(?:Proposal|PROPOSAL)\s+' 
 
   - hierarchy_type: rule     # Example: Rule 10b-5 — Employment of Manipulative"
     patterns:
       - regex: '^\s*(?:Rule|RULE)\s+'
+
+  # --- Captions ---
 
   - hierarchy_type: figure     # Example: Figure 3.2: System Architecture"
     patterns:
@@ -90,18 +128,9 @@ hierarchy_rules:
     patterns:
       - regex: '^\s*(?:Table|TABLE)\s+(?!(?i:of\s+contents?\b))' # excludes "Table of contents"
 
-  - hierarchy_type: appendix     # Appendix B: Methodology"
-    patterns:
-      - regex: '^\s*(?:Appendix|APPENDIX)\s+'
-
-  - hierarchy_type: exhibit     # Exhibit A — Certificate of Incorporation"
-    patterns:
-      - regex: '^\s*(?:Exhibit|EXHIBIT)\s+'
-
-  - hierarchy_type: attachment     # Attachment 2 Frequency Chart
-    patterns:
-      - regex: '^\s*(?:Attachment|ATTACHMENT)\s+'
-
+  # --- One-offs ---
+  # Only occur once per doc
+  # Recitals, preamble, colophon, references, abstract
 
   # =========================
   # Parenthetical headings

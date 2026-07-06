@@ -483,7 +483,7 @@ def _walk_streaming_groups(
     return group_id, shifted_left
 
 
-def assign_stream_group_id(df_words: pd.DataFrame) -> pd.DataFrame:
+def assign_stream_group_id(df_words: pd.DataFrame, debug: bool = False) -> pd.DataFrame:
     """Assign ``stream_group_id`` to every word and attach its pair features.
 
     Collapses words to text objects, runs the vectorized pair analysis and the
@@ -498,12 +498,17 @@ def assign_stream_group_id(df_words: pd.DataFrame) -> pd.DataFrame:
     Every feature/shifted_left value describes the transition *into* the word's
     text object; the first object on each page has no predecessor, so those words
     get ``<NA>`` (a handy page-start marker). ``stream_group_id`` is always set.
+
+    If ``debug`` is False (the default), the intermediate pair-feature columns
+    (``shifted_left`` and ``<pair features>``) are omitted and only
+    ``stream_group_id`` is added.
     """
     if df_words is None or df_words.empty:
         out = df_words.copy() if df_words is not None else pd.DataFrame()
         out["stream_group_id"] = pd.Series(dtype="Int64")
-        for col in _PAIR_FEATURE_COLS:
-            out[col] = pd.Series(dtype="boolean")
+        if debug:
+            for col in _PAIR_FEATURE_COLS:
+                out[col] = pd.Series(dtype="boolean")
         return out
 
     df_objs = _collapse_to_objects(df_words)
@@ -531,12 +536,16 @@ def assign_stream_group_id(df_words: pd.DataFrame) -> pd.DataFrame:
         col[page_start] = None       # drop cross-page / first-object values
         result[name] = col
 
+    if not debug:
+        result = result[["page_number", "__obj_key", "stream_group_id"]]
+
     words = df_words.copy()
     words["__obj_key"] = _object_key(df_words)
     out = words.merge(result, on=["page_number", "__obj_key"], how="left").drop(columns="__obj_key")
 
     out["stream_group_id"] = out["stream_group_id"].astype("Int64")
-    for col in _PAIR_FEATURE_COLS:
-        out[col] = out[col].astype("boolean")
+    if debug:
+        for col in _PAIR_FEATURE_COLS:
+            out[col] = out[col].astype("boolean")
 
-    return out
+    return out #df_words

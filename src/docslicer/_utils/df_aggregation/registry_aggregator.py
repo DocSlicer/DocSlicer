@@ -105,7 +105,6 @@ UPPERCASE_THRESHOLD = 0.90
 
 COLUMN_REGISTRY: Dict[str, Agg] = {
     # --- document / page identity -------------------------------------------
-    "doc_name": Agg.FIRST,
     "page_number": Agg.FIRST,
     "page_width": Agg.FIRST,
     "page_height": Agg.FIRST,
@@ -117,6 +116,26 @@ COLUMN_REGISTRY: Dict[str, Agg] = {
     "section": Agg.FIRST,
     "section_id": Agg.FIRST,
 
+    # --- page label detector internals (candidate scoring, see step_10) --------
+    "page_label_raw": Agg.DROP,
+    "page_label_candidate": Agg.DROP,
+    "page_label_cell_sharing": Agg.DROP,
+    "page_label_wrapper": Agg.DROP,
+    "page_label_score": Agg.DROP,
+    "page_label_series_id": Agg.DROP,
+
+    # --- OCR internals: word-level detail, consumed upstream -------------------
+    "background_non_stroking_color_hex_raw": Agg.DROP,
+    "non_stroking_color_hex_raw": Agg.DROP,
+    "font_pointsize": Agg.DROP,
+    "ink_coverage": Agg.DROP,
+    "ocr_confidence": Agg.DROP,
+    "text_raw": Agg.DROP,
+    "is_line_start": Agg.DROP,
+    "has_capital": Agg.DROP,       # OCR font size estimation; not meaningful once aggregated
+    "has_ascender": Agg.DROP,      
+    "has_descender": Agg.DROP,     
+
     # --- layout / reading order ----------------------------------------------
     "layout_id": Agg.FIRST,
     "layout_type": Agg.FIRST,
@@ -127,10 +146,35 @@ COLUMN_REGISTRY: Dict[str, Agg] = {
     "gutter_id_right": Agg.FIRST,
     "stream_group_id": Agg.FIRST,
     "sentence_score": Agg.FIRST,
+    "center_bucket": Agg.FIRST,
+    "line_number_flag": Agg.DROP,   # pdf line-number margin flag; word-level detail
     "line_class": Agg.FIRST,
-    "line_score": Agg.FIRST,
-    "line_em_threshold": Agg.FIRST,
-    "line_is_bimodal": Agg.FIRST,
+    "line_score": Agg.MAX,
+
+    # --- cell-builder line-splitting diagnostics (word/line-level detail) ------
+    "line_em_threshold": Agg.DROP,
+    "line_is_bimodal": Agg.DROP,
+    "line_has_punct": Agg.DROP,
+    "line_max_em": Agg.DROP,
+    "line_median_em": Agg.DROP,
+    "line_n_gaps": Agg.DROP,
+    "line_n_words": Agg.DROP,
+    "line_split_em": Agg.DROP,
+    "line_jump_ratio": Agg.DROP,
+    "line_alpha_ratio": Agg.DROP,
+    "line_numeric_ratio": Agg.DROP,
+    "line_stopword_hits": Agg.DROP,
+    "line_cap_ratio": Agg.DROP,
+
+    # --- native PDF stream-group pair-feature diagnostics (see step_07) --------
+    "large_gap": Agg.DROP,
+    "new_textbox": Agg.DROP,
+    "objects_between": Agg.DROP,
+    "same_line": Agg.DROP,
+    "same_struct": Agg.DROP,
+    "same_table": Agg.DROP,
+    "shifted_left": Agg.DROP,
+    "y_decreases": Agg.DROP,
 
     # --- heading hierarchy -----------------------------------------------------
     "heading_id": Agg.FIRST,
@@ -219,16 +263,17 @@ COLUMN_REGISTRY: Dict[str, Agg] = {
     "ancestor_classes": Agg.FIRST,
     "ancestor_tags": Agg.FIRST,
     "ancestor_aria_roles": Agg.FIRST,
-    "struct_ancestors": Agg.FIRST,
+    
     "img_alt": Agg.FIRST,
     "img_src": Agg.FIRST,
     "shape_id_vertical_grid_line": Agg.UNIQUE_LIST,
 
     # --- PDF structure tree / content-stream provenance ----------------------------------------
     "struct_group_id": Agg.FIRST,
-    "struct_tag": Agg.FIRST,
-    "struct_tag_id": Agg.FIRST,
-    "struct_raw_tag": Agg.FIRST,
+    "struct_tag": Agg.DROP,
+    "struct_tag_id": Agg.DROP,
+    "struct_raw_tag": Agg.DROP,
+    "struct_ancestors": Agg.FIRST,
     "struct_ancestor_ids": Agg.FIRST,
     "struct_raw_ancestors": Agg.FIRST,
     "struct_scope": Agg.FIRST,
@@ -236,14 +281,13 @@ COLUMN_REGISTRY: Dict[str, Agg] = {
     "struct_col_span": Agg.FIRST,
     "struct_row_span": Agg.FIRST,
     "bdc_tag": Agg.FIRST,
-    "dfs_position": Agg.MIN,       # struct-tree traversal order key
+    "dfs_position": Agg.DROP,       # struct-tree traversal order key
     "reading_order": Agg.MIN,      # reading-order key
     "textbox_id": Agg.FIRST,
     "raw_shape_id": Agg.FIRST,
     "word_source": Agg.FIRST,
     "mcid": Agg.DROP,              # marked-content id; word-level detail
     "text_object_id": Agg.DROP,    # content-stream object id; word-level detail
-    "gap_em_right": Agg.DROP,      # inter-word gap, consumed by cell splitting
 
     # --- PDF form fields ------------------------------------------------------------------------
     "form_widget": Agg.FIRST,
@@ -251,6 +295,11 @@ COLUMN_REGISTRY: Dict[str, Agg] = {
     "form_value": Agg.FIRST,
     "form_tooltip": Agg.FIRST,
     "form_is_empty": Agg.FIRST,
+
+    # --- PDF Layout grouping ------------------------------------------------------------------------
+    "line_gap": Agg.DROP,   # Not meaningful to aggregate from line to block level once layouts have been assigned
+    "page_gap_thresh": Agg.DROP,
+    "median_gap": Agg.DROP,
 
     # --- DOCX / PPTX structure ----------------------------------------------------------------
     "header_footer_type": Agg.FIRST,
@@ -287,15 +336,39 @@ COLUMN_REGISTRY: Dict[str, Agg] = {
     # Override at the call site to collect them (e.g. {"word_id": list}).
     "text": Agg.DROP,              # rebuilt per level with a level-specific joiner
     "word_id": Agg.DROP,
+    "word_ids": Agg.DROP,          # word_id, already combined (mcid cells)
     "run_id": Agg.DROP,
     "run_type": Agg.DROP,
     "box_id": Agg.DROP,
     "cell_id": Agg.DROP,
+    "cell_ids": Agg.DROP,
     "line_id": Agg.DROP,
+    "line_ids": Agg.DROP,          # line_id, already combined (mcid cells)
     "block_id": Agg.DROP,
     "paragraph_id": Agg.UNIQUE_LIST,
     "order_index": Agg.DROP,
     "script_type": Agg.DROP,
+
+    # --- cell grouper (vstack / grouped-row) diagnostics: consumed upstream, ---
+    # not propagated past the cell level ----------------------------------------
+    "cell_id_orig": Agg.DROP,
+    "line_id_orig": Agg.DROP,
+    "grouped_row_id": Agg.DROP,
+    "grouped_row_n_vstacks": Agg.DROP,
+    "grouped_row_x_left": Agg.DROP,
+    "grouped_row_x_right": Agg.DROP,
+    "grouped_row_y_bottom": Agg.DROP,
+    "grouped_row_y_top": Agg.DROP,
+    "vstack_gap_em": Agg.DROP,
+    "vstack_id": Agg.DROP,
+    "vstack_n_cells": Agg.DROP,
+    "vstack_n_lines": Agg.DROP,
+    "vstack_score": Agg.DROP,
+    "vstack_width": Agg.DROP,
+    "x_movement": Agg.DROP,
+    "y_center": Agg.DROP,
+    "y_movement": Agg.DROP,
+    "gap_em_right": Agg.DROP,      # inter-word gap, consumed by cell splitting
 }
 
 # Naming conventions for columns not in the registry. Checked in order.

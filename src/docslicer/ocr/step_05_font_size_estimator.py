@@ -72,12 +72,12 @@ def estimate_ocr_font_sizes(
     method: Literal["line", "word"] = "line",
 ) -> pd.DataFrame:
     """
-    Estimate stable font sizes grouped by horizontal_band_id, from word-level input.
+    Estimate stable font sizes grouped by layout_id, from word-level input.
 
     Parameters
     ----------
     df_words : pd.DataFrame
-        One row per word.  Required columns: line_id, horizontal_band_id,
+        One row per word.  Required columns: line_id, layout_id,
         y_top, y_bottom, text.
     method : "line" | "word"
         "line"  — aggregate typographic flags per line_id (any word in the line
@@ -94,7 +94,7 @@ def estimate_ocr_font_sizes(
         has_capital, has_ascender, has_descender  bool   (word-level)
         font_size                                 float  (band-level canonical)
     """
-    required = {"line_id", "horizontal_band_id", "y_top", "y_bottom", "text"}
+    required = {"line_id", "layout_id", "y_top", "y_bottom", "text"}
     missing  = required - set(df_words.columns)
     if missing:
         raise ValueError(f"estimate_ocr_font_sizes: missing columns: {sorted(missing)}")
@@ -115,7 +115,7 @@ def estimate_ocr_font_sizes(
             _has_asc  =("has_ascender",       "any"),
             _has_desc =("has_descender",      "any"),
             _height   =("_word_height",       "median"),
-            _band_id  =("horizontal_band_id", "first"),
+            _band_id  =("layout_id",          "first"),
         )
 
         # ── Step 3a: adjusted height per line ────────────────────────────────
@@ -133,7 +133,7 @@ def estimate_ocr_font_sizes(
         adjustment     = missing_top.astype(float) * 0.20 + missing_bottom.astype(float) * 0.20
         df["_adj_h"]   = df["_word_height"] * (1.0 + adjustment)
 
-        band_canonical = _band_mode(df["horizontal_band_id"], df["_adj_h"])
+        band_canonical = _band_mode(df["layout_id"], df["_adj_h"])
 
     # ── Step 4: scale glyph bbox → nominal em-square, then snap ─────────────
     # OCR measures pixel bboxes; even fully-covered lines span only ~85% of the
@@ -146,6 +146,6 @@ def estimate_ocr_font_sizes(
     )
 
     # ── Join back onto input df ───────────────────────────────────────────────
-    df["font_size"] = df["horizontal_band_id"].map(band_font_size)
+    df["font_size"] = df["layout_id"].map(band_font_size)
 
     return df.drop(columns=["_word_height", "_adj_h"], errors="ignore")

@@ -102,6 +102,8 @@ MASTER_COLUMN_ORDER: List[str] = [
     # Mid-pipeline IDs (pdf + html)
     "cell_id",
     "line_id",
+    "layout_id",
+    "cell_count",
     "temp_line_id",
     "paragraph_id",
     "gutter_id",
@@ -124,24 +126,20 @@ MASTER_COLUMN_ORDER: List[str] = [
     "raw_shape_ids",
 
     #Native PDF Stream Data
-    
-    
     "struct_ancestors",	
     "struct_raw_ancestors",	
     "struct_ancestor_ids",
+
+    # Secondary / structural IDs HTML
+    "structure_tag",
+    "structure_tag_id",
 
     # Aggregated hierarchical counts
     "run_count",            # docx, pptx  — runs collapsed into this paragraph
     "paragraph_count",      # docx, pptx  — paragraphs collapsed into this line
     "block_count",
 
-    # Secondary / structural IDs
-    "structure_tag",
-    "structure_tag_id",
-    "horizontal_band_id",
-
     # Layout IDs
-    "layout_id",
     "layout_type",
     "block_type",
 
@@ -247,7 +245,7 @@ MASTER_COLUMN_ORDER: List[str] = [
     "word_count",
     "alpha_word_count",
     "capitalized_word_count",
-    "cell_count",
+    
 
     # Ratios
     "bold_ratio",
@@ -330,6 +328,8 @@ MASTER_COLUMN_ORDER: List[str] = [
     "mcid",
     "bdc_tag",
     "dfs_position",	 # mostly inaccurate, even in well-tagged pdf's
+
+    
 
     # ===== 11. HTML DOM provenance =====
     "dom_id",

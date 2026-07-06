@@ -197,10 +197,8 @@ def assign_reading_order(
         and df["gutter_id_right"].notna().any()
     )
     if not gutter_cols_present:
-        from .gutter_detector import detect_and_annotate_gutters
-        df, _, _ = detect_and_annotate_gutters(
-            df, df_shapes if df_shapes is not None else pd.DataFrame()
-        )
+        from .gutter_detector import detect_gutters
+        df, _ = detect_gutters(df, df_shapes)
 
     # Split horizontal (LTR/default) vs vertical (TTB/BTT)
     if "text_orientation" in df.columns:

@@ -679,6 +679,178 @@ def assign_grouped_rows(
 
 
 # ================================================================================
+# FINAL REINDEX (cell_id / line_id)
+# ================================================================================
+
+def reindex_grouped_ids(df_cells: pd.DataFrame) -> pd.DataFrame:
+    """
+    Final pass: fold the grouped structures back into the cell/line id space.
+
+    A vstack that was linked into a logical row (grouped_row_id set) is one
+    logical table cell -> all its cells share one cell_id (keyed by page +
+    vstack_id). The whole group of linked neighbours is one logical row -> all
+    its cells share one line_id (keyed by page + grouped_row_id). Ungrouped
+    cells keep their own cell and line identity.
+
+    Both ids are then renumbered densely (1..N) by first appearance — cells in
+    reading order (page, old cell_id), lines in line order (page, earliest old
+    line, old cell_id) — so a merged row sits at the earliest line it swallowed
+    and downstream steps see an ordinary cells table again. The originals are
+    preserved in cell_id_orig / line_id_orig. line_ids (when present) is
+    rewritten to the single new line id: the old per-visual-line numbering no
+    longer exists after the renumber.
+
+    Returns df_cells unchanged when grouping never ran (no grouped_row_id) or
+    the id columns it needs are missing.
+    """
+    required = {"cell_id", "vstack_id", "grouped_row_id"}
+    if df_cells is None or df_cells.empty or not required.issubset(df_cells.columns):
+        return df_cells
+    bounds = _cell_line_bounds(df_cells)
+    if bounds is None:
+        return df_cells
+    line_lo, _ = bounds
+
+    df = df_cells.copy()
+    n = len(df)
+    page = (df["page_number"].to_numpy() if "page_number" in df.columns
+            else np.zeros(n, dtype=int))
+    grouped  = df["grouped_row_id"].notna().to_numpy()
+    old_cell = df["cell_id"].to_numpy()
+    vstack   = df["vstack_id"].to_numpy()
+    grow     = df["grouped_row_id"].to_numpy()
+    old_line = df["line_id"].to_numpy() if "line_id" in df.columns else line_lo
+
+    # Identity keys: a grouped vstack is one cell; a grouped row is one line.
+    # The tag keeps grouped and ungrouped keys in disjoint namespaces.
+    cell_key = [
+        ("v", page[i], vstack[i]) if grouped[i] else ("c", old_cell[i])
+        for i in range(n)
+    ]
+    line_key = [
+        ("g", page[i], grow[i]) if grouped[i] else ("l", page[i], old_line[i])
+        for i in range(n)
+    ]
+
+    # Dense 1..N by first appearance in the respective order (lexsort keys are
+    # listed minor -> major).
+    cell_order = np.lexsort((old_cell, page))
+    line_order = np.lexsort((old_cell, line_lo, page))
+    new_cell_of: dict = {}
+    for i in cell_order:
+        new_cell_of.setdefault(cell_key[i], len(new_cell_of) + 1)
+    new_line_of: dict = {}
+    for i in line_order:
+        new_line_of.setdefault(line_key[i], len(new_line_of) + 1)
+
+    df["cell_id_orig"] = df["cell_id"]
+    df["cell_id"]      = [new_cell_of[k] for k in cell_key]
+    if "line_id" in df.columns:
+        df["line_id_orig"] = df["line_id"]
+    df["line_id"] = [new_line_of[k] for k in line_key]
+    if "line_ids" in df.columns:
+        df["line_ids"] = [[int(v)] for v in df["line_id"].to_numpy()]
+
+    return df
+
+
+def rebuild_merged_cells(
+    df_cells: pd.DataFrame,
+    text_sep: str = " ",
+) -> pd.DataFrame:
+    """
+    Physically collapse the cells that reindex_grouped_ids merged, so cell_id is
+    unique again — one df row per cell instead of N stacked rows sharing an id.
+
+    reindex_grouped_ids gave every cell of a merged vstack the same cell_id but
+    left them as separate rows. The merged row is rebuilt by running just those
+    rows back through the central registry aggregator (:func:`aggregate_to`,
+    grouped by cell_id) — the same rules the words -> cells step uses — so the
+    metadata is correct, not just copied off the top row:
+
+      counts (char_count, alpha_count, word_count, ...) : summed
+      ratios (bold_ratio, italic_ratio, ...)            : char_count-weighted mean
+      style  (font_size, font_family, colors, align)    : dominant (most-alpha row)
+      bbox / width / height                             : merged + recomputed
+      is_bold / is_italic / is_uppercase                : recomputed from the above
+
+    Call-site exceptions:
+      text            : the rows' text joined top-to-bottom (y_top, x_left order)
+                        with ``text_sep`` (default a space). This does NOT
+                        dehyphenate a word split across the seam between two
+                        stacked lines ("inter-" / "national") — that needs the
+                        word table; within each original cell it already happened.
+      word_ids        : flattened into one ordered list (UNIQUE_LIST).
+      line_id         : kept (FIRST) — the registry drops it as a group key, but
+                        here it carries the reindexed value (uniform in the cell).
+      font_size_ratio : kept (FIRST). Cells that merge into one are almost
+                        certainly the same font, so the top row's ratio holds;
+                        recomputing it here would use only this handful of cells
+                        as the median reference and corrupt it.
+
+    Annotation columns the registry doesn't know (vstack_*, grouped_row_*,
+    cell_id_orig, line_ids, y_center, movement/gap) fall through to FIRST; the
+    movement/gap ones describe the pre-merge transitions and are stale on a
+    rebuilt row. Any column aggregate_to would otherwise drop is backfilled from
+    the cell's first row so nothing is silently lost.
+
+    Cells that did not merge (a unique cell_id) pass through untouched, so the
+    aggregation only runs on the handful of merged cells. Returns df_cells
+    unchanged when it never went through the reindex (no cell_id_orig) or lacks
+    cell_id.
+    """
+    if (df_cells is None or df_cells.empty
+            or "cell_id" not in df_cells.columns
+            or "cell_id_orig" not in df_cells.columns):
+        return df_cells
+
+    dup = df_cells["cell_id"].duplicated(keep=False)
+    merged = df_cells[dup]
+    if merged.empty:
+        return df_cells.reset_index(drop=True)
+
+    from .._utils.df_aggregation.registry_aggregator import (
+        Agg, aggregate_to, _compute_derived,
+    )
+
+    # Row order within a cell drives the text join and FIRST picks: top to bottom.
+    sort_cols = ["cell_id"] + [c for c in ("y_top", "x_left") if c in merged.columns]
+    merged = merged.sort_values(sort_cols, kind="mergesort")
+
+    overrides = {
+        "text":            lambda s: text_sep.join(
+            str(t) for t in s if t is not None and not (isinstance(t, float) and np.isnan(t))
+        ),
+        "word_ids":        Agg.UNIQUE_LIST,
+        "line_id":         Agg.FIRST,
+        "font_size_ratio": Agg.FIRST,   # merged cells share a font; keep top row's
+    }
+    grouped = aggregate_to(
+        merged, by="cell_id", overrides=overrides,
+        derived=False, on_unknown="silent",
+    )
+
+    # Recompute geometry + style flags at the merged level, but preserve the
+    # FIRST font_size_ratio (derived would recompute it against this tiny subset).
+    saved_fsr = grouped["font_size_ratio"].copy() if "font_size_ratio" in grouped.columns else None
+    grouped = _compute_derived(grouped)
+    if saved_fsr is not None:
+        grouped["font_size_ratio"] = saved_fsr
+
+    # Backfill any original column the aggregator dropped (unknown/DROP columns
+    # not otherwise reconstructed) from the cell's first row, so nothing is lost.
+    missing = [c for c in df_cells.columns if c not in grouped.columns]
+    if missing:
+        first = merged.drop_duplicates("cell_id", keep="first")[["cell_id"] + missing]
+        grouped = grouped.merge(first, on="cell_id", how="left")
+
+    grouped = grouped[df_cells.columns.tolist()]
+    out = pd.concat([df_cells[~dup], grouped], ignore_index=True)
+    out = out.sort_values("cell_id", kind="mergesort").reset_index(drop=True)
+    return out
+
+
+# ================================================================================
 # ENTRY POINT
 # ================================================================================
 
@@ -797,5 +969,12 @@ def group_multiline_cells(
 
     # ── Final decision: merge scored vstacks into logical rows (grouped_row_id) ─
     df = assign_grouped_rows(df, config)
+
+    # ── Fold groups into the id space: 1 vstack -> 1 cell_id, 1 group -> 1
+    # line_id, both renumbered densely (originals in cell_id_orig/line_id_orig).
+    df = reindex_grouped_ids(df)
+
+    # ── Physically collapse each merged cell_id back to a single row.
+    df = rebuild_merged_cells(df)
 
     return df

@@ -318,4 +318,4 @@ def prefill_styles(df: pd.DataFrame) -> pd.DataFrame:
     _assign_table_fields(df)
     _assign_textbox_id(df)
     _assign_block_type(df)
-    return df
+    return df # df_words
