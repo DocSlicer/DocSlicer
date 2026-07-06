@@ -54,7 +54,7 @@ from ._utils.coordinates import convert_to_global_y_coordinates
 from ._utils.shape_relationships import add_link_relationships
 
 # Global Utils
-from .._utils.layout.shape_merger import merge_shapes
+from .._utils.layout.shape_processor import process_shapes
 from .._utils.layout.reading_order import assign_reading_order as assign_reading_order_fallback
 from .._utils.layout.line_number_detector import detect_line_numbers
 from .._utils.io.yaml_loader import load_yamls
@@ -159,7 +159,7 @@ def run_pipeline(
                 "pip install 'docslicer[ocr]'"
             )
             from ..ocr.ocr_orchestrator import run_ocr_pipeline
-            df_words, df_shapes, _ = run_ocr_pipeline(pdf_bytes)
+            df_words, df_shapes, df_grid_cells, _ = run_ocr_pipeline(pdf_bytes)
             discovered_metadata["has_ocr"] = True
 
         if df_words.empty:
@@ -177,8 +177,8 @@ def run_pipeline(
             if on_stage:
                 on_stage("df cleanup")
 
-            # Cleanup 1 - Shape Merging
-            df_shapes = merge_shapes(df_shapes)
+            # Cleanup 1 - Shape Merging, Role Assignment & Grid Cells
+            df_shapes, df_grid_cells = process_shapes(df_shapes)
 
             # Cleanup 2 - Line Number Detection & Removal
             # Line numbers are margin artefacts that must be removed entirely — unlike

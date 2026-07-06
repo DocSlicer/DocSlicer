@@ -112,6 +112,9 @@ MASTER_COLUMN_ORDER: List[str] = [
     "struct_group_id",
     "stream_group_id",
     "stream_group_trigger",
+    "table_grid_id", # Detected grids in df_shapes, not the same as table_id (there are more tables than grids ~ tables with only horizontal lines)
+    "grid_cell_id",  # Detected grid cells in df_shapes, not the same as table_cell_id 
+                     # (1 grid cell can have multiple table cells, for example in tables without inside borders)
 
     # Shared-pipeline IDs
     "block_id",
@@ -379,6 +382,7 @@ MASTER_COLUMN_ORDER: List[str] = [
     # Merger intermediate
     "candidate_group_id",       # grouping scratch ID during merge
     "shape_role",               # page_background / table_grid / underline / separator / background_band / other
+    "table_grid_id",            # shared ID across the lines of one detected table grid
     "has_intersection",
     "intersection_count",
     "intersecting_line_ids",

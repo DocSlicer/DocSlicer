@@ -25,7 +25,7 @@ from .._utils.text_utils import add_calculated_text_features
 from .._utils.layout.line_number_detector import detect_line_numbers
 from .._utils.layout.reading_order import assign_reading_order
 from .._utils.layout.layouts import assign_layouts
-from .._utils.layout.shape_merger import merge_shapes
+from .._utils.layout.shape_processor import process_shapes
 
 
 # ==================================================================================================
@@ -196,7 +196,7 @@ def run_ocr_pipeline(
 
 
     # Enrich df_shapes for the gutter detector
-    df_shapes = merge_shapes(df_shapes)
+    df_shapes, df_grid_cells = process_shapes(df_shapes)
 
     # 4) Assign reading order (gutter-aware)
     t0 = perf_counter()
@@ -220,5 +220,5 @@ def run_ocr_pipeline(
     df_words = assign_layouts(df_words, line_level=False)
     df_words = estimate_ocr_font_sizes(df_words, method="word")
 
-    return df_words, df_shapes, timings
+    return df_words, df_shapes, df_grid_cells, timings
 
