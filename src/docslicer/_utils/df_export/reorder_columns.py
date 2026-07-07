@@ -167,8 +167,8 @@ MASTER_COLUMN_ORDER: List[str] = [
     # ===== 4. Content =====
     "chunk_heading",
     "chunk_path",
-    "shape_id_hr_above", # TODO: Reorder after stable debug
-    "shape_id_hr_below", # TODO: Reorder after stable debug
+    "shape_id_tr_above", # TODO: Reorder after stable debug
+    "shape_id_tr_below", # TODO: Reorder after stable debug
     "text",
     "text_raw", # Pre-processed OCR text
     "cells",
@@ -260,6 +260,7 @@ MASTER_COLUMN_ORDER: List[str] = [
     "uppercase_ratio",
     "capitalized_token_ratio",
     "underlined_ratio",
+    "strikethrough_ratio",
     "inside_rect_fraction",
 
     # Boolean style flags (derived from ratios / direct XML attributes)
@@ -316,6 +317,7 @@ MASTER_COLUMN_ORDER: List[str] = [
     "has_horizontal_grid_line",
     "has_vertical_grid_line",
     "shape_id_underline",       # pdf — shape that provides the underline flag
+    "shape_id_strikethrough",
     "shape_id_horizontal_grid_line",
     "shape_id_vertical_grid_line",   # pdf — shape that provides the vertical line flag
     "inside_rect_shape",

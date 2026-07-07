@@ -8,7 +8,7 @@ from .struct_tree import (
 )
 from .form_fields import FormField, build_form_index, has_acroform
 from .form_label_link import build_form_label_index
-from .shape_relationships import (
+from ..step_07_word_relationships import (
     add_link_relationships,
     add_rect_relationships,
 )

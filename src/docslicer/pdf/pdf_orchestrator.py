@@ -41,17 +41,18 @@ from .step_03_shape_extractor import extract_shapes
 from .step_04_link_extractor import extract_links
 from .step_05_struct_group import assign_struct_group_id
 from .step_06_style_prefiller import prefill_styles
-from .step_07_stream_group import assign_stream_group_id
-from .step_08_reading_order import assign_reading_order
-from .step_09_cell_builder import build_cells
-from .step_10_page_label_detector import detect_pdf_page_labels
-from .step_12_line_builder import build_lines
-from .step_13_table_builder import build_tables
+from .step_07_word_relationships import add_link_relationships
+from .step_08_stream_group import assign_stream_group_id
+from .step_09_reading_order import assign_reading_order
+from .step_10_cell_builder import build_cells
+from .step_11_page_label_detector import detect_pdf_page_labels
+from .step_13_line_builder import build_lines
+from .step_14_table_builder import build_tables
 
 # PDF Utils
 from ._utils.struct_context import build_struct_context
 from ._utils.coordinates import convert_to_global_y_coordinates
-from ._utils.shape_relationships import add_link_relationships
+
 
 # Global Utils
 from .._utils.layout.shape_processor import process_shapes

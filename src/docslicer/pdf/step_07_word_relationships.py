@@ -1,13 +1,8 @@
 """
-shape_relationships.py
+step_5_word_relationships.py
 
 Word-to-shape relationship detection: links, background rects, vertical grid
 lines, and horizontal grid lines / underlines.
-
-There is no df_cells anymore — everything here operates directly on df_words
-(one row per word, its own bounding box). Each function matches a word's own
-bbox against df_links / df_shapes and annotates that word's row. No grouping
-or aggregation step is involved.
 """
 
 from __future__ import annotations
@@ -16,6 +11,46 @@ from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
+
+# ================================================================================
+# Public API
+# ================================================================================
+
+def add_word_relationships(
+    df_words: pd.DataFrame,
+    df_links: pd.DataFrame = None,
+    df_shapes: pd.DataFrame = None,
+    df_grid_cells: pd.DataFrame = None,
+    min_link_overlap_ratio: float = 0.5,
+    min_rect_overlap_ratio: float = 0.5,
+    grid_contain_tol: float = 1.0,
+    min_tr_x_overlap_ratio: float = 0.75,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Annotate df_words with links, background rects, grid-cell containment,
+    horizontal-line (underline / strikethrough) relationships, and nearest
+    table-rule above/below in one call. Each input is optional — omitting one just
+    skips that annotation (the default columns are still added).
+
+    This also runs the full horizontal-line pipeline on df_shapes internally
+    (score_horizontal_lines -> classify_horizontal_lines), so the returned
+    df_shapes carries the hl_ KPI/score columns and the underline/strikethrough
+    shape_role updates. Returns ``(df_words, df_shapes)`` — the enriched df_shapes
+    must be captured to keep those columns downstream.
+    """
+    # Enrich df_shapes first: classify horizontal lines (underline / strikethrough
+    # / table_rule / separator) and stash the touched-word ids, so the word merge
+    # below is a pure lookup. The enriched df_shapes is returned to the caller.
+    if df_shapes is not None and not df_shapes.empty:
+        df_shapes = score_horizontal_lines(df_shapes, df_words)
+        df_shapes = classify_horizontal_lines(df_shapes)
+
+    df_words = add_link_relationships(df_words, df_links, min_link_overlap_ratio)
+    df_words = add_rect_relationships(df_words, df_shapes, min_rect_overlap_ratio)
+    df_words = add_grid_cell_relationships(df_words, df_grid_cells, grid_contain_tol)
+    df_words = add_horizontal_line_relationships(df_words, df_shapes)
+    df_words = add_table_rule_relationships(df_words, df_shapes, min_tr_x_overlap_ratio)
+    return df_words, df_shapes
 
 
 # ================================================================================
@@ -236,33 +271,182 @@ def add_grid_cell_relationships(
 
 
 # ================================================================================
-# CONVENIENCE ENTRY POINT
+# HORIZONTAL-LINE WORD ANNOTATIONS  (underline / strikethrough)
 # ================================================================================
 
-def add_word_relationships(
+def add_horizontal_line_relationships(
     df_words: pd.DataFrame,
-    df_links: pd.DataFrame = None,
-    df_shapes: pd.DataFrame = None,
-    df_grid_cells: pd.DataFrame = None,
-    min_link_overlap_ratio: float = 0.5,
-    min_rect_overlap_ratio: float = 0.5,
-    grid_contain_tol: float = 1.0,
+    df_shapes: pd.DataFrame,
 ) -> pd.DataFrame:
     """
-    Annotate df_words with links, background rects, and grid-cell containment
-    in one call. Each input is optional — omitting one just skips that
-    annotation (the corresponding default columns are still added).
+    Fold classified horizontal-line insights back onto the words each line touches.
+
+    Reuses the word sets the line scorer already computed (hl_run_word_ids for the
+    underlined text run, hl_strike_word_ids for struck words), so this step does no
+    geometry of its own — the line's classification (shape_role == "underline" /
+    "strikethrough") is the gate. Run AFTER score_horizontal_lines +
+    classify_horizontal_lines have populated shape_role and the id columns.
+
+    Columns added to df_words:
+        is_underlined          bool  — a line classified "underline" hugs this word
+        shape_id_underline     obj   — that line's shape_id (last wins on overlap)
+        is_strikethrough       bool  — a line classified "strikethrough" crosses it
+        strikethrough_ratio    float — 1.0 when struck, else 0.0
+        shape_id_strikethrough obj   — that line's shape_id (last wins on overlap)
     """
-    df_words = add_link_relationships(df_words, df_links, min_link_overlap_ratio)
-    df_words = add_rect_relationships(df_words, df_shapes, min_rect_overlap_ratio)
-    df_words = add_grid_cell_relationships(df_words, df_grid_cells, grid_contain_tol)
+    df_words = df_words.copy()
+    df_words["is_underlined"]          = False
+    df_words["shape_id_underline"]     = None
+    df_words["is_strikethrough"]       = False
+    df_words["strikethrough_ratio"]    = 0.0
+    df_words["shape_id_strikethrough"] = None
+
+    if (df_words.empty or df_shapes is None or df_shapes.empty
+            or "shape_role" not in df_shapes.columns):
+        return df_words
+
+    has_shape_id = "shape_id" in df_shapes.columns
+
+    def _apply(role: str, ids_col: str, flag_col: str, id_col: str) -> None:
+        if ids_col not in df_shapes.columns:
+            return
+        lines = df_shapes[df_shapes["shape_role"] == role]
+        for _, line in lines.iterrows():
+            ids = line[ids_col]
+            if not isinstance(ids, (list, tuple, np.ndarray)) or len(ids) == 0:
+                continue
+            target = df_words.index.intersection(pd.Index(ids))
+            if target.empty:
+                continue
+            df_words.loc[target, flag_col] = True
+            if has_shape_id:
+                df_words.loc[target, id_col] = line["shape_id"]
+
+    _apply("underline", "hl_run_word_ids", "is_underlined", "shape_id_underline")
+    _apply("strikethrough", "hl_strike_word_ids", "is_strikethrough",
+           "shape_id_strikethrough")
+
+    df_words.loc[df_words["is_strikethrough"], "strikethrough_ratio"] = 1.0
+    return df_words
+
+
+# Horizontal-line roles that block a word<->table_rule search: an explicit
+# separator, or an undetermined ("other") line the classifier couldn't resolve.
+_TR_WALL_ROLES = ("separator", "other")
+
+
+def add_table_rule_relationships(
+    df_words: pd.DataFrame,
+    df_shapes: pd.DataFrame,
+    min_x_overlap_ratio: float = 0.75,
+) -> pd.DataFrame:
+    """
+    Tag each word with the nearest table-rule line above and below it (by vertical
+    distance), restricted to rules that horizontally back the word.
+
+    A word only considers a table rule (shape_role == "table_rule") if the rule
+    overlaps the word's x-span by at least ``min_x_overlap_ratio`` of the word's
+    width (e.g. a word at x [80, 110] needs >= 0.75 * 30 = 22.5 pt of overlap).
+    There is no y-distance limit and no contact requirement: intervening words
+    between the word and the rule are fine — the nearest qualifying rule on each
+    side wins. A rule level with the word's box (its y-center inside the glyph box)
+    is neither above nor below, so it is skipped.
+
+    A search can't cross a barrier line: the nearest line whose shape_role is in
+    ``_TR_WALL_ROLES`` (a "separator", or an undetermined "other" line) and whose
+    x-span passes over the word acts as a wall on each side. A table rule beyond
+    that wall (farther from the word than the barrier) is excluded, so a word
+    directly under a full-width divider gets no shape_id_tr_below from rules living
+    below that divider.
+
+    Columns added to df_words:
+        shape_id_tr_above   obj — shape_id of the nearest qualifying rule above
+        shape_id_tr_below   obj — shape_id of the nearest qualifying rule below
+    Words with no qualifying rule on a side get None there.
+    """
+    df_words = df_words.copy()
+    df_words["shape_id_tr_above"] = None
+    df_words["shape_id_tr_below"] = None
+
+    if (df_words.empty or df_shapes is None or df_shapes.empty
+            or "shape_role" not in df_shapes.columns):
+        return df_words
+
+    rules = df_shapes[df_shapes["shape_role"] == "table_rule"]
+    if rules.empty:
+        return df_words
+    has_shape_id = "shape_id" in rules.columns
+    walls = df_shapes[df_shapes["shape_role"].isin(_TR_WALL_ROLES)]
+
+    for page_num in df_words["page_number"].unique():
+        page_rules = rules[rules["page_number"] == page_num]
+        if page_rules.empty:
+            continue
+
+        word_idxs = df_words.index[df_words["page_number"] == page_num].to_numpy()
+        w_xl = df_words.loc[word_idxs, "x_left"].to_numpy(float)
+        w_xr = df_words.loc[word_idxs, "x_right"].to_numpy(float)
+        w_yt = df_words.loc[word_idxs, "y_top"].to_numpy(float)
+        w_yb = df_words.loc[word_idxs, "y_bottom"].to_numpy(float)
+        w_width  = np.maximum(w_xr - w_xl, 1e-6)
+        w_center = 0.5 * (w_yt + w_yb)
+        w_cx     = 0.5 * (w_xl + w_xr)
+
+        r_xl = page_rules["x_left"].to_numpy(float)
+        r_xr = page_rules["x_right"].to_numpy(float)
+        r_yc = 0.5 * (page_rules["y_top"].to_numpy(float)
+                      + page_rules["y_bottom"].to_numpy(float))
+        r_ids = (page_rules["shape_id"].to_numpy() if has_shape_id
+                 else page_rules.index.to_numpy())
+
+        # Barrier walls: the nearest wall line (separator / undetermined "other")
+        # that spans over the word's x-center caps how far the rule search may reach
+        # on each side. No wall on a side => an open wall (+/-inf).
+        wall_above = np.full(len(word_idxs), -np.inf)
+        wall_below = np.full(len(word_idxs), np.inf)
+        page_walls = walls[walls["page_number"] == page_num]
+        if not page_walls.empty:
+            s_xl = page_walls["x_left"].to_numpy(float)
+            s_xr = page_walls["x_right"].to_numpy(float)
+            s_yc = 0.5 * (page_walls["y_top"].to_numpy(float)
+                          + page_walls["y_bottom"].to_numpy(float))
+            spans = (s_xl[None, :] <= w_cx[:, None]) & (s_xr[None, :] >= w_cx[:, None])
+            sep_above = spans & (s_yc[None, :] <= w_yt[:, None])
+            sep_below = spans & (s_yc[None, :] >= w_yb[:, None])
+            wall_above = np.where(sep_above, s_yc[None, :], -np.inf).max(axis=1)
+            wall_below = np.where(sep_below, s_yc[None, :],  np.inf).min(axis=1)
+
+        # x overlap of each (word, rule) pair, as an absolute pt amount.
+        overlap = (np.minimum(w_xr[:, None], r_xr[None, :])
+                   - np.maximum(w_xl[:, None], r_xl[None, :]))
+        x_ok = np.clip(overlap, 0.0, None) >= (min_x_overlap_ratio * w_width[:, None])
+
+        # Above: rule center at/above the word's top, not past the separator wall.
+        # Below: at/below its bottom, not past the wall.
+        above = x_ok & (r_yc[None, :] <= w_yt[:, None]) & (r_yc[None, :] >= wall_above[:, None])
+        below = x_ok & (r_yc[None, :] >= w_yb[:, None]) & (r_yc[None, :] <= wall_below[:, None])
+
+        dist    = np.abs(r_yc[None, :] - w_center[:, None])
+        d_above = np.where(above, dist, np.inf)
+        d_below = np.where(below, dist, np.inf)
+
+        has_above = np.isfinite(d_above).any(axis=1)
+        has_below = np.isfinite(d_below).any(axis=1)
+
+        if has_above.any():
+            pick = np.argmin(d_above, axis=1)[has_above]
+            df_words.loc[word_idxs[has_above], "shape_id_tr_above"] = r_ids[pick]
+        if has_below.any():
+            pick = np.argmin(d_below, axis=1)[has_below]
+            df_words.loc[word_idxs[has_below], "shape_id_tr_below"] = r_ids[pick]
+
     return df_words
 
 
 # ================================================================================
 # HORIZONTAL-LINE KPIs  (underline vs. hrule — stage 1: feature extraction)
 # ================================================================================
-#
+
 # Diagnostic pass over df_shapes. For every *candidate* horizontal line (shape_type
 # == "line", horizontal, not already shape_role == "table_grid" or "box") it computes a set
 # of KPI columns — shape-only and word-relative — WITHOUT deciding anything. The
@@ -346,6 +530,13 @@ def _init_hl_columns(df: pd.DataFrame) -> None:
     df["hl_rect_relation"] = pd.array([pd.NA] * n, dtype="string")
     df["hl_top_content"] = pd.array([pd.NA] * n, dtype="string")
     df["hl_top_is_bimodal"] = pd.array([pd.NA] * n, dtype="boolean")
+    # Word ids the line touches, captured here where the masks already exist so the
+    # word-merge step (add_horizontal_line_relationships) needs no geometry of its
+    # own. None on non-candidate / no-match rows; a list of df_words index values
+    # otherwise. hl_run_word_ids = the underlined text run (top set);
+    # hl_strike_word_ids = words the line strikes through.
+    for c in ("hl_run_word_ids", "hl_strike_word_ids"):
+        df[c] = pd.Series([None] * n, index=df.index, dtype=object)
 
 
 def _candidate_line_mask(df_shapes: pd.DataFrame) -> np.ndarray:
@@ -430,7 +621,7 @@ def score_horizontal_lines(
     if not words_ok:
         return df_shapes
 
-    from docslicer.pdf.step_09_cell_builder import _line_gap_stats, classify_line
+    from docslicer.pdf.step_10_cell_builder import _line_gap_stats, classify_line
 
     has_fs = "font_size" in df_words.columns
     has_text = "text" in df_words.columns
@@ -439,6 +630,7 @@ def score_horizontal_lines(
     by_page: dict = {}
     for pg, grp in df_words.groupby("page_number", sort=False):
         by_page[pg] = {
+            "idx": grp.index.to_numpy(),
             "xl": grp["x_left"].to_numpy(float),
             "xr": grp["x_right"].to_numpy(float),
             "yt": grp["y_top"].to_numpy(float),
@@ -471,6 +663,7 @@ def score_horizontal_lines(
         n_struck = int(struck.sum())
         df_shapes.iat[row, col("hl_strike_n_words")] = n_struck
         if n_struck:
+            df_shapes.iat[row, col("hl_strike_word_ids")] = wp["idx"][struck].tolist()
             s_l = float(wp["xl"][struck].min())
             s_r = float(wp["xr"][struck].max())
             s_overlap = max(0.0, min(lxr, s_r) - max(lxl, s_l))
@@ -498,6 +691,7 @@ def score_horizontal_lines(
         if n_top == 0:
             continue
 
+        df_shapes.iat[row, col("hl_run_word_ids")] = wp["idx"][top].tolist()
         run_l = float(wp["xl"][top].min())
         run_r = float(wp["xr"][top].max())
         run_w = max(run_r - run_l, 1e-6)

@@ -93,6 +93,7 @@ _RATIO_WEIGHT_COL = "char_count"
 BOLD_THRESHOLD = 0.75
 ITALIC_THRESHOLD = 0.75
 UNDERLINED_THRESHOLD = 0.75
+STRIKETHROUGH_THRESHOLD = 0.75
 UPPERCASE_THRESHOLD = 0.90
 
 
@@ -225,11 +226,13 @@ COLUMN_REGISTRY: Dict[str, Agg] = {
     "bold_ratio": Agg.WEIGHTED_RATIO,
     "italic_ratio": Agg.WEIGHTED_RATIO,
     "underlined_ratio": Agg.WEIGHTED_RATIO,
+    "strikethrough_ratio": Agg.WEIGHTED_RATIO,
     "font_size_ratio": Agg.DROP,   # recomputed vs. the aggregated level's median
     "is_bold": Agg.DROP,           # recomputed from bold_ratio
     "is_italic": Agg.DROP,         # recomputed from italic_ratio
     "is_uppercase": Agg.DROP,      # recomputed from uppercase_count / alpha_count
     "is_underlined": Agg.ANY,      # OR'd; overwritten by underlined_ratio when present
+    "is_strikethrough": Agg.ANY,   # OR'd; overwritten by strikethrough_ratio when present
 
     # --- links / metadata ----------------------------------------------------------------
     "has_link": Agg.ANY,
@@ -244,6 +247,8 @@ COLUMN_REGISTRY: Dict[str, Agg] = {
     "table_id": Agg.FIRST,
     "table_row_id": Agg.FIRST,
     "table_cell_id": Agg.FIRST,    # line builders override to UNIQUE_LIST (lines span cells)
+    "table_grid_id": Agg.FIRST, # Explicit grids found in df_shapes
+    "grid_cell_id": Agg.FIRST,
     "table_header_flag": Agg.FIRST,
     "table_cell_index": Agg.FIRST,
     "table_row_cell_count": Agg.FIRST,
@@ -266,7 +271,13 @@ COLUMN_REGISTRY: Dict[str, Agg] = {
     
     "img_alt": Agg.FIRST,
     "img_src": Agg.FIRST,
-    "shape_id_vertical_grid_line": Agg.UNIQUE_LIST,
+
+    # --- PDF word + shape connection -----------------------------------------------------------------
+    "shape_id_underline": Agg.FIRST,
+    "shape_id_strikethrough": Agg.FIRST,
+    "shape_id_tr_above": Agg.FIRST,
+    "shape_id_tr_below": Agg.FIRST,
+    "shape_id_vertical_grid_line": Agg.UNIQUE_LIST, #TODO check if still relevant
 
     # --- PDF structure tree / content-stream provenance ----------------------------------------
     "struct_group_id": Agg.FIRST,
@@ -614,7 +625,8 @@ def aggregate_to(
         rename_by: Rename the group column in the output
             (e.g. ``by="_block_id", rename_by="block_id"``).
         derived: Recompute derived columns after aggregation: width/height,
-            is_bold/is_italic/is_underlined/is_uppercase, font_size_ratio.
+            is_bold/is_italic/is_underlined/is_strikethrough/is_uppercase,
+            font_size_ratio.
         on_unknown: What to do with columns that fall through to the default
             policy: ``"warn"`` (default), ``"raise"``, or ``"silent"``.
 
@@ -791,6 +803,8 @@ def _compute_derived(grouped: pd.DataFrame) -> pd.DataFrame:
         grouped["is_italic"] = grouped["italic_ratio"] > ITALIC_THRESHOLD
     if "underlined_ratio" in cols:
         grouped["is_underlined"] = grouped["underlined_ratio"] > UNDERLINED_THRESHOLD
+    if "strikethrough_ratio" in cols:
+        grouped["is_strikethrough"] = grouped["strikethrough_ratio"] > STRIKETHROUGH_THRESHOLD
 
     if "uppercase_count" in cols and "alpha_count" in cols:
         alpha_safe = grouped["alpha_count"].replace(0, np.nan)
