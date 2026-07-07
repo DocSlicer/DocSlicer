@@ -66,6 +66,7 @@ MASTER_COLUMN_ORDER: List[str] = [
 
     # ===== 1. Document / page identifiers =====
     "page_number",
+    "hl_class", # TODO: Temp table hr debug
     "page_label",
     "section",
     "section_id",           # docx

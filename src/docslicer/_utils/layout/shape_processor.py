@@ -34,7 +34,11 @@ _GRID_CELL_COLS = (
 # ==============================
 
 ShapeType   = Literal["rect", "line", "curve", "unknown"]
-ShapeRole   = Literal["page_background", "table_grid", "underline", "separator", "background_band", "other"]
+ShapeRole   = Literal[
+    "page_background", "table_grid", "box",
+    "table_rule", "underline", "strikethrough", "separator",
+    "background_band", "other",
+]
 Orientation = Literal["horizontal", "vertical", "unknown"]
 
 # Drawing metadata copied onto merged records from the representative shape.
@@ -406,6 +410,56 @@ def _assign_page_background_roles(df: pd.DataFrame) -> None:
     df.loc[is_bg, "shape_role"] = "page_background"
 
 
+def _cluster_touching_lines(
+    sel: np.ndarray,
+    orient: np.ndarray,
+    cx: np.ndarray,
+    cy: np.ndarray,
+    x_left: np.ndarray,
+    x_right: np.ndarray,
+    y_top: np.ndarray,
+    y_bottom: np.ndarray,
+    tol: float,
+) -> List[List[int]]:
+    """
+    Union-find `sel` (positions into the full line arrays) into connected
+    clusters, where a horizontal and vertical line join the same cluster when
+    they touch, i.e. the vertical crosses the horizontal's x-span and the
+    horizontal crosses the vertical's y-span, each within `tol`. Returns
+    clusters as lists of local indices into `sel`.
+    """
+    parent = list(range(sel.size))
+
+    def find(a: int) -> int:
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]  # path halving
+            a = parent[a]
+        return a
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    h_loc = [t for t in range(sel.size) if orient[sel[t]] == "horizontal"]
+    v_loc = [t for t in range(sel.size) if orient[sel[t]] == "vertical"]
+
+    for a in h_loc:
+        ha = sel[a]
+        for b in v_loc:
+            vb = sel[b]
+            if (
+                x_left[ha] - tol <= cx[vb] <= x_right[ha] + tol
+                and y_top[vb] - tol <= cy[ha] <= y_bottom[vb] + tol
+            ):
+                union(a, b)
+
+    clusters: Dict[int, List[int]] = {}
+    for t in range(sel.size):
+        clusters.setdefault(find(t), []).append(t)
+    return list(clusters.values())
+
+
 def _assign_table_grid_roles(df: pd.DataFrame, start_id: int) -> int:
     """
     Detect table grids among the line shapes and tag their members with
@@ -456,38 +510,9 @@ def _assign_table_grid_roles(df: pd.DataFrame, start_id: int) -> int:
         if sel.size < 3:  # need >= 2 horizontals + >= 1 vertical
             continue
 
-        parent = list(range(sel.size))
+        clusters = _cluster_touching_lines(sel, orient, cx, cy, x_left, x_right, y_top, y_bottom, tol)
 
-        def find(a: int) -> int:
-            while parent[a] != a:
-                parent[a] = parent[parent[a]]  # path halving
-                a = parent[a]
-            return a
-
-        def union(a: int, b: int) -> None:
-            ra, rb = find(a), find(b)
-            if ra != rb:
-                parent[rb] = ra
-
-        # Local indices (into sel) split by orientation.
-        h_loc = [t for t in range(sel.size) if orient[sel[t]] == "horizontal"]
-        v_loc = [t for t in range(sel.size) if orient[sel[t]] == "vertical"]
-
-        for a in h_loc:
-            ha = sel[a]
-            for b in v_loc:
-                vb = sel[b]
-                if (
-                    x_left[ha] - tol <= cx[vb] <= x_right[ha] + tol
-                    and y_top[vb] - tol <= cy[ha] <= y_bottom[vb] + tol
-                ):
-                    union(a, b)
-
-        clusters: Dict[int, List[int]] = {}
-        for t in range(sel.size):
-            clusters.setdefault(find(t), []).append(t)
-
-        for members in clusters.values():
+        for members in clusters:
             h_mem = [t for t in members if orient[sel[t]] == "horizontal"]
             v_mem = [t for t in members if orient[sel[t]] == "vertical"]
             if len(h_mem) < 2 or not v_mem:
@@ -513,6 +538,70 @@ def _assign_table_grid_roles(df: pd.DataFrame, start_id: int) -> int:
     return next_id
 
 
+def _assign_box_roles(df: pd.DataFrame) -> None:
+    """
+    Detect plain 4-line boxes among the line shapes not already claimed by
+    table_grid, and tag their members with shape_role 'box' (in place).
+
+    A box is a cluster of exactly 2 horizontal lines (top/bottom) and 2
+    vertical lines (left/right) with no ruling lines in between -- unlike a
+    table_grid, every horizontal must touch every vertical, i.e. all four
+    corners are closed. This is what distinguishes a box from a table_grid
+    (which requires at least one interior separator).
+
+    Unlike table_grid detection, no minimum line length is enforced: box
+    sides (e.g. a single small cell) are often shorter than
+    _GRID_MIN_LINE_LEN_PX. The all-four-corners-closed check is a strong
+    enough constraint on its own to reject spurious tiny fragments.
+    """
+    role   = df["shape_role"].to_numpy(dtype=object, copy=True)
+    page   = df["page_number"].to_numpy()
+    orient = df["shape_orientation"].to_numpy()
+    stype  = df["shape_type"].to_numpy()
+    x_left   = df["x_left"].to_numpy(dtype=np.float64)
+    x_right  = df["x_right"].to_numpy(dtype=np.float64)
+    y_top    = df["y_top"].to_numpy(dtype=np.float64)
+    y_bottom = df["y_bottom"].to_numpy(dtype=np.float64)
+    cx = 0.5 * (x_left + x_right)
+    cy = 0.5 * (y_top + y_bottom)
+
+    tol = _GRID_SNAP_TOL_PX
+    for pg in pd.unique(page):
+        sel = np.flatnonzero(
+            (page == pg)
+            & (stype == "line")
+            & np.isin(orient, ("horizontal", "vertical"))
+            & (role == "other")
+        )
+        if sel.size < 4:  # need exactly 2 horizontals + 2 verticals
+            continue
+
+        clusters = _cluster_touching_lines(sel, orient, cx, cy, x_left, x_right, y_top, y_bottom, tol)
+
+        for members in clusters:
+            if len(members) != 4:
+                continue
+            h_mem = [t for t in members if orient[sel[t]] == "horizontal"]
+            v_mem = [t for t in members if orient[sel[t]] == "vertical"]
+            if len(h_mem) != 2 or len(v_mem) != 2:
+                continue
+
+            # Every horizontal must touch every vertical -- all four corners closed.
+            closed = all(
+                x_left[sel[h]] - tol <= cx[sel[v]] <= x_right[sel[h]] + tol
+                and y_top[sel[v]] - tol <= cy[sel[h]] <= y_bottom[sel[v]] + tol
+                for h in h_mem
+                for v in v_mem
+            )
+            if not closed:
+                continue
+
+            for t in members:
+                role[sel[t]] = "box"
+
+    df["shape_role"] = role
+
+
 def _assign_shape_roles(df: pd.DataFrame) -> None:
     """
     Classify merged shape records into shape_roles (in place).
@@ -523,6 +612,7 @@ def _assign_shape_roles(df: pd.DataFrame) -> None:
     """
     _assign_page_background_roles(df)
     _assign_table_grid_roles(df, start_id=1)
+    _assign_box_roles(df)
 
 
 # ==============================
