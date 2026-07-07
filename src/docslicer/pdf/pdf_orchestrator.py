@@ -159,7 +159,7 @@ def run_pipeline(
                 "pip install 'docslicer[ocr]'"
             )
             from ..ocr.ocr_orchestrator import run_ocr_pipeline
-            df_words, df_shapes, df_grid_cells, _ = run_ocr_pipeline(pdf_bytes)
+            df_words, df_shapes, df_grid_cells = run_ocr_pipeline(pdf_bytes)
             discovered_metadata["has_ocr"] = True
 
         if df_words.empty:

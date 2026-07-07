@@ -166,6 +166,8 @@ MASTER_COLUMN_ORDER: List[str] = [
     # ===== 4. Content =====
     "chunk_heading",
     "chunk_path",
+    "shape_id_hr_above", # TODO: Reorder after stable debug
+    "shape_id_hr_below", # TODO: Reorder after stable debug
     "text",
     "text_raw", # Pre-processed OCR text
     "cells",
@@ -382,7 +384,7 @@ MASTER_COLUMN_ORDER: List[str] = [
     # Merger intermediate
     "candidate_group_id",       # grouping scratch ID during merge
     "shape_role",               # page_background / table_grid / underline / separator / background_band / other
-    "table_grid_id",            # shared ID across the lines of one detected table grid
+    #"table_grid_id",            # shared ID across the lines of one detected table grid
     "has_intersection",
     "intersection_count",
     "intersecting_line_ids",
@@ -461,6 +463,17 @@ MASTER_COLUMN_ORDER: List[str] = [
     "footnote_id",
     "endnote_id",
 ]
+
+_seen: set[str] = set()
+_dupes = {col for col in MASTER_COLUMN_ORDER if col in _seen or _seen.add(col)}
+if _dupes:
+    raise ValueError(
+        f"MASTER_COLUMN_ORDER contains duplicate entries: {sorted(_dupes)}. "
+        "Selecting a duplicated name twice (df[existing_cols]) produces "
+        "repeated columns, which pandas then disambiguates as 'name.1', etc. "
+        "Remove the duplicate(s) from MASTER_COLUMN_ORDER."
+    )
+del _seen, _dupes
 
 # =====================
 # Reorder Function

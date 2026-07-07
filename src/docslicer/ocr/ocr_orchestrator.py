@@ -1,10 +1,10 @@
 # ocr/ocr_orchestrator.py
 from __future__ import annotations
 
+import logging
 import warnings
 from dataclasses import dataclass
 from typing import List, Tuple, Optional
-from time import perf_counter
 
 import pypdfium2 as pdfium
 import numpy as np
@@ -26,6 +26,9 @@ from .._utils.layout.line_number_detector import detect_line_numbers
 from .._utils.layout.reading_order import assign_reading_order
 from .._utils.layout.layouts import assign_layouts
 from .._utils.layout.shape_processor import process_shapes
+from .._utils.timing import timed_step
+
+logger = logging.getLogger(__name__)
 
 
 # ==================================================================================================
@@ -88,7 +91,7 @@ def run_ocr_pipeline(
     file_bytes: bytes,
     *,
     config: OCRPipelineConfig = OCRPipelineConfig(),
-) -> Tuple[pd.DataFrame, pd.DataFrame, List[Tuple[str, float]]]:
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     Production entrypoint.
 
@@ -101,124 +104,114 @@ def run_ocr_pipeline(
                   is_line_start=1 flags the leftmost word per line, useful for
                   correcting OCR noise on line-initial tokens (e.g. "m=" → bullet).
       - df_shapes: shapes dataframe (rule lines / borders)
-      - timings: list of (step_name, duration_seconds) tuples
+      - df_grid_cells: grid cell dataframe (from shape enrichment)
     """
-    timings = []
-
     # --------------------
     # Pipeline in PX
     # --------------------
-    
+
     # Render PDF to images
-    t0 = perf_counter()
-    images_bgr = _render_pdf_bytes_to_images_bgr(file_bytes, dpi_scale=config.dpi_scale)
-    timings.append(("PDF rendering", perf_counter() - t0))
+    with timed_step("PDF rendering", logger=logger):
+        images_bgr = _render_pdf_bytes_to_images_bgr(file_bytes, dpi_scale=config.dpi_scale)
 
     # 1) Words (Tesseract, page-level parallel)
-    t0 = perf_counter()
-    ocr_workers = resolve_worker_count(config.ocr_workers, n_items=len(images_bgr))
-    df_words = extract_words_from_images(
-        images_bgr,
-        ocr_config=TesserocrConfig(tessdata_path=config.ocr_tessdata_path),
-        max_workers=ocr_workers,
-    )
-    timings.append(("STEP 1: OCR word extraction", perf_counter() - t0))
+    with timed_step("OCR word extraction", logger=logger):
+        ocr_workers = resolve_worker_count(config.ocr_workers, n_items=len(images_bgr))
+        df_words = extract_words_from_images(
+            images_bgr,
+            ocr_config=TesserocrConfig(tessdata_path=config.ocr_tessdata_path),
+            max_workers=ocr_workers,
+        )
 
     # 2) Colorize words and add ink coverage
-    t0 = perf_counter()
-    df_words = colorize_words_df(df_words, images_bgr, config=config.colorizer, max_workers=ocr_workers)
-    ink_cov = df_words["ink_coverage"].to_numpy(dtype=float)
-    median_ink = float(np.median(ink_cov[ink_cov > 0])) if np.any(ink_cov > 0) else 0.0
-    df_words["bold_ratio"] = (ink_cov >= config.colorizer.bold_ink_multiplier * median_ink).astype(int)
+    with timed_step("Word colorization", logger=logger):
+        df_words = colorize_words_df(df_words, images_bgr, config=config.colorizer, max_workers=ocr_workers)
+        ink_cov = df_words["ink_coverage"].to_numpy(dtype=float)
+        median_ink = float(np.median(ink_cov[ink_cov > 0])) if np.any(ink_cov > 0) else 0.0
+        df_words["bold_ratio"] = (ink_cov >= config.colorizer.bold_ink_multiplier * median_ink).astype(int)
 
-    # Drop words where the colorizer found no ink — these are Tesseract hallucinations
-    # in whitespace/gutter areas where no actual text pixels exist.
-    # NOTE: This operation removes rows from the df
-    df_words = df_words[df_words["non_stroking_color"].notna()].reset_index(drop=True)
-
-    timings.append(("STEP 2: Word colorization", perf_counter() - t0))
+        # Drop words where the colorizer found no ink — these are Tesseract hallucinations
+        # in whitespace/gutter areas where no actual text pixels exist.
+        # NOTE: This operation removes rows from the df
+        df_words = df_words[df_words["non_stroking_color"].notna()].reset_index(drop=True)
 
     # 3) Extract rule shapes (horizontal/vertical lines)
-    t0 = perf_counter()
-    df_shapes = extract_shapes_df(images_bgr, config=config.shapes)
-    timings.append(("STEP 3: Shape extraction", perf_counter() - t0))
+    with timed_step("Shape extraction", logger=logger):
+        df_shapes = extract_shapes_df(images_bgr, config=config.shapes)
 
     # --------------------
     # Pipeline in PT (convert from pixels to points)
     # --------------------
-    
-    t0 = perf_counter()
-    
-    # Convert words bbox from PX to PT
-    bbox_cols_words = ['x_left', 'x_right', 'y_top', 'y_bottom', 'width', 'height']
-    for col in bbox_cols_words:
-        if col in df_words.columns:
-            df_words[col] = df_words[col] / config.dpi_scale
 
-    # Derive font_size from bbox height (best available proxy from Tesseract output)
-    if "height" in df_words.columns:
-        df_words["font_size"] = df_words["height"]
+    with timed_step("Conversion PX -> PT", logger=logger):
+        # Convert words bbox from PX to PT
+        bbox_cols_words = ['x_left', 'x_right', 'y_top', 'y_bottom', 'width', 'height']
+        for col in bbox_cols_words:
+            if col in df_words.columns:
+                df_words[col] = df_words[col] / config.dpi_scale
 
-    # Derive page_width / page_height from rendered image dimensions (converted to PT)
-    if "page_number" in df_words.columns and images_bgr:
-        page_dims = {
-            idx + 1: (img.shape[1] / config.dpi_scale, img.shape[0] / config.dpi_scale)
-            for idx, img in enumerate(images_bgr)
-            if img is not None
-        }
-        df_words["page_width"]  = df_words["page_number"].map(lambda p: page_dims.get(p, (0, 0))[0])
-        df_words["page_height"] = df_words["page_number"].map(lambda p: page_dims.get(p, (0, 0))[1])
-    
-    # Convert shapes bbox from PX to PT and remove x1,y1,x2,y2
-    bbox_cols_shapes = ['x_left', 'x_right', 'y_top', 'y_bottom', 'width', 'height', 'area', 'linewidth', 'length']
-    for col in bbox_cols_shapes:
-        if col in df_shapes.columns:
-            df_shapes[col] = df_shapes[col] / config.dpi_scale
-    # area is width*height so it scales by dpi_scale^2 — correct after both dims are divided once each
-    if "area" in df_shapes.columns:
-        df_shapes["area"] = df_shapes["area"] / config.dpi_scale
+        # Derive font_size from bbox height (best available proxy from Tesseract output)
+        if "height" in df_words.columns:
+            df_words["font_size"] = df_words["height"]
 
-    # Remove x1, y1, x2, y2 from shapes (not used downstream)
-    cols_to_drop = ['x1', 'y1', 'x2', 'y2']
-    df_shapes = df_shapes.drop(columns=[c for c in cols_to_drop if c in df_shapes.columns])
-    
-    timings.append(("Conversion PX -> PT", perf_counter() - t0))
+        # Derive page_width / page_height from rendered image dimensions (converted to PT)
+        if "page_number" in df_words.columns and images_bgr:
+            page_dims = {
+                idx + 1: (img.shape[1] / config.dpi_scale, img.shape[0] / config.dpi_scale)
+                for idx, img in enumerate(images_bgr)
+                if img is not None
+            }
+            df_words["page_width"]  = df_words["page_number"].map(lambda p: page_dims.get(p, (0, 0))[0])
+            df_words["page_height"] = df_words["page_number"].map(lambda p: page_dims.get(p, (0, 0))[1])
+
+        # Convert shapes bbox from PX to PT and remove x1,y1,x2,y2
+        bbox_cols_shapes = ['x_left', 'x_right', 'y_top', 'y_bottom', 'width', 'height', 'area', 'linewidth', 'length']
+        for col in bbox_cols_shapes:
+            if col in df_shapes.columns:
+                df_shapes[col] = df_shapes[col] / config.dpi_scale
+        # area is width*height so it scales by dpi_scale^2 — correct after both dims are divided once each
+        if "area" in df_shapes.columns:
+            df_shapes["area"] = df_shapes["area"] / config.dpi_scale
+
+        # Remove x1, y1, x2, y2 from shapes (not used downstream)
+        cols_to_drop = ['x1', 'y1', 'x2', 'y2']
+        df_shapes = df_shapes.drop(columns=[c for c in cols_to_drop if c in df_shapes.columns])
 
     # Detect and remove line numbers
-    df_words = detect_line_numbers(df_words)
+    with timed_step("Line number detection", logger=logger):
+        df_words = detect_line_numbers(df_words)
 
-    # NOTE: This operation removes rows from the df
-    # Step 05c - Drop line-number words
-    # Line numbers are margin artefacts that must be removed entirely — unlike
-    # other annotations they cannot be represented as a meaningful block_type.
-    if "line_number_flag" in df_words.columns:
-        df_words = df_words[~df_words["line_number_flag"]].copy()
+        # NOTE: This operation removes rows from the df
+        # Step 05c - Drop line-number words
+        # Line numbers are margin artefacts that must be removed entirely — unlike
+        # other annotations they cannot be represented as a meaningful block_type.
+        if "line_number_flag" in df_words.columns:
+            df_words = df_words[~df_words["line_number_flag"]].copy()
 
 
     # Enrich df_shapes for the gutter detector
-    df_shapes, df_grid_cells = process_shapes(df_shapes)
+    with timed_step("Shape processing", logger=logger):
+        df_shapes, df_grid_cells = process_shapes(df_shapes)
 
     # 4) Assign reading order (gutter-aware)
-    t0 = perf_counter()
-    df_words = assign_reading_order(df_words, df_shapes)
-    df_words = df_words.drop(columns=["center_bucket"], errors="ignore")
+    with timed_step("Reading order", logger=logger):
+        df_words = assign_reading_order(df_words, df_shapes)
+        df_words = df_words.drop(columns=["center_bucket"], errors="ignore")
 
-    # Flag the leftmost word in each line (useful for OCR noise correction,
-    # e.g. "m=" or "e" at line start may be a misread bullet)
-    min_x = df_words.groupby(["page_number", "line_id"])["x_left"].transform("min")
-    df_words["is_line_start"] = (df_words["x_left"] == min_x).astype(int)
-
-    timings.append(("STEP 4: Reading order", perf_counter() - t0))
+        # Flag the leftmost word in each line (useful for OCR noise correction,
+        # e.g. "m=" or "e" at line start may be a misread bullet)
+        min_x = df_words.groupby(["page_number", "line_id"])["x_left"].transform("min")
+        df_words["is_line_start"] = (df_words["x_left"] == min_x).astype(int)
 
     # 5) Text cleaning (runs after is_line_start is available for bullet detection)
-    t0 = perf_counter()
-    df_words = clean_words_df(df_words)
-    df_words = add_calculated_text_features(df_words)
-    timings.append(("STEP 5: Text cleaning", perf_counter() - t0))
+    with timed_step("Text cleaning", logger=logger):
+        df_words = clean_words_df(df_words)
+        df_words = add_calculated_text_features(df_words)
 
     # 6) Estimate font size (per horizontal band, too noisy on a line level)
-    df_words = assign_layouts(df_words, line_level=False)
-    df_words = estimate_ocr_font_sizes(df_words, method="word")
+    with timed_step("Font size estimation", logger=logger):
+        df_words = assign_layouts(df_words, line_level=False)
+        df_words = estimate_ocr_font_sizes(df_words, method="word")
 
-    return df_words, df_shapes, df_grid_cells, timings
+    return df_words, df_shapes, df_grid_cells
 

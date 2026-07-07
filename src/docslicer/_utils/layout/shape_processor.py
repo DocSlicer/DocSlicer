@@ -15,6 +15,8 @@ import pandas as pd
 _GAP_TOL_PX   = 1.5  # max y (or x) spread to group shapes into the same band
 _CHAIN_TOL_PX = 1.7  # max gap between segments in a run to merge into one shape
 LINE_HEIGHT_MAX_PX = 4.2  # max height (or width) to reclassify a rect/curve as a line (a double line is usually 4pt)
+_CURVE_SQUARE_TOL_PX = 1.0  # max |width - height| for a thin curve to still count as "square" (never a line)
+_CURVE_TO_LINE_MIN_LONG_SIDE_PX = 8.0  # min long-side length for a thin curve to reclassify as a line
 _PAGE_BG_COVERAGE = 0.80  # min fraction of page width AND height for a rect to count as page_background
 _GRID_SNAP_TOL_PX = 3.0  # max gap for a horizontal and vertical line to count as touching (grid detection)
 _GRID_MIN_LINE_LEN_PX = 20.0  # min primary-axis length for a line to participate in a grid (rejects tiny fragments)
@@ -181,7 +183,12 @@ def _build_shape_record(
         (orientation == "horizontal" and height <= LINE_HEIGHT_MAX_PX)
         or (orientation == "vertical" and width <= LINE_HEIGHT_MAX_PX)
     )
-    if shape_type in ("rect", "curve"):
+    if shape_type == "curve":
+        is_square = abs(width - height) <= _CURVE_SQUARE_TOL_PX
+        long_side = max(width, height)
+        if is_thin and not is_square and long_side >= _CURVE_TO_LINE_MIN_LONG_SIDE_PX:
+            shape_type = "line"
+    elif shape_type == "rect":
         if is_thin:
             shape_type = "line"
     elif shape_type == "line" and not is_thin:

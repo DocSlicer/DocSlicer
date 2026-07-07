@@ -754,6 +754,44 @@ def reindex_grouped_ids(df_cells: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def sync_word_ids(df_words: pd.DataFrame, df_reindexed: pd.DataFrame) -> pd.DataFrame:
+    """
+    Carry the reindex_grouped_ids renumbering onto df_words so word↔cell ids
+    stay aligned.
+
+    ``df_reindexed`` is the cells frame straight out of :func:`reindex_grouped_ids`
+    (one row per original cell, still carrying ``cell_id_orig``): its ``cell_id``
+    holds the new dense id and ``cell_id_orig`` the old one, so old->new is a plain
+    per-cell lookup. Each word follows its cell — its new ``cell_id`` and (when both
+    frames have it) ``line_id`` are taken from that cell's reindexed row, since a
+    merged multi-line cell now sits on a single new line whose number does not
+    follow from the word's old line_id alone.
+
+    Words whose cell_id is absent from the mapping keep their existing ids. Returns
+    df_words unchanged when the reindex never ran (no ``cell_id_orig``) or df_words
+    lacks ``cell_id``.
+    """
+    if (df_words is None or df_words.empty
+            or "cell_id" not in df_words.columns
+            or df_reindexed is None or "cell_id_orig" not in df_reindexed.columns):
+        return df_words
+
+    old = df_reindexed["cell_id_orig"].to_numpy()
+    cell_map = dict(zip(old, df_reindexed["cell_id"].to_numpy()))
+
+    df_words = df_words.copy()
+    orig_cell = df_words["cell_id"]                         # keyed on the old id
+    df_words["cell_id"] = (
+        orig_cell.map(cell_map).fillna(orig_cell).astype(np.int64)
+    )
+    if "line_id" in df_words.columns and "line_id" in df_reindexed.columns:
+        line_map = dict(zip(old, df_reindexed["line_id"].to_numpy()))
+        df_words["line_id"] = (
+            orig_cell.map(line_map).fillna(df_words["line_id"]).astype(np.int64)
+        )
+    return df_words
+
+
 def rebuild_merged_cells(
     df_cells: pd.DataFrame,
     text_sep: str = " ",
@@ -856,17 +894,23 @@ def rebuild_merged_cells(
 
 def group_multiline_cells(
     df_cells: pd.DataFrame,
+    df_words: pd.DataFrame | None = None,
     config: RowGroupConfig = CONFIG,
-) -> pd.DataFrame:
+) -> pd.DataFrame | tuple[pd.DataFrame, pd.DataFrame]:
     """
     Annotate cells with their vertical center and cell-to-cell movement.
 
-    Adds y_center, y_movement, x_movement (see module docstring). Pure
-    annotation: row/column membership is decided in a later pass.
+    Adds y_center, y_movement, x_movement (see module docstring). The later passes
+    reindex cell_id/line_id when they merge multi-line cells into logical rows; pass
+    ``df_words`` to have that renumbering carried onto the word rows too, so the two
+    frames stay in sync (see :func:`sync_word_ids`).
+
+    Returns df_cells alone when called without df_words (back-compat), or the
+    (df_cells, df_words) pair when df_words is given.
     """
     required = {"cell_id", "x_left", "x_right", "y_top", "y_bottom"}
     if df_cells is None or df_cells.empty or not required.issubset(df_cells.columns):
-        return df_cells
+        return df_cells if df_words is None else (df_cells, df_words)
 
     df = df_cells.copy()
 
@@ -974,7 +1018,12 @@ def group_multiline_cells(
     # line_id, both renumbered densely (originals in cell_id_orig/line_id_orig).
     df = reindex_grouped_ids(df)
 
+    # ── Carry the cell_id/line_id renumbering onto the word rows (before the
+    # rebuild collapses the per-original-cell rows the mapping is read from).
+    if df_words is not None:
+        df_words = sync_word_ids(df_words, df)
+
     # ── Physically collapse each merged cell_id back to a single row.
     df = rebuild_merged_cells(df)
 
-    return df
+    return df if df_words is None else (df, df_words)

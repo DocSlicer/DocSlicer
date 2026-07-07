@@ -11,8 +11,6 @@ from .form_label_link import build_form_label_index
 from .shape_relationships import (
     add_link_relationships,
     add_rect_relationships,
-    add_vertical_line_relationships,
-    add_horizontal_line_relationships,
 )
 
 __all__ = [
@@ -27,6 +25,5 @@ __all__ = [
     "build_form_label_index",
     "add_link_relationships",
     "add_rect_relationships",
-    "add_vertical_line_relationships",
     "add_horizontal_line_relationships",
 ]
