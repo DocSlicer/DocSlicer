@@ -273,8 +273,9 @@ COLUMN_REGISTRY: Dict[str, Agg] = {
     "img_src": Agg.FIRST,
 
     # --- PDF word + shape connection -----------------------------------------------------------------
-    "shape_id_underline": Agg.FIRST,
-    "shape_id_strikethrough": Agg.FIRST,
+    "shape_id_container": Agg.FIRST,
+    "shape_id_underline": Agg.DROP,
+    "shape_id_strikethrough": Agg.DROP,
     "shape_id_tr_above": Agg.FIRST,
     "shape_id_tr_below": Agg.FIRST,
     "shape_id_vertical_grid_line": Agg.UNIQUE_LIST, #TODO check if still relevant

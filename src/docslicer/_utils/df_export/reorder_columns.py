@@ -129,10 +129,7 @@ MASTER_COLUMN_ORDER: List[str] = [
     "paragraph_ids",        # docx, pptx  — list of paragraph_id values aggregated here
     "raw_shape_ids",
 
-    #Native PDF Stream Data
-    "struct_ancestors",	
-    "struct_raw_ancestors",	
-    "struct_ancestor_ids",
+    
 
     # Secondary / structural IDs HTML
     "structure_tag",
@@ -145,6 +142,7 @@ MASTER_COLUMN_ORDER: List[str] = [
 
     # Layout IDs
     "layout_type",
+    "layout_score",
     "block_type",
 
     # Table IDs
@@ -326,6 +324,11 @@ MASTER_COLUMN_ORDER: List[str] = [
     "shape_id_container",       # pdf — shape acting as a bounding rectangle
 
     # ===== 11. PDF Struct Tree provenance =====
+    # Main cols
+    "struct_ancestors",	
+    "struct_raw_ancestors",	
+    "struct_ancestor_ids",
+    # Other
     "struct_tag_id",
     "struct_tag",
     "struct_raw_tag",

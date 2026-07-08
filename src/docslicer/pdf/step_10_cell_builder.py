@@ -630,7 +630,7 @@ def _refine_multi_cell_lines(df: pd.DataFrame, config: CellBuildConfig = CONFIG)
     df = df.copy()
     mask = df["line_id"].isin(df.loc[suspect, "line_id"].unique())
 
-    df.loc[mask, "line_class"]        = "table"
+    df.loc[mask, "line_class"]        = "table" # NOTE: it may be more useful to keep the original assessment, so we know this was doubtful
     df.loc[mask, "line_em_threshold"] = config.em_table
 
     # Re-merge only the suspect rows at the tight threshold, then map the fresh

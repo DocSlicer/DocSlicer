@@ -2,7 +2,7 @@
 Horizontal band assignment.
 
 Public API:
-    df = assign_horizontal_bands(df, merge_by_vertical_lines=False)
+    df = assign_layouts(df)
 
 Accepts any DataFrame that has a `line_id` column — words, cells, or lines.
 When multiple rows share the same line_id the per-line geometry (y_top, y_bottom)
@@ -18,8 +18,7 @@ Pipeline (internal, always line-level):
     4. Compute adaptive gap threshold per page (median of positive gaps ×
        interpolated multiplier).
     5. Assign layout_id (1-based, monotonically increasing).
-    6. Optionally merge bands by shared vertical grid-line IDs (union-find).
-    7. Join layout_id, line_gap, median_gap, page_gap_thresh back
+    6. Join layout_id, line_gap, median_gap, page_gap_thresh back
        onto the original input df.
 """
 
@@ -43,9 +42,11 @@ _PARA_TAG     = "P"
 _DEFAULT_FONT_SIZE_SPLIT_DELTA: float = 1.0   # pt; |Δfont_size| ≥ this splits (toggle to 2.0 if too sensitive)
 
 # Untagged-table line merge (see _merge_untagged_table_lines)
-_MAX_SINGLE_CELL_BRIDGE: int   = 2     # max consecutive 1-cell rows allowed to bridge two table segments
-_MAX_TABLE_ROW_GAP:      float = 20.0  # pt; a gap larger than this breaks the run (likely a separate table)
-_TABLE_BRIDGE_FONT_TOL:  float = 2.0   # pt; a bridged 1-cell row must be within this of the table font size
+_MAX_SINGLE_CELL_BRIDGE:     int   = 2     # max consecutive 1-cell rows allowed to bridge two table segments
+_MAX_TABLE_ROW_GAP:          float = 20.0  # pt; a gap larger than this breaks the run (likely a separate table)
+_MAX_SINGLE_CELL_BRIDGE_GAP: float = 15.0  # pt; tighter cap on the gap around a bridged 1-cell row (e.g. a
+                                            # section header like "REVENUES" between two tables sits > this away)
+_TABLE_BRIDGE_FONT_TOL:      float = 2.0   # pt; a bridged 1-cell row must be within this of the table font size
 
 
 # ============================================================
@@ -195,7 +196,7 @@ def _to_line_df(df: pd.DataFrame) -> pd.DataFrame:
     For each line_id takes:
         y_top    → min across rows  (topmost edge of the line)
         y_bottom → max across rows  (bottommost edge)
-        page_number, block_type, text_orientation, shape_id_vertical_grid_line
+        page_number, block_type, text_orientation
                  → first value (they are constant within a line_id)
     """
     agg: dict[str, object] = {
@@ -209,22 +210,13 @@ def _to_line_df(df: pd.DataFrame) -> pd.DataFrame:
         agg["font_size"] = ("font_size", "median")
     for col in (
         "page_number", "block_type", "text_orientation",
-        "table_id", "struct_ancestors", "struct_ancestor_ids",
+        "table_id", "table_grid_id", "struct_ancestors", "struct_ancestor_ids",
         "font_family", "is_bold", "is_italic", "non_stroking_color",
     ):
         if col in df.columns:
             agg[col] = (col, "first")
 
     line_df = df.groupby("line_id", sort=False).agg(**agg).reset_index()
-
-    if "shape_id_vertical_grid_line" in df.columns:
-        vlines = (
-            df.groupby("line_id", sort=False)["shape_id_vertical_grid_line"]
-            .apply(lambda s: list({v for cell in s if isinstance(cell, list) for v in cell}
-                                  or ({s.dropna().iloc[0]} if not s.isna().all() else set())))
-            .reset_index()
-        )
-        line_df = line_df.merge(vlines, on="line_id", how="left")
 
     return line_df
 
@@ -277,6 +269,11 @@ def _process_page(
         if "table_id" in ltr_df.columns
         else np.full(n, None, dtype=object)
     )
+    grid_arr = (
+        ltr_df["table_grid_id"].to_numpy(dtype=object)
+        if "table_grid_id" in ltr_df.columns
+        else np.full(n, None, dtype=object)
+    )
     heading_arr, list_arr, para_arr = _struct_group_ids(ltr_df)
     style_changed = _style_change_flags(ltr_df, font_size_split_delta)
 
@@ -305,6 +302,7 @@ def _process_page(
     prev_yb   = None
 
     prev_table   = None
+    prev_grid    = None
     prev_heading = None
     prev_list    = None
     prev_para    = None
@@ -320,6 +318,7 @@ def _process_page(
             cur_band       = 0
             prev_yb        = yb
             prev_table     = table_arr[i]
+            prev_grid      = grid_arr[i]
             prev_heading   = heading_arr[i]
             prev_list      = list_arr[i]
             prev_para      = para_arr[i]
@@ -335,6 +334,7 @@ def _process_page(
         # NOTE: use pd.isna (not `is not None`) — a table_id column mixing None
         # with real ids gets upcast to float64, turning missing values into NaN.
         cur_table_na, prev_table_na     = pd.isna(table_arr[i]),   pd.isna(prev_table)
+        cur_grid_na, prev_grid_na       = pd.isna(grid_arr[i]),    pd.isna(prev_grid)
         cur_heading_na, prev_heading_na = pd.isna(heading_arr[i]), pd.isna(prev_heading)
         cur_list_na, prev_list_na       = pd.isna(list_arr[i]),    pd.isna(prev_list)
         cur_para_na, prev_para_na       = pd.isna(para_arr[i]),    pd.isna(prev_para)
@@ -357,6 +357,16 @@ def _process_page(
                 forced_same = (not cur_para_na) and para_arr[i] == prev_para
                 forced_new  = not forced_same
 
+            # table_grid_id: pure merge signal — a shared grid id always wins
+            # and merges the lines (e.g. only part of a table is a detected
+            # grid, so table_id/heading/list/para may disagree at its edges).
+            # It never forces a split on its own: a grid id change/absence
+            # just falls through to whatever the other signals decided.
+            if (bt_arr[i] == prev_bt and not cur_grid_na and not prev_grid_na
+                    and grid_arr[i] == prev_grid):
+                forced_same = True
+                forced_new  = False
+
         # Style change is a split-only trigger and never overrides a struct
         # force-merge (it is gated behind `not forced_same`): two lines close
         # enough to merge on gap still split when their style key differs.
@@ -370,6 +380,7 @@ def _process_page(
         band_arr[i]  = cur_band
         prev_yb      = yb
         prev_table   = table_arr[i]
+        prev_grid    = grid_arr[i]
         prev_heading = heading_arr[i]
         prev_list    = list_arr[i]
         prev_para    = para_arr[i]
@@ -381,79 +392,15 @@ def _process_page(
 
 
 # ============================================================
-# STEP 6: merge bands by shared vertical lines (optional)
-# ============================================================
-
-def _merge_bands_by_shared_vertical_lines(
-    line_df: pd.DataFrame,
-    min_shared_lines: int = 1,
-) -> pd.DataFrame:
-    """
-    For each page, merge bands that share ≥ min_shared_lines vertical grid-line IDs.
-    Uses union-find; merged bands adopt the smallest band_id.
-    Returns line_df unchanged if shape_id_vertical_grid_line is absent.
-    """
-    if "shape_id_vertical_grid_line" not in line_df.columns:
-        return line_df
-
-    df = line_df.copy()
-
-    for _, page_df in df.groupby("page_number", sort=False):
-        page_idx = page_df.index
-
-        band_to_vlines: dict[int, set] = {}
-        for idx in page_idx:
-            bid = df.at[idx, "layout_id"]
-            if pd.isna(bid) or bid < 0:
-                continue
-            bid    = int(bid)
-            vlines = df.at[idx, "shape_id_vertical_grid_line"]
-            if vlines is None or (isinstance(vlines, float) and pd.isna(vlines)):
-                continue
-            if not isinstance(vlines, list):
-                vlines = [vlines]
-            band_to_vlines.setdefault(bid, set()).update(vlines)
-
-        bids = sorted(band_to_vlines)
-        if len(bids) < 2:
-            continue
-
-        parent = {b: b for b in bids}
-
-        def find(b: int) -> int:
-            while parent[b] != b:
-                parent[b] = parent[parent[b]]
-                b = parent[b]
-            return b
-
-        for i in range(len(bids)):
-            for j in range(i + 1, len(bids)):
-                b1, b2 = bids[i], bids[j]
-                if len(band_to_vlines[b1] & band_to_vlines[b2]) >= min_shared_lines:
-                    r1, r2 = find(b1), find(b2)
-                    if r1 != r2:
-                        parent[max(r1, r2)] = min(r1, r2)
-
-        for idx in page_idx:
-            bid = df.at[idx, "layout_id"]
-            if pd.isna(bid) or bid < 0:
-                continue
-            bid = int(bid)
-            if bid in parent:
-                df.at[idx, "layout_id"] = find(bid)
-
-    return df
-
-
-# ============================================================
 # STEP 6b: pull untagged table rows into one layout (optional)
 # ============================================================
 
 def _merge_untagged_table_lines(
-    line_df:                pd.DataFrame,
-    max_single_cell_bridge: int   = _MAX_SINGLE_CELL_BRIDGE,
-    max_table_row_gap:      float = _MAX_TABLE_ROW_GAP,
-    bridge_font_tol:        float = _TABLE_BRIDGE_FONT_TOL,
+    line_df:                     pd.DataFrame,
+    max_single_cell_bridge:      int   = _MAX_SINGLE_CELL_BRIDGE,
+    max_table_row_gap:           float = _MAX_TABLE_ROW_GAP,
+    max_single_cell_bridge_gap:  float = _MAX_SINGLE_CELL_BRIDGE_GAP,
+    bridge_font_tol:             float = _TABLE_BRIDGE_FONT_TOL,
 ) -> pd.DataFrame:
     """
     Merge the layout_id of consecutive multi-cell lines that form an *untagged*
@@ -462,10 +409,16 @@ def _merge_untagged_table_lines(
     Per page, walking lines in reading order (line_id):
         - a line with cell_count ≥ 2 opens/extends a table run;
         - up to ``max_single_cell_bridge`` consecutive 1-cell lines may bridge two
-          multi-cell segments, but only when another multi-cell line follows and
+          multi-cell segments, but only when another multi-cell line follows,
           each bridging line's font_size is within ``bridge_font_tol`` pt of the
-          run's last multi-cell line (leading/trailing 1-cell lines are never
-          pulled in — a footnote block below a table stays out);
+          run's last multi-cell line, its non_stroking_color is an exact match
+          (any color change breaks the bridge — e.g. a red note between two
+          black table blocks), and every gap around the bridged line(s) is
+          ≤ ``max_single_cell_bridge_gap`` pt (leading/trailing 1-cell lines are
+          never pulled in — a footnote block below a table stays out, and a
+          section header like "REVENUES" sitting further away than that from
+          both neighbors is never bridged across, even if it would pass the
+          looser ``max_table_row_gap``);
         - a vertical gap (y_top − prev y_bottom) larger than ``max_table_row_gap``
           pt breaks the run — that usually means a second, separate table.
     Every line in a run of ≥ 2 lines is relabelled to the run's smallest
@@ -479,6 +432,7 @@ def _merge_untagged_table_lines(
 
     has_table = "table_id"  in line_df.columns
     has_font  = "font_size" in line_df.columns
+    has_color = "non_stroking_color" in line_df.columns
 
     updates: dict[object, int] = {}   # original index label → new layout_id
 
@@ -490,6 +444,7 @@ def _merge_untagged_table_lines(
         ybot  = pdf["y_bottom"].to_numpy(dtype=float)
         lay   = pdf["layout_id"].to_numpy()
         fs    = pdf["font_size"].to_numpy(dtype=float) if has_font  else np.full(len(pdf), np.nan)
+        nsc   = pdf["non_stroking_color"].to_numpy(dtype=object) if has_color else np.full(len(pdf), None, dtype=object)
         tagged = pdf["table_id"].notna().to_numpy()    if has_table else np.zeros(len(pdf), dtype=bool)
         n = len(pdf)
 
@@ -523,13 +478,18 @@ def _merge_untagged_table_lines(
                     k += 1
                 n_single = k - j
                 if k < n and is_row(k) and n_single <= max_single_cell_bridge:
-                    gaps_ok = all(gap(m) <= max_table_row_gap for m in range(j, k + 1))
+                    gaps_ok = all(gap(m) <= max_single_cell_bridge_gap for m in range(j, k + 1))
                     font_ok = (not has_font) or all(
                         (not np.isnan(fs[m]) and not np.isnan(fs[last_multi])
                          and abs(fs[m] - fs[last_multi]) <= bridge_font_tol)
                         for m in range(j, k)
                     )
-                    if gaps_ok and font_ok:
+                    color_ok = (not has_color) or all(
+                        (not _isna_scalar(nsc[m]) and not _isna_scalar(nsc[last_multi])
+                         and nsc[m] == nsc[last_multi])
+                        for m in range(j, k)
+                    )
+                    if gaps_ok and font_ok and color_ok:
                         run.extend(range(j, k + 1))
                         last_multi = k
                         j = k + 1
@@ -552,19 +512,215 @@ def _merge_untagged_table_lines(
 
 
 # ============================================================
+# LAYOUT TYPE CLASSIFICATION  (text / table / chart per layout)
+# ============================================================
+
+# block_type shortcuts: a layout carrying any of these tags is decided outright,
+# without scoring. Chart wins over everything (we do not actively assess charts);
+# the text tags below are structural roles that are never tabular.
+_CHART_BLOCK_TYPES = frozenset({"chart"})
+_TEXT_BLOCK_TYPES  = frozenset({
+    "heading", "page_label", "vertical_text", "footnote", "block_quote",
+})
+
+
+def assign_layout_types(
+    df: pd.DataFrame,
+    layout_col: str = "layout_id",
+) -> pd.DataFrame:
+    """
+    Classify every layout as ``'text'``, ``'table'`` or ``'chart'`` and broadcast
+    the verdict (plus its raw score) down to line level.
+
+    Pure, vectorized per-layout classification. A signed score is accumulated per
+    layout: negative pulls toward text, positive toward table. Two columns are
+    added to ``df`` (one value per line, constant within a layout):
+
+        layout_type   'text' | 'table' | 'chart'
+        layout_score  float — the accumulated score (NaN when a shortcut decided
+                      the layout without scoring; see below)
+
+    Decision order (first match wins)
+    ---------------------------------
+    Shortcuts (no scoring, ``layout_score`` = NaN):
+        1. any line block_type == chart              → chart
+        2. any nonblank table_id or table_grid_id    → table
+        3. any line block_type in {heading, page_label, vertical_text,
+           footnote, block_quote}                    → text
+        4. every line has ≤ 1 cell (cell_count)      → text
+
+    Otherwise (layout has ≥ 1 multi-cell line and no tag above) the score is the
+    sum of four band lookups, and ``layout_type`` is ``'table'`` when
+    ``layout_score > 0`` else ``'text'``:
+
+        median cell_count   ≤1:-5  =2:-1  >2:+1  >5:+5  >10:+10
+        distinct shapes¹    0:-2   1-2:0  >2:+1  >4:+5  >10:+10  >15:+20
+        median line_score²  <-8:-10 <-5:-5 <-2:-2 <0:-2 <=2:0 >2:+2 >5:+5 >8:+10
+        line count          <2:-5  <4:-1  ≥4:+1  >10:+2
+
+        ¹ count of distinct non-null ids across shape_id_tr_above +
+          shape_id_tr_below (the horizontal rules bounding each line — dense
+          ruling is a table tell).
+        ² median of per-line line_score (the step-10 word-gap classifier prior).
+
+    Each band extends up to the next threshold (gaps fill downward), so e.g. a
+    median cell_count of exactly 3 scores +1 and a line count of exactly 4
+    scores +1.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        One row per line, carrying ``layout_col``. All feature columns are
+        optional and degrade gracefully when absent (missing cell_count makes
+        every layout single-cell → text; missing line_score / shapes contribute
+        0). Required: ``layout_col``.
+    layout_col : str
+        Name of the layout id column (default ``'layout_id'``).
+
+    Returns
+    -------
+    df with two added columns: ``layout_type`` (object) and
+    ``layout_score`` (float).
+    """
+    out = df.copy()
+    if out.empty:
+        out["layout_type"]  = pd.Series(dtype=object)
+        out["layout_score"] = pd.Series(dtype=float)
+        return out
+
+    n   = len(out)
+    idx = out.index
+
+    # ── Per-line feature extraction (all columns optional) ───────────────────
+    if "cell_count" in out.columns:
+        cc = out["cell_count"].fillna(0).to_numpy(dtype=float)
+    else:
+        cc = np.ones(n, dtype=float)   # no cell info → treat as single-cell text
+
+    ls = (
+        out["line_score"].to_numpy(dtype=float)
+        if "line_score" in out.columns
+        else np.full(n, np.nan)
+    )
+
+    if "block_type" in out.columns:
+        bt            = out["block_type"].fillna("").astype(str).str.strip().str.lower()
+        is_chart      = bt.isin(_CHART_BLOCK_TYPES).to_numpy()
+        is_text_block = bt.isin(_TEXT_BLOCK_TYPES).to_numpy()
+    else:
+        is_chart      = np.zeros(n, dtype=bool)
+        is_text_block = np.zeros(n, dtype=bool)
+
+    has_table = np.zeros(n, dtype=bool)
+    if "table_id" in out.columns:
+        has_table |= out["table_id"].notna().to_numpy()
+    if "table_grid_id" in out.columns:
+        has_table |= out["table_grid_id"].notna().to_numpy()
+
+    # ── Per-layout aggregation ───────────────────────────────────────────────
+    work = pd.DataFrame({
+        "layout_id":     out[layout_col].to_numpy(),
+        "cell_count":    cc,
+        "line_score":    ls,
+        "is_chart":      is_chart,
+        "is_text_block": is_text_block,
+        "has_table":     has_table,
+    })
+    agg = work.groupby("layout_id", sort=False).agg(
+        n_lines        = ("cell_count",    "size"),
+        median_cc      = ("cell_count",    "median"),
+        max_cc         = ("cell_count",    "max"),
+        median_ls      = ("line_score",    "median"),
+        any_chart      = ("is_chart",      "any"),
+        any_text_block = ("is_text_block", "any"),
+        any_table      = ("has_table",     "any"),
+    )
+
+    # Distinct-shape count: union of the two rule-id columns, non-null, per layout.
+    # Melt to long form and nunique — stays vectorized (no per-layout Python).
+    shape_cols = [c for c in ("shape_id_tr_above", "shape_id_tr_below") if c in out.columns]
+    if shape_cols:
+        long = pd.DataFrame({
+            "layout_id": np.tile(out[layout_col].to_numpy(), len(shape_cols)),
+            "shape":     np.concatenate([out[c].to_numpy(dtype=object) for c in shape_cols]),
+        })
+        long = long[long["shape"].notna()]
+        n_shapes = long.groupby("layout_id")["shape"].nunique()
+        agg["n_shapes"] = agg.index.map(n_shapes).fillna(0).to_numpy(dtype=float)
+    else:
+        agg["n_shapes"] = 0.0
+
+    # ── Band scores (np.select: first true band wins, gaps fill downward) ─────
+    mcc = agg["median_cc"].to_numpy(dtype=float)
+    cc_score = np.select(
+        [mcc > 10, mcc > 5, mcc > 2, mcc <= 1, mcc <= 2],
+        [    10.0,     5.0,    1.0,     -5.0,    -1.0],
+        default=0.0,
+    )
+
+    ns = agg["n_shapes"].to_numpy(dtype=float)
+    shape_score = np.select(
+        [ns > 15, ns > 10, ns > 4, ns > 2, ns == 0],
+        [   20.0,    10.0,    5.0,    1.0,   -2.0],
+        default=0.0,   # 1-2 shapes
+    )
+
+    mls = agg["median_ls"].to_numpy(dtype=float)
+    ls_score = np.select(
+        [mls < -8, mls < -5, mls < -2, mls < 0, mls > 8, mls > 5, mls > 2],
+        [  -10.0,     -5.0,     -2.0,    -2.0,    10.0,     5.0,     2.0],
+        default=0.0,   # -0..2 or NaN
+    )
+
+    nl = agg["n_lines"].to_numpy(dtype=float)
+    nl_score = np.select(
+        [nl < 2, nl < 4, nl > 10, nl >= 4],
+        [  -5.0,   -1.0,     2.0,     1.0],
+        default=0.0,
+    )
+
+    total = cc_score + shape_score + ls_score + nl_score
+
+    # ── Verdict per layout: shortcuts first, else sign of the score ──────────
+    any_chart      = agg["any_chart"].to_numpy(dtype=bool)
+    any_table      = agg["any_table"].to_numpy(dtype=bool)
+    any_text_block = agg["any_text_block"].to_numpy(dtype=bool)
+    single_cell    = agg["max_cc"].to_numpy(dtype=float) <= 1
+
+    scored_type = np.where(total > 0, "table", "text")
+    layout_type = np.select(
+        [any_chart,          any_table,          any_text_block, single_cell],
+        ["chart",            "table",            "text",         "text"],
+        default=scored_type,
+    ).astype(object)
+
+    # Score is only meaningful for scored layouts; shortcut verdicts get NaN.
+    shortcut     = any_chart | any_table | any_text_block | single_cell
+    layout_score = np.where(shortcut, np.nan, total)
+
+    # ── Broadcast back to line level ─────────────────────────────────────────
+    type_map  = pd.Series(layout_type,  index=agg.index)
+    score_map = pd.Series(layout_score, index=agg.index)
+    out["layout_type"]  = out[layout_col].map(type_map).to_numpy()
+    out["layout_score"] = pd.Series(out[layout_col].map(score_map).to_numpy(), index=idx)
+
+    return out
+
+
+# ============================================================
 # PUBLIC API
 # ============================================================
 
 def assign_layouts(
     df: pd.DataFrame,
     line_level: bool = True,
-    merge_by_vertical_lines: bool = False,
-    min_shared_lines: int = 1,
     font_size_split_delta: float = _DEFAULT_FONT_SIZE_SPLIT_DELTA,
     merge_untagged_tables: bool = True,
     max_single_cell_bridge: int = _MAX_SINGLE_CELL_BRIDGE,
     max_table_row_gap: float = _MAX_TABLE_ROW_GAP,
+    max_single_cell_bridge_gap: float = _MAX_SINGLE_CELL_BRIDGE_GAP,
     table_bridge_font_tol: float = _TABLE_BRIDGE_FONT_TOL,
+    classify_types: bool = True,
 ) -> pd.DataFrame:
     """
     Assign layout_id to every row of df.
@@ -596,6 +752,11 @@ def assign_layouts(
                                           Lowest priority: only consulted when the
                                           line is not held by a table or list, so a
                                           <P> nested in a <Table>/<L> never decides.
+        - same table_grid_id           → always merges, regardless of what the
+                                          above decided (merge-only: a grid id
+                                          change or absence never forces a split
+                                          by itself, since a detected grid may
+                                          only cover part of a table).
     No-op (plain gap-based bands) when these columns are absent, e.g. OCR
     input or a PDF with no struct tree.
 
@@ -614,18 +775,11 @@ def assign_layouts(
     ----------
     df : pd.DataFrame
         Words, cells, or lines.  Required: line_id, page_number, y_top, y_bottom.
-        Optional: block_type, text_orientation, shape_id_vertical_grid_line,
+        Optional: block_type, text_orientation, table_grid_id,
         and the style-key columns above.
     font_size_split_delta : float
         Minimum |Δfont_size| (pt) between adjacent lines that triggers a style
         split. Default 1.0; raise to 2.0 if 1 pt proves too sensitive.
-    merge_by_vertical_lines : bool
-        Merge bands sharing vertical grid-line IDs (union-find).  Use True for
-        PDF (reliable line detection).  Leave False for OCR — line detection is
-        too noisy and risks collapsing an entire page into one band.
-    min_shared_lines : int
-        Minimum shared vertical line IDs required to merge two bands.
-        Only relevant when merge_by_vertical_lines=True.
     merge_untagged_tables : bool
         After band assignment, pull consecutive multi-cell lines (cell_count ≥ 2)
         that form an untagged table into one layout_id. Needs a cell_count column
@@ -637,9 +791,20 @@ def assign_layouts(
     max_table_row_gap : float
         A vertical gap (pt) larger than this between adjacent lines breaks the
         table run — likely a separate table (default 30). merge_untagged_tables.
+    max_single_cell_bridge_gap : float
+        Tighter cap (pt) on the gap around a bridged 1-cell line specifically
+        (default 15). A section header like "REVENUES" sitting further than
+        this from both its neighbors is never bridged across, even though it
+        would pass the looser max_table_row_gap. merge_untagged_tables.
     table_bridge_font_tol : float
         A bridged 1-cell line must be within this many pt of the run's table
         font size to be pulled in (default 2). merge_untagged_tables.
+    classify_types : bool
+        After band assignment, classify every layout as 'text' / 'table' /
+        'chart' and add layout_type + layout_score columns (default True).
+        See assign_layout_types for the scoring; degrades gracefully when the
+        feature columns (cell_count, line_score, block_type, table_id,
+        table_grid_id, shape_id_tr_above/below) are absent.
     line_level : bool
         Set True when df already has exactly one row per line_id (e.g. the PDF
         line builder), skipping the _to_line_df aggregation step. Leave False
@@ -652,14 +817,19 @@ def assign_layouts(
         line_gap            float  vertical gap above this line (pt)
         median_gap          float  per-page median of positive line gaps
         page_gap_thresh     float  adaptive gap threshold used for this page
+        layout_type         object 'text' | 'table' | 'chart' (classify_types only)
+        layout_score        float  signed table/text score (classify_types only)
     """
     if df.empty:
-        return df.assign(
+        empty = df.assign(
             layout_id=0,
             line_gap=np.nan,
             median_gap=0.0,
             page_gap_thresh=0.0,
         )
+        if classify_types:
+            empty = empty.assign(layout_type=None, layout_score=np.nan)
+        return empty
 
     # ── Step 1: one row per line ─────────────────────────────────────────────
     if line_level:
@@ -710,23 +880,24 @@ def assign_layouts(
             line_df.at[idx, "page_gap_thresh"]    = threshold
             line_df.at[idx, "layout_id"]          = band_counter
 
-    # ── Step 6: optional merge by vertical lines ─────────────────────────────
-    if merge_by_vertical_lines:
-        line_df = _merge_bands_by_shared_vertical_lines(line_df, min_shared_lines=min_shared_lines)
-
     # ── Step 6b: pull untagged multi-cell table rows into one layout ─────────
     if merge_untagged_tables:
         line_df = _merge_untagged_table_lines(
             line_df,
             max_single_cell_bridge=max_single_cell_bridge,
             max_table_row_gap=max_table_row_gap,
+            max_single_cell_bridge_gap=max_single_cell_bridge_gap,
             bridge_font_tol=table_bridge_font_tol,
         )
 
+    # ── Step 6c: classify each layout as text / table / chart ────────────────
+    join_cols = ["layout_id", "line_gap", "median_gap", "page_gap_thresh"]
+    if classify_types:
+        line_df = assign_layout_types(line_df, layout_col="layout_id")
+        join_cols += ["layout_type", "layout_score"]
+
     # ── Step 7: join back onto input df ─────────────────────────────────────
-    band_cols = line_df.set_index("line_id")[
-        ["layout_id", "line_gap", "median_gap", "page_gap_thresh"]
-    ]
+    band_cols = line_df.set_index("line_id")[join_cols]
     out = df.copy()
     for col in band_cols.columns:
         out[col] = df["line_id"].map(band_cols[col])

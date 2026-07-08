@@ -59,8 +59,9 @@ def _build_lines_df(df_cells: pd.DataFrame) -> pd.DataFrame:
     Cell ``text`` is already inline-markup'd and de-hyphenated per word, so here
     we only join sibling cells on the same line. Prose lines join with a plain
     space (bullet_sep keeps a cell opening with a bullet glyph on its own visual
-    line); lines inside a tagged table (nonblank ``table_id``) join pipe-
-    delimited so the column structure survives into ``df_lines``.
+    line); lines inside a tagged table (nonblank ``table_id``, falling back to
+    ``table_grid_id`` when absent) join pipe-delimited so the column structure
+    survives into ``df_lines``.
     """
     prose_text = merge_text_within_line(
         df_cells["text"], df_cells["line_id"], bullet_sep="\n"
@@ -71,12 +72,21 @@ def _build_lines_df(df_cells: pd.DataFrame) -> pd.DataFrame:
     # table-free doc `.any()` short-circuits and we skip the second full string
     # merge entirely. When tables exist, restrict the pipe-join to the tagged
     # cells and splice those rows over the prose default per line_id.
-    if "table_id" in df_cells.columns and df_cells["table_id"].notna().any():
+    # table_id (struct tree) is preferred; table_grid_id (detected grid, no
+    # struct tag) covers the rest — a cell tagged by either counts.
+    if "table_id" in df_cells.columns:
+        is_tagged = df_cells["table_id"].notna()
+    else:
+        is_tagged = pd.Series(False, index=df_cells.index)
+    if "table_grid_id" in df_cells.columns:
+        is_tagged = is_tagged | df_cells["table_grid_id"].notna()
+
+    if is_tagged.any():
         # A line is a table row if any of its cells is tagged; pipe-join *all*
         # cells on such lines (a mixed line must not drop its untagged cells).
         # Restricting the merge to those cells skips the second full string join
         # on the prose majority.
-        table_line = df_cells["table_id"].notna().groupby(df_cells["line_id"]).transform("any")
+        table_line = is_tagged.groupby(df_cells["line_id"]).transform("any")
         table_cells = df_cells[table_line]
         table_text = merge_table_rows(table_cells["text"], table_cells["line_id"])
         line_text = prose_text.copy()
