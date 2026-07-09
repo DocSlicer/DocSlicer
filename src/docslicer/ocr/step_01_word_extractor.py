@@ -17,7 +17,10 @@ import re
 import shutil
 import subprocess
 from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
+
+from .._utils.parallel import warn_pool_fell_back
 from functools import lru_cache
 from typing import List, Optional
 
@@ -321,8 +324,14 @@ def extract_words_from_images(
     payload = [(chunk, ocr_config, include_text_orientation) for chunk in chunks]
 
     all_rows = []
-    with ProcessPoolExecutor(max_workers=max_workers, initializer=_worker_init) as ex:
-        for rows in ex.map(_worker_run_chunk, payload):
-            all_rows.extend(rows)
+    try:
+        with ProcessPoolExecutor(max_workers=max_workers, initializer=_worker_init) as ex:
+            for rows in ex.map(_worker_run_chunk, payload):
+                all_rows.extend(rows)
+    except BrokenProcessPool:
+        warn_pool_fell_back("OCR word extraction")
+        return _extract_words_serial(
+            images_bgr, ocr_config=ocr_config, include_text_orientation=include_text_orientation
+        )
 
     return _finalize(all_rows, include_text_orientation)

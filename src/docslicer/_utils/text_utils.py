@@ -206,6 +206,10 @@ _NUMERIC_VALUE_RE = re.compile(
 # Dash placeholders used for "no value" cells in financial tables.
 _DASH_TOKENS: frozenset[str] = frozenset({"-", "–", "—", "−"})
 
+# NA-style "no value" placeholders, same role as the dashes ("Revenue  NA
+# 1,234  5%"). Matched case-insensitively (NA / n/a / N.A.).
+_NA_PLACEHOLDER_TOKENS: frozenset[str] = frozenset({"na", "n/a", "n.a."})
+
 # Standalone unit tokens that flank numbers in table value columns: a detached
 # percent sign ("17 %" extracted as two words), same role as a detached
 # currency symbol.
@@ -216,7 +220,7 @@ def is_numeric_value(text: object) -> bool:
     """
     True if *text* is a numeric/currency table value: a numeric value token
     (see _NUMERIC_VALUE_RE), a standalone currency symbol or percent sign, or
-    a dash placeholder.
+    a dash / NA placeholder.
     """
     if text is None:
         return False
@@ -227,6 +231,7 @@ def is_numeric_value(text: object) -> bool:
         return False
     return (
         t in _DASH_TOKENS
+        or t.lower() in _NA_PLACEHOLDER_TOKENS
         or t in _CURRENCY_SYMBOLS
         or t in _UNIT_TOKENS
         or bool(_NUMERIC_VALUE_RE.match(t))
@@ -238,6 +243,7 @@ def numeric_value_mask(series: pd.Series) -> pd.Series:
     s = series.fillna("").astype(str).str.strip()
     return (
         s.isin(_DASH_TOKENS)
+        | s.str.lower().isin(_NA_PLACEHOLDER_TOKENS)
         | s.isin(_CURRENCY_SYMBOLS)
         | s.isin(_UNIT_TOKENS)
         | s.str.match(_NUMERIC_VALUE_RE)

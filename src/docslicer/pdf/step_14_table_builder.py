@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 
 from .._utils.table_utils import detect_cell_roles
+from .._utils.text_utils import numeric_value_mask
 
 # ============================================================
 # CONFIG
@@ -466,6 +467,48 @@ def _assign_is_subheading(df_cells: pd.DataFrame) -> pd.DataFrame:
 
 
 # ============================================================
+# Numeric-like rows
+# ============================================================
+
+def _assign_is_numeric_like(df_cells: pd.DataFrame) -> pd.DataFrame:
+    """
+    Tag every cell with ``is_numeric_like`` (bool, per line): whether its line
+    looks like a table data row -- at least 3 populated cells, the first
+    populated cell (by x_left) is text (not a numeric value), and at least 2 of
+    the remaining cells are numeric. "Numeric" is numeric_value_mask: numbers
+    in various formats ($ 802,873 / 10% / 1.29 / (100)), standalone $ or %,
+    and dash / NA-style placeholders (- / NA / N/A / n.a.).
+    """
+    result = df_cells.copy()
+    if "text" not in result.columns or "line_id" not in result.columns:
+        result["is_numeric_like"] = False
+        return result
+
+    stripped = result["text"].fillna("").astype(str).str.strip()
+    populated = stripped.ne("")
+    numeric = numeric_value_mask(result["text"])
+
+    sub = result.loc[populated, ["line_id"]].copy()
+    sub["_num"] = numeric.loc[sub.index]
+    if "x_left" in result.columns:
+        sub["_x"] = result.loc[sub.index, "x_left"]
+        sub = sub.sort_values(["line_id", "_x"], kind="stable")
+
+    stats = sub.groupby("line_id")["_num"].agg(
+        n_populated="size", n_numeric="sum", first_numeric="first"
+    )
+    ok = (
+        (stats["n_populated"] >= 3)
+        & ~stats["first_numeric"].astype(bool)
+        & (stats["n_numeric"] >= 2)
+    )
+    result["is_numeric_like"] = (
+        result["line_id"].map(ok).fillna(False).astype(bool)
+    )
+    return result
+
+
+# ============================================================
 # Grid trustworthiness
 # ============================================================
 
@@ -536,6 +579,227 @@ def _assign_grid_trustworthy(df_cells: pd.DataFrame) -> pd.DataFrame:
 
 
 
+# ============================================================
+# Row layout (row_start / rowspan)
+# ============================================================
+
+def _line_summary(grp: pd.DataFrame) -> pd.DataFrame:
+    """
+    One row per line_id of a single table, sorted by line_id (reading order),
+    with the per-line signals row assignment needs. groupby().first() skips NA,
+    so struct_row is the line's first non-NA struct_table_row_id.
+    """
+    agg: dict[str, tuple[str, str]] = {}
+    if "struct_table_row_id" in grp.columns:
+        agg["struct_row"] = ("struct_table_row_id", "first")
+    if "row_complete" in grp.columns:
+        agg["row_complete"] = ("row_complete", "max")
+    if "is_subheading" in grp.columns:
+        agg["is_subheading"] = ("is_subheading", "any")
+    if "is_last_tr_below" in grp.columns:
+        agg["is_last_tr"] = ("is_last_tr_below", "max")
+    if "is_numeric_like" in grp.columns:
+        agg["is_numeric_like"] = ("is_numeric_like", "any")
+
+    lines = grp.groupby("line_id").agg(**agg).sort_index()
+    for col, default in (("struct_row", pd.NA), ("row_complete", False),
+                         ("is_subheading", False), ("is_last_tr", False),
+                         ("is_numeric_like", False)):
+        if col not in lines.columns:
+            lines[col] = default
+    return lines
+
+
+def _assign_row_layout(df_cells: pd.DataFrame) -> pd.DataFrame:
+    """
+    Assign ``row_start`` (0-based logical row within the table, shared by all
+    cells of a line) and ``rowspan`` per cell. Three strategies, chosen per
+    table_id:
+
+    1. STRUCT (tagged table) -- takes precedence even over a trustworthy grid.
+       Walk the table's lines in line_id order; row_start increments whenever
+       the line's struct_table_row_id differs from the previous line's (a line
+       with no struct_table_row_id counts as its own new row). rowspan is
+       struct_row_span where > 1; where struct claims 1 but a trustworthy grid
+       says grid_rowspan > 1, the grid wins; else 1.
+
+    2. GRID (grid_trustworthy is True, no struct tagging) -- copy the detected
+       ruling grid's grid_row_start / grid_rowspan per cell. Cells the grid
+       didn't capture (no grid_cell_id, e.g. a footnote line outside the ruled
+       area) keep NA row_start.
+
+    3. SCRATCH (no struct, no trusted grid) -- first line gets row_start 0;
+       each next line increments when the line itself is a complete row
+       (row_complete), a subheading (is_subheading), or a numeric-like data
+       row (is_numeric_like), or when the previous line sat directly above a
+       table rule (is_last_tr_below) -- otherwise it continues the previous
+       logical row (wrapped / multiline cells). rowspan is 1 everywhere.
+
+    Cells outside a table layout get NA in both columns.
+    """
+    result = df_cells.copy()
+    result["row_start"] = pd.array([pd.NA] * len(result), dtype="Int64")
+    result["rowspan"]   = pd.array([pd.NA] * len(result), dtype="Int64")
+
+    if "table_id" not in result.columns or not result["table_id"].notna().any():
+        return result
+
+    struct_span = (
+        pd.to_numeric(result["struct_row_span"], errors="coerce")
+        if "struct_row_span" in result.columns
+        else pd.Series(np.nan, index=result.index)
+    )
+    grid_row_start = (
+        pd.to_numeric(result["grid_row_start"], errors="coerce")
+        if "grid_row_start" in result.columns
+        else pd.Series(np.nan, index=result.index)
+    )
+    grid_rowspan = (
+        pd.to_numeric(result["grid_rowspan"], errors="coerce")
+        if "grid_rowspan" in result.columns
+        else pd.Series(np.nan, index=result.index)
+    )
+    grid_trust = (
+        result["grid_trustworthy"].fillna(False).astype(bool)
+        if "grid_trustworthy" in result.columns
+        else pd.Series(False, index=result.index)
+    )
+
+    in_table = result["table_id"].notna()
+    for _, grp in result.loc[in_table].groupby("table_id", sort=False):
+        lines = _line_summary(grp)
+        has_struct = lines["struct_row"].notna().any()
+        trusted_grid = bool(grid_trust.loc[grp.index].any())
+
+        if has_struct:
+            # New logical row whenever struct_table_row_id changes between
+            # consecutive lines. NA lines (untagged, e.g. an inserted
+            # subheading) get a unique sentinel so each one is its own row.
+            keys = lines["struct_row"].astype(object)
+            keys = keys.where(keys.notna(), -pd.Series(lines.index, index=lines.index))
+            row_start_by_line = (keys != keys.shift()).cumsum() - 1
+
+            span = struct_span.loc[grp.index].where(struct_span.loc[grp.index] > 1)
+            if trusted_grid:
+                # Struct says span 1 (or nothing) but the trusted ruling grid
+                # detected a taller cell -> take the grid's rowspan.
+                span = span.fillna(grid_rowspan.loc[grp.index].where(
+                    grid_rowspan.loc[grp.index] > 1))
+            rowspan_cells = span.fillna(1)
+
+        elif trusted_grid:
+            row_start_cells = grid_row_start.loc[grp.index]
+            # rowspan defaults to 1 only where the grid placed the cell at
+            # all; a cell outside the ruled area stays NA in both columns.
+            span_cells = grid_rowspan.loc[grp.index].fillna(1.0).where(
+                row_start_cells.notna())
+            result.loc[grp.index, "row_start"] = pd.array(
+                row_start_cells.to_numpy(), dtype="Int64")
+            result.loc[grp.index, "rowspan"] = pd.array(
+                span_cells.to_numpy(), dtype="Int64")
+            continue
+
+        else:
+            increment = (
+                lines["row_complete"].fillna(False).astype(bool)
+                | lines["is_subheading"].fillna(False).astype(bool)
+                | lines["is_numeric_like"].fillna(False).astype(bool)
+                | lines["is_last_tr"].fillna(False).astype(bool).shift(fill_value=False)
+            )
+            increment.iloc[0] = False           # first line is always row 0
+            row_start_by_line = increment.cumsum()
+            rowspan_cells = pd.Series(1, index=grp.index)
+
+        result.loc[grp.index, "row_start"] = pd.array(
+            grp["line_id"].map(row_start_by_line).to_numpy(), dtype="Int64")
+        result.loc[grp.index, "rowspan"] = pd.array(
+            rowspan_cells.to_numpy(), dtype="Int64")
+
+    return result
+
+
+# ============================================================
+# Final table_cell_id
+# ============================================================
+
+def _assign_table_cell_ids(df_cells: pd.DataFrame) -> pd.DataFrame:
+    """
+    Assign the final ``table_cell_id``: dense, 1-based, global across the
+    document (mirroring how the DOCX pipeline counts cells), in reading order
+    -- by table_id, then row_start, then col_start. It identifies the LOGICAL
+    table cell, so physical cells sharing (table_id, row_start, col_start) --
+    e.g. a wrapped label whose continuation lines were folded into the same
+    logical row -- share one id. Cells outside a table, or without a resolved
+    row_start, get NA.
+    """
+    result = df_cells.copy()
+    result["table_cell_id"] = pd.array([pd.NA] * len(result), dtype="Int64")
+
+    key_cols = ["table_id", "row_start", "col_start"]
+    if not set(key_cols).issubset(result.columns):
+        return result
+    mask = result["table_id"].notna() & result["row_start"].notna()
+    if not mask.any():
+        return result
+
+    ordered = result.loc[mask, key_cols].sort_values(key_cols, kind="stable")
+    ids = ordered.groupby(key_cols, sort=False, dropna=False).ngroup() + 1
+    result.loc[ids.index, "table_cell_id"] = pd.array(
+        ids.to_numpy(), dtype="Int64")
+    return result
+
+
+# ============================================================
+# Table cells frame
+# ============================================================
+
+# df_table_cells output columns, in order. table_cell_role is reserved for
+# detect_cell_roles and left NA for now.
+_TABLE_CELLS_COLS = [
+    "page_number", "page_label", "layout_id", "table_id", "table_cell_id",
+    "text", "row_start", "col_start", "rowspan", "colspan", "table_cell_role",
+]
+
+
+def _build_table_cells_df(df_cells: pd.DataFrame) -> pd.DataFrame:
+    """
+    Fold df_cells down to one row per logical table cell (table_cell_id):
+    fragment texts join with a newline in reading order (line_id, then x_left),
+    rowspan/colspan take the max across fragments (the widest claim wins, same
+    policy as _reconcile_colspan), everything else is constant within a cell
+    and takes the first value. Rows are ordered by table_cell_id, which is
+    itself reading order.
+    """
+    if "table_cell_id" not in df_cells.columns or not df_cells["table_cell_id"].notna().any():
+        return pd.DataFrame(columns=_TABLE_CELLS_COLS)
+
+    sub = df_cells.loc[df_cells["table_cell_id"].notna()].copy()
+    sort_cols = [c for c in ("table_cell_id", "line_id", "x_left") if c in sub.columns]
+    sub = sub.sort_values(sort_cols, kind="stable")
+
+    agg: dict[str, tuple[str, object]] = {
+        "text": ("text", lambda s: "\n".join(s.dropna().astype(str))),
+    }
+    for col in ("page_number", "page_label", "layout_id", "table_id",
+                "row_start", "col_start"):
+        if col in sub.columns:
+            agg[col] = (col, "first")
+    for col in ("rowspan", "colspan"):
+        if col in sub.columns:
+            agg[col] = (col, "max")
+
+    out = (
+        sub.groupby("table_cell_id", sort=True)
+        .agg(**agg)
+        .reset_index()
+    )
+    out["table_cell_role"] = pd.array([pd.NA] * len(out), dtype="string")
+
+    for col in _TABLE_CELLS_COLS:
+        if col not in out.columns:
+            out[col] = pd.NA
+    return out[_TABLE_CELLS_COLS]
+
 
 # ============================================================
 # PUBLIC API
@@ -553,6 +817,11 @@ def build_tables(
     df_cells = _assign_row_completeness(df_cells)
     df_cells = _assign_last_tr_below(df_cells)
     df_cells = _assign_is_subheading(df_cells)
+    df_cells = _assign_is_numeric_like(df_cells)
     df_cells = _assign_grid_trustworthy(df_cells)
+    df_cells = _assign_row_layout(df_cells)
+    df_cells = _assign_table_cell_ids(df_cells)
 
-    return df_cells#, df_table_cells
+    df_table_cells = _build_table_cells_df(df_cells)
+
+    return df_cells, df_table_cells

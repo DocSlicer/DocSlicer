@@ -718,7 +718,7 @@ def _compute_line_separator(df_with_block_ids: pd.DataFrame) -> pd.DataFrame:
     # Skip lines that belong to tables (handled by table rendering)
     has_table_id = pd.Series(False, index=df_with_block_ids.index)
     if "table_id" in df_with_block_ids.columns:
-        has_table_id = df_with_block_ids["table_id"].fillna("").astype(str).str.strip().ne("")
+        has_table_id = df_with_block_ids["table_id"].notna()
 
     # Rule 1: TOC and exhibits always use newlines (if not part of a table)
     if "block_type" in df_with_block_ids.columns:
@@ -806,11 +806,8 @@ def _join_text(
     first = df_with_block_ids.groupby("_block_id", sort=False).first()
 
     _bt  = first["block_type"].fillna("") if "block_type" in first.columns else pd.Series("", index=first.index)
-    _tid = first["table_id"].fillna("").astype(str).str.strip() if "table_id" in first.columns else pd.Series("", index=first.index)
-    _cid = first["chart_id"].fillna("").astype(str).str.strip() if "chart_id" in first.columns else pd.Series("", index=first.index)
-
-    _has_table = ~_tid.isin({"", "nan", "None"})
-    _has_chart = ~_cid.isin({"", "nan", "None"})
+    _has_table = first["table_id"].notna() if "table_id" in first.columns else pd.Series(False, index=first.index)
+    _has_chart = first["chart_id"].notna() if "chart_id" in first.columns else pd.Series(False, index=first.index)
 
     is_special_block = (
         (_bt == "table") |

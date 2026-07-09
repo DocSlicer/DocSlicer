@@ -157,6 +157,7 @@ MASTER_COLUMN_ORDER: List[str] = [
     "row_complete",
     "is_last_tr_below",
     "is_subheading",
+    "is_numeric_like",
     "grid_trustworthy",
 
     "table_cell_id",

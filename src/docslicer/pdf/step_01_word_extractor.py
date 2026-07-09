@@ -67,6 +67,7 @@ import ctypes
 import io
 import math
 from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -76,7 +77,7 @@ import pypdfium2.raw as pdfium_c
 import pandas as pd
 
 from .._utils.cpu import resolve_worker_count
-from .._utils.parallel import PARALLEL_PAGE_THRESHOLD, chunk_evenly
+from .._utils.parallel import PARALLEL_PAGE_THRESHOLD, chunk_evenly, warn_pool_fell_back
 from .._utils.text_utils import add_calculated_text_features
 from ._utils.struct_tree import StructInfo
 from ._utils.form_fields import FormField
@@ -893,6 +894,42 @@ def _extract_words_chunk(
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
+def _extract_words_serial(
+    pdf_path: Path,
+    page_numbers_list: List[int],
+    struct_index,
+    form_index,
+    form_label_index,
+) -> List[pd.DataFrame]:
+    """Single-process page loop. Used below the parallel threshold and as the
+    fallback when a process pool can't start (see ``warn_pool_fell_back``)."""
+    all_dfs: List[pd.DataFrame] = []
+    next_word_id = 0
+    with pdfium.PdfDocument(pdf_path) as doc:
+        total_pages = len(doc)
+        for page_number in page_numbers_list:
+            if page_number < 1 or page_number > total_pages:
+                continue
+            try:
+                page = doc[page_number - 1]
+            except Exception:
+                continue
+            try:
+                page_df, next_word_id = _extract_words_for_page(
+                    page,
+                    page_number=page_number,
+                    start_word_id=next_word_id,
+                    struct_index=struct_index,
+                    form_fields=form_index.get(page_number - 1, []),
+                    form_label_index=form_label_index,
+                )
+            finally:
+                page.close()
+            if not page_df.empty:
+                all_dfs.append(page_df)
+    return all_dfs
+
+
 def extract_words(
     pdf_path: str | Path,
     pages_to_process: Optional[List[int]] = None,
@@ -950,40 +987,27 @@ def extract_words(
     if n_workers > 1:
         pdf_bytes = pdf_path.read_bytes()
         chunks = chunk_evenly(page_numbers_list, n_workers)
-        with ProcessPoolExecutor(max_workers=n_workers) as ex:
-            futures = [
-                ex.submit(
-                    _extract_words_chunk,
-                    pdf_bytes, chunk, struct_index, form_index, form_label_index,
-                )
-                for chunk in chunks
-            ]
-            for f in futures:
-                all_dfs.extend(f.result())
-    else:
-        next_word_id = 0
-        with pdfium.PdfDocument(pdf_path) as doc:
-            total_pages = len(doc)
-            for page_number in page_numbers_list:
-                if page_number < 1 or page_number > total_pages:
-                    continue
-                try:
-                    page = doc[page_number - 1]
-                except Exception:
-                    continue
-                try:
-                    page_df, next_word_id = _extract_words_for_page(
-                        page,
-                        page_number=page_number,
-                        start_word_id=next_word_id,
-                        struct_index=struct_index,
-                        form_fields=form_index.get(page_number - 1, []),
-                        form_label_index=form_label_index,
+        try:
+            with ProcessPoolExecutor(max_workers=n_workers) as ex:
+                futures = [
+                    ex.submit(
+                        _extract_words_chunk,
+                        pdf_bytes, chunk, struct_index, form_index, form_label_index,
                     )
-                finally:
-                    page.close()
-                if not page_df.empty:
-                    all_dfs.append(page_df)
+                    for chunk in chunks
+                ]
+                for f in futures:
+                    all_dfs.extend(f.result())
+        except BrokenProcessPool:
+            warn_pool_fell_back("word extraction")
+            n_workers = 1  # skip the parallel-only word_id renumber below
+            all_dfs = _extract_words_serial(
+                pdf_path, page_numbers_list, struct_index, form_index, form_label_index
+            )
+    else:
+        all_dfs = _extract_words_serial(
+            pdf_path, page_numbers_list, struct_index, form_index, form_label_index
+        )
 
     if not all_dfs:
         return pd.DataFrame()

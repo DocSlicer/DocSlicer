@@ -793,6 +793,19 @@ def assign_layout_types(
     out["layout_type"]  = out[layout_col].map(type_map).to_numpy()
     out["layout_score"] = pd.Series(out[layout_col].map(score_map).to_numpy(), index=idx)
 
+    # Struct-tagged tables already carry block_type == "table" from step_06.
+    # Untagged (layout-detected) tables only become known as tables here, so
+    # promote block_type too — downstream consumers (block merger) key off
+    # block_type alone and shouldn't need to know how the table was detected.
+    # A layout can still be verdict "table" while containing a stray line that
+    # already has a deliberate block_type (toc, exhibits, chart, heading, ...)
+    # — any_table wins over any_text_block above — so only fill lines that
+    # have no block_type yet; never overwrite an existing one.
+    if "block_type" not in out.columns:
+        out["block_type"] = None
+    bt_is_blank = out["block_type"].isna() | (out["block_type"].astype(str).str.strip() == "")
+    out.loc[(out["layout_type"] == "table") & bt_is_blank, "block_type"] = "table"
+
     return out
 
 

@@ -44,13 +44,14 @@ separates them -- only the within-line ratio does (0.47/0.25 ~= 1.9 vs
 from __future__ import annotations
 
 from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
 
 from .._utils.cpu import resolve_worker_count
-from .._utils.parallel import PARALLEL_PAGE_THRESHOLD, chunk_evenly
+from .._utils.parallel import PARALLEL_PAGE_THRESHOLD, chunk_evenly, warn_pool_fell_back
 from .._utils.text_utils import _BULLET_TOKENS, _CURRENCY_SYMBOLS, is_list_marker
 from .._utils.df_aggregation.registry_aggregator import Agg, aggregate_to
 from .._utils.df_aggregation.text_merge import apply_inline_markup, merge_text_within_line
@@ -1129,35 +1130,41 @@ def build_cells(
         vw_parts: list[pd.DataFrame] = []
         vc_parts: list[pd.DataFrame] = []
         chunks = chunk_evenly(pages, n_workers)
-        with ProcessPoolExecutor(max_workers=n_workers) as ex:
-            futures = [
-                ex.submit(
-                    _build_cells_pages,
-                    df_horiz[df_horiz["page_number"].isin(chunk)],
-                    df_vert[df_vert["page_number"].isin(chunk)],
-                    config, detect_scripts,
-                )
-                for chunk in chunks
-            ]
-            running_cell = 0
-            for f in futures:                       # submit order == page order
-                h, vw, vc = f.result()
-                chunk_max = max(
-                    (int(p["cell_id"].max()) for p in (h, vw) if not p.empty),
-                    default=0,
-                )
-                for part, sink in ((h, h_parts), (vw, vw_parts), (vc, vc_parts)):
-                    if not part.empty:
-                        part["cell_id"] += running_cell
-                        sink.append(part)
-                running_cell += chunk_max
+        try:
+            with ProcessPoolExecutor(max_workers=n_workers) as ex:
+                futures = [
+                    ex.submit(
+                        _build_cells_pages,
+                        df_horiz[df_horiz["page_number"].isin(chunk)],
+                        df_vert[df_vert["page_number"].isin(chunk)],
+                        config, detect_scripts,
+                    )
+                    for chunk in chunks
+                ]
+                running_cell = 0
+                for f in futures:                   # submit order == page order
+                    h, vw, vc = f.result()
+                    chunk_max = max(
+                        (int(p["cell_id"].max()) for p in (h, vw) if not p.empty),
+                        default=0,
+                    )
+                    for part, sink in ((h, h_parts), (vw, vw_parts), (vc, vc_parts)):
+                        if not part.empty:
+                            part["cell_id"] += running_cell
+                            sink.append(part)
+                    running_cell += chunk_max
+        except BrokenProcessPool:
+            warn_pool_fell_back("cell building")
+            df_horiz_out, df_vert_out, df_vert_cells = _build_cells_pages(
+                df_horiz, df_vert, config, detect_scripts
+            )
+        else:
+            def _concat(parts: list[pd.DataFrame]) -> pd.DataFrame:
+                return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
 
-        def _concat(parts: list[pd.DataFrame]) -> pd.DataFrame:
-            return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
-
-        df_horiz_out  = _concat(h_parts)
-        df_vert_out   = _concat(vw_parts)
-        df_vert_cells = _concat(vc_parts)
+            df_horiz_out  = _concat(h_parts)
+            df_vert_out   = _concat(vw_parts)
+            df_vert_cells = _concat(vc_parts)
     else:
         df_horiz_out, df_vert_out, df_vert_cells = _build_cells_pages(
             df_horiz, df_vert, config, detect_scripts

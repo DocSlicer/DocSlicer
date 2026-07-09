@@ -224,7 +224,7 @@ def run_pipeline(
             on_stage("layout")
 
         # Step 09 - Cell Builder
-        df_cells, df_words = build_cells(df_words, df_shapes, df_links)
+        df_cells, df_words = build_cells(df_words)
 
         # Step 10 - Page Labels
         if page_label_config:
@@ -260,12 +260,7 @@ def run_pipeline(
         # Step 10 - Table Builder
         df_cells, df_table_cells = build_tables(df_cells, df_grid_cells)
 
-
-        ###############################
-        # NOTE Not yet used as of here
-        ###############################
-
-        # Step 08 - Convert Y coordinates from page-relative to global
+        # Optional - Convert Y coordinates from page-relative to global
         #df_cells = convert_to_global_y_coordinates(df_cells)
 
         # ── Document Information ─────────────────────────────────────────────
@@ -286,11 +281,11 @@ def run_pipeline(
             debug_steps["words"] = df_words
             debug_steps["shapes"] = df_shapes
             debug_steps["cells"] = df_cells
-            #debug_steps["lines"] = df_lines
-            #if df_table_cells is not None:
-            #    debug_steps["table_cells"] = df_table_cells
+            debug_steps["lines"] = df_lines
+            if df_table_cells is not None:
+                debug_steps["table_cells"] = df_table_cells
 
-        return discovered_metadata, #df_lines, df_table_cells, debug_steps
+        return discovered_metadata, df_lines, df_table_cells, debug_steps
 
     finally:
         try:

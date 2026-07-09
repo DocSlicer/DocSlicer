@@ -3,8 +3,11 @@ from __future__ import annotations
 
 import os
 from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
 from typing import Optional, Tuple, List
+
+from .._utils.parallel import warn_pool_fell_back
 
 import numpy as np
 import pandas as pd
@@ -490,8 +493,12 @@ def colorize_words_df(
     if max_workers == 1 or n_pages <= 1:
         results = [_colorize_page_worker(t) for t in tasks]
     else:
-        with ProcessPoolExecutor(max_workers=max_workers) as ex:
-            results = list(ex.map(_colorize_page_worker, tasks))
+        try:
+            with ProcessPoolExecutor(max_workers=max_workers) as ex:
+                results = list(ex.map(_colorize_page_worker, tasks))
+        except BrokenProcessPool:
+            warn_pool_fell_back("word colorization")
+            results = [_colorize_page_worker(t) for t in tasks]
 
     for idxs, ihr, bhr, ihn, bhn, ic in results:
         ink_hex_raw[idxs] = ihr

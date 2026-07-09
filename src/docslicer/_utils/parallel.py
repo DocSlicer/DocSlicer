@@ -10,9 +10,30 @@ growing its own copy.
 
 from __future__ import annotations
 
+import logging
 from typing import List, Sequence, TypeVar
 
+logger = logging.getLogger(__name__)
+
 T = TypeVar("T")
+
+
+def warn_pool_fell_back(stage: str) -> None:
+    """Log the once-per-stage warning emitted when a process pool can't start.
+
+    A ``BrokenProcessPool`` at pool startup almost always means the calling
+    process's ``__main__`` module runs work at import time without an
+    ``if __name__ == "__main__":`` guard: under the ``spawn`` start method
+    (macOS/Windows default) each worker re-imports ``__main__`` and crashes.
+    Rather than fail the whole parse, callers catch it and re-run the stage
+    single-process; this explains the (recoverable) slowdown in the logs.
+    """
+    logger.warning(
+        "%s: process pool could not start (BrokenProcessPool); falling back to "
+        "single-process. If you call docslicer from a script, guard the entry "
+        "point with `if __name__ == \"__main__\":` to restore parallelism.",
+        stage,
+    )
 
 # Below this many pages a stage runs single-process: the pool's fixed costs
 # (process spawn + interpreter/pandas import per worker, pickling work in and
