@@ -205,7 +205,9 @@ def run_ocr_pipeline(
 
     # 5) Text cleaning (runs after is_line_start is available for bullet detection)
     with timed_step("Text cleaning", logger=logger):
-        df_words = clean_words_df(df_words)
+        df_words = clean_words_df(df_words, df_shapes)
+        # Remove all blanked out words
+        df_words = df_words[df_words["text"].fillna("").str.strip() != ""].reset_index(drop=True)
         df_words = add_calculated_text_features(df_words)
 
     # 6) Estimate font size (per horizontal band, too noisy on a line level)

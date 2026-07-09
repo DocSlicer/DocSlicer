@@ -31,6 +31,7 @@ Classification of a block's content role. Set progressively through the shared p
 
 - Add: Comments, Footnote, Math, FormField
 - block_quote (picked up from pdf / html / docx) - can never be a heading
+- A toc can be both in table as well as text form
 - Maybe change navigation to bookmark
 - We don't have ListItem because it's not mutually exclusive
 **Example**

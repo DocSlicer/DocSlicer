@@ -113,9 +113,7 @@ MASTER_COLUMN_ORDER: List[str] = [
     "struct_group_id",
     "stream_group_id",
     "stream_group_trigger",
-    "table_grid_id", # Detected grids in df_shapes, not the same as table_id (there are more tables than grids ~ tables with only horizontal lines)
-    "grid_cell_id",  # Detected grid cells in df_shapes, not the same as table_cell_id 
-                     # (1 grid cell can have multiple table cells, for example in tables without inside borders)
+
 
     # Shared-pipeline IDs
     "block_id",
@@ -145,12 +143,49 @@ MASTER_COLUMN_ORDER: List[str] = [
     "layout_score",
     "block_type",
 
-    # Table IDs
+    # Table IDs # TODO WIP
     "table_id",
-    "table_row_id",
+
+    "row_start",
+    "col_start",
+    "col_end",
+    "rowspan", 
+    "colspan",
+    "band_total_cols",
+    "role",                 # header / data / row_label
+
+    "row_complete",
+    "is_last_tr_below",
+    "is_subheading",
+    "grid_trustworthy",
+
     "table_cell_id",
     "table_header_flag",
-    "textbox_id",
+
+    "struct_table_id",
+    "table_row_id", # Not a column in table_cell_df
+    "struct_table_row_id",
+    "struct_table_cell_id",
+    "struct_col_span",
+    "struct_row_span",
+
+    "table_grid_id", # Detected grids in df_shapes, not the same as table_id (there are more tables than grids ~ tables with only horizontal lines)
+    "grid_cell_id",  # Detected grid cells in df_shapes, not the same as table_cell_id 
+                     # (1 grid cell can have multiple table cells, for example in tables without inside borders)
+
+    "grid_row_start",	
+    "grid_col_start",	
+    "grid_rowspan",	
+    "grid_colspan",
+
+
+    
+
+
+
+
+
+    
 
     # Shape core
     "raw_shape_type",
@@ -328,12 +363,12 @@ MASTER_COLUMN_ORDER: List[str] = [
     "struct_ancestors",	
     "struct_raw_ancestors",	
     "struct_ancestor_ids",
+    "textbox_id",
     # Other
     "struct_tag_id",
     "struct_tag",
     "struct_raw_tag",
-    "struct_col_span",
-    "struct_row_span",
+    
     "struct_scope",
     "struct_headers",
     "mcid",
@@ -364,6 +399,7 @@ MASTER_COLUMN_ORDER: List[str] = [
     "effective_character_style_name",
 
     # ===== 13. Table-specific fields =====
+    """"
     "row_start",
     "col_start",
     "col_end",
@@ -371,6 +407,7 @@ MASTER_COLUMN_ORDER: List[str] = [
     "colspan",
     "role",                 # header / data / row_label
     "band_total_cols",
+    """
 
     # ===== 14. Image metadata (pdf) =====
     "image_width",

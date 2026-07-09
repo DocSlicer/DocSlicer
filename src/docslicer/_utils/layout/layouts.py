@@ -24,6 +24,9 @@ Pipeline (internal, always line-level):
 
 from __future__ import annotations
 
+import operator
+from dataclasses import dataclass
+
 import numpy as np
 import pandas as pd
 
@@ -424,6 +427,9 @@ def _merge_untagged_table_lines(
     Every line in a run of ≥ 2 lines is relabelled to the run's smallest
     layout_id. Rows already inside a tagged table (non-null table_id) are treated
     as hard run boundaries and never merged, so real struct tables are untouched.
+    A block_type change from one line to the next also breaks the run and is never
+    bridged across — this mirrors the upstream "block_type change → always splits"
+    rule in _process_page, so this merge can never undo a block_type split.
 
     No-op when cell_count is absent.
     """
@@ -433,6 +439,7 @@ def _merge_untagged_table_lines(
     has_table = "table_id"  in line_df.columns
     has_font  = "font_size" in line_df.columns
     has_color = "non_stroking_color" in line_df.columns
+    has_bt    = "block_type" in line_df.columns
 
     updates: dict[object, int] = {}   # original index label → new layout_id
 
@@ -446,6 +453,12 @@ def _merge_untagged_table_lines(
         fs    = pdf["font_size"].to_numpy(dtype=float) if has_font  else np.full(len(pdf), np.nan)
         nsc   = pdf["non_stroking_color"].to_numpy(dtype=object) if has_color else np.full(len(pdf), None, dtype=object)
         tagged = pdf["table_id"].notna().to_numpy()    if has_table else np.zeros(len(pdf), dtype=bool)
+        # Normalized like _process_page so the block_type comparison matches the
+        # upstream split rule (fillna -> str -> lower); "" when the column is absent.
+        bt    = (
+            pdf["block_type"].fillna("").astype(str).str.lower().to_numpy()
+            if has_bt else np.full(len(pdf), "", dtype=object)
+        )
         n = len(pdf)
 
         def gap(m: int) -> float:                       # gap above local line m (m ≥ 1)
@@ -462,9 +475,14 @@ def _merge_untagged_table_lines(
 
             run        = [i]
             last_multi = i
+            run_bt     = bt[i]                           # every run line must share this block_type
             j          = i + 1
             while j < n:
                 if tagged[j] or gap(j) > max_table_row_gap:
+                    break
+                # A block_type change ends the run — never merge across it (mirrors
+                # the upstream "block_type change → always splits" rule).
+                if has_bt and bt[j] != run_bt:
                     break
                 if cc[j] >= 2:
                     run.append(j)
@@ -479,6 +497,9 @@ def _merge_untagged_table_lines(
                 n_single = k - j
                 if k < n and is_row(k) and n_single <= max_single_cell_bridge:
                     gaps_ok = all(gap(m) <= max_single_cell_bridge_gap for m in range(j, k + 1))
+                    # No block_type change anywhere in the bridged span (j..k), so a
+                    # bridge can't stitch across a split either.
+                    bt_ok = (not has_bt) or all(bt[m] == run_bt for m in range(j, k + 1))
                     font_ok = (not has_font) or all(
                         (not np.isnan(fs[m]) and not np.isnan(fs[last_multi])
                          and abs(fs[m] - fs[last_multi]) <= bridge_font_tol)
@@ -489,7 +510,7 @@ def _merge_untagged_table_lines(
                          and nsc[m] == nsc[last_multi])
                         for m in range(j, k)
                     )
-                    if gaps_ok and font_ok and color_ok:
+                    if gaps_ok and bt_ok and font_ok and color_ok:
                         run.extend(range(j, k + 1))
                         last_multi = k
                         j = k + 1
@@ -524,9 +545,95 @@ _TEXT_BLOCK_TYPES  = frozenset({
 })
 
 
+# ── Table/text scoring: weights as data ──────────────────────────────────────
+# A scored layout accumulates a single signed score — negative pulls toward
+# text, positive toward table. The per-feature weights live here as ordered band
+# tables so tuning only ever edits this dict, never the control flow in
+# assign_layout_types. Each rule is (comparator, threshold, points); the rules
+# for a feature are tried in order and the FIRST match per layout wins (exactly
+# the np.select cascade this replaces), so a value matching no rule — including
+# NaN, whose comparisons are all False — contributes 0. Only the graded numeric
+# evidence lives here; the block_type / table_id shortcuts and the final
+# table-vs-text threshold are policy and live in LayoutTypeConfig.
+_COMPARATORS = {
+    ">":  operator.gt, ">=": operator.ge,
+    "<":  operator.lt, "<=": operator.le,
+    "==": operator.eq,
+}
+
+_LAYOUT_SCORE_BANDS: dict[str, tuple[tuple[str, float, float], ...]] = {
+    # median cell_count: more cells per line => more table-like.
+    "median_cc": (
+        (">", 10.0, 10.0), (">", 5.0, 5.0), (">", 2.0, 1.0),
+        ("<=", 1.0, -5.0), ("<=", 2.0, -1.0),
+    ),
+    # distinct bounding rules (shape_id_tr_above/below): dense ruling => table.
+    "n_shapes": (
+        (">", 15.0, 20.0), (">", 10.0, 10.0), (">", 4.0, 5.0),
+        (">", 2.0, 1.0), ("==", 0.0, -2.0),           # 1-2 shapes => 0 (no rule)
+    ),
+    # median per-line line_score (step-10 word-gap prior): +ve tabular, -ve prose.
+    "median_ls": (
+        ("<", -8.0, -10.0), ("<", -5.0, -5.0), ("<", -2.0, -2.0), ("<", 0.0, -2.0),
+        (">", 8.0, 10.0), (">", 5.0, 5.0), (">", 2.0, 2.0),
+    ),
+    # line count: a couple of lines is rarely a table; many lines lean table.
+    "n_lines": (
+        ("==", 1.0, -10.0), ("<", 4.0, -1.0), (">", 10.0, 2.0), (">=", 4.0, 1.0),
+    ),
+}
+
+# Fail fast on a fat-fingered comparator at import, rather than mis-scoring
+# silently at run time (the tables are meant to be edited by hand).
+assert all(
+    op in _COMPARATORS
+    for rules in _LAYOUT_SCORE_BANDS.values()
+    for op, _, _ in rules
+), "_LAYOUT_SCORE_BANDS: unknown comparator"
+
+
+@dataclass(frozen=True)
+class LayoutTypeConfig:
+    """
+    Policy knobs for assign_layout_types. The graded weights live separately in
+    _LAYOUT_SCORE_BANDS; this holds only the decision policy — which block_types
+    short-circuit to chart / text, and the score threshold above which a scored
+    layout is a table.
+    """
+    chart_block_types: frozenset[str] = _CHART_BLOCK_TYPES
+    text_block_types:  frozenset[str] = _TEXT_BLOCK_TYPES
+    # A scored layout is a table when its summed score exceeds this, else text.
+    table_score_threshold: float = 1.0
+
+
+LAYOUT_TYPE_CONFIG = LayoutTypeConfig()
+
+
+def _apply_score_bands(
+    values: np.ndarray,
+    rules: tuple[tuple[str, float, float], ...],
+) -> np.ndarray:
+    """
+    First-match-wins band lookup over `values` (vectorized, one pass per rule).
+
+    Mirrors np.select: rules are tried in order, each element takes the points of
+    the first rule it satisfies, and an element matching none (including NaN,
+    whose comparisons are all False) scores 0. Returns a float array aligned to
+    `values`.
+    """
+    score    = np.zeros(len(values), dtype=float)
+    assigned = np.zeros(len(values), dtype=bool)
+    for op, thr, pts in rules:
+        hit = _COMPARATORS[op](values, thr) & ~assigned
+        score[hit] = pts
+        assigned |= hit
+    return score
+
+
 def assign_layout_types(
     df: pd.DataFrame,
     layout_col: str = "layout_id",
+    config: LayoutTypeConfig = LAYOUT_TYPE_CONFIG,
 ) -> pd.DataFrame:
     """
     Classify every layout as ``'text'``, ``'table'`` or ``'chart'`` and broadcast
@@ -565,7 +672,9 @@ def assign_layout_types(
 
     Each band extends up to the next threshold (gaps fill downward), so e.g. a
     median cell_count of exactly 3 scores +1 and a line count of exactly 4
-    scores +1.
+    scores +1. The weights themselves live in ``_LAYOUT_SCORE_BANDS`` (edit
+    there to tune — no control-flow change needed); the shortcut block_types and
+    the table/text threshold live in ``LayoutTypeConfig``.
 
     Parameters
     ----------
@@ -576,6 +685,10 @@ def assign_layout_types(
         0). Required: ``layout_col``.
     layout_col : str
         Name of the layout id column (default ``'layout_id'``).
+    config : LayoutTypeConfig
+        Decision policy: which block_types short-circuit to chart / text, and the
+        score threshold above which a scored layout is a table (default 0.0). The
+        graded weights are separate — see ``_LAYOUT_SCORE_BANDS``.
 
     Returns
     -------
@@ -605,8 +718,8 @@ def assign_layout_types(
 
     if "block_type" in out.columns:
         bt            = out["block_type"].fillna("").astype(str).str.strip().str.lower()
-        is_chart      = bt.isin(_CHART_BLOCK_TYPES).to_numpy()
-        is_text_block = bt.isin(_TEXT_BLOCK_TYPES).to_numpy()
+        is_chart      = bt.isin(config.chart_block_types).to_numpy()
+        is_text_block = bt.isin(config.text_block_types).to_numpy()
     else:
         is_chart      = np.zeros(n, dtype=bool)
         is_text_block = np.zeros(n, dtype=bool)
@@ -650,36 +763,12 @@ def assign_layout_types(
     else:
         agg["n_shapes"] = 0.0
 
-    # ── Band scores (np.select: first true band wins, gaps fill downward) ─────
-    mcc = agg["median_cc"].to_numpy(dtype=float)
-    cc_score = np.select(
-        [mcc > 10, mcc > 5, mcc > 2, mcc <= 1, mcc <= 2],
-        [    10.0,     5.0,    1.0,     -5.0,    -1.0],
-        default=0.0,
-    )
-
-    ns = agg["n_shapes"].to_numpy(dtype=float)
-    shape_score = np.select(
-        [ns > 15, ns > 10, ns > 4, ns > 2, ns == 0],
-        [   20.0,    10.0,    5.0,    1.0,   -2.0],
-        default=0.0,   # 1-2 shapes
-    )
-
-    mls = agg["median_ls"].to_numpy(dtype=float)
-    ls_score = np.select(
-        [mls < -8, mls < -5, mls < -2, mls < 0, mls > 8, mls > 5, mls > 2],
-        [  -10.0,     -5.0,     -2.0,    -2.0,    10.0,     5.0,     2.0],
-        default=0.0,   # -0..2 or NaN
-    )
-
-    nl = agg["n_lines"].to_numpy(dtype=float)
-    nl_score = np.select(
-        [nl < 2, nl < 4, nl > 10, nl >= 4],
-        [  -5.0,   -1.0,     2.0,     1.0],
-        default=0.0,
-    )
-
-    total = cc_score + shape_score + ls_score + nl_score
+    # ── Band scores: weights come from _LAYOUT_SCORE_BANDS, applied by the
+    #    generic first-match-wins engine (identical semantics to the previous
+    #    np.select cascade — first matching band wins, no match / NaN => 0). ──
+    total = np.zeros(len(agg), dtype=float)
+    for feature, rules in _LAYOUT_SCORE_BANDS.items():
+        total += _apply_score_bands(agg[feature].to_numpy(dtype=float), rules)
 
     # ── Verdict per layout: shortcuts first, else sign of the score ──────────
     any_chart      = agg["any_chart"].to_numpy(dtype=bool)
@@ -687,7 +776,7 @@ def assign_layout_types(
     any_text_block = agg["any_text_block"].to_numpy(dtype=bool)
     single_cell    = agg["max_cc"].to_numpy(dtype=float) <= 1
 
-    scored_type = np.where(total > 0, "table", "text")
+    scored_type = np.where(total > config.table_score_threshold, "table", "text")
     layout_type = np.select(
         [any_chart,          any_table,          any_text_block, single_cell],
         ["chart",            "table",            "text",         "text"],

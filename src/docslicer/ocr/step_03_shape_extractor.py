@@ -196,7 +196,12 @@ def _merge_collinear_boxes(
                 mc = (m[2] + m[4]) / 2.0 if is_h else (m[1] + m[3]) / 2.0
                 if abs(mc - c) > perp_tol:
                     continue
-                gap = (xl - m[3]) if is_h else (yt - m[4])  # negative => overlap
+                # True 1-D separation regardless of along-axis order: positive when
+                # disjoint, negative when overlapping. The sort is by perpendicular
+                # center first, so segments may arrive out of along-axis order; a
+                # one-sided (xl - m[3]) reads "entirely before" as a huge negative
+                # "overlap" and fuses rules across arbitrary whitespace.
+                gap = max(xl - m[3], m[1] - xr) if is_h else max(yt - m[4], m[2] - yb)
                 if gap <= gap_tol:
                     m[1] = min(m[1], xl)
                     m[2] = min(m[2], yt)

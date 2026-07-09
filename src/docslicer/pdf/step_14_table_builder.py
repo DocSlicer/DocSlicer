@@ -1,56 +1,12 @@
 """
-step_11_table_builder.py
+step_14_table_builder.py
 
-Classify bands into text or table, and for tables derive the full layout.
-
-Public API:
-    df_lines, df_cells, df_table_cells = build_tables(df_lines, df_cells, df_words=None)
-
-Pipeline (northstar — steps marked [TODO] are not yet implemented):
-    Step 1: Infer column grid                                         [DONE]
-        Input:  df_cells with horizontal_band_id, x_left, x_right, line_id
-        Output: col_start, col_end, colspan, band_total_cols added to df_cells
-        - Within each (page_number, horizontal_band_id), infers a column grid
-          by seeding from the densest line and walking up/down
-
-    Step 2: Classify horizontal bands as table or text                [DONE]
-        Input:  df_cells with col_start, colspan, band_total_cols, horizontal_band_id
-        Output: layout_type ("table"|"text"), layout_id, band_table_score
-                added to df_cells and df_lines
-        - Bands are scored on grid quality signals (column reuse, atomic cell
-          ratio, gap patterns, prose penalties) and thresholded at score ≥ 3.0
-        - layout_id is currently set equal to horizontal_band_id (no merging yet)
-
-    Step 3: Eject header rows from table bands                        [DONE
-        Input:  df_cells with layout_type, col_start, colspan, band_total_cols
-        Output: ejected lines reclassified as layout_type="text"
-        - A single-cell, left-aligned line at the top of a table band is often
-          a section header that was pulled into the band; it should be split off
-          and reclassified as text before further table processing
-
-    Step 4: Merge consecutive table bands → layout_id                 [DONE]
-        Input:  df_cells with layout_type, band_total_cols, col_start/end, y_top/bottom
-        Output: layout_id updated so adjacent table bands with matching column
-                structure and small vertical gap share the same layout_id
-        - Consecutive table bands on the same page with equal band_total_cols,
-          aligned column boundaries, and vertical gap ≤ ~8 pt are merged
-        - Text bands always keep their own layout_id
-
-    Step 5: Build table structure — rows, rowspan, cell roles          [TODO]
-        Input:  df_cells with layout_type="table", layout_id, col_start, col_end, colspan
-        Output: df_table_cells with one row per assembled table cell containing:
-                table_cell_id, layout_id, table_id, row_start, col_start,
-                rowspan, colspan, text, text_raw_lines, cell_ids, line_ids, role
-        - Iterates line_ids in order within each (layout_id, page_number),
-          accumulating cells into rows; flushes a row when column coverage
-          is complete or an underline boundary is crossed
-        - Rowspan: columns missing from a row extend the previous row's cell
-        - Roles assigned: header, row_label, value_numeric, value_text, footnote
 """
 
 from __future__ import annotations
 
-from itertools import groupby as _itertools_groupby
+import re
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -61,25 +17,98 @@ from .._utils.table_utils import detect_cell_roles
 # CONFIG
 # ============================================================
 
-_MAX_VERTICAL_GAP = 8.0   # max gap (pt) between bands for layout merging
 
 
 # ============================================================
-# STEP 1: Infer column grid
+# Prepare DF
 # ============================================================
 
-def _assign_column_layout(
+# Struct-tree table columns (step_06) get a struct_ prefix so they sit
+# alongside the grid_ namespace below instead of colliding with the final
+# table_id / table_row_id / table_cell_id this module assigns.
+_STRUCT_RENAME = {
+    "table_id":      "struct_table_id",
+    "table_row_id":  "struct_table_row_id",
+    "table_cell_id": "struct_table_cell_id",
+}
+
+# df_grid_cells columns looked up by grid_cell_id and merged onto df_cells
+# with a grid_ prefix (table_grid_id / grid_cell_id themselves are already
+# correctly named and are left alone).
+_GRID_CELL_LAYOUT_COLS = ("row_start", "col_start", "rowspan", "colspan")
+
+
+def _merge_grid_cell_layout(
     df_cells: pd.DataFrame,
-    group_col: str = "horizontal_band_id",
+    df_grid_cells: pd.DataFrame,
 ) -> pd.DataFrame:
     """
-    Infer a column grid within each (page_number, group_col) group and assign
-    col_start, col_end, colspan, band_total_cols to every cell.
+    Rename the struct-tree table columns to the struct_ namespace, then look
+    up each cell's grid_cell_id in df_grid_cells and merge its row/col span
+    geometry (row_start, col_start, rowspan, colspan) onto df_cells with a
+    grid_ prefix. Cells with no grid_cell_id (no detected ruling grid) get NA.
+    """
+    result = df_cells.rename(columns=_STRUCT_RENAME)
 
-    group_col is normally "horizontal_band_id" (initial pass) but is set to
-    "layout_id" when re-running after tables have been merged (step 4).
+    grid_cols = [f"grid_{c}" for c in _GRID_CELL_LAYOUT_COLS]
+    if (df_grid_cells is None or df_grid_cells.empty
+            or "grid_cell_id" not in result.columns):
+        for col in grid_cols:
+            result[col] = pd.array([pd.NA] * len(result), dtype="Int64")
+        return result
 
-    Algorithm (per group):
+    lookup = df_grid_cells[["grid_cell_id", *_GRID_CELL_LAYOUT_COLS]].rename(
+        columns=dict(zip(_GRID_CELL_LAYOUT_COLS, grid_cols))
+    )
+    return result.merge(lookup, on="grid_cell_id", how="left")
+
+
+def _assign_table_ids(
+    df_cells: pd.DataFrame,
+    layout_col: str = "layout_id",
+    type_col: str = "layout_type",
+) -> pd.DataFrame:
+    """
+    Assign the final table_id: dense, 1-based, one id per distinct layout_id
+    whose layout_type is "table" (struct_table_id is untrustworthy on its own
+    -- a document can be struct-tagged for some tables and not others, e.g. a
+    presentation's native tables vs. pasted-in Excel tables -- so table
+    identity is decided fresh here from the reconstructed layout, not the
+    struct tree). layout_id is already 1-based and monotonically increasing
+    in reading order, so sorting its distinct "table" values reproduces that
+    order. Rows outside a table layout get NA.
+    """
+    result = df_cells.copy()
+    result["table_id"] = pd.array([pd.NA] * len(result), dtype="Int64")
+
+    if (result.empty or layout_col not in result.columns
+            or type_col not in result.columns):
+        return result
+
+    is_table = result[type_col] == "table"
+    if not is_table.any():
+        return result
+
+    table_layout_ids = np.sort(result.loc[is_table, layout_col].unique())
+    id_map = {lid: i + 1 for i, lid in enumerate(table_layout_ids)}
+    result.loc[is_table, "table_id"] = (
+        result.loc[is_table, layout_col].map(id_map).astype("Int64")
+    )
+    return result
+
+
+# ============================================================
+# Infer column grid
+# ============================================================
+
+def _assign_column_layout(df_cells: pd.DataFrame) -> pd.DataFrame:
+    """
+    Infer a column grid within each table (grouped by table_id) and assign
+    col_start, col_end, colspan, band_total_cols to its cells. One pass per
+    table_id; cells outside a table layout (table_id is NA) are skipped and
+    get NA in all four columns.
+
+    Algorithm (per table):
         1. Seed columns from the line with the most cells.
         2. Walk lines below the seed (DOWN), then above (UP).
            - 0 overlaps → insert new column.
@@ -141,32 +170,32 @@ def _assign_column_layout(
             col_rights[col_idx:col_idx + 1] = [e for _, e in segs]
 
     result = df_cells.copy()
-    # Defaults are correct for single-cell bands; multi-cell bands override below.
-    result["col_start"]       = 0
-    result["col_end"]         = 0
-    result["colspan"]         = 1
-    result["band_total_cols"] = 1
+    for col in ("col_start", "col_end", "colspan", "band_total_cols"):
+        result[col] = pd.array([pd.NA] * len(result), dtype="Int64")
 
-    # Max cells per line within each band — only bands with >1 need grid inference.
-    # Use cell_count propagated from line_builder if available; fall back to groupby.
-    if "cell_count" in result.columns:
-        band_max = result.groupby(["page_number", group_col], sort=False)["cell_count"].max()
-    else:
-        line_sizes = result.groupby("line_id", sort=False)["cell_id"].transform("count")
-        result["_tmp_line_size"] = line_sizes
-        band_max = result.groupby(["page_number", group_col], sort=False)["_tmp_line_size"].max()
-        result = result.drop(columns=["_tmp_line_size"])
+    if "table_id" not in result.columns:
+        return result
+    in_table = result["table_id"].notna()
+    if not in_table.any():
+        return result
 
-    multi_cell_bands = set(band_max[band_max > 1].index.tolist())
+    # Defaults are correct for single-cell tables; multi-cell tables override below.
+    table_idx = result.index[in_table]
+    result.loc[table_idx, "col_start"]       = 0
+    result.loc[table_idx, "col_end"]         = 0
+    result.loc[table_idx, "colspan"]         = 1
+    result.loc[table_idx, "band_total_cols"] = 1
 
-    for (page, band), band_df in result.groupby(["page_number", group_col], sort=False):
-        if (page, band) not in multi_cell_bands:
+    # Only tables with >1 cell on some line need grid inference.
+    line_sizes = result.loc[table_idx].groupby("line_id", sort=False)["cell_id"].transform("count")
+    table_max  = line_sizes.groupby(result.loc[table_idx, "table_id"]).transform("max")
+    multi_cell_tables = set(result.loc[table_idx, "table_id"][table_max > 1].unique())
+
+    for table_id, band_df in result.loc[table_idx].groupby("table_id", sort=False):
+        if table_id not in multi_cell_tables:
             continue  # already initialised with correct single-cell values
 
-        if "cell_count" in band_df.columns:
-            line_cell_counts = band_df.groupby("line_id")["cell_count"].first()
-        else:
-            line_cell_counts = band_df.groupby("line_id").size()
+        line_cell_counts = band_df.groupby("line_id").size()
         seed_line_id     = line_cell_counts.idxmax()
 
         # Pre-group by line_id once; store sorted numpy arrays to avoid
@@ -225,999 +254,287 @@ def _assign_column_layout(
 
 
 # ============================================================
-# STEP 2: Classify Horizontal Bands (into Table or Text)
+# Reconcile colspan across sources
 # ============================================================
 
-def _compute_line_grid_metrics(
-    df_cells: pd.DataFrame,
-    df_lines: pd.DataFrame,
-) -> pd.DataFrame:
+# The three per-cell column-span estimates, reconciled by max below. Each is
+# unreliable on its own and in a different direction, so the largest span any
+# source claims wins:
+#   colspan         inferred here from x-overlap against the table's column grid;
+#                   a near-miss (a header that only just fails to overlap the
+#                   column below it) undercounts -- e.g. a "% Change" header that
+#                   barely misses the "CER" column reads as span 1.
+#   grid_colspan    from the ruling-line grid (df_grid_cells); present only where
+#                   an actual grid was detected.
+#   struct_col_span from the PDF struct tree; highly inaccurate but occasionally
+#                   the only source that catches a merged header.
+_COLSPAN_SOURCES = ("colspan", "grid_colspan", "struct_col_span")
+
+
+def _reconcile_colspan(df_cells: pd.DataFrame) -> pd.DataFrame:
     """
-    Precompute all line-level metrics used by the band classifier.
+    Fold the available column-span estimates into the final ``colspan`` by
+    taking the per-cell max across _COLSPAN_SOURCES (NA-aware: a source missing
+    for a cell doesn't drag the max down; a cell with no source at all stays
+    NA). Sources absent from the frame entirely (e.g. struct_col_span before the
+    struct extraction lands) are simply skipped, so this degrades to
+    max(colspan, grid_colspan) today.
 
-    This replaces the old nested band→line loops. Most work is now dataframe-wide
-    groupby/NumPy arithmetic, with only a small string aggregation for row
-    patterns.
+    NOTE (future): this only *widens* to the largest claimed span. It does not
+    yet look at unoccupied column positions to pad top-row header cells over the
+    gaps they should cover -- that padding pass would slot in here, after the max.
     """
-    if df_cells.empty:
-        return pd.DataFrame()
+    result = df_cells.copy()
+    present = [c for c in _COLSPAN_SOURCES if c in result.columns]
+    if not present:
+        return result
 
-    df = df_cells.sort_values(
-        ["horizontal_band_id", "line_id", "x_left"],
-        kind="mergesort",
-    ).copy()
+    stacked = np.vstack([
+        pd.to_numeric(result[c], errors="coerce").to_numpy(float) for c in present
+    ])
+    with warnings.catch_warnings():          # all-NaN column -> NaN, not a warning
+        warnings.simplefilter("ignore", RuntimeWarning)
+        merged = np.nanmax(stacked, axis=0)
+    result["colspan"] = pd.array(merged, dtype="Int64")
+    return result
 
-    text = df["text"].fillna("").astype(str)
-    df["_cell_word_count"] = text.str.count(r"\S+").astype("int32")
-    df["_digit_count"] = text.str.count(r"\d").astype("int32")
-    df["_char_count"] = text.str.len().clip(lower=1).astype("int32")
 
-    same_line = df["line_id"].eq(df["line_id"].shift())
-    prev_x_right = df["x_right"].shift()
-    df["_gap"] = np.where(
-        same_line,
-        df["x_left"].to_numpy(dtype=float) - prev_x_right.to_numpy(dtype=float),
-        np.nan,
+# ============================================================
+# Row completeness
+# ============================================================
+
+# For a table row (one line_id) the occupied column count is the sum of its
+# cells' colspans. A row counts as "complete" when that sum reaches a threshold
+# that depends on the table's column count and the row's 1-based position: the
+# first `num_top_rows` rows use the looser `min_top` (headers are often sparse /
+# have merged, span-under-counted cells), the rest use `min_normal`.
+#
+#     band_total_cols   min_normal   min_top   num_top_rows
+#     ---------------------------------------------------
+#     2                 2            1         1
+#     3                 3            2         1
+#     4                 4            3         1
+#     5                 4            3         2
+#     6                 5            3         3
+#     7                 6            3         3
+#     8-10              band-2       3         3
+#     11+               band-3       3         3
+#
+# min_normal follows one rule for every width: slack = min(3, (band-2)//3),
+# min_normal = band - slack (reproduces the whole column above, incl. the ranges;
+# band=10 resolves to band-2). min_top / num_top_rows plateau at 3 from band 6-7
+# on and stay flat for all larger tables.
+_TOP_THRESHOLDS: dict[int, tuple[int, int]] = {  # band -> (min_top, num_top_rows)
+    2: (1, 1), 3: (2, 1), 4: (3, 1), 5: (3, 2), 6: (3, 3), 7: (3, 3),
+}
+
+
+def _row_completeness_thresholds(band_total_cols) -> tuple[int, int, int]:
+    """(min_normal, min_top, num_top_rows) for a table this many columns wide."""
+    b = int(band_total_cols)
+    slack = max(0, min(3, (b - 2) // 3))
+    min_normal = max(1, b - slack)
+    min_top, num_top_rows = _TOP_THRESHOLDS.get(b, (3, 3))
+    min_top = min(min_top, min_normal)          # never require more of a top row
+    return min_normal, min_top, num_top_rows
+
+
+def _assign_row_completeness(df_cells: pd.DataFrame) -> pd.DataFrame:
+    """
+    Tag every cell with ``row_complete`` (nullable boolean): whether its line
+    occupies enough column positions to count as a full table row. Occupancy is
+    the sum of the line's cell colspans (so it must run AFTER _reconcile_colspan);
+    the threshold comes from _row_completeness_thresholds, with the first
+    `num_top_rows` rows of each table (ordered by line_id) using the looser
+    `min_top`. Cells outside a table (table_id is NA) get NA.
+    """
+    result = df_cells.copy()
+    needed = {"table_id", "band_total_cols", "colspan", "line_id"}
+    if not needed.issubset(result.columns) or not result["table_id"].notna().any():
+        result["row_complete"] = pd.array([pd.NA] * len(result), dtype="boolean")
+        return result
+
+    in_table = result["table_id"].notna()
+    sub = result.loc[in_table, ["table_id", "line_id", "colspan", "band_total_cols"]]
+
+    lines = (
+        sub.groupby(["table_id", "line_id"], sort=True)
+        .agg(occupied=("colspan", "sum"), band_total_cols=("band_total_cols", "max"))
+        .reset_index()
+        .sort_values(["table_id", "line_id"])
     )
-    df.loc[df["_gap"] <= 0, "_gap"] = np.nan
+    lines["row_idx"] = lines.groupby("table_id").cumcount() + 1
 
-    line_gb = df.groupby("line_id", sort=False)
-    metrics = line_gb.agg(
-        horizontal_band_id=("horizontal_band_id", "first"),
-        cell_count=("cell_id", "size"),
-        x_left=("x_left", "min"),
-        x_right=("x_right", "max"),
-        total_cols=("band_total_cols", "max"),
-        max_colspan=("colspan", "max"),
-        digit_count=("_digit_count", "sum"),
-        char_count=("_char_count", "sum"),
-        median_cell_words=("_cell_word_count", "median"),
-        max_gap=("_gap", "max"),
-        median_gap=("_gap", "median"),
+    th = lines["band_total_cols"].map(_row_completeness_thresholds)
+    lines[["min_normal", "min_top", "num_top"]] = pd.DataFrame(
+        th.tolist(), index=lines.index
     )
-
-    gap_std = line_gb["_gap"].std(ddof=0).rename("gap_std")
-    gap_count = line_gb["_gap"].count().rename("gap_count")
-    metrics = metrics.join([gap_std, gap_count])
-
-    metrics[["max_gap", "median_gap", "gap_std"]] = (
-        metrics[["max_gap", "median_gap", "gap_std"]].fillna(0.0)
+    threshold = np.where(
+        lines["row_idx"].to_numpy() <= lines["num_top"].to_numpy(),
+        lines["min_top"].to_numpy(),
+        lines["min_normal"].to_numpy(),
     )
-    metrics["gap_cv"] = np.where(
-        metrics["gap_count"].to_numpy(dtype=float) > 1,
-        metrics["gap_std"].to_numpy(dtype=float)
-        / (metrics["median_gap"].to_numpy(dtype=float) + 1e-6),
-        0.0,
-    )
+    lines["is_complete"] = lines["occupied"].astype("int64").to_numpy() >= threshold
 
-    metrics["line_width"] = metrics["x_right"] - metrics["x_left"]
-    metrics["digit_ratio"] = (
-        metrics["digit_count"] / metrics["char_count"].replace(0, np.nan)
-    ).fillna(0.0)
+    # A line_id lives in exactly one table, so map completeness back by line_id;
+    # non-table lines are absent from the map and land as boolean NA.
+    cmap = dict(zip(lines["line_id"], lines["is_complete"]))
+    result["row_complete"] = result["line_id"].map(cmap).astype("boolean")
+    return result
 
-    if "page_width" in df_lines.columns:
-        page_width = df_lines.set_index("line_id")["page_width"]
-        metrics["page_width"] = metrics.index.map(page_width).astype(float)
-        metrics["width_ratio"] = (
-            metrics["line_width"] / metrics["page_width"].replace(0, np.nan)
-        ).fillna(0.0)
-    elif "width" in df_lines.columns:
-        line_width = df_lines.set_index("line_id")["width"]
-        metrics["source_width"] = metrics.index.map(line_width).astype(float)
-        metrics["width_ratio"] = (
-            metrics["source_width"] / metrics["line_width"].replace(0, np.nan)
-        ).fillna(0.0)
+
+# ============================================================
+# Last row above a table rule
+# ============================================================
+
+def _assign_last_tr_below(df_cells: pd.DataFrame) -> pd.DataFrame:
+    """
+    Tag every cell with ``is_last_tr_below`` (nullable boolean): whether its
+    line is the last (highest line_id, i.e. last in reading order) among all
+    lines that share the same ``shape_id_tr_below`` -- the rule sitting directly
+    below this line rather than merely somewhere below it.
+
+    A single table rule backs every row above it, so several consecutive lines
+    carry the same shape_id_tr_below; only the bottom-most of them is the row
+    immediately above the rule. Example: rule 2803 has lines 17001 and 17002
+    above it -> 17001 False, 17002 True. Cells with no shape_id_tr_below get NA.
+    """
+    result = df_cells.copy()
+    if {"shape_id_tr_below", "line_id"}.issubset(result.columns):
+        has = result["shape_id_tr_below"].notna()
     else:
-        metrics["width_ratio"] = 0.0
+        has = pd.Series(False, index=result.index)
+    if not has.any():
+        result["is_last_tr_below"] = pd.array([pd.NA] * len(result), dtype="boolean")
+        return result
 
-    metrics["has_large_gap"] = metrics["max_gap"] >= 25.0
-    metrics["is_multi_cell"] = metrics["cell_count"] >= 2
-    metrics["is_strong_multi_cell"] = metrics["cell_count"] >= 3
-    metrics["is_full_span_line"] = (
-        (metrics["cell_count"] == 1)
-        & (metrics["max_colspan"] >= metrics["total_cols"])
-    )
-    metrics["is_prose_candidate"] = metrics["cell_count"] >= 3
-    metrics["is_justified_prose_like"] = (
-        metrics["is_prose_candidate"]
-        & (metrics["digit_ratio"] < 0.15)
-        & (metrics["median_cell_words"] <= 2.0)
-        & (metrics["width_ratio"] >= 0.25)
-        & (metrics["max_gap"] <= 30.0)
-        & (metrics["gap_cv"] <= 0.75)
-    )
+    sub = result.loc[has]
+    max_line = sub.groupby("shape_id_tr_below")["line_id"].transform("max")
+    is_last = (sub["line_id"] == max_line).reindex(result.index)
+    result["is_last_tr_below"] = is_last.astype("boolean")
+    return result
 
-    if "table_row_score" in df.columns:
-        metrics["table_row_score"] = line_gb["table_row_score"].first()
+
+# ============================================================
+# Subheading rows
+# ============================================================
+
+# Trailing inline script tokens ([^...] superscript / [_...] subscript, e.g. a
+# "[^(a)]" footnote ref), one or more, with optional surrounding whitespace.
+# Stripped from the tail before the ":" test so a footnoted label still counts.
+_TRAILING_SCRIPT_RE = re.compile(r"(?:\s*\[[\^_][^\]]*\])+\s*$")
+
+
+def _assign_is_subheading(df_cells: pd.DataFrame) -> pd.DataFrame:
+    """
+    Tag every cell with ``is_subheading`` (bool): a full-width label row that
+    introduces a group of table rows rather than carrying data. True when the
+    line is a single cell (cell_count == 1) starting in the first column
+    (col_start == 0) whose text ends in ":" or is bold -- e.g. "Market and per
+    common share data" or "Race/Ethnicity:".
+
+    col_start is NA outside a table, so this naturally fires only within a table
+    layout (the big document title above a table is a single bold cell too, but
+    has no col_start and is therefore never flagged).
+    """
+    result = df_cells.copy()
+    if "col_start" not in result.columns or "line_id" not in result.columns:
+        result["is_subheading"] = False
+        return result
+
+    single = result.groupby("line_id")["cell_id"].transform("count").eq(1)
+    col0 = result["col_start"].eq(0).fillna(False)
+
+    if "text" in result.columns:
+        # Strip trailing footnote markers -- superscript / subscript script
+        # tokens ([^...] / [_...], possibly repeated) that apply_inline_markup
+        # appends with no space -- so "Race/Ethnicity:[^(a)]" still reads as
+        # ending in ":".
+        cleaned = (result["text"].fillna("").astype(str)
+                   .str.replace(_TRAILING_SCRIPT_RE, "", regex=True)
+                   .str.rstrip())
+        ends_colon = cleaned.str.endswith(":")
     else:
-        metrics["table_row_score"] = 0.0
-
-    token_df = df[["line_id", "col_start", "col_end"]].copy()
-    token_df["_pattern_token"] = (
-        token_df["col_start"].astype("int32").astype(str)
-        + ":"
-        + token_df["col_end"].astype("int32").astype(str)
-    )
-    metrics["row_pattern"] = token_df.groupby("line_id", sort=False)["_pattern_token"].agg("|".join)
-
-    return metrics
-
-
-def _compute_band_grid_metrics(
-    df_cells: pd.DataFrame,
-    line_metrics: pd.DataFrame,
-) -> pd.DataFrame:
-    """Aggregate precomputed line metrics into one KPI row per horizontal band."""
-    if df_cells.empty or line_metrics.empty:
-        return pd.DataFrame()
-
-    band_gb = line_metrics.groupby("horizontal_band_id", sort=False)
-    band = band_gb.agg(
-        total_lines=("cell_count", "size"),
-        max_cell_count=("cell_count", "max"),
-        total_cols=("total_cols", "max"),
-        multi_cell_lines=("is_multi_cell", "sum"),
-        strong_multi_cell_lines=("is_strong_multi_cell", "sum"),
-        large_gap_lines=("has_large_gap", "sum"),
-        prose_candidate_lines=("is_prose_candidate", "sum"),
-        justified_prose_lines=("is_justified_prose_like", "sum"),
-        full_span_lines=("is_full_span_line", "sum"),
-        mean_table_row_score=("table_row_score", "mean"),
-    )
-
-    cell_gb = df_cells.groupby("horizontal_band_id", sort=False)
-    cell_counts = cell_gb.size().rename("total_cells")
-    atomic_counts = (
-        df_cells["colspan"].astype(int).eq(1)
-        .groupby(df_cells["horizontal_band_id"], sort=False)
-        .sum()
-        .rename("atomic_cells")
-    )
-    band = band.join([cell_counts, atomic_counts]).fillna({
-        "total_cells": 0,
-        "atomic_cells": 0,
-    })
-
-    atomic = df_cells[df_cells["colspan"].astype(int).eq(1)]
-    if atomic.empty:
-        reused_cols = pd.Series(0, index=band.index, name="reused_cols")
+        ends_colon = pd.Series(False, index=result.index)
+    if "is_bold" in result.columns:
+        is_bold = result["is_bold"].fillna(False).astype(bool)
     else:
-        col_line_counts = (
-            atomic.groupby(["horizontal_band_id", "col_start"], sort=False)["line_id"]
-            .nunique()
-        )
-        reused_cols = (
-            col_line_counts.ge(2)
-            .groupby(level=0, sort=False)
-            .sum()
-            .rename("reused_cols")
-        )
-    band = band.join(reused_cols).fillna({"reused_cols": 0})
+        is_bold = pd.Series(False, index=result.index)
 
-    pattern_counts = (
-        line_metrics.groupby(["horizontal_band_id", "row_pattern"], sort=False)
-        .size()
-    )
-    row_pattern_max = (
-        pattern_counts.groupby(level=0, sort=False)
-        .max()
-        .rename("row_pattern_max")
-    )
-    band = band.join(row_pattern_max).fillna({"row_pattern_max": 0})
-
-    band["multi_cell_line_ratio"] = (
-        band["multi_cell_lines"] / band["total_lines"].replace(0, np.nan)
-    ).fillna(0.0)
-    band["strong_multi_cell_line_ratio"] = (
-        band["strong_multi_cell_lines"] / band["total_lines"].replace(0, np.nan)
-    ).fillna(0.0)
-    band["atomic_cell_ratio"] = (
-        band["atomic_cells"] / band["total_cells"].replace(0, np.nan)
-    ).fillna(0.0)
-    band["column_reuse"] = (
-        band["reused_cols"] / band["total_cols"].replace(0, np.nan)
-    ).fillna(0.0)
-    band["full_span_line_ratio"] = (
-        band["full_span_lines"] / band["total_lines"].replace(0, np.nan)
-    ).fillna(0.0)
-    band["row_pattern_reuse"] = (
-        band["row_pattern_max"] / band["total_lines"].replace(0, np.nan)
-    ).fillna(0.0)
-    band["large_gap_ratio"] = (
-        band["large_gap_lines"] / band["multi_cell_lines"].replace(0, np.nan)
-    ).fillna(0.0)
-    band["justified_prose_ratio"] = (
-        band["justified_prose_lines"]
-        / band["prose_candidate_lines"].replace(0, np.nan)
-    ).fillna(0.0)
-
-    return band
-
-
-def _classify_bands(
-    df_lines: pd.DataFrame,
-    df_cells: pd.DataFrame,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Classify every horizontal_band_id as "table" or "text" using the inferred grid.
-
-    The key distinction is whether the grid is reused across lines. Justified
-    prose can create many cells, but it usually creates weak columns, one-off row
-    patterns, short word fragments, and many full-row paragraph-like splits.
-    """
-    result_cells = _assign_column_layout(df_cells)
-
-    result_cells["layout_id"] = result_cells["horizontal_band_id"]
-    result_cells["layout_type"] = "text"
-    if "block_type" not in result_cells.columns:
-        result_cells["block_type"] = pd.NA
-
-    result_lines = df_lines.copy()
-    result_lines["layout_id"] = result_lines["horizontal_band_id"]
-    result_lines["layout_type"] = "text"
-
-    if result_cells.empty:
-        return result_lines, result_cells
-
-    line_metrics = _compute_line_grid_metrics(result_cells, result_lines)
-    band_metrics = _compute_band_grid_metrics(result_cells, line_metrics)
-
-    if band_metrics.empty:
-        return result_lines, result_cells
-
-    eligible = (
-        (band_metrics["max_cell_count"] > 1)
-        & (band_metrics["multi_cell_lines"] >= 2)
-        & (band_metrics["total_cols"] > 1)
-    )
-
-    score = pd.Series(0.0, index=band_metrics.index)
-    score += np.where(band_metrics["total_cols"] >= 3, 2.0, 0.0)
-    score += np.where(band_metrics["column_reuse"] >= 0.45, 2.0, 0.0)
-    score += np.where(band_metrics["atomic_cell_ratio"] >= 0.55, 1.5, 0.0)
-    score += np.where(band_metrics["multi_cell_line_ratio"] >= 0.25, 1.5, 0.0)
-    score += np.where(band_metrics["strong_multi_cell_line_ratio"] >= 0.15, 1.0, 0.0)
-    score += np.where(band_metrics["large_gap_ratio"] >= 0.40, 1.0, 0.0)
-    score += np.where(band_metrics["row_pattern_reuse"] >= 0.35, 1.0, 0.0)
-    score += np.where(band_metrics["mean_table_row_score"] >= 1.5, 1.0, 0.0)
-
-    score -= np.where(
-        (band_metrics["full_span_line_ratio"] >= 0.60)
-        & (band_metrics["atomic_cell_ratio"] < 0.45),
-        2.0,
-        0.0,
-    )
-
-    strong_prose_penalty = (
-        (band_metrics["justified_prose_ratio"] >= 0.60)
-        & (band_metrics["large_gap_ratio"] < 0.25)
-        & (band_metrics["mean_table_row_score"] < 1.5)
-    )
-    weak_prose_penalty = (
-        (band_metrics["justified_prose_ratio"] >= 0.60)
-        & ~strong_prose_penalty
-    )
-    score -= np.where(strong_prose_penalty, 8.0, 0.0)
-    score -= np.where(weak_prose_penalty, 3.0, 0.0)
-    score = score.where(eligible, 0.0)
-
-    band_types = pd.Series(
-        np.where(eligible & (score >= 3.0), "table", "text"),
-        index=band_metrics.index,
-    )
-    band_scores = score
-
-    result_cells["layout_type"] = result_cells["horizontal_band_id"].map(band_types).fillna("text")
-    result_cells["band_table_score"] = result_cells["horizontal_band_id"].map(band_scores).fillna(0.0)
-    result_cells.loc[result_cells["layout_type"] == "table", "block_type"] = "table"
-
-    result_lines["layout_type"] = result_lines["horizontal_band_id"].map(band_types).fillna("text")
-    result_lines["band_table_score"] = result_lines["horizontal_band_id"].map(band_scores).fillna(0.0)
-
-    return result_lines, result_cells
-
-
-
-
+    result["is_subheading"] = (single & col0 & (ends_colon | is_bold)).to_numpy()
+    return result
 
 
 # ============================================================
-# STEP 3: Eject single-cell header rows from table bands
+# Grid trustworthiness
 # ============================================================
 
-def _eject_single_cell_table_headers(
-    df_lines: pd.DataFrame,
-    df_cells: pd.DataFrame,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+# A grid_row_start holding this many complete rows means several table rows
+# collapsed into one detected grid band -- the ruling grid is too coarse for the
+# content, so it's not trustworthy as the row structure.
+_SPARSE_GRID_ROW_MIN_COMPLETE = 3
+
+
+def _assign_grid_trustworthy(df_cells: pd.DataFrame) -> pd.DataFrame:
     """
-    For each band classified as 'table', if the first line_id in that band
-    contains exactly 1 cell at col_start=0 (a left-aligned full-width header),
-    reclassify that line as layout_type='text' with its own new layout_id.
+    Tag every cell with ``grid_trustworthy`` (nullable boolean): whether the
+    detected ruling grid can be trusted as the table's row/column structure.
+    Only meaningful for tables that actually have a detected grid; cells in a
+    grid-less table (or outside any table) get NA.
 
-    The remaining lines in the band keep their layout_id and layout_type='table'.
+    Per table_id:
+      1. If the table's gridded rows don't all share one table_grid_id (the
+         layout spans more than one detected grid), it's not trustworthy.
+         Rows with no table_grid_id (subheadings, footnotes) are ignored here.
+      2. Otherwise, trustworthy only when there is at least one qualifying data
+         band and no band is over-packed: if any grid_row_start holds
+         >= _SPARSE_GRID_ROW_MIN_COMPLETE distinct complete lines (row_complete)
+         the grid is too sparse (many real rows in one band) -> not trustworthy;
+         and if NO qualifying band exists at all (the grid never demonstrably
+         places a complete data row below the top band) -> also not trustworthy.
+         Excluded from the count: single-cell lines (cell_count == 1, e.g. a
+         subheading), and the top band (grid_row_start == 0), whose header rows
+         clear only the looser min_top threshold and would trip a false sparse.
+
+    E.g. a fully-ruled table (one grid row per data row) is trustworthy; a table
+    with far more rows than ruling lines packs several complete rows into a grid
+    band and is not.
     """
-    result_cells = df_cells.copy()
-    result_lines = df_lines.copy()
+    result = df_cells.copy()
+    result["grid_trustworthy"] = pd.array([pd.NA] * len(result), dtype="boolean")
 
-    new_lid = int(result_cells["layout_id"].max()) + 1
+    need = {"table_id", "table_grid_id", "grid_row_start", "row_complete", "line_id"}
+    if not need.issubset(result.columns) or not result["table_id"].notna().any():
+        return result
 
-    table_cells = result_cells[result_cells["layout_type"] == "table"]
-    for _, band_df in table_cells.groupby(["page_number", "horizontal_band_id"]):
-        first_line_id = int(band_df["line_id"].min())
-        first_line = band_df[band_df["line_id"] == first_line_id]
-
-        if len(first_line) == 1 and int(first_line.iloc[0]["col_start"]) == 0:
-            cell_mask = result_cells["line_id"] == first_line_id
-            result_cells.loc[cell_mask, "layout_type"] = "text"
-            result_cells.loc[cell_mask, "layout_id"]   = new_lid
-
-            line_mask = result_lines["line_id"] == first_line_id
-            result_lines.loc[line_mask, "layout_type"] = "text"
-            result_lines.loc[line_mask, "layout_id"]   = new_lid
-
-            new_lid += 1
-
-    return result_lines, result_cells
-
-
-# ============================================================
-# STEP 4: Merge adjacent table bands → shared layout_id
-# ============================================================
-
-def _merge_adjacent_tables(
-    df_lines: pd.DataFrame,
-    df_cells: pd.DataFrame,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    On each page, merge consecutive table layout_ids that have no intervening
-    text layout between them (regardless of column count).  The smallest
-    layout_id in each merge group becomes the canonical id.
-
-    After this step, call _reassign_merged_table_grids to re-infer the column
-    grid for each merged layout using all its cells together.
-    """
-    result_cells = df_cells.copy()
-    result_lines = df_lines.copy()
-
-    for page_num, page_cells in result_cells.groupby("page_number"):
-        # Build per-layout-id bounds and type, sorted by top edge.
-        bounds = (
-            page_cells.groupby("layout_id")
-            .agg(
-                layout_type  = ("layout_type", "first"),
-                y_top_min    = ("y_top",        "min"),
-                y_bottom_max = ("y_bottom",      "max"),
+    in_table = result["table_id"].notna()
+    for _, grp in result.loc[in_table].groupby("table_id", sort=False):
+        grid_ids = grp["table_grid_id"].dropna().unique()
+        if len(grid_ids) == 0:
+            continue  # no detected grid -> not applicable, leave NA
+        if len(grid_ids) > 1:
+            trust = False
+        else:
+            # Count only complete, multi-cell lines below the top band: a
+            # single-cell line (cell_count == 1, e.g. a subheading) must not
+            # inflate a band, and grid_row_start 0 rows pass only the looser
+            # min_top threshold so they'd falsely read as over-packed.
+            cells_per_line = grp.groupby("line_id")["cell_id"].transform("count")
+            keep = (
+                grp["row_complete"].fillna(False).astype(bool)
+                & (cells_per_line > 1)
+                & grp["grid_row_start"].ne(0).fillna(False).astype(bool)
             )
-            .sort_values("y_top_min")
-            .reset_index()
-        )
-
-        table_bounds = bounds[bounds["layout_type"] == "table"].reset_index(drop=True)
-        if len(table_bounds) < 2:
-            continue
-
-        # Union-find over table layout_ids on this page.
-        lids = table_bounds["layout_id"].tolist()
-        parent = {lid: lid for lid in lids}
-
-        def _find(x):
-            while parent[x] != x:
-                parent[x] = parent[parent[x]]
-                x = parent[x]
-            return x
-
-        def _union(x, y):
-            rx, ry = _find(x), _find(y)
-            if rx != ry:
-                parent[max(rx, ry)] = min(rx, ry)
-
-        for i in range(len(table_bounds) - 1):
-            lid1 = table_bounds.loc[i,     "layout_id"]
-            lid2 = table_bounds.loc[i + 1, "layout_id"]
-            gap_top    = table_bounds.loc[i,     "y_bottom_max"]
-            gap_bottom = table_bounds.loc[i + 1, "y_top_min"]
-
-            # Check whether any non-table layout occupies the vertical gap.
-            text_between = bounds[
-                (bounds["layout_type"] != "table")
-                & (bounds["y_top_min"]    < gap_bottom)
-                & (bounds["y_bottom_max"] > gap_top)
-            ]
-            if text_between.empty:
-                _union(lid1, lid2)
-
-        # Apply merges: remap every layout_id to its root.
-        lid_map = {lid: _find(lid) for lid in lids}
-        changed = {lid: root for lid, root in lid_map.items() if lid != root}
-        if not changed:
-            continue
-
-        page_mask_c = result_cells["page_number"] == page_num
-        page_mask_l = result_lines["page_number"] == page_num
-
-        for old_lid, new_lid in changed.items():
-            result_cells.loc[page_mask_c & (result_cells["layout_id"] == old_lid), "layout_id"] = new_lid
-            result_lines.loc[page_mask_l & (result_lines["layout_id"] == old_lid), "layout_id"] = new_lid
-
-    return result_lines, result_cells
-
-
-def _reassign_merged_table_grids(df_cells: pd.DataFrame) -> pd.DataFrame:
-    """
-    For every table layout_id that now spans more than one horizontal_band_id
-    (i.e. was created by merging), re-run column grid inference using the
-    combined cells so col_start, col_end, colspan, band_total_cols are correct
-    for the merged layout as a whole.
-    """
-    table_cells = df_cells[df_cells["layout_type"] == "table"]
-    if table_cells.empty:
-        return df_cells
-
-    bands_per_layout = (
-        table_cells.groupby("layout_id")["horizontal_band_id"].nunique()
-    )
-    merged_lids = set(bands_per_layout[bands_per_layout > 1].index.tolist())
-    if not merged_lids:
-        return df_cells
-
-    result = df_cells.copy()
-    merged_mask = result["layout_id"].isin(merged_lids) & (result["layout_type"] == "table")
-    updated = _assign_column_layout(result[merged_mask].copy(), group_col="layout_id")
-
-    grid_cols = ["col_start", "col_end", "colspan", "band_total_cols"]
-    result.loc[updated.index, grid_cols] = updated[grid_cols]
-    return result
-
-# ============================================================
-# LAYOUT ID REINDEX
-# ============================================================
-
-def _reindex_layout_id_and_add_table_id(
-    df_lines: pd.DataFrame,
-    df_cells: pd.DataFrame,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Reassign layout_ids to sequential integers (1, 2, 3, …) ordered by
-    (page_number, min line_id) so the final output has monotonically increasing
-    layout_ids across the document regardless of how ejection/merging shifted them.
-
-    line_id is assigned upstream in stable reading order, so do not reinterpret
-    layout ordering from y_top/y_bottom coordinates here.
-    """
-    if df_cells.empty:
-        return df_lines, df_cells
-
-    layout_order = (
-        df_cells.groupby("layout_id")
-        .agg(
-            page_number=("page_number", "first"),
-            line_id_min=("line_id", "min"),
-            layout_type=("layout_type", "first"),
-        )
-        .sort_values(["page_number", "line_id_min"])
-        .reset_index()
-    )
-    old_to_new = dict(zip(
-        layout_order["layout_id"].astype(int),
-        range(1, len(layout_order) + 1),
-    ))
-
-    is_table_arr = (layout_order["layout_type"] == "table").to_numpy()
-    table_nums   = is_table_arr.cumsum()
-    old_to_table_id: dict[int, int | None] = {
-        int(lid): (int(tnum) if flag else None)
-        for lid, tnum, flag in zip(
-            layout_order["layout_id"],
-            table_nums,
-            is_table_arr,
-        )
-    }
-
-    df_cells = df_cells.copy()
-    df_cells["layout_id"] = df_cells["layout_id"].map(old_to_new)
-    df_cells["table_id"] = df_cells["layout_id"].map(
-        {new: old_to_table_id[old] for old, new in old_to_new.items()}
-    )
-
-    df_lines = df_lines.copy()
-    if "layout_id" in df_lines.columns:
-        df_lines["layout_id"] = df_lines["layout_id"].map(old_to_new)
-        df_lines["table_id"] = df_lines["layout_id"].map(
-            {new: old_to_table_id[old] for old, new in old_to_new.items()}
-        )
-
-    return df_lines, df_cells
-
-
-def _sync_table_block_type(
-    df_lines: pd.DataFrame,
-    df_cells: pd.DataFrame,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Keep block_type aligned with the final table classification.
-
-    The table classifier may reclassify/eject/merge layouts after the initial
-    layout_type assignment, so write block_type from the final layout_type state.
-    """
-    result_lines = df_lines.copy()
-    result_cells = df_cells.copy()
-
-    for df in (result_lines, result_cells):
-        if "block_type" not in df.columns:
-            df["block_type"] = pd.NA
-        if "layout_type" not in df.columns:
-            continue
-
-        layout_type = df["layout_type"].astype("string").str.strip().str.lower()
-        table_mask = layout_type.eq("table").fillna(False)
-        stale_table_mask = df["block_type"].astype("string").eq("table").fillna(False)
-        df.loc[table_mask, "block_type"] = "table"
-        df.loc[~table_mask & stale_table_mask, "block_type"] = pd.NA
-
-    return result_lines, result_cells
-
-
-# ============================================================
-# STEP 5: Build table structure — rows, rowspan, cell roles
-# ============================================================
-
-
-# ============================================================
-# STEP 5: Expand horizontal grid-line assignments for table cells
-# ============================================================
-
-def _expand_table_grid_lines(
-    df_cells: pd.DataFrame,
-    df_shapes: pd.DataFrame,
-) -> pd.DataFrame:
-    """
-    For cells with layout_type='table', assign shape_id_horizontal_grid_line to
-    the correct boundary shape using column-aware logic:
-
-    For each horizontal shape S and each column (col_start) it x-overlaps, only
-    the LAST cell in that column above S (i.e. the cell with the maximum y_bottom
-    that is still ≤ S.y) receives the assignment.  If multiple shapes qualify for
-    the same cell, the nearest one (minimum shape y) wins.
-
-    This replaces the step-8 proximity assignment (≤ 10 pt) and correctly handles
-    cells whose text sits far above the row's bottom border (e.g. a sparse label
-    in a tall row where adjacent columns have many lines of wrapping text).
-
-    Non-table cells are not touched.  Cells in the last table row (no shape below
-    them) have their assignment cleared to NA / False.
-    """
-    if "layout_type" not in df_cells.columns:
-        return df_cells
-
-    result = df_cells.copy()
-    table_mask = result["layout_type"] == "table"
-    if not table_mask.any() or df_shapes.empty:
-        return result
-
-    shape_mask = pd.Series(True, index=df_shapes.index)
-    if "shape_type" in df_shapes.columns:
-        shape_mask &= df_shapes["shape_type"] == "line"
-    if "shape_orientation" in df_shapes.columns:
-        shape_mask &= df_shapes["shape_orientation"] == "horizontal"
-    h_shapes = df_shapes[shape_mask].copy()
-    if h_shapes.empty:
-        return result
-
-    has_page = "page_number" in h_shapes.columns
-
-    for key, grp in result[table_mask].groupby(
-        ["layout_id", "page_number"], sort=True
-    ):
-        page_num = key[1]
-        page_shapes = (
-            h_shapes[h_shapes["page_number"] == page_num]
-            if has_page else h_shapes
-        )
-        if page_shapes.empty:
-            continue
-
-        tbl_xl = float(grp["x_left"].min())
-        tbl_xr = float(grp["x_right"].max())
-        tbl_yt = float(grp["y_top"].min())
-
-        # Pre-filter: shapes that x-overlap the table and start at or below its top edge.
-        # No tolerance — shapes outside the table's x/y range are never candidates.
-        cand = page_shapes[
-            (page_shapes["x_right"] > tbl_xl) &
-            (page_shapes["x_left"]  < tbl_xr) &
-            (page_shapes["y_top"]   >= tbl_yt)
-        ]
-        if cand.empty:
-            continue
-
-        cell_xl      = grp["x_left"].to_numpy(dtype=float)
-        cell_xr      = grp["x_right"].to_numpy(dtype=float)
-        cell_yb      = grp["y_bottom"].to_numpy(dtype=float)
-        cell_cs      = grp["col_start"].to_numpy()
-        cell_indices = grp.index.to_numpy()
-
-        sh_xl  = cand["x_left"].to_numpy(dtype=float)
-        sh_xr  = cand["x_right"].to_numpy(dtype=float)
-        sh_y   = ((cand["y_top"] + cand["y_bottom"]) / 2).to_numpy(dtype=float)
-        sh_ids = cand["shape_id"].to_numpy()
-
-        # assignments[global_idx] = (shape_id, shape_y) — nearest shape wins
-        assignments: dict[int, tuple[int, float]] = {}
-
-        for si in range(len(sh_y)):
-            sy  = sh_y[si]
-            sxl = sh_xl[si]
-            sxr = sh_xr[si]
-            sid = int(sh_ids[si])
-
-            # Cells that x-overlap this shape and sit at or above it
-            x_ok     = (cell_xl < sxr) & (sxl < cell_xr)
-            y_ok     = cell_yb <= sy
-            cand_arr = np.where(x_ok & y_ok)[0]
-            if cand_arr.size == 0:
-                continue
-
-            # Per col_start: keep only the cell with the maximum y_bottom
-            # (the last cell in that column before this shape).
-            cand_cs_arr = cell_cs[cand_arr]
-            cand_yb_arr = cell_yb[cand_arr]
-            for cs in np.unique(cand_cs_arr):
-                in_cs      = cand_cs_arr == cs
-                group_arr  = cand_arr[in_cs]
-                best_local = group_arr[cand_yb_arr[in_cs].argmax()]
-                global_idx = int(cell_indices[best_local])
-
-                existing = assignments.get(global_idx)
-                if existing is None or sy < existing[1]:
-                    assignments[global_idx] = (sid, sy)
-
-        for global_idx, (sid, _) in assignments.items():
-            if pd.isna(result.at[global_idx, "shape_id_horizontal_grid_line"]):
-                result.at[global_idx, "shape_id_horizontal_grid_line"] = sid
-                result.at[global_idx, "has_horizontal_grid_line"] = True
-
+            per_row = grp[keep].groupby("grid_row_start")["line_id"].nunique()
+            # Need at least one qualifying data band with an acceptable count:
+            # a grid that never demonstrably places a complete data row below the
+            # top band (per_row empty) isn't trusted either.
+            trust = bool(len(per_row) > 0
+                         and (per_row < _SPARSE_GRID_ROW_MIN_COMPLETE).all())
+        result.loc[grp.index, "grid_trustworthy"] = trust
     return result
 
 
-
-
-
-
-# ============================================================
-# STEP 5: Per-column slot-based table cell assembly
-# ============================================================
-
-def _compute_grid_line_last_map(df_tables: pd.DataFrame) -> dict:
-    """
-    For each (layout_id, page_number, shape_id_horizontal_grid_line),
-    return the maximum line_id that carries that shape.
-    This is the line that triggers the flush for that shape.
-    """
-    col = "shape_id_horizontal_grid_line"
-    if col not in df_tables.columns:
-        return {}
-    valid = df_tables.dropna(subset=[col])
-    if valid.empty:
-        return {}
-    last_df = (
-        valid.groupby(["layout_id", "page_number", col])["line_id"]
-        .max()
-        .reset_index()
-    )
-    return {
-        (int(a), int(b), int(c)): int(d)
-        for a, b, c, d in zip(
-            last_df["layout_id"],
-            last_df["page_number"],
-            last_df[col],
-            last_df["line_id"],
-        )
-    }
-
-
-def _get_completion_threshold(band_total_cols: int, row_index: int) -> int:
-    """
-    How many distinct column indices must be covered for a row to be considered
-    complete enough to flush, given the total column count and 1-based row index.
-
-        band_total_cols   min_normal   min_top   num_top_rows
-        ----------------------------------------------------
-        2                 2            1         1
-        3                 3            2         1
-        4                 4            3         1
-        5                 4            3         2
-        6                 4            3         3
-        7                 4            3         3
-        8+                4            3         3
-    """
-    if band_total_cols <= 0:
-        return 0
-    if band_total_cols == 1:
-        return 1
-    elif band_total_cols == 2:
-        min_normal, min_top, n_top = 2, 1, 1
-    elif band_total_cols == 3:
-        min_normal, min_top, n_top = 3, 2, 1
-    elif band_total_cols == 4:
-        min_normal, min_top, n_top = 4, 3, 1
-    elif band_total_cols == 5:
-        min_normal, min_top, n_top = 4, 3, 2
-    else:
-        min_normal, min_top, n_top = 4, 3, 3
-    return min_top if row_index <= n_top else min_normal
-
-
-def _is_complete_row(covered_cols: set[int], band_total_cols: int, row_index: int) -> bool:
-    if band_total_cols <= 0:
-        return False
-    return len(covered_cols) >= _get_completion_threshold(band_total_cols, row_index)
-
-
-def _nearest_col_record(col_to_record_idx: dict[int, int], cs: int) -> int | None:
-    if not col_to_record_idx:
-        return None
-    return col_to_record_idx[min(col_to_record_idx, key=lambda k: abs(k - cs))]
-
-
-def _flush_slot(
-    records: list,
-    tcell_counter: int,
-    slot: dict,
-    cs: int,
-    new_row_idx: int,
-    layout_id: int,
-    page_number: int,
-    table_id: int,
-) -> tuple[int, int]:
-    # slot["cells"] contains (line_id, col_start, col_end, cell_id, text, gid) tuples.
-    # text is always a str (pre-converted upstream); gid is int | None.
-    text_raw_lines: list[str] = []
-    cell_ids: list[int] = []
-    line_ids: list[int] = []
-    seen_line_ids: set[int] = set()
-
-    cells_sorted = sorted(slot["cells"], key=lambda r: (r[0], r[1]))
-
-    for cell in cells_sorted:
-        lid = cell[0]
-        if lid not in seen_line_ids:
-            seen_line_ids.add(lid)
-            line_ids.append(lid)
-        cell_ids.append(cell[3])
-
-    for lid, grp in _itertools_groupby(cells_sorted, key=lambda r: r[0]):
-        parts = [r[4].strip() for r in grp if r[4].strip()]
-        if parts:
-            text_raw_lines.append(" ".join(parts))
-
-    records.append({
-        "table_cell_id":  tcell_counter,
-        "page_number":    page_number,
-        "layout_id":      layout_id,
-        "table_id":       table_id,
-        "row_start":      slot["row_start"],
-        "col_start":      cs,
-        "rowspan":        new_row_idx - slot["row_start"],
-        "colspan":        slot["colspan"],
-        "text":           " ".join(text_raw_lines),
-        "text_raw_lines": text_raw_lines,
-        "cell_ids":       cell_ids,
-        "line_ids":       line_ids,
-    })
-    return tcell_counter + 1, len(records) - 1
-
-
-def _build_table_cells(df_cells: pd.DataFrame) -> pd.DataFrame:
-    """
-    Assemble one record per logical table cell using per-column slot flushing.
-
-    Each column (col_start) maintains an open slot that accumulates PDF lines.
-    Flush priority per line:
-      1. Retroactive attach — if the line's grid-line shape was already anchored
-         to a prior flushed row, append the line (and any pending open slots) to
-         that row rather than starting a new one.
-      2. Complete-row flush — cumulative coverage across open slots + current line
-         meets _is_complete_row threshold → flush all open slots.
-      3. Grid-line partial flush — current line is the last instance of a shape
-         that was not yet anchored → flush only the columns sharing that shape.
-      4. Neither → keep accumulating.
-
-    global_row_idx increments once per flush event regardless of how many
-    columns participate, so surviving slots accumulate the correct rowspan.
-    """
-    _EMPTY_COLS = [
-        "table_cell_id", "page_number", "layout_id", "table_id",
-        "row_start", "col_start", "rowspan", "colspan",
-        "text", "text_raw_lines", "cell_ids", "line_ids",
-    ]
-
-    df_tables = (
-        df_cells[df_cells["layout_type"] == "table"].copy()
-        if "layout_type" in df_cells.columns
-        else df_cells.copy()
-    )
-    if df_tables.empty:
-        return pd.DataFrame(columns=_EMPTY_COLS)
-
-    if "shape_id_horizontal_grid_line" not in df_tables.columns:
-        df_tables["shape_id_horizontal_grid_line"] = pd.NA
-
-    grid_line_last_map = _compute_grid_line_last_map(df_tables)
-
-    records: list[dict] = []
-    tcell_counter = 1
-
-    for (layout_id, page_number), df_seg in df_tables.groupby(
-        ["layout_id", "page_number"], sort=True
-    ):
-        if df_seg.empty:
-            continue
-
-        df_seg          = df_seg.sort_values(["line_id", "col_start", "cell_id"])
-        band_total_cols = int(df_seg["band_total_cols"].max())
-        table_id        = int(df_seg["table_id"].iloc[0]) if "table_id" in df_seg.columns else 0
-
-        # --- Extract columns as arrays once per segment ---
-        n        = len(df_seg)
-        cs_arr   = df_seg["col_start"].to_numpy(dtype=np.int32)
-        ce_arr   = df_seg["col_end"].to_numpy(dtype=np.int32)
-        cid_arr  = df_seg["cell_id"].to_numpy(dtype=np.int64)
-        lid_arr  = df_seg["line_id"].to_numpy(dtype=np.int64)
-        txt_arr  = df_seg["text"].fillna("").astype(str).to_numpy()
-
-        # Pre-convert gid: NaN/NA → None, valid → int
-        _gid_series  = df_seg["shape_id_horizontal_grid_line"]
-        _notna       = _gid_series.notna().to_numpy()
-        _gid_int_arr = (
-            pd.to_numeric(_gid_series, errors="coerce")
-            .fillna(-1).astype(np.int64).to_numpy()
-        )
-
-        # --- Pre-group by line_id into dict[int, list[cell_tuple]] ---
-        # Cell tuple layout: (line_id, col_start, col_end, cell_id, text, gid_or_None)
-        # df_seg is already sorted by (line_id, col_start), so each list is in col order.
-        line_to_cells: dict[int, list] = {}
-        for i in range(n):
-            lid = int(lid_arr[i])
-            gid = int(_gid_int_arr[i]) if _notna[i] else None
-            cell = (lid, int(cs_arr[i]), int(ce_arr[i]), int(cid_arr[i]), txt_arr[i], gid)
-            if lid not in line_to_cells:
-                line_to_cells[lid] = []
-            line_to_cells[lid].append(cell)
-
-        # --- Pre-compute shape_to_col_starts from pre-grouped data ---
-        shape_to_col_starts: dict[int, set[int]] = {}
-        for cells in line_to_cells.values():
-            for cell in cells:
-                gid = cell[5]
-                if gid is not None:
-                    if gid not in shape_to_col_starts:
-                        shape_to_col_starts[gid] = set()
-                    shape_to_col_starts[gid].add(cell[1])
-
-        slot_open: dict[int, dict] = {}
-        global_row_idx = 0
-        # gid -> True once that shape has been used to flush (or anchor) a row
-        grid_line_row_anchor: dict[int, bool] = {}
-        # col_start -> index in `records` of the last flushed cell for that col
-        col_to_record_idx: dict[int, int] = {}
-
-        for line_id in sorted(line_to_cells.keys()):
-            line_cells = line_to_cells[line_id]
-
-            # ── Priority 1: retroactive attach ───────────────────────────────
-            anchor_gid = None
-            for cell in line_cells:
-                gid = cell[5]
-                if gid is not None and grid_line_row_anchor.get(gid):
-                    anchor_gid = gid
-                    break
-
-            if anchor_gid is not None:
-                # Drain pending open slots first so they appear before the current line.
-                for cs, slot in sorted(slot_open.items()):
-                    rec_idx = col_to_record_idx.get(cs)
-                    if rec_idx is None:
-                        rec_idx = _nearest_col_record(col_to_record_idx, cs)
-                    if rec_idx is not None:
-                        rec = records[rec_idx]
-                        for c in slot["cells"]:
-                            txt = c[4].strip()
-                            if txt:
-                                rec["text"] = (rec["text"] + " " + txt).strip() if rec["text"] else txt
-                                rec["text_raw_lines"].append(txt)
-                            rec["cell_ids"].append(c[3])
-                            c_lid = c[0]
-                            if c_lid not in rec["line_ids"]:
-                                rec["line_ids"].append(c_lid)
-                slot_open.clear()
-
-                # Append the current (triggering) line's cells
-                for cell in line_cells:
-                    cs = cell[1]
-                    rec_idx = col_to_record_idx.get(cs)
-                    if rec_idx is None:
-                        rec_idx = _nearest_col_record(col_to_record_idx, cs)
-                    if rec_idx is not None:
-                        rec = records[rec_idx]
-                        txt = cell[4].strip()
-                        if txt:
-                            rec["text"] = (rec["text"] + " " + txt).strip() if rec["text"] else txt
-                            rec["text_raw_lines"].append(txt)
-                        rec["cell_ids"].append(cell[3])
-                        c_lid = cell[0]
-                        if c_lid not in rec["line_ids"]:
-                            rec["line_ids"].append(c_lid)
-
-                continue  # skip normal accumulation / flush logic
-
-            # ── Accumulate current line into open slots ───────────────────────
-            flush_col_starts: set[int] = set()
-            covered: set[int] = set()
-            fired_gids: set[int] = set()
-            all_line_gids: set[int] = set()
-
-            for cell in line_cells:
-                cs, ce, gid = cell[1], cell[2], cell[5]
-
-                if cs not in slot_open:
-                    slot_open[cs] = {
-                        "col_end":   ce,
-                        "colspan":   ce - cs + 1,
-                        "row_start": global_row_idx,
-                        "cells":     [],
-                    }
-                slot_open[cs]["cells"].append(cell)
-
-                for c in range(cs, ce + 1):
-                    covered.add(c)
-
-                if gid is not None:
-                    all_line_gids.add(gid)
-                    key = (int(layout_id), int(page_number), gid)
-                    if grid_line_last_map.get(key) == line_id:
-                        fired_gids.add(gid)
-                        flush_col_starts |= shape_to_col_starts.get(gid, set())
-
-            # ── Priority 2: complete-row flush (wins over grid-line partial) ──
-            complete_flush = _is_complete_row(covered, band_total_cols, global_row_idx + 1)
-            if complete_flush:
-                flush_col_starts = set(slot_open.keys())
-
-            # ── Priority 3: grid-line partial flush ───────────────────────────
-            # flush_col_starts already populated from fired_gids above (if not overridden)
-
-            if flush_col_starts:
-                new_row_idx = global_row_idx + 1
-                for cs in sorted(flush_col_starts):
-                    slot = slot_open.pop(cs, None)
-                    if slot is None:
-                        continue
-                    tcell_counter, rec_idx = _flush_slot(
-                        records, tcell_counter, slot, cs, new_row_idx,
-                        int(layout_id), int(page_number), table_id,
-                    )
-                    col_to_record_idx[cs] = rec_idx
-
-                gids_to_anchor = all_line_gids if complete_flush else fired_gids
-                for gid in gids_to_anchor:
-                    grid_line_row_anchor[gid] = True
-
-                global_row_idx = new_row_idx
-
-        # End-of-table: flush all remaining open slots
-        if slot_open:
-            new_row_idx = global_row_idx + 1
-            for cs in sorted(slot_open.keys()):
-                tcell_counter, rec_idx = _flush_slot(
-                    records, tcell_counter, slot_open[cs], cs, new_row_idx,
-                    int(layout_id), int(page_number), table_id,
-                )
-                col_to_record_idx[cs] = rec_idx
-
-    if not records:
-        return pd.DataFrame(columns=_EMPTY_COLS)
-    return pd.DataFrame.from_records(records)
 
 
 # ============================================================
@@ -1225,88 +542,17 @@ def _build_table_cells(df_cells: pd.DataFrame) -> pd.DataFrame:
 # ============================================================
 
 def build_tables(
-    df_lines: pd.DataFrame,
     df_cells: pd.DataFrame,
-    df_shapes: pd.DataFrame | None = None,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """
-    Classify bands into text or table, and for tables derive the full layout.
+    df_grid_cells: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
 
-    Parameters
-    ----------
-    df_lines : pd.DataFrame
-        One row per line_id.  Output of step_09_line_builder.build_lines().
-        Must contain: line_id, cell_count, char_count, digit_count, word_count,
-        capitalized_word_count, has_vertical_line, is_underlined, page_width, width,
-        horizontal_band_id.
+    df_cells = _merge_grid_cell_layout(df_cells, df_grid_cells)
+    df_cells = _assign_table_ids(df_cells)
+    df_cells = _assign_column_layout(df_cells)
+    df_cells = _reconcile_colspan(df_cells)
+    df_cells = _assign_row_completeness(df_cells)
+    df_cells = _assign_last_tr_below(df_cells)
+    df_cells = _assign_is_subheading(df_cells)
+    df_cells = _assign_grid_trustworthy(df_cells)
 
-    df_cells : pd.DataFrame
-        One row per cell.  Output of step_09_line_builder.build_lines()
-        (with horizontal_band_id added).
-        Must contain: cell_id, line_id, page_number, horizontal_band_id,
-        x_left, x_right, y_top, y_bottom, text.
-
-    df_shapes : pd.DataFrame | None
-        Shape records from the PDF extractor (step_06 output).  Used to expand
-        horizontal grid-line assignments for table cells beyond the 10-pt cap
-        applied in the cell builder.  Pass None to skip this step.
-
-    Returns
-    -------
-    df_lines : pd.DataFrame
-        With added columns: layout_id, layout_type, band_table_score.
-
-    df_cells : pd.DataFrame
-        With added columns: col_start, col_end, colspan, band_total_cols,
-        layout_id, layout_type, block_type, band_table_score.
-
-    df_table_cells : pd.DataFrame
-        One row per assembled table cell.  Contains: table_cell_id, page_number,
-        layout_id, table_id, row_start, col_start, rowspan, colspan, text,
-        text_raw_lines, cell_ids, line_ids, role.
-    """
-    if df_cells.empty:
-        empty_tcells = pd.DataFrame(columns=[
-            "table_cell_id", "page_number", "layout_id", "table_id",
-            "row_start", "col_start", "rowspan", "colspan",
-            "text", "text_raw_lines", "cell_ids", "line_ids", "role",
-        ])
-        return df_lines.copy(), df_cells.copy(), empty_tcells
-
-    # Step 1/2 — infer grid, then classify each horizontal band.
-    df_lines, df_cells = _classify_bands(df_lines, df_cells)
-
-    # Step 3 — eject single-cell left-aligned headers from table bands.
-    df_lines, df_cells = _eject_single_cell_table_headers(df_lines, df_cells)
-
-    # Step 4 — merge adjacent table bands with no intervening text.
-    df_lines, df_cells = _merge_adjacent_tables(df_lines, df_cells)
-
-    # Step 4b — re-run column grid inference for merged layouts.
-    df_cells = _reassign_merged_table_grids(df_cells)
-
-    
-
-    # Reindex layout_ids to be sequential ordered by stable upstream line_id.
-    df_lines, df_cells = _reindex_layout_id_and_add_table_id(df_lines, df_cells)
-
-    ## REMOVE THIS SYNC IN THE FINAL SCRIPT
-
-    # Keep block_type in sync with final layout_type on both lines and cells.
-    df_lines, df_cells = _sync_table_block_type(df_lines, df_cells)
-
-    # Step 4c — expand horizontal grid-line assignments for table cells. THIS IS BELOW THE REINDEXING !!! - START OF A NEW METHOD WHERE WE CONVERT LINE INTO TABLE
-    # STOP ADDING IT ON TOP OF REINDEXING !!!
-    if df_shapes is not None and not df_shapes.empty:
-        df_cells = _expand_table_grid_lines(df_cells, df_shapes)
-
-    # Step 5 — assemble table rows and assign cell roles.
-    df_table_cells = _build_table_cells(df_cells)
-    if not df_table_cells.empty:
-        parts = [
-            detect_cell_roles(grp, with_row_label=True)
-            for _, grp in df_table_cells.groupby("table_id", sort=False)
-        ]
-        df_table_cells = pd.concat(parts, ignore_index=True)
-
-    return df_lines, df_cells, df_table_cells
+    return df_cells#, df_table_cells

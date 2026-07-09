@@ -3,8 +3,9 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from typing import Set
+from typing import Optional, Set
 
+import numpy as np
 import pandas as pd
 
 
@@ -44,6 +45,27 @@ _BULLET_TOKENS: Set[str] = {
 }
 
 _BULLET = "•"
+
+
+# ==================================================================================================
+# TABLE RULE CHARACTERS
+# Characters an OCR engine emits when a table border line is misread as a (short) word.
+# Used by _clean_table_rule_words together with shape geometry: a 1-2 char token made
+# entirely of these characters, sitting on top of a matching line shape, is a rule misread.
+# ==================================================================================================
+
+# Horizontal rules: hyphen, underscore, equals, en/em dash and the minus sign.
+_HRULE_CHARS: Set[str] = {'-', '_', '=', '—', '–', '−'}
+# Vertical rules: pipe, broken bar and the box-drawing vertical bar.
+_VRULE_CHARS: Set[str] = {'|', '¦', '│', ']', '[', '='}
+
+# A word must be this short (after stripping) to be considered a rule misread here;
+# longer all-rule tokens are already handled by _remove_table_rule_noise.
+_RULE_MAX_CHARS = 2
+
+# Padding (points) applied to the thin dimension of a line shape so a word whose
+# baseline sits slightly above/beside the rule still counts as overlapping it.
+_RULE_PAD = 3.0
 
 
 # ==================================================================================================
@@ -105,6 +127,93 @@ def _remove_table_rule_noise(text: str) -> str:
     if len(stripped) >= 3 and re.fullmatch(r'[—–\-_=\s]+', stripped):
         return ''
     return text
+
+
+def _is_rule_token(text: str, rule_chars: Set[str]) -> bool:
+    """
+    True when `text` is a short token (<= _RULE_MAX_CHARS) made up solely of the
+    given rule characters (e.g. '-', '=_', '||'). Empty / whitespace-only is False.
+    """
+    stripped = text.strip()
+    if not stripped or len(stripped) > _RULE_MAX_CHARS:
+        return False
+    return all(ch in rule_chars for ch in stripped)
+
+
+def _clean_table_rule_words(out: pd.DataFrame, df_shapes: pd.DataFrame) -> None:
+    """
+    Blank short rule-character tokens ('-', '=', '|', '=_', …) that geometrically
+    sit on top of a table border line, in place on `out['text']`.
+
+    _remove_table_rule_noise already handles 3+ char runs by text alone; here we
+    catch the 1-2 char misreads that are only distinguishable from real text by
+    their position over a line shape:
+
+      - horizontal line (shape_type='line', shape_orientation='horizontal'):
+        pad y_top by -_RULE_PAD and y_bottom by +_RULE_PAD (thicken the rule by
+        2*_RULE_PAD), then blank any word overlapping that band within the line's
+        x-span whose text is solely horizontal rule chars.
+      - vertical line: pad x_left/x_right analogously and blank overlapping words
+        made solely of vertical rule chars.
+    """
+    if df_shapes is None or df_shapes.empty:
+        return
+    if not {'shape_type', 'shape_orientation'}.issubset(df_shapes.columns):
+        return
+
+    lines = df_shapes[df_shapes['shape_type'] == 'line']
+    if lines.empty:
+        return
+
+    # Per-orientation line boxes, grouped by page so a word only matches lines on its page.
+    has_page = 'page_number' in out.columns and 'page_number' in lines.columns
+
+    for orientation, rule_chars in (('horizontal', _HRULE_CHARS),
+                                    ('vertical', _VRULE_CHARS)):
+        band = lines[lines['shape_orientation'] == orientation]
+        if band.empty:
+            continue
+
+        # Candidate words: short tokens made solely of this orientation's rule chars.
+        cand_mask = out['text'].astype(str).map(lambda t: _is_rule_token(t, rule_chars))
+        if not cand_mask.any():
+            continue
+
+        pages = out.loc[cand_mask, 'page_number'].unique() if has_page else [None]
+        for page in pages:
+            if has_page:
+                w = out[cand_mask & (out['page_number'] == page)]
+                s = band[band['page_number'] == page]
+            else:
+                w, s = out[cand_mask], band
+            if w.empty or s.empty:
+                continue
+
+            wx0 = w['x_left'].to_numpy(dtype=np.float64)[:, None]
+            wx1 = w['x_right'].to_numpy(dtype=np.float64)[:, None]
+            wy0 = w['y_top'].to_numpy(dtype=np.float64)[:, None]
+            wy1 = w['y_bottom'].to_numpy(dtype=np.float64)[:, None]
+
+            sx0 = s['x_left'].to_numpy(dtype=np.float64)[None, :]
+            sx1 = s['x_right'].to_numpy(dtype=np.float64)[None, :]
+            sy0 = s['y_top'].to_numpy(dtype=np.float64)[None, :]
+            sy1 = s['y_bottom'].to_numpy(dtype=np.float64)[None, :]
+
+            if orientation == 'horizontal':
+                sy0 = sy0 - _RULE_PAD
+                sy1 = sy1 + _RULE_PAD
+            else:
+                sx0 = sx0 - _RULE_PAD
+                sx1 = sx1 + _RULE_PAD
+
+            # Word overlaps a line box on both axes.
+            overlap = (
+                (wx0 <= sx1) & (wx1 >= sx0) &
+                (wy0 <= sy1) & (wy1 >= sy0)
+            )
+            hit = overlap.any(axis=1)
+            if hit.any():
+                out.loc[w.index[hit], 'text'] = ''
 
 
 def _normalize_superscript_parens(text: str, line_open_excess: int = 0) -> str:
@@ -171,7 +280,10 @@ def _collapse_whitespace(text: str) -> str:
 # PUBLIC API
 # ==================================================================================================
 
-def clean_words_df(words_df: pd.DataFrame) -> pd.DataFrame:
+def clean_words_df(
+    words_df: pd.DataFrame,
+    df_shapes: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
     """
     Word-level OCR text cleaning. Conservative by design — goal is to remove
     noise tokens that would pollute a RAG index, not to "correct" OCR.
@@ -188,6 +300,8 @@ def clean_words_df(words_df: pd.DataFrame) -> pd.DataFrame:
       6. Whitespace collapse
       7. Line-start bullet normalization (requires is_line_start column)
          Matched against text_raw so pre-normalization OCR tokens are caught.
+      8. Table rule word removal (requires df_shapes): short 1-2 char rule
+         tokens ('-', '|', '=_' …) sitting on top of a line shape → ''.
     """
     if words_df is None or words_df.empty:
         return words_df.copy() if words_df is not None else pd.DataFrame()
@@ -230,5 +344,8 @@ def clean_words_df(words_df: pd.DataFrame) -> pd.DataFrame:
             (out['text_raw'].str.strip().isin(_BULLET_TOKENS))
         )
         out.loc[bullet_mask, 'text'] = _BULLET
+
+    # Blank short rule-char tokens that sit on top of a table border line.
+    _clean_table_rule_words(out, df_shapes)
 
     return out

@@ -46,6 +46,7 @@ from .step_08_stream_group import assign_stream_group_id
 from .step_09_reading_order import assign_reading_order
 from .step_10_cell_builder import build_cells
 from .step_11_page_label_detector import detect_pdf_page_labels
+from .step_12_cell_grouper import group_multiline_cells
 from .step_13_line_builder import build_lines
 from .step_14_table_builder import build_tables
 
@@ -56,6 +57,7 @@ from ._utils.coordinates import convert_to_global_y_coordinates
 
 # Global Utils
 from .._utils.layout.shape_processor import process_shapes
+from .._utils.layout.layouts import assign_layouts
 from .._utils.layout.reading_order import assign_reading_order as assign_reading_order_fallback
 from .._utils.layout.line_number_detector import detect_line_numbers
 from .._utils.io.yaml_loader import load_yamls
@@ -217,7 +219,7 @@ def run_pipeline(
                 # Step 08(a) - Stream Group Assignment
                 df_words = assign_reading_order(df_words)
 
-        # ── Stage: Cell & Line Construction ─────────────────────────────────
+        # ── Stage: Cell / Line / Layout Construction ─────────────────────────────────
         if on_stage:
             on_stage("layout")
 
@@ -232,14 +234,31 @@ def run_pipeline(
         # NOTE Next steps
         ###############################
 
+        if not discovered_metadata.get("has_ocr"):
 
-        #if not discovered_metadata.get("has_ocr"):
-            # TODO: Group rows (multirow cells) and reindex line_id
-            # TODO: Add layout_id
+            # Step 12 - Group Multiline Cells
+            df_cells, df_words = group_multiline_cells(df_cells, df_words)
 
-        # TODO: Table vs text per layout_id
+        # Step 13 - Line Builder
+        df_lines = build_lines(df_cells)
 
+        # Step 14 - Layout Assignment (layout_id, layout_type - table vs text, layout_score)
+        df_lines = assign_layouts(df_lines)
 
+        # Merge layout_id onto df_cells
+        line_layout = df_lines.set_index("line_id")[
+            ["layout_id", "layout_type", "layout_score"]
+        ]
+        df_cells["layout_id"]    = df_cells["line_id"].map(line_layout["layout_id"])
+        df_cells["layout_type"]  = df_cells["line_id"].map(line_layout["layout_type"])
+        df_cells["layout_score"] = df_cells["line_id"].map(line_layout["layout_score"])
+
+        # ── Stage: Table Construction ─────────────────────────────────
+        if on_stage:
+            on_stage("table")
+
+        # Step 10 - Table Builder
+        df_cells, df_table_cells = build_tables(df_cells, df_grid_cells)
 
 
         ###############################
@@ -248,12 +267,6 @@ def run_pipeline(
 
         # Step 08 - Convert Y coordinates from page-relative to global
         #df_cells = convert_to_global_y_coordinates(df_cells)
-
-        # Step 09 - Line Builder
-        #df_lines, df_cells = build_lines(df_cells)
-
-        # Step 10 - Table Builder
-        #df_lines, df_cells, df_table_cells = build_tables(df_lines, df_cells, df_shapes)
 
         # ── Document Information ─────────────────────────────────────────────
         try:
