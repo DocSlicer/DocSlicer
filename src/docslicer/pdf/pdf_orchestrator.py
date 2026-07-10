@@ -41,7 +41,7 @@ from .step_03_shape_extractor import extract_shapes
 from .step_04_link_extractor import extract_links
 from .step_05_struct_group import assign_struct_group_id
 from .step_06_style_prefiller import prefill_styles
-from .step_07_word_relationships import add_link_relationships
+from .step_07_word_relationships import add_word_relationships
 from .step_08_stream_group import assign_stream_group_id
 from .step_09_reading_order import assign_reading_order
 from .step_10_cell_builder import build_cells
@@ -196,8 +196,6 @@ def run_pipeline(
                     logger.debug("Dropping %d line-number word(s) from df_words", n_removed)
                 df_words = df_words[~df_words["line_number_flag"]].copy()
 
-            # Cleanup 3 - Merge links onto words
-            df_words = add_link_relationships(df_words, df_links)
 
             # ── Stage: Reading Order ────────────────────────────────────────────────
             if on_stage:
@@ -219,6 +217,17 @@ def run_pipeline(
                 df_words = assign_stream_group_id(df_words)
                 # Step 08(a) - Stream Group Assignment
                 df_words = assign_reading_order(df_words)
+
+
+        # ── Stage: DF Enrichment (word level) ────────────────────────────────────────────────
+            if on_stage:
+                on_stage("df enrichment")
+
+        # Step 07 - - Word relationships: links, background rects, grid-cell
+        # containment, underline/strikethrough and table rules. Also enriches
+        # df_shapes with the hl_ KPI/classification columns.
+        df_words, df_shapes = add_word_relationships(
+            df_words, df_links, df_shapes, df_grid_cells)
 
         # ── Stage: Cell / Line / Layout Construction ─────────────────────────────────
         if on_stage:

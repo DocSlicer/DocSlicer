@@ -1,5 +1,6 @@
 from __future__ import annotations
 import re
+import numpy as np
 import pandas as pd
 
 
@@ -385,37 +386,50 @@ def add_calculated_text_features(df: pd.DataFrame) -> pd.DataFrame:
             out["italic_ratio"] = font_name.map(_im)
 
     # ---- Text features ----
+    # Same dedup trick as fonts: word text repeats heavily ("the", digits,
+    # boilerplate), so compute each feature once per unique string and
+    # broadcast back through the factorize codes.
     if "text" in out.columns:
         text = out["text"].fillna("").astype(str)
+        codes, uniques = pd.factorize(text)
+        utext = pd.Series(uniques)
+
+        def _bcast(values: pd.Series) -> np.ndarray:
+            return values.to_numpy()[codes]
+
         if "char_count" not in out.columns:
-            out["char_count"] = text.str.len()
+            out["char_count"] = _bcast(utext.str.len())
         if "alpha_count" not in out.columns:
-            out["alpha_count"] = text.str.count(r'[^\W\d_]')
+            out["alpha_count"] = _bcast(utext.str.count(r'[^\W\d_]'))
         if "digit_count" not in out.columns:
-            out["digit_count"] = text.str.count(r'\d')
+            out["digit_count"] = _bcast(utext.str.count(r'\d'))
         if "uppercase_count" not in out.columns:
-            out["uppercase_count"] = text.str.count(r'[A-Z]')
+            out["uppercase_count"] = _bcast(utext.str.count(r'[A-Z]'))
         if "word_count" not in out.columns:
-            out["word_count"] = text.str.split().str.len().fillna(0).astype(int)
+            out["word_count"] = _bcast(utext.str.count(r'\S+'))
+        # These two stay as Python lambdas: str.isalpha/isupper are
+        # Unicode-aware, unlike the RE2 engine behind arrow-backed
+        # str.count. Running them on uniques keeps them cheap.
         if "alpha_word_count" not in out.columns:
-            out["alpha_word_count"] = text.apply(
+            out["alpha_word_count"] = _bcast(utext.apply(
                 lambda s: sum(1 for w in s.split() if any(map(str.isalpha, w)))
-            )
+            ))
         if "capitalized_word_count" not in out.columns:
-            out["capitalized_word_count"] = text.apply(
+            out["capitalized_word_count"] = _bcast(utext.apply(
                 lambda s: sum(1 for w in s.split() if w and w[0].isupper())
-            )
+            ))
 
     # ---- Link features ----
     if "link_url" in out.columns:
-        link_url = out["link_url"].fillna("").astype(str)
+        stripped = out["link_url"].fillna("").astype(str).str.strip()
+        nonempty = stripped.ne("")
         if "has_link" not in out.columns:
-            out["has_link"] = link_url.apply(lambda url: bool(url and url.strip()))
+            out["has_link"] = nonempty
         if "link_type" not in out.columns:
-            def _link_type(url: str) -> str | None:
-                if not url or not url.strip():
-                    return None
-                return "internal" if url.strip().startswith("#") else "external"
-            out["link_type"] = link_url.apply(_link_type)
+            out["link_type"] = np.where(
+                nonempty,
+                np.where(stripped.str.startswith("#"), "internal", "external"),
+                None,
+            )
 
     return out

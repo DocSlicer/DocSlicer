@@ -1,8 +1,8 @@
 """
-step_5_word_relationships.py
+step_07_word_relationships.py
 
-Word-to-shape relationship detection: links, background rects, vertical grid
-lines, and horizontal grid lines / underlines.
+Word-to-shape relationship detection: hyperlinks, background rects, table
+grid-cell containment, underlines / strikethroughs, and nearest table rules.
 """
 
 from __future__ import annotations
@@ -12,15 +12,33 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
+from ._utils.line_classification import classify_line, line_gap_stats
+
+__all__ = [
+    "add_word_relationships",
+    "add_link_relationships",
+    "add_rect_relationships",
+    "add_grid_cell_relationships",
+    "add_horizontal_line_relationships",
+    "add_table_rule_relationships",
+    "score_horizontal_lines",
+    "classify_horizontal_lines",
+    "LineKpiConfig",
+    "LINE_KPI_CONFIG",
+    "LineClassConfig",
+    "LINE_CLASS_CONFIG",
+    "SCORE_CLASSES",
+]
+
 # ================================================================================
 # Public API
 # ================================================================================
 
 def add_word_relationships(
     df_words: pd.DataFrame,
-    df_links: pd.DataFrame = None,
-    df_shapes: pd.DataFrame = None,
-    df_grid_cells: pd.DataFrame = None,
+    df_links: pd.DataFrame | None = None,
+    df_shapes: pd.DataFrame | None = None,
+    df_grid_cells: pd.DataFrame | None = None,
     min_link_overlap_ratio: float = 0.5,
     min_rect_overlap_ratio: float = 0.5,
     grid_contain_tol: float = 1.0,
@@ -57,23 +75,29 @@ def add_word_relationships(
 # SHARED HELPERS
 # ================================================================================
 
-def _bbox_overlap_ratio(
-    x_left_a: np.ndarray, x_right_a: np.ndarray,
-    y_top_a:  np.ndarray, y_bottom_a: np.ndarray,
-    x_left_b: float, x_right_b: float,
-    y_top_b:  float, y_bottom_b: float,
-) -> np.ndarray:
-    """Overlap of each box-A with a single box-B, as a fraction of box-A area."""
-    xi_l = np.maximum(x_left_a,  x_left_b)
-    xi_r = np.minimum(x_right_a, x_right_b)
-    yi_t = np.maximum(y_top_a,   y_top_b)
-    yi_b = np.minimum(y_bottom_a, y_bottom_b)
+def _best_overlap_per_word(
+    w_xl: np.ndarray, w_xr: np.ndarray,
+    w_yt: np.ndarray, w_yb: np.ndarray,
+    b_xl: np.ndarray, b_xr: np.ndarray,
+    b_yt: np.ndarray, b_yb: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Best-overlapping box-B for each box-A (overlap as a fraction of box-A area),
+    computed over the full A x B grid in one broadcast. Returns
+    ``(best_ratio, best_b_pos)``; an A with no positive overlap anywhere gets
+    ratio 0.0 (its best_b_pos is then meaningless — gate on the ratio).
+    """
+    inter_w = (np.minimum(w_xr[:, None], b_xr[None, :])
+               - np.maximum(w_xl[:, None], b_xl[None, :]))
+    inter_h = (np.minimum(w_yb[:, None], b_yb[None, :])
+               - np.maximum(w_yt[:, None], b_yt[None, :]))
+    inter_area = np.clip(inter_w, 0.0, None) * np.clip(inter_h, 0.0, None)
+    area_a = np.maximum((w_xr - w_xl) * (w_yb - w_yt), 1e-12)
 
-    has_overlap = (xi_l < xi_r) & (yi_t < yi_b)
-    inter_area  = np.where(has_overlap, (xi_r - xi_l) * (yi_b - yi_t), 0.0)
-    area_a      = (x_right_a - x_left_a) * (y_bottom_a - y_top_a)
-
-    return np.where(area_a > 0, inter_area / area_a, 0.0)
+    ratios = inter_area / area_a[:, None]
+    best_pos = np.argmax(ratios, axis=1)
+    best = np.take_along_axis(ratios, best_pos[:, None], axis=1)[:, 0]
+    return best, best_pos
 
 
 # ================================================================================
@@ -82,7 +106,7 @@ def _bbox_overlap_ratio(
 
 def add_link_relationships(
     df_words: pd.DataFrame,
-    df_links: pd.DataFrame,
+    df_links: pd.DataFrame | None,
     min_overlap_ratio: float = 0.5,
 ) -> pd.DataFrame:
     """Attach the best-overlapping hyperlink to each word."""
@@ -95,42 +119,44 @@ def add_link_relationships(
     if df_words.empty or df_links is None or df_links.empty:
         return df_words
 
-    for page_num in df_words["page_number"].unique():
-        page_links = df_links[df_links["page_number"] == page_num]
-        if page_links.empty:
+    idx_arr = df_words.index.to_numpy()
+    w_xl = df_words["x_left"].to_numpy(float)
+    w_xr = df_words["x_right"].to_numpy(float)
+    w_yt = df_words["y_top"].to_numpy(float)
+    w_yb = df_words["y_bottom"].to_numpy(float)
+    word_pages = df_words.groupby("page_number", sort=False).indices
+    link_pages = df_links.groupby("page_number", sort=False).indices
+
+    l_xl = df_links["x_left"].to_numpy(float)
+    l_xr = df_links["x_right"].to_numpy(float)
+    l_yt = df_links["y_top"].to_numpy(float)
+    l_yb = df_links["y_bottom"].to_numpy(float)
+    l_type = df_links["link_type"].to_numpy()
+    l_url  = df_links["link_url"].to_numpy() if "link_url" in df_links.columns else None
+    l_dest = df_links["link_dest"].to_numpy() if "link_dest" in df_links.columns else None
+
+    for page_num, wpos in word_pages.items():
+        lpos = link_pages.get(page_num)
+        if lpos is None:
             continue
 
-        word_idxs = df_words.index[df_words["page_number"] == page_num].to_numpy()
-        x_left    = df_words.loc[word_idxs, "x_left"].to_numpy()
-        x_right   = df_words.loc[word_idxs, "x_right"].to_numpy()
-        y_top     = df_words.loc[word_idxs, "y_top"].to_numpy()
-        y_bottom  = df_words.loc[word_idxs, "y_bottom"].to_numpy()
-
-        best_ratios   = np.zeros(len(word_idxs))
-        best_link_pos = np.full(len(word_idxs), -1, dtype=np.int64)
-
-        for pos, (_, link) in enumerate(page_links.iterrows()):
-            ratios = _bbox_overlap_ratio(
-                x_left, x_right, y_top, y_bottom,
-                link["x_left"], link["x_right"], link["y_top"], link["y_bottom"],
-            )
-            better = ratios > best_ratios
-            best_ratios   = np.where(better, ratios, best_ratios)
-            best_link_pos = np.where(better, pos,    best_link_pos)
-
-        matched = (best_ratios >= min_overlap_ratio) & (best_link_pos >= 0)
+        best_ratios, best_link_pos = _best_overlap_per_word(
+            w_xl[wpos], w_xr[wpos], w_yt[wpos], w_yb[wpos],
+            l_xl[lpos], l_xr[lpos], l_yt[lpos], l_yb[lpos],
+        )
+        matched = (best_ratios >= min_overlap_ratio) & (best_ratios > 0)
         if not matched.any():
             continue
 
-        target_word_idxs = word_idxs[matched]
-        source_link_rows = page_links.iloc[best_link_pos[matched]]
+        target_word_idxs = idx_arr[wpos[matched]]
+        source_link_pos  = lpos[best_link_pos[matched]]
 
         df_words.loc[target_word_idxs, "has_link"]  = True
-        df_words.loc[target_word_idxs, "link_type"] = source_link_rows["link_type"].values
-        if "link_url" in df_links.columns:
-            df_words.loc[target_word_idxs, "link_url"]  = source_link_rows["link_url"].values
-        if "link_dest" in df_links.columns:
-            df_words.loc[target_word_idxs, "link_dest"] = source_link_rows["link_dest"].values
+        df_words.loc[target_word_idxs, "link_type"] = l_type[source_link_pos]
+        if l_url is not None:
+            df_words.loc[target_word_idxs, "link_url"]  = l_url[source_link_pos]
+        if l_dest is not None:
+            df_words.loc[target_word_idxs, "link_dest"] = l_dest[source_link_pos]
 
     return df_words
 
@@ -144,7 +170,7 @@ _RECT_ROLE_EXCLUDE = {"page_background", "background_band"}
 
 def add_rect_relationships(
     df_words: pd.DataFrame,
-    df_shapes: pd.DataFrame,
+    df_shapes: pd.DataFrame | None,
     min_overlap_ratio: float = 0.80,
 ) -> pd.DataFrame:
     """Attach the best-overlapping background rect to each word."""
@@ -163,43 +189,47 @@ def add_rect_relationships(
     if rects.empty:
         return df_words
 
-    for page_num in df_words["page_number"].unique():
-        page_rects = rects[rects["page_number"] == page_num]
-        if page_rects.empty:
+    idx_arr = df_words.index.to_numpy()
+    w_xl = df_words["x_left"].to_numpy(float)
+    w_xr = df_words["x_right"].to_numpy(float)
+    w_yt = df_words["y_top"].to_numpy(float)
+    w_yb = df_words["y_bottom"].to_numpy(float)
+    word_pages = df_words.groupby("page_number", sort=False).indices
+    rect_pages = rects.groupby("page_number", sort=False).indices
+
+    r_xl = rects["x_left"].to_numpy(float)
+    r_xr = rects["x_right"].to_numpy(float)
+    r_yt = rects["y_top"].to_numpy(float)
+    r_yb = rects["y_bottom"].to_numpy(float)
+    r_ns  = (rects["non_stroking_color"].to_numpy()
+             if "non_stroking_color" in rects.columns else None)
+    r_st  = (rects["stroking_color"].to_numpy()
+             if "stroking_color" in rects.columns else None)
+    r_sid = rects["shape_id"].to_numpy() if "shape_id" in rects.columns else None
+
+    for page_num, wpos in word_pages.items():
+        rpos = rect_pages.get(page_num)
+        if rpos is None:
             continue
 
-        word_idxs = df_words.index[df_words["page_number"] == page_num].to_numpy()
-        x_left    = df_words.loc[word_idxs, "x_left"].to_numpy()
-        x_right   = df_words.loc[word_idxs, "x_right"].to_numpy()
-        y_top     = df_words.loc[word_idxs, "y_top"].to_numpy()
-        y_bottom  = df_words.loc[word_idxs, "y_bottom"].to_numpy()
-
-        best_ratios  = np.zeros(len(word_idxs))
-        best_rect_pos = np.full(len(word_idxs), -1, dtype=np.int64)
-
-        for pos, (_, rect) in enumerate(page_rects.iterrows()):
-            ratios = _bbox_overlap_ratio(
-                x_left, x_right, y_top, y_bottom,
-                rect["x_left"], rect["x_right"], rect["y_top"], rect["y_bottom"],
-            )
-            better = ratios > best_ratios
-            best_ratios   = np.where(better, ratios, best_ratios)
-            best_rect_pos = np.where(better, pos,    best_rect_pos)
-
-        matched = (best_ratios >= min_overlap_ratio) & (best_rect_pos >= 0)
+        best_ratios, best_rect_pos = _best_overlap_per_word(
+            w_xl[wpos], w_xr[wpos], w_yt[wpos], w_yb[wpos],
+            r_xl[rpos], r_xr[rpos], r_yt[rpos], r_yb[rpos],
+        )
+        matched = (best_ratios >= min_overlap_ratio) & (best_ratios > 0)
         if not matched.any():
             continue
 
-        target_word_idxs = word_idxs[matched]
-        matched_rects     = page_rects.iloc[best_rect_pos[matched]]
+        target_word_idxs = idx_arr[wpos[matched]]
+        matched_rect_pos = rpos[best_rect_pos[matched]]
 
         df_words.loc[target_word_idxs, "inside_rect_shape"] = True
-        if "non_stroking_color" in page_rects.columns:
-            df_words.loc[target_word_idxs, "background_non_stroking_color"] = matched_rects["non_stroking_color"].values
-        if "stroking_color" in page_rects.columns:
-            df_words.loc[target_word_idxs, "background_stroking_color"] = matched_rects["stroking_color"].values
-        if "shape_id" in page_rects.columns:
-            df_words.loc[target_word_idxs, "shape_id_container"] = matched_rects["shape_id"].values
+        if r_ns is not None:
+            df_words.loc[target_word_idxs, "background_non_stroking_color"] = r_ns[matched_rect_pos]
+        if r_st is not None:
+            df_words.loc[target_word_idxs, "background_stroking_color"] = r_st[matched_rect_pos]
+        if r_sid is not None:
+            df_words.loc[target_word_idxs, "shape_id_container"] = r_sid[matched_rect_pos]
 
     return df_words
 
@@ -210,7 +240,7 @@ def add_rect_relationships(
 
 def add_grid_cell_relationships(
     df_words: pd.DataFrame,
-    df_grid_cells: pd.DataFrame,
+    df_grid_cells: pd.DataFrame | None,
     contain_tol: float = 1.0,
 ) -> pd.DataFrame:
     """
@@ -276,7 +306,7 @@ def add_grid_cell_relationships(
 
 def add_horizontal_line_relationships(
     df_words: pd.DataFrame,
-    df_shapes: pd.DataFrame,
+    df_shapes: pd.DataFrame | None,
 ) -> pd.DataFrame:
     """
     Fold classified horizontal-line insights back onto the words each line touches.
@@ -311,16 +341,27 @@ def add_horizontal_line_relationships(
         if ids_col not in df_shapes.columns:
             return
         lines = df_shapes[df_shapes["shape_role"] == role]
-        for _, line in lines.iterrows():
-            ids = line[ids_col]
+        if lines.empty:
+            return
+        # Fold every line's word ids into one word_id -> shape_id map first (a
+        # later line overwrites an earlier one, preserving the documented
+        # last-wins-on-overlap), then write each column once.
+        shape_ids = (lines["shape_id"] if has_shape_id
+                     else pd.Series(None, index=lines.index, dtype=object))
+        assign: dict = {}
+        for ids, sid in zip(lines[ids_col], shape_ids):
             if not isinstance(ids, (list, tuple, np.ndarray)) or len(ids) == 0:
                 continue
-            target = df_words.index.intersection(pd.Index(ids))
-            if target.empty:
-                continue
-            df_words.loc[target, flag_col] = True
-            if has_shape_id:
-                df_words.loc[target, id_col] = line["shape_id"]
+            for wid in ids:
+                assign[wid] = sid
+        if not assign:
+            return
+        target = df_words.index.intersection(pd.Index(list(assign)))
+        if target.empty:
+            return
+        df_words.loc[target, flag_col] = True
+        if has_shape_id:
+            df_words.loc[target, id_col] = [assign[w] for w in target]
 
     _apply("underline", "hl_run_word_ids", "is_underlined", "shape_id_underline")
     _apply("strikethrough", "hl_strike_word_ids", "is_strikethrough",
@@ -337,7 +378,7 @@ _TR_WALL_ROLES = ("separator", "other")
 
 def add_table_rule_relationships(
     df_words: pd.DataFrame,
-    df_shapes: pd.DataFrame,
+    df_shapes: pd.DataFrame | None,
     min_x_overlap_ratio: float = 0.75,
 ) -> pd.DataFrame:
     """
@@ -378,38 +419,58 @@ def add_table_rule_relationships(
     has_shape_id = "shape_id" in rules.columns
     walls = df_shapes[df_shapes["shape_role"].isin(_TR_WALL_ROLES)]
 
-    for page_num in df_words["page_number"].unique():
-        page_rules = rules[rules["page_number"] == page_num]
-        if page_rules.empty:
+    idx_arr = df_words.index.to_numpy()
+    a_xl = df_words["x_left"].to_numpy(float)
+    a_xr = df_words["x_right"].to_numpy(float)
+    a_yt = df_words["y_top"].to_numpy(float)
+    a_yb = df_words["y_bottom"].to_numpy(float)
+    word_pages = df_words.groupby("page_number", sort=False).indices
+    rule_pages = rules.groupby("page_number", sort=False).indices
+    wall_pages = (walls.groupby("page_number", sort=False).indices
+                  if not walls.empty else {})
+
+    r_xl_all = rules["x_left"].to_numpy(float)
+    r_xr_all = rules["x_right"].to_numpy(float)
+    r_yc_all = 0.5 * (rules["y_top"].to_numpy(float)
+                      + rules["y_bottom"].to_numpy(float))
+    r_ids_all = (rules["shape_id"].to_numpy() if has_shape_id
+                 else rules.index.to_numpy())
+
+    if not walls.empty:
+        s_xl_all = walls["x_left"].to_numpy(float)
+        s_xr_all = walls["x_right"].to_numpy(float)
+        s_yc_all = 0.5 * (walls["y_top"].to_numpy(float)
+                          + walls["y_bottom"].to_numpy(float))
+
+    for page_num, wpos in word_pages.items():
+        rpos = rule_pages.get(page_num)
+        if rpos is None:
             continue
 
-        word_idxs = df_words.index[df_words["page_number"] == page_num].to_numpy()
-        w_xl = df_words.loc[word_idxs, "x_left"].to_numpy(float)
-        w_xr = df_words.loc[word_idxs, "x_right"].to_numpy(float)
-        w_yt = df_words.loc[word_idxs, "y_top"].to_numpy(float)
-        w_yb = df_words.loc[word_idxs, "y_bottom"].to_numpy(float)
+        word_idxs = idx_arr[wpos]
+        w_xl = a_xl[wpos]
+        w_xr = a_xr[wpos]
+        w_yt = a_yt[wpos]
+        w_yb = a_yb[wpos]
         w_width  = np.maximum(w_xr - w_xl, 1e-6)
         w_center = 0.5 * (w_yt + w_yb)
         w_cx     = 0.5 * (w_xl + w_xr)
 
-        r_xl = page_rules["x_left"].to_numpy(float)
-        r_xr = page_rules["x_right"].to_numpy(float)
-        r_yc = 0.5 * (page_rules["y_top"].to_numpy(float)
-                      + page_rules["y_bottom"].to_numpy(float))
-        r_ids = (page_rules["shape_id"].to_numpy() if has_shape_id
-                 else page_rules.index.to_numpy())
+        r_xl = r_xl_all[rpos]
+        r_xr = r_xr_all[rpos]
+        r_yc = r_yc_all[rpos]
+        r_ids = r_ids_all[rpos]
 
         # Barrier walls: the nearest wall line (separator / undetermined "other")
         # that spans over the word's x-center caps how far the rule search may reach
         # on each side. No wall on a side => an open wall (+/-inf).
         wall_above = np.full(len(word_idxs), -np.inf)
         wall_below = np.full(len(word_idxs), np.inf)
-        page_walls = walls[walls["page_number"] == page_num]
-        if not page_walls.empty:
-            s_xl = page_walls["x_left"].to_numpy(float)
-            s_xr = page_walls["x_right"].to_numpy(float)
-            s_yc = 0.5 * (page_walls["y_top"].to_numpy(float)
-                          + page_walls["y_bottom"].to_numpy(float))
+        spos = wall_pages.get(page_num)
+        if spos is not None:
+            s_xl = s_xl_all[spos]
+            s_xr = s_xr_all[spos]
+            s_yc = s_yc_all[spos]
             spans = (s_xl[None, :] <= w_cx[:, None]) & (s_xr[None, :] >= w_cx[:, None])
             sep_above = spans & (s_yc[None, :] <= w_yt[:, None])
             sep_below = spans & (s_yc[None, :] >= w_yb[:, None])
@@ -450,9 +511,9 @@ def add_table_rule_relationships(
 # Diagnostic pass over df_shapes. For every *candidate* horizontal line (shape_type
 # == "line", horizontal, not already shape_role == "table_grid" or "box") it computes a set
 # of KPI columns — shape-only and word-relative — WITHOUT deciding anything. The
-# score / classification is stage 2 and is intentionally NOT done here: we want to
-# eyeball these columns on real docs first, then fit thresholds (like the gutter
-# scorer). Non-candidate rows get NA/0 so the columns are safe to carry on df_shapes.
+# score / classification is stage 2 (classify_horizontal_lines), kept separate so
+# the KPI columns stay inspectable on their own when tuning against a new corpus.
+# Non-candidate rows get NA/0 so the columns are safe to carry on df_shapes.
 #
 # Columns added (all prefixed hl_):
 #   shape-only
@@ -461,6 +522,8 @@ def add_table_rule_relationships(
 #     hl_n_segments      Int64  — len(raw_shape_ids): raw strokes merged into it
 #     hl_rect_relation   str    — "none" | "inside" (fully in a rect) | "crosses"
 #     hl_repeat_count    Int64  — identical lines (same x_left/x_right) on the page
+#     hl_y_aligned_count Int64  — candidate lines sharing this line's y (same row rule
+#                                 across columns); counts self, so 1 == none aligned
 #   word-relative (from the "top set": aligned words hugging the line from above)
 #     hl_top_n_words     Int64  — words in the top set
 #     hl_run_x_left      float  — left edge of the underlined text run
@@ -483,7 +546,7 @@ def add_table_rule_relationships(
 class LineKpiConfig:
     # A word belongs to a line's "top set" if its y_bottom sits within this many pt
     # of the nearest-above word's y_bottom (absorbs OCR baseline jitter / aligned
-    # words that are a hair off). May be too wide — this is the knob to tune.
+    # words that are a hair off).
     top_set_jitter: float = 5.0
     # A word may dip this far below the line's top edge and still count as "above"
     # (glyph descenders / the rule drawn a hair into the text box).
@@ -500,6 +563,10 @@ class LineKpiConfig:
     # Two candidate lines are "the same line repeated" when both their x_left and
     # x_right agree within this many pt.
     repeat_tol: float = 1.0
+    # Two candidate lines are "on the same row rule" (y-aligned) when their
+    # y_centers agree within this many pt. Feeds hl_y_aligned_count — a small tol
+    # keeps only lines that are visually flush (table row separators, header rules).
+    y_align_tol: float = 2.0
     # Slack when testing "line fully inside a rect".
     rect_contain_tol: float = 1.0
 
@@ -515,8 +582,8 @@ _HL_FLOAT_COLS = (
     "hl_gap_above", "hl_gap_below",
     "hl_strike_coverage", "hl_strike_center_dev",
 )
-_HL_INT_COLS = ("hl_n_segments", "hl_repeat_count", "hl_top_n_words",
-                "hl_strike_n_words")
+_HL_INT_COLS = ("hl_n_segments", "hl_repeat_count", "hl_y_aligned_count",
+                "hl_top_n_words", "hl_strike_n_words")
 
 
 def _init_hl_columns(df: pd.DataFrame) -> None:
@@ -609,6 +676,25 @@ def score_horizontal_lines(
     repeat = key.groupby(["p", "l", "r"])["p"].transform("size").to_numpy()
     df_shapes.iloc[ci, df_shapes.columns.get_loc("hl_repeat_count")] = repeat
 
+    # Y-aligned count: candidate lines on the page flush at the same y (a row rule
+    # split across columns, like the 4 short lines above a table header). Single-
+    # linkage cluster on y_center within each page — sort, then start a new group
+    # whenever the gap to the previous line exceeds y_align_tol, so there are no
+    # arbitrary bin edges. Count includes self, so 1 means no other line is aligned.
+    ytol = max(config.y_align_tol, 1e-6)
+    y_center = 0.5 * (y_top + y_bottom)
+    order = np.lexsort((y_center, page))            # by page, then y_center
+    p_sorted = page[order]
+    y_sorted = y_center[order]
+    new_group = np.empty(len(order), dtype=bool)
+    new_group[0] = True
+    new_group[1:] = (p_sorted[1:] != p_sorted[:-1]) | (np.diff(y_sorted) > ytol)
+    group_id = np.cumsum(new_group) - 1
+    counts = np.bincount(group_id)
+    y_aligned = np.empty(len(order), dtype=np.int64)
+    y_aligned[order] = counts[group_id]             # scatter back to input order
+    df_shapes.iloc[ci, df_shapes.columns.get_loc("hl_y_aligned_count")] = y_aligned
+
     # Rect relation: fully-inside a background rect (0) vs. crossing its edge (+2).
     rel = _line_rect_relation(df_shapes, ci, x_left, x_right, y_top, y_bottom, page,
                               config)
@@ -620,8 +706,6 @@ def score_horizontal_lines(
                 .issubset(df_words.columns))
     if not words_ok:
         return df_shapes
-
-    from docslicer.pdf.step_10_cell_builder import _line_gap_stats, classify_line
 
     has_fs = "font_size" in df_words.columns
     has_text = "text" in df_words.columns
@@ -639,13 +723,32 @@ def score_horizontal_lines(
             "txt": grp["text"].astype(str).to_numpy() if has_text else None,
         }
 
-    col = df_shapes.columns.get_loc
+    # Per-line results accumulate in plain arrays and are folded onto df_shapes
+    # in one pass after the loop — a per-cell .iat write on this wide frame goes
+    # through the block manager every time and dominates the runtime otherwise.
+    n_cand = len(ci)
+    o_strike_n   = np.full(n_cand, np.nan)
+    o_strike_ids = np.full(n_cand, None, dtype=object)
+    o_strike_cov = np.full(n_cand, np.nan)
+    o_strike_dev = np.full(n_cand, np.nan)
+    o_gap_below  = np.full(n_cand, np.nan)
+    o_gap_above  = np.full(n_cand, np.nan)
+    o_top_n      = np.full(n_cand, np.nan)
+    o_run_ids    = np.full(n_cand, None, dtype=object)
+    o_run_xl     = np.full(n_cand, np.nan)
+    o_run_xr     = np.full(n_cand, np.nan)
+    o_run_w      = np.full(n_cand, np.nan)
+    o_width_cov  = np.full(n_cand, np.nan)
+    o_over_run   = np.full(n_cand, np.nan)
+    o_jump       = np.full(n_cand, np.nan)
+    o_bimodal    = np.full(n_cand, None, dtype=object)
+    o_content    = np.full(n_cand, None, dtype=object)
+
     for k in range(len(ci)):
         pg = page[k]
         wp = by_page.get(pg)
         if wp is None:
             continue
-        row = ci[k]
         lyt, lyb = y_top[k], y_bottom[k]
         lxl, lxr, llen = x_left[k], x_right[k], line_len[k]
 
@@ -661,21 +764,19 @@ def score_horizontal_lines(
         struck = (in_band & (wp["yt"] < lyt) & (wp["yb"] > lyb)
                   & (np.abs(w_yc - lyc) <= config.strike_center_tol))
         n_struck = int(struck.sum())
-        df_shapes.iat[row, col("hl_strike_n_words")] = n_struck
+        o_strike_n[k] = n_struck
         if n_struck:
-            df_shapes.iat[row, col("hl_strike_word_ids")] = wp["idx"][struck].tolist()
+            o_strike_ids[k] = wp["idx"][struck].tolist()
             s_l = float(wp["xl"][struck].min())
             s_r = float(wp["xr"][struck].max())
             s_overlap = max(0.0, min(lxr, s_r) - max(lxl, s_l))
-            df_shapes.iat[row, col("hl_strike_coverage")] = s_overlap / llen
-            df_shapes.iat[row, col("hl_strike_center_dev")] = float(
-                np.abs(w_yc[struck] - lyc).mean())
+            o_strike_cov[k] = s_overlap / llen
+            o_strike_dev[k] = float(np.abs(w_yc[struck] - lyc).mean())
 
         # Nearest word BELOW the line (single word; no set needed).
         below = in_band & (wp["yt"] >= lyb - config.above_overlap_tol)
         if below.any():
-            df_shapes.iat[row, col("hl_gap_below")] = float(
-                wp["yt"][below].min() - lyb)
+            o_gap_below[k] = float(wp["yt"][below].min() - lyb)
 
         # Top set: words whose y_bottom hugs the line from above. Anchor on the
         # nearest-above word's y_bottom, then widen by the jitter tolerance.
@@ -683,39 +784,79 @@ def score_horizontal_lines(
         if not above.any():
             continue
         yb_star = wp["yb"][above].max()
-        df_shapes.iat[row, col("hl_gap_above")] = float(lyt - yb_star)
+        o_gap_above[k] = float(lyt - yb_star)
 
         top = above & (wp["yb"] >= yb_star - config.top_set_jitter)
         n_top = int(top.sum())
-        df_shapes.iat[row, col("hl_top_n_words")] = n_top
+        o_top_n[k] = n_top
         if n_top == 0:
             continue
 
-        df_shapes.iat[row, col("hl_run_word_ids")] = wp["idx"][top].tolist()
+        o_run_ids[k] = wp["idx"][top].tolist()
         run_l = float(wp["xl"][top].min())
         run_r = float(wp["xr"][top].max())
         run_w = max(run_r - run_l, 1e-6)
         overlap = max(0.0, min(lxr, run_r) - max(lxl, run_l))
-        df_shapes.iat[row, col("hl_run_x_left")] = run_l
-        df_shapes.iat[row, col("hl_run_x_right")] = run_r
-        df_shapes.iat[row, col("hl_run_width")] = run_r - run_l
-        df_shapes.iat[row, col("hl_width_coverage")] = overlap / llen
-        df_shapes.iat[row, col("hl_line_over_run")] = llen / run_w
+        o_run_xl[k] = run_l
+        o_run_xr[k] = run_r
+        o_run_w[k] = run_r - run_l
+        o_width_cov[k] = overlap / llen
+        o_over_run[k] = llen / run_w
 
-        # Text-vs-table prior on the top set (borrowed, kept cheap). Needs
-        # font_size for gap stats and text for the content classifier.
+        # Text-vs-table prior on the top set: the same full gap-stats +
+        # classification pass the cell builder runs per line, applied here to
+        # the words above this rule. Needs font_size for gap stats and text
+        # for the content classifier.
         if has_fs and n_top >= 2:
             order = np.argsort(wp["xl"][top], kind="stable")
             gxl = wp["xl"][top][order]
             gxr = wp["xr"][top][order]
             gfs = wp["fs"][top][order]
-            gs = _line_gap_stats(gxl, gxr, gfs)
-            df_shapes.iat[row, col("hl_top_jump_ratio")] = float(gs["jump_ratio"])
-            df_shapes.iat[row, col("hl_top_is_bimodal")] = bool(gs["is_bimodal"])
+            gs = line_gap_stats(gxl, gxr, gfs)
+            o_jump[k] = float(gs["jump_ratio"])
+            o_bimodal[k] = bool(gs["is_bimodal"])
             if has_text:
                 texts = list(wp["txt"][top][order])
                 label, _ = classify_line(texts, gs)
-                df_shapes.iat[row, col("hl_top_content")] = label
+                o_content[k] = label
+
+    # Scatter the per-candidate arrays back onto the full-length columns.
+    n_all = len(df_shapes)
+
+    def _scatter_float(col_name: str, vals: np.ndarray) -> None:
+        full = np.full(n_all, np.nan)
+        full[ci] = vals
+        df_shapes[col_name] = full
+
+    def _scatter_obj(col_name: str, vals: np.ndarray, dtype: str | None = None) -> None:
+        full = np.full(n_all, None, dtype=object)
+        full[ci] = vals
+        if dtype is None:
+            df_shapes[col_name] = pd.Series(full, index=df_shapes.index, dtype=object)
+        else:
+            df_shapes[col_name] = pd.array(full, dtype=dtype)
+
+    def _scatter_int(col_name: str, vals: np.ndarray) -> None:
+        full = np.full(n_all, np.nan)
+        full[ci] = vals
+        df_shapes[col_name] = pd.array(full, dtype="Int64")
+
+    _scatter_int("hl_strike_n_words", o_strike_n)
+    _scatter_obj("hl_strike_word_ids", o_strike_ids)
+    _scatter_float("hl_strike_coverage", o_strike_cov)
+    _scatter_float("hl_strike_center_dev", o_strike_dev)
+    _scatter_float("hl_gap_below", o_gap_below)
+    _scatter_float("hl_gap_above", o_gap_above)
+    _scatter_int("hl_top_n_words", o_top_n)
+    _scatter_obj("hl_run_word_ids", o_run_ids)
+    _scatter_float("hl_run_x_left", o_run_xl)
+    _scatter_float("hl_run_x_right", o_run_xr)
+    _scatter_float("hl_run_width", o_run_w)
+    _scatter_float("hl_width_coverage", o_width_cov)
+    _scatter_float("hl_line_over_run", o_over_run)
+    _scatter_float("hl_top_jump_ratio", o_jump)
+    _scatter_obj("hl_top_is_bimodal", o_bimodal, dtype="boolean")
+    _scatter_obj("hl_top_content", o_content, dtype="string")
 
     return df_shapes
 
@@ -789,10 +930,9 @@ def _line_rect_relation(
 #   separator      long standalone divider between blocks (not tabular)
 #   other          none of the above won clearly
 #
-# The weights below are a STARTING POINT, meant to be edited. Only the two rules
-# you specified (hl_width_pct, hl_width_coverage) are "locked"; the rest are DRAFT
-# seeds so the pass produces a full label column to eyeball. Tune by editing the
-# numbers in _NUMERIC_RULES / _CATEGORICAL_RULES — no control-flow changes needed.
+# The weights below are heuristics tuned against real documents. To adapt them
+# to a new corpus, edit the numbers in _NUMERIC_RULES / _CATEGORICAL_RULES —
+# no control-flow changes needed.
 
 SCORE_CLASSES = ("table_rule", "underline", "strikethrough", "separator")
 
@@ -825,8 +965,10 @@ _NEG_INF, _INF = float("-inf"), float("inf")
 # while staying far below any realistic combined additive score.
 _HARD_GATE = -1e6
 
+# NOTE: bands are lo <= v < hi (lo inclusive, hi exclusive)
+
 _NUMERIC_RULES: dict[str, tuple] = {
-    # --- LOCKED: width as a fraction of page width -----------------------------
+    # --- Width as a fraction of page width -------------------------------------
     # Wide => table_rule / separator; narrow => underline / strikethrough.
     "hl_width_pct": (
         (0.70, _INF,     {"underline": -1, "table_rule": +2, "separator": +2}),
@@ -836,7 +978,7 @@ _NUMERIC_RULES: dict[str, tuple] = {
         (0.01, 0.10,     {"underline": +3, "table_rule": -5, "separator": -10}),
         (_NEG_INF, 0.01, {"underline": +5, "table_rule": -10, "separator": -20}),
     ),
-    # --- LOCKED: how much of the line is backed by the text run above ----------
+    # --- How much of the line is backed by the text run above ------------------
     # line_len / run_width: ~1 => the rule fits its text exactly (underline or a
     # tight row rule); >>1 => it overhangs into margins => separator.
     "hl_width_coverage": (
@@ -867,8 +1009,17 @@ _NUMERIC_RULES: dict[str, tuple] = {
         (0, 1.0,         {"underline": +0, "table_rule": -5, "separator": +5}),
         (3.0, 5.0,       {"underline": +0, "table_rule": +2, "separator": -1}),
         (5.0, 8.0,       {"underline": -2, "table_rule": +5, "separator": -2}),
-        (8.0, 15.0,      {"underline": -3, "table_rule": +5, "separator": -10}),
+        (8.0, 15.0,      {"underline": -3, "table_rule": +8, "separator": -10}),
         (15.0, _INF,     {"underline": -5, "table_rule": +10, "separator": -20}), # Don't go too negative for underline: large blocks of justified underlined text
+    ),
+    # Lines flush at the same y across columns (a row rule split into segments) =>
+    # table evidence only. Count includes self: 2 aligned => +1, 3 => +2, 4 => +3,
+    # 5+ holds at +4. table_rule only — never votes for/against the other classes.
+    "hl_y_aligned_count": (
+        (2.0, 3.0,       {"table_rule": +1}),
+        (3.0, 4.0,       {"table_rule": +2}),
+        (4.0, 5.0,       {"table_rule": +3}),
+        (5.0, _INF,      {"table_rule": +4}),
     ),
     # Many raw strokes (# of raw_shape_ids in the dict) merged in => grid-built rule.
     "hl_n_segments": (

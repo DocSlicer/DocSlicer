@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import numpy as np
 import pandas as pd
 
 from .line_merger import assign_line_id
@@ -112,19 +113,33 @@ def detect_line_numbers(
     out = df_words.copy()
     out["line_number_flag"] = False
 
-    for page_num, page_group in df_tmp.groupby("page_number"):
-        flagged_ids = _detect_page_line_numbers(page_group, font_size_threshold, config)
+    # Document-wide candidate selection: one groupby/filter pass instead of a
+    # full pandas pipeline per page. Only the (cheap) sequence check stays
+    # per-page.
+    candidates = _select_candidates(df_tmp, font_size_threshold, config)
+
+    # Lines per page, needed for the fraction QC below.
+    lines_per_page: pd.Series | None = None
+    if config.min_line_number_line_fraction > 0:
+        lines_per_page = df_tmp.groupby("page_number")["line_id"].nunique()
+
+    flagged_pairs: list[tuple[object, object]] = []  # (page_number, word_id)
+    for page_num, page_cand in candidates.groupby("page_number"):
+        flagged_ids = _detect_page_line_numbers(page_cand, config)
 
         # QC: enough of the page's lines must carry a number, otherwise the hit
         # is likely a numbered footnote block rather than margin line numbers.
-        if flagged_ids and config.min_line_number_line_fraction > 0:
-            total_lines = page_group["line_id"].nunique()
+        if flagged_ids and lines_per_page is not None:
+            total_lines = lines_per_page.get(page_num, 0)
             if total_lines and len(flagged_ids) / total_lines < config.min_line_number_line_fraction:
                 flagged_ids = []
 
-        if flagged_ids:
-            mask = (out["page_number"] == page_num) & (out["word_id"].isin(flagged_ids))
-            out.loc[mask, "line_number_flag"] = True
+        flagged_pairs.extend((page_num, wid) for wid in flagged_ids)
+
+    if flagged_pairs:
+        # Single write-back instead of one O(n) boolean mask per page.
+        key = pd.MultiIndex.from_arrays([out["page_number"], out["word_id"]])
+        out.loc[key.isin(flagged_pairs), "line_number_flag"] = True
 
     # QC: line numbers must be present on at least min_page_coverage of all pages.
     # Sparse hits (e.g. a few lines starting with years like 2020/2021) are rejected.
@@ -141,16 +156,18 @@ def detect_line_numbers(
 # Internal helpers
 # =============================================================================
 
-def _detect_page_line_numbers(
-    page_df: pd.DataFrame,
+def _select_candidates(
+    df_tmp: pd.DataFrame,
     font_size_threshold: float | None,
     config: LineNumberConfig,
-) -> list[int]:
-    """Return word_ids identified as line numbers on this page."""
-
-    # Per line_id: pick the leftmost word — idxmin is C-level, no apply overhead
-    idx = page_df.groupby("line_id")["x_left"].idxmin()
-    candidates = page_df.loc[idx].reset_index(drop=True)
+) -> pd.DataFrame:
+    """
+    One document-wide pass: leftmost word per (page, line), filtered down to
+    narrow positive-integer tokens. Adds an int ``_num`` column.
+    """
+    # Per (page, line): pick the leftmost word — idxmin is C-level, no apply overhead
+    idx = df_tmp.groupby(["page_number", "line_id"])["x_left"].idxmin()
+    candidates = df_tmp.loc[idx].reset_index(drop=True)
 
     if config.exclude_note_ancestors and "struct_ancestors" in candidates.columns:
         candidates = candidates[
@@ -167,32 +184,51 @@ def _detect_page_line_numbers(
         if font_size_threshold is not None and "font_size" in candidates.columns
         else True
     )
-    candidates = candidates[
+    keep = (
         is_pos_int
         & ((candidates["x_right"] - candidates["x_left"]) <= config.max_number_width)
         & size_ok
-    ].copy()
+    )
+    candidates = candidates[keep].copy()
+    candidates["_num"] = text_str[keep].astype(int)
+    return candidates
 
+
+def _detect_page_line_numbers(
+    candidates: pd.DataFrame,
+    config: LineNumberConfig,
+) -> list[int]:
+    """
+    Return word_ids identified as line numbers on this page.
+
+    ``candidates`` is this page's slice of _select_candidates output: the
+    leftmost narrow positive-integer word of each line, with ``_num`` set.
+    """
     if len(candidates) < config.min_series_length:
         return []
 
-    candidates["_num"] = candidates["text"].astype(str).str.strip().astype(int)
-
-    # Sort by reading order (y_top ascending)
-    candidates = candidates.sort_values("y_top").reset_index(drop=True)
+    # Small per-page arrays: plain numpy from here on.
+    x_right = candidates["x_right"].to_numpy()
+    order = np.argsort(x_right, kind="stable")
+    x_sorted = x_right[order]
+    nums = candidates["_num"].to_numpy()[order]
+    y_top = candidates["y_top"].to_numpy()[order]
+    word_ids = candidates["word_id"].to_numpy()[order]
 
     # Group into x-aligned clusters, then check each for a near-contiguous series.
     flagged_ids: list[int] = []
     missing_budget = config.max_missing_numbers_per_page
-    for cluster in _cluster_by_x(candidates, config.x_align_tolerance):
-        if len(cluster) < config.min_series_length:
+    for start, stop in _cluster_bounds_by_x(x_sorted, config.x_align_tolerance):
+        if stop - start < config.min_series_length:
             continue
-        nums = cluster.sort_values("y_top")["_num"].tolist()
+        # Reading order (y_top ascending) within the cluster
+        y_order = np.argsort(y_top[start:stop], kind="stable")
+        cluster_nums = nums[start:stop][y_order].tolist()
         ok, missing_count = _is_line_number_sequence(
-            nums, max_missing=missing_budget, min_series_length=config.min_series_length
+            cluster_nums, max_missing=missing_budget, min_series_length=config.min_series_length
         )
         if ok:
-            flagged_ids.extend(cluster["word_id"].tolist())
+            flagged_ids.extend(word_ids[start:stop].tolist())
             missing_budget -= missing_count
 
     return flagged_ids
@@ -236,23 +272,20 @@ def _is_line_number_sequence(
     return True, missing_count
 
 
-def _cluster_by_x(candidates: pd.DataFrame, x_align_tolerance: float) -> list[pd.DataFrame]:
+def _cluster_bounds_by_x(x_sorted: np.ndarray, x_align_tolerance: float) -> list[tuple[int, int]]:
     """
-    Split candidates into groups where the total x_right spread stays within
-    x_align_tolerance.  Sorts by x_right before splitting.
+    Split an ascending x_right array into [start, stop) ranges where the total
+    spread within each range stays within x_align_tolerance.
     """
-    if candidates.empty:
+    if len(x_sorted) == 0:
         return []
 
-    sorted_c = candidates.sort_values("x_right").reset_index(drop=True)
-    x_vals = sorted_c["x_right"].values
-
-    clusters: list[pd.DataFrame] = []
+    bounds: list[tuple[int, int]] = []
     start = 0
-    for i in range(1, len(x_vals)):
-        if x_vals[i] - x_vals[start] > x_align_tolerance:
-            clusters.append(sorted_c.iloc[start:i])
+    for i in range(1, len(x_sorted)):
+        if x_sorted[i] - x_sorted[start] > x_align_tolerance:
+            bounds.append((start, i))
             start = i
-    clusters.append(sorted_c.iloc[start:])
+    bounds.append((start, len(x_sorted)))
 
-    return clusters
+    return bounds

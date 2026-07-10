@@ -6,8 +6,9 @@ Takes an arbitrary set of words on one visible line and classifies them as
 and content. No neighboring rows, lookahead, or gridlines are consulted;
 callers may feed it a full line or an arbitrary word subset.
 
-Shared by step_10_cell_builder (authoritative per-line cell-split decision)
-and step_07_word_relationships (cheap borrowed prior over a word subset).
+Shared by step_10_cell_builder (per-line cell-split decision, full lines)
+and step_07_word_relationships (same analysis over the word set above a
+candidate horizontal rule).
 See step_10_cell_builder's module docstring for the full per-line decision
 pipeline this feeds into.
 """
@@ -39,10 +40,28 @@ class LineClassificationConfig:
 
 CONFIG = LineClassificationConfig()
 
+# Words that essentially only occur in running prose, almost never as a
+# standalone cell/header token in a table. Matched lowercased (see
+# content_stats), so anything that doubles as a table token when cased
+# differently stays out: "may" (May 31 date columns), "no" ("No." item
+# columns), "a"/"i" (row labels, roman numerals), "per" ("per share" headers).
 _STOPWORDS = {
-    "the", "and", "of", "to", "in", "for", "with", "as", "on", "by", "from", "at",
-    "into", "among", "including", "that", "which", "who", "whose", "its",
+    # articles / determiners / pronouns
+    "the", "an", "that", "which", "who", "whose", "its", "this", "these",
+    "those", "their", "they", "we", "our", "such", "each", "any", "all",
+    "other",
+    # conjunctions / subordinators
+    "and", "or", "but", "if", "than", "then", "because", "while", "when",
+    "where", "whether", "unless", "although",
+    # prepositions
+    "of", "to", "in", "for", "with", "as", "on", "by", "from", "at", "into",
+    "among", "about", "after", "before", "between", "against", "during",
+    "since", "under", "over", "through", "without", "within", "upon",
+    "including",
+    # verbs / auxiliaries
     "is", "are", "was", "were", "be", "been", "being",
+    "has", "have", "had", "having", "will", "would", "shall", "should",
+    "could", "must", "do", "does", "did", "not",
 }
 _STRIP_CHARS = ".,;:()[]{}\"'"
 
@@ -51,7 +70,7 @@ _STRIP_CHARS = ".,;:()[]{}\"'"
 # 1. GAP DISTRIBUTION  (primary signal, per line)
 # ================================================================================
 
-def _line_gap_stats(
+def line_gap_stats(
     x_left:    np.ndarray,
     x_right:   np.ndarray,
     font_size: np.ndarray,
@@ -64,14 +83,19 @@ def _line_gap_stats(
     of the two flanking words' font sizes, so the result is scale-invariant.
 
     Returns a dict:
-        gaps_em    : np.ndarray, len = n_words - 1   (np.nan for overlaps)
+        gaps_em    : np.ndarray, len = n_words - 1. Signed: negative for
+                     overlapping words; np.nan where a flanking font size is
+                     invalid. Only positive finite gaps feed the stats below.
         median_em  : float  -- the line's typical space width, in em
         max_em     : float
-        jump_ratio : float  -- largest ratio between consecutive *sorted* gaps
-                              (~1.0 uniform, >>1 means two clusters / a valley)
+        jump_ratio : float  -- ratio between consecutive *sorted* gaps:
+                              at the detected valley when is_bimodal, else the
+                              largest jump found (~1.0 means uniform spacing)
         split_em   : float  -- gaps strictly above this are the wide cluster
                               (gutters). Only meaningful when is_bimodal.
-        n_gaps     : int
+        n_gaps     : int    -- positive finite gaps feeding the stats (falls
+                              back to the non-NaN count when none are positive,
+                              i.e. an all-overlap line)
         is_bimodal : bool   -- a clear valley separates spaces from gutters
 
     The valley is the LOWEST jump that separates word-spaces from wider gaps,
@@ -136,7 +160,7 @@ def _line_gap_stats(
 # 2. CLASSIFICATION  (prior; resolves unimodal lines only)
 # ================================================================================
 
-def _content_stats(texts: list[str]) -> dict:
+def content_stats(texts: list[str]) -> dict:
     """Cheap per-line content features computed straight from token text."""
     n = len(texts)
     if n == 0:
@@ -155,11 +179,14 @@ def _content_stats(texts: list[str]) -> dict:
         has_alpha = any(c.isalpha() for c in s)
         if has_alpha:
             alpha += 1
-            if s[:1].isupper():
+            if s[:1].isupper():   # first letter only: title-case and ALL CAPS both count
                 caps += 1
+            # Punctuation only counts on alpha tokens, so numeric formatting
+            # ("1,000", "(2.5)") never reads as prose punctuation.
             if any(c in ".,;:" for c in s):
                 has_punct = True
-        # numeric-like token: digits + numeric punctuation only
+        # numeric-like token: nothing but digits and numeric punctuation. No
+        # digit is required, so bare "%", "-", "()" tokens also count.
         if s and all(c.isdigit() or c in ",.()-+%—– " for c in s):
             numeric += 1
 
@@ -176,9 +203,14 @@ def _content_stats(texts: list[str]) -> dict:
 def classify_line(
     texts: list[str],
     gap_stats: dict,
-) -> str:
+) -> tuple[str, float]:
     """
-    Classify ONE line as "text", "table", or "undetermined".
+    Classify ONE line, returning ``(label, score)`` with label one of
+    "text", "table", or "undetermined".
+
+    ``gap_stats`` is the dict produced by line_gap_stats() for the same words —
+    passed in (rather than recomputed here) because every caller also consumes
+    the raw stats directly for its own feature columns.
 
     Lines with <= 2 words (0-1 gaps) are always "undetermined" — too little
     geometry to say anything meaningful.
@@ -187,14 +219,13 @@ def classify_line(
         negative  =>  text
         positive  =>  table
     Signals are grouped into sentence evidence (drives score negative) and
-    table evidence (drives score positive). The gap jump_ratio replaces the
-    old pt-absolute gap_ratio — it is em-normalised and bimodality-aware.
+    table evidence (drives score positive).
     """
     n = len(texts)
     if n <= 2:
         return "undetermined", 0.0
 
-    c     = _content_stats(texts)
+    c     = content_stats(texts)
     score = 0.0
 
     # ── Sentence signals (push negative) ──────────────────────────────────
@@ -213,7 +244,7 @@ def classify_line(
     if   c["alpha_ratio"] >= 0.75: score -= 2.0
     elif c["alpha_ratio"] >= 0.60: score -= 1.0
 
-    # Mixed-case (not all-caps) with several alpha tokens: prose-like
+    # Mostly lowercase-initial tokens across several alpha words: prose-like
     if n >= 4 and c["alpha_ratio"] > 0 and c["cap_ratio"] <= 0.5:
         score -= 1.0
 
@@ -222,7 +253,8 @@ def classify_line(
     if   c["numeric_token_ratio"] >= 0.35: score += 2.0
     elif c["numeric_token_ratio"] >= 0.20: score += 1.0
 
-    # All-caps tokens with no stopwords: header row or label column
+    # Nearly every token capitalised (title-case or ALL CAPS — cap_ratio only
+    # checks the first letter) with no stopwords: header row or label column
     if c["cap_ratio"] >= 0.8 and c["stopword_hits"] == 0:
         score += 1.0
 
