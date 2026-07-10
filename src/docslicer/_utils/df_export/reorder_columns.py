@@ -66,7 +66,6 @@ MASTER_COLUMN_ORDER: List[str] = [
 
     # ===== 1. Document / page identifiers =====
     "page_number",
-    "hl_class", # TODO: Temp table hr debug
     "page_label",
     "section",
     "section_id",           # docx
@@ -142,6 +141,9 @@ MASTER_COLUMN_ORDER: List[str] = [
     "layout_type",
     "layout_score",
     "block_type",
+
+    # Shape classification
+    "shape_role",               # page_background / table_grid / underline / separator / background_band / other
 
     # Table IDs # TODO WIP
     "table_id",
@@ -443,13 +445,15 @@ MASTER_COLUMN_ORDER: List[str] = [
     # ===== 15. Shape internals (pdf) =====
     # Merger intermediate
     "candidate_group_id",       # grouping scratch ID during merge
-    "shape_role",               # page_background / table_grid / underline / separator / background_band / other
+    
     #"table_grid_id",            # shared ID across the lines of one detected table grid
     "has_intersection",
     "intersection_count",
     "intersecting_line_ids",
     "color_hex",
     "color_label",
+
+    "hl_class", # TODO: Temp table hr debug
 
     # Cell-builder shape diagnostics
     "is_sentence_like",

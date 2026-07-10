@@ -162,14 +162,15 @@ def run_pipeline(
                 "pip install 'docslicer[ocr]'"
             )
             from ..ocr.ocr_orchestrator import run_ocr_pipeline
-            df_words, df_shapes, df_grid_cells = run_ocr_pipeline(pdf_bytes)
+            df_words, df_shapes, df_grid_cells, df_gutters = run_ocr_pipeline(pdf_bytes)
             discovered_metadata["has_ocr"] = True
 
         if df_words.empty:
             # No text even after OCR — nothing to parse
             return discovered_metadata, pd.DataFrame(), None, {}
 
-        
+        df_gutters = pd.DataFrame()
+
         # The OCR pipeline already produces its own line_id via gutter-aware
         # reading order and strips its own margin line numbers, so struct-tree-based
         # enrichment is both unavailable (no struct tree for a scanned page) and
@@ -210,7 +211,7 @@ def run_pipeline(
             # back to spatial line ordering instead.
             if "struct_group_id" not in df_words.columns or df_words["struct_group_id"].isna().all():
                 # Step 08(b) - Stream Group Assignment - Fallback
-                df_words = assign_reading_order_fallback(df_words, df_shapes)
+                df_words, df_gutters = assign_reading_order_fallback(df_words, df_shapes)
             else:
                 # Step 06 - Prefill Styles
                 df_words = prefill_styles(df_words)
@@ -224,7 +225,11 @@ def run_pipeline(
             on_stage("layout")
 
         # Step 09 - Cell Builder
-        df_cells, df_words = build_cells(df_words)
+        # OCR font sizes are estimated per glyph and too noisy for the size/
+        # baseline heuristics, so suppress sub/superscript detection on OCR pages.
+        df_cells, df_words = build_cells(
+            df_words, detect_scripts=not discovered_metadata.get("has_ocr")
+        )
 
         # Step 10 - Page Labels
         if page_label_config:
@@ -284,6 +289,8 @@ def run_pipeline(
             debug_steps["lines"] = df_lines
             if df_table_cells is not None:
                 debug_steps["table_cells"] = df_table_cells
+            if not df_gutters.empty:
+                debug_steps["gutters"] = df_gutters
 
         return discovered_metadata, df_lines, df_table_cells, debug_steps
 

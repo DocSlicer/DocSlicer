@@ -22,7 +22,10 @@ from .step_05_font_size_estimator import estimate_ocr_font_sizes
 
 from .._utils.cpu import resolve_worker_count
 from .._utils.text_utils import add_calculated_text_features
-from .._utils.layout.line_number_detector import detect_line_numbers
+from .._utils.layout.line_number_detector import (
+    detect_line_numbers,
+    OCR_CONFIG as OCR_LINE_NUMBER_CONFIG,
+)
 from .._utils.layout.reading_order import assign_reading_order
 from .._utils.layout.layouts import assign_layouts
 from .._utils.layout.shape_processor import process_shapes
@@ -91,7 +94,7 @@ def run_ocr_pipeline(
     file_bytes: bytes,
     *,
     config: OCRPipelineConfig = OCRPipelineConfig(),
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     Production entrypoint.
 
@@ -105,6 +108,7 @@ def run_ocr_pipeline(
                   correcting OCR noise on line-initial tokens (e.g. "m=" → bullet).
       - df_shapes: shapes dataframe (rule lines / borders)
       - df_grid_cells: grid cell dataframe (from shape enrichment)
+      - df_gutters: gutter zone dataframe from gutter-aware reading order detection
     """
     # --------------------
     # Pipeline in PX
@@ -179,7 +183,7 @@ def run_ocr_pipeline(
 
     # Detect and remove line numbers
     with timed_step("Line number detection", logger=logger):
-        df_words = detect_line_numbers(df_words)
+        df_words = detect_line_numbers(df_words, config=OCR_LINE_NUMBER_CONFIG)
 
         # NOTE: This operation removes rows from the df
         # Step 05c - Drop line-number words
@@ -195,7 +199,7 @@ def run_ocr_pipeline(
 
     # 4) Assign reading order (gutter-aware)
     with timed_step("Reading order", logger=logger):
-        df_words = assign_reading_order(df_words, df_shapes)
+        df_words, df_gutters = assign_reading_order(df_words, df_shapes)
         df_words = df_words.drop(columns=["center_bucket"], errors="ignore")
 
         # Flag the leftmost word in each line (useful for OCR noise correction,
@@ -215,5 +219,5 @@ def run_ocr_pipeline(
         df_words = assign_layouts(df_words, line_level=False)
         df_words = estimate_ocr_font_sizes(df_words, method="word")
 
-    return df_words, df_shapes, df_grid_cells
+    return df_words, df_shapes, df_grid_cells, df_gutters
 

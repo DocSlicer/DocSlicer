@@ -67,7 +67,7 @@ _REPAIR_FIELDS = (
     "struct_ancestors", "struct_raw_ancestors", "struct_ancestor_ids",
 )
 
-_INVALID_TAGS  = frozenset({"Document", "Part"})
+_INVALID_TAGS  = frozenset({"Document", "Part", "Art"})
 _TABLE_CELL    = frozenset({"TD", "TH"})
 _HEADINGS      = frozenset({"H", "H1", "H2", "H3", "H4", "H5", "H6"})
 

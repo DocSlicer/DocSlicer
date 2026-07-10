@@ -371,7 +371,7 @@ def _normalize_form_text(widget_type: str, value: Optional[str], is_empty: bool)
         return "[Unchecked]" if is_empty else "[Checked]"
     if is_empty or value is None:
         return "[blank]"
-    return value
+    return f"[{value}]"
 
 
 def _inject_form_value_rows(

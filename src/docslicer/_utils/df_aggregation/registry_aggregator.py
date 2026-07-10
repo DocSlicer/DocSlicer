@@ -140,6 +140,7 @@ COLUMN_REGISTRY: Dict[str, Agg] = {
     # --- layout / reading order ----------------------------------------------
     "layout_id": Agg.FIRST,
     "layout_type": Agg.FIRST,
+    "layout_score": Agg.DROP, 
     "block_type": Agg.FIRST,
     "chart_id": Agg.FIRST,
     "reading_column": Agg.FIRST,

@@ -43,6 +43,7 @@ separates them -- only the within-line ratio does (0.47/0.25 ~= 1.9 vs
 
 from __future__ import annotations
 
+import re
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
@@ -97,6 +98,24 @@ CONFIG = CellBuildConfig()
 # Script detection thresholds (mirror step_01 constants applied at word granularity)
 _SCRIPT_DETECT_SIZE_RATIO = 0.82   # word font_size < this * cell ref → candidate
 _SCRIPT_DETECT_Y_FACTOR   = 0.20   # baseline shift > this * ref_size → confirmed
+
+# Plausible sub/superscript & math tokens: short, and either non-alphabetic,
+# a single letter, an ordinal (1st/2nd), or a small roman numeral. Long or
+# multi-letter alphabetic runs ("PURSUANT", "TO", "THE") never qualify, so a
+# font/baseline anomaly on real words can't be mistaken for a script.
+_SCRIPT_TOKEN_RE = re.compile(
+    r"""^(?:
+        [(\[]?[-+–−]?\d{1,3}[)\].,]?   # small ints, opt sign/bracket:  2  13  -1  (1)  1)
+      | \d{1,2}(?:st|nd|rd|th)          # ordinals:  1st 2nd 3rd 4th
+      | [(\[]?[A-Za-z][)\].]?           # single letter, opt bracket:  a  (a)  x)
+      | [ivxlcIVXLC]{1,3}               # small roman numerals:  i ii iv IX
+      | [-+*/=<>~^·•°′″†‡§¶±×÷…()\[\]]+  # math / footnote / bracket symbols
+      | (?=[A-Za-z0-9+\-*/=^_·×÷–−]{2,5}$)
+        [A-Za-z0-9]+(?:[-+*/=^_·×÷–−][A-Za-z0-9]+)+  # short math expr:  t-1  x+y  n+1
+      | [☐☑☒✓✗✔✘]                     # checkbox & cross glyphs
+    )$""",
+    re.VERBOSE,
+)
 
 _STOPWORDS = {
     "the", "and", "of", "to", "in", "for", "with", "as", "on", "by", "from", "at",
@@ -725,6 +744,11 @@ def _detect_cell_level_scripts(df: pd.DataFrame) -> pd.DataFrame:
     baseline difference there reflects separate stacked lines, not a sub/
     superscript relationship. Words inside a tagged table (nonblank table_id) are
     likewise never tagged, for the same stacked-row reason.
+
+    An inverted-reference guard also skips any cell where the size-based "small"
+    words outnumber the body-size words: that means the reference size (the cell
+    max) is pinned to an oversized outlier (checkbox glyph, drop cap, icon) rather
+    than the body text, which would otherwise flag the whole run.
     """
     if "cell_id" not in df.columns or "font_size" not in df.columns:
         return df
@@ -769,6 +793,30 @@ def _detect_cell_level_scripts(df: pd.DataFrame) -> pd.DataFrame:
     small     = untagged & valid & (font_size < _SCRIPT_DETECT_SIZE_RATIO * ref_size)
     has_ref   = ref_baseline.notna()
 
+    # Inverted-reference guard, on the RAW size-based candidates (before the
+    # format gate). ref_size is the cell max, so a single slightly-larger glyph
+    # (an 11pt checkbox among 9pt body text, a drop cap, an icon) becomes the
+    # reference and makes every body word look "small" and baseline-shifted. A
+    # real script is outnumbered by body-size words; when the small words instead
+    # outnumber them, the reference is that oversized outlier — skip the cell.
+    # This must be measured on the raw mask: the format gate below removes most
+    # of those false "small" words, which would otherwise hide the inversion.
+    n_small = small.groupby(cell_id).transform("sum")
+    n_large = (untagged & ~small).groupby(cell_id).transform("sum")
+    ref_ok  = n_small <= n_large
+
+    # Format gate: only tokens shaped like a real sub/superscript or math atom
+    # are eligible. Restricted to the small candidates so the regex runs on a
+    # fraction of rows. Rejects long/multi-letter words a font anomaly alone
+    # would otherwise flag (e.g. "[^PURSUANT]").
+    fmt_ok = pd.Series(False, index=df.index)
+    if small.any():
+        cand = df.loc[small, "text"].astype(str).str.strip()
+        # Match via the compiled object: Series.str.match rejects a compiled
+        # pattern that carries flags (re.VERBOSE). Runs only on candidates.
+        fmt_ok.loc[small] = cand.map(lambda s: _SCRIPT_TOKEN_RE.match(s) is not None)
+    small = small & fmt_ok & ref_ok
+
     df.loc[small & has_ref & (shift >  threshold), "script_type"] = "superscript"
     df.loc[small & has_ref & (shift < -threshold), "script_type"] = "subscript"
 
@@ -791,12 +839,27 @@ def _build_cells_df(df_words: pd.DataFrame) -> pd.DataFrame:
     # only scramble them. This reorders only the text/word_ids join — aggregate_to
     # geometry is order-independent, and the upstream x_left gap-split sorts that
     # cell segmentation depends on are untouched.
+    # Form-value words borrow the text_object_id of the nearest content-stream
+    # word so they slot near their label, but that neighbour is not necessarily
+    # the logical last token of the cell. Force word_source == "form_value" to
+    # sort last within each cell regardless of the borrowed id, so the filled
+    # value trails the label text it belongs to (e.g. "Name: [John]"). A stable
+    # sort keeps every other word's relative order intact.
+    sort_cols: list[str] = []
+    if "word_source" in df_words.columns:
+        df_words = df_words.copy()
+        df_words["_form_last"] = (df_words["word_source"] == "form_value").astype(int)
+        sort_cols.append("_form_last")
     if "text_object_id" in df_words.columns:
+        sort_cols += ["text_object_id", "line_id", "x_left"]
+    if sort_cols:
         df_words = df_words.sort_values(
-            ["text_object_id", "line_id", "x_left"],
+            sort_cols,
             kind="mergesort",
             na_position="last",
         )
+    if "_form_last" in df_words.columns:
+        df_words = df_words.drop(columns="_form_last")
 
     # Super/subscript markers ("[^…]"/"[_…]") applied per word, then joined
     # per cell with markers attaching to the previous token. dehyphenate keeps

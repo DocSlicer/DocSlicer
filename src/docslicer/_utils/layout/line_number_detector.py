@@ -9,9 +9,16 @@ For each page:
 3. Check whether those leftmost candidates form a monotonically increasing
    sequence of integers that share a common x alignment.
 4. If such a series is found, set line_number_flag = True on those words.
+
+Thresholds live in ``LineNumberConfig``. The PDF pipeline uses the strict
+defaults (``PDF_CONFIG``); the OCR pipeline passes ``OCR_CONFIG``, which is
+looser because tesseract garbles digits (9 -> S, 44 -> 4A) and drops the
+line-number column on some pages entirely.
 """
 
 from __future__ import annotations
+
+from dataclasses import dataclass
 
 import pandas as pd
 
@@ -22,25 +29,36 @@ from .line_merger import assign_line_id
 # CONFIG
 # =============================================================================
 
-_MIN_SERIES_LENGTH: int = 3       # minimum candidates to qualify as line numbers
-_X_ALIGN_TOLERANCE: float = 7.0   # pt — max x_right spread within an x-cluster (line numbers tend to be right-aligned)
-_MAX_NUMBER_WIDTH: float = 30.0   # pt — line-number token must be narrow
-_MAX_MISSING_NUMBERS_PER_PAGE: int = 1  # allow at most one skipped line number
-_FONT_SIZE_RATIO: float = 0.85    # line numbers may not be smaller than this × doc median, otherwise likely footnotes
-_MIN_PAGE_COVERAGE: float = 0.80  # line numbers must appear on at least this fraction of pages
+@dataclass(frozen=True)
+class LineNumberConfig:
+    min_series_length: int = 3         # minimum candidates to qualify as line numbers
+    x_align_tolerance: float = 7.0     # pt — max x_right spread within an x-cluster (line numbers tend to be right-aligned)
+    max_number_width: float = 30.0     # pt — line-number token must be narrow
+    max_missing_numbers_per_page: int = 1  # allowed skipped line numbers per page
+    font_size_ratio: float = 0.85      # line numbers may not be smaller than this × doc median, otherwise likely footnotes
+    min_page_coverage: float = 0.80    # line numbers must appear on at least this fraction of pages
+    exclude_note_ancestors: bool = True  # drop candidates with a 'Note' struct_ancestors tag (tagged PDFs only; column never exists in OCR)
+    # OCR-only KPI (inactive at the default below):
+    min_line_number_line_fraction: float = 0.0  # min fraction of a page's lines that must be numbered (guards against footnote hits)
 
-# NOTE: for OCR PDF, the config should be looser, 
-# 2-3 missing (may output some numbers as text, like 9 -> S or 44 -> 4A) 
-# and ~50% page coverage, possibly feed in as args (tesseract turns line number column into BTT garbled text on some pages)
 
-# NOTE: For ocr, font size detection is less accurate, add an extra KPI that min 10% of lines on a page should have a line number (otherwise hits on footnotes)
-#+ exclude rows where struct_raw_ancestors contains *note* Footnote, Note, Endnote, etc
+PDF_CONFIG = LineNumberConfig()
+
+OCR_CONFIG = LineNumberConfig(
+    max_missing_numbers_per_page=3,
+    min_page_coverage=0.50,
+    min_line_number_line_fraction=0.10,
+)
+
 
 # =============================================================================
 # Public API
 # =============================================================================
 
-def detect_line_numbers(df_words: pd.DataFrame) -> pd.DataFrame:
+def detect_line_numbers(
+    df_words: pd.DataFrame,
+    config: LineNumberConfig = PDF_CONFIG,
+) -> pd.DataFrame:
     """
     Adds a boolean column ``line_number_flag`` to df_words.
 
@@ -48,6 +66,8 @@ def detect_line_numbers(df_words: pd.DataFrame) -> pd.DataFrame:
     ----------
     df_words : pd.DataFrame
         Must contain: page_number, word_id, text, x_left, x_right, y_top, y_bottom.
+    config : LineNumberConfig
+        Detection thresholds; defaults to the strict PDF preset.
 
     Returns
     -------
@@ -69,6 +89,8 @@ def detect_line_numbers(df_words: pd.DataFrame) -> pd.DataFrame:
         _tmp_cols.append("text_orientation")
     if "font_size" in df_words.columns:
         _tmp_cols.append("font_size")
+    if config.exclude_note_ancestors and "struct_ancestors" in df_words.columns:
+        _tmp_cols.append("struct_ancestors")
 
     # Assign temporary line IDs on a minimal copy (avoids mutating df_words).
     # Ignore non-LTR words before line merging so rotated/vertical footer text
@@ -85,23 +107,31 @@ def detect_line_numbers(df_words: pd.DataFrame) -> pd.DataFrame:
     if "font_size" in df_words.columns:
         valid_sizes = df_words["font_size"].replace(0, pd.NA).dropna()
         if not valid_sizes.empty:
-            font_size_threshold = _FONT_SIZE_RATIO * float(valid_sizes.median())
+            font_size_threshold = config.font_size_ratio * float(valid_sizes.median())
 
     out = df_words.copy()
     out["line_number_flag"] = False
 
     for page_num, page_group in df_tmp.groupby("page_number"):
-        flagged_ids = _detect_page_line_numbers(page_group, font_size_threshold)
+        flagged_ids = _detect_page_line_numbers(page_group, font_size_threshold, config)
+
+        # QC: enough of the page's lines must carry a number, otherwise the hit
+        # is likely a numbered footnote block rather than margin line numbers.
+        if flagged_ids and config.min_line_number_line_fraction > 0:
+            total_lines = page_group["line_id"].nunique()
+            if total_lines and len(flagged_ids) / total_lines < config.min_line_number_line_fraction:
+                flagged_ids = []
+
         if flagged_ids:
             mask = (out["page_number"] == page_num) & (out["word_id"].isin(flagged_ids))
             out.loc[mask, "line_number_flag"] = True
 
-    # QC: line numbers must be present on at least _MIN_PAGE_COVERAGE of all pages.
+    # QC: line numbers must be present on at least min_page_coverage of all pages.
     # Sparse hits (e.g. a few lines starting with years like 2020/2021) are rejected.
     if out["line_number_flag"].any():
         total_pages = out["page_number"].nunique()
         pages_with_flags = out.loc[out["line_number_flag"], "page_number"].nunique()
-        if pages_with_flags / total_pages < _MIN_PAGE_COVERAGE:
+        if pages_with_flags / total_pages < config.min_page_coverage:
             out["line_number_flag"] = False
 
     return out
@@ -114,12 +144,18 @@ def detect_line_numbers(df_words: pd.DataFrame) -> pd.DataFrame:
 def _detect_page_line_numbers(
     page_df: pd.DataFrame,
     font_size_threshold: float | None,
+    config: LineNumberConfig,
 ) -> list[int]:
     """Return word_ids identified as line numbers on this page."""
 
     # Per line_id: pick the leftmost word — idxmin is C-level, no apply overhead
     idx = page_df.groupby("line_id")["x_left"].idxmin()
     candidates = page_df.loc[idx].reset_index(drop=True)
+
+    if config.exclude_note_ancestors and "struct_ancestors" in candidates.columns:
+        candidates = candidates[
+            ~candidates["struct_ancestors"].map(_has_note_ancestor)
+        ].reset_index(drop=True)
 
     # Vectorised positive-integer check (replaces row-wise _is_positive_integer)
     text_str = candidates["text"].astype(str).str.strip()
@@ -133,11 +169,11 @@ def _detect_page_line_numbers(
     )
     candidates = candidates[
         is_pos_int
-        & ((candidates["x_right"] - candidates["x_left"]) <= _MAX_NUMBER_WIDTH)
+        & ((candidates["x_right"] - candidates["x_left"]) <= config.max_number_width)
         & size_ok
     ].copy()
 
-    if len(candidates) < _MIN_SERIES_LENGTH:
+    if len(candidates) < config.min_series_length:
         return []
 
     candidates["_num"] = candidates["text"].astype(str).str.strip().astype(int)
@@ -147,12 +183,14 @@ def _detect_page_line_numbers(
 
     # Group into x-aligned clusters, then check each for a near-contiguous series.
     flagged_ids: list[int] = []
-    missing_budget = _MAX_MISSING_NUMBERS_PER_PAGE
-    for cluster in _cluster_by_x(candidates):
-        if len(cluster) < _MIN_SERIES_LENGTH:
+    missing_budget = config.max_missing_numbers_per_page
+    for cluster in _cluster_by_x(candidates, config.x_align_tolerance):
+        if len(cluster) < config.min_series_length:
             continue
         nums = cluster.sort_values("y_top")["_num"].tolist()
-        ok, missing_count = _is_line_number_sequence(nums, max_missing=missing_budget)
+        ok, missing_count = _is_line_number_sequence(
+            nums, max_missing=missing_budget, min_series_length=config.min_series_length
+        )
         if ok:
             flagged_ids.extend(cluster["word_id"].tolist())
             missing_budget -= missing_count
@@ -160,7 +198,21 @@ def _detect_page_line_numbers(
     return flagged_ids
 
 
-def _is_line_number_sequence(nums: list[int], *, max_missing: int) -> tuple[bool, int]:
+def _has_note_ancestor(ancestors: object) -> bool:
+    """
+    True if any struct_ancestors tag is note-like, e.g. ['Part', 'Note', 'P'].
+
+    Matches any tag containing 'note' (case-insensitive) so unnormalized
+    variants like 'Footnote' or 'Endnote' are caught too.
+    """
+    if not isinstance(ancestors, (list, tuple)):
+        return False
+    return any(isinstance(tag, str) and "note" in tag.lower() for tag in ancestors)
+
+
+def _is_line_number_sequence(
+    nums: list[int], *, max_missing: int, min_series_length: int
+) -> tuple[bool, int]:
     """
     Return whether nums look like margin line numbers and how many numbers are missing.
 
@@ -168,7 +220,7 @@ def _is_line_number_sequence(nums: list[int], *, max_missing: int) -> tuple[bool
     the page gets a tiny missing-number budget, e.g. [1, 2, 4, 5] is acceptable
     with max_missing=1, while TOC/page-label jumps like [2, 12, 14] are not.
     """
-    if len(nums) < _MIN_SERIES_LENGTH:
+    if len(nums) < min_series_length:
         return False, 0
 
     missing_count = 0
@@ -184,10 +236,10 @@ def _is_line_number_sequence(nums: list[int], *, max_missing: int) -> tuple[bool
     return True, missing_count
 
 
-def _cluster_by_x(candidates: pd.DataFrame) -> list[pd.DataFrame]:
+def _cluster_by_x(candidates: pd.DataFrame, x_align_tolerance: float) -> list[pd.DataFrame]:
     """
     Split candidates into groups where the total x_right spread stays within
-    _X_ALIGN_TOLERANCE.  Sorts by x_right before splitting.
+    x_align_tolerance.  Sorts by x_right before splitting.
     """
     if candidates.empty:
         return []
@@ -198,7 +250,7 @@ def _cluster_by_x(candidates: pd.DataFrame) -> list[pd.DataFrame]:
     clusters: list[pd.DataFrame] = []
     start = 0
     for i in range(1, len(x_vals)):
-        if x_vals[i] - x_vals[start] > _X_ALIGN_TOLERANCE:
+        if x_vals[i] - x_vals[start] > x_align_tolerance:
             clusters.append(sorted_c.iloc[start:i])
             start = i
     clusters.append(sorted_c.iloc[start:])

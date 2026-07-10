@@ -48,6 +48,17 @@ _META_COLS = (
     "non_stroking_color", "stroking_color",
 )
 
+# Struct-tree / content-stream provenance (attached per raw shape by
+# step_03_shape_extractor when a struct_index is supplied). Copied verbatim
+# from the representative shape — the raw shapes of a merged run come from the
+# same marked-content item in practice. Absent columns pass through as None.
+_STRUCT_COLS = (
+    "mcid", "dfs_position",
+    "struct_tag", "struct_raw_tag", "struct_tag_id",
+    "struct_ancestors", "struct_raw_ancestors", "struct_ancestor_ids",
+    "struct_scope", "struct_headers", "struct_col_span", "struct_row_span",
+)
+
 
 # ==============================
 # Helpers
@@ -105,7 +116,7 @@ def _extract_page_arrays(page_df: pd.DataFrame) -> Dict[str, Any]:
         "y_bottom":        page_df["y_bottom"].to_numpy(dtype=np.float64),
         "raw_orientation": page_df["raw_orientation"].to_numpy(),
     }
-    for col in _META_COLS:
+    for col in _META_COLS + _STRUCT_COLS:
         arrays[col] = page_df[col].to_numpy(dtype=object) if col in page_df.columns else None
     # Page dimensions (optional — absent on the OCR path); constant per page.
     for col in ("page_width", "page_height"):
@@ -238,6 +249,8 @@ def _build_shape_record(
         "paint_op":           str(paint_op)    if paint_op  is not None else None,
         "non_stroking_color": _meta(pa, "non_stroking_color", rep_pos),
         "stroking_color":     _meta(pa, "stroking_color", rep_pos),
+        # Struct-tree provenance (from representative shape)
+        **{col: _meta(pa, col, rep_pos) for col in _STRUCT_COLS},
         # Derived
         "shape_type":        shape_type,
         "shape_orientation": orientation,
@@ -805,12 +818,18 @@ def process_shapes(
     Input columns (optional — enable page_background detection):
         page_width, page_height
 
+    Input columns (optional — struct-tree provenance, pass through as None if
+    absent): mcid, dfs_position, struct_tag, struct_raw_tag, struct_tag_id,
+        struct_ancestors, struct_raw_ancestors, struct_ancestor_ids,
+        struct_scope, struct_headers, struct_col_span, struct_row_span
+
     df_shapes columns (one row per logical shape):
         page_number, shape_id, raw_shape_ids, candidate_group_id,
         x_left, x_right, y_top, y_bottom, width, height, area,
         raw_shape_type, shape_type, shape_orientation,
         linewidth, fill, stroke, paint_op,
         non_stroking_color, stroking_color,
+        mcid, dfs_position, struct_* (provenance, from representative shape),
         table_id, shape_role, table_grid_id,
         has_intersection, intersection_count, intersecting_line_ids,
         color_hex, color_label

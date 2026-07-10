@@ -5,8 +5,8 @@ Used by the OCR pipeline (sole method) and the PDF pipeline (when text_object_id
 is absent).
 
 Public API:
-    df_words = assign_reading_order(df_words, df_shapes)
-    df_vert  = assign_vertical_line_ids(df_vert, line_id_offset)
+    df_words, df_gutters = assign_reading_order(df_words, df_shapes)
+    df_vert               = assign_vertical_line_ids(df_vert, line_id_offset)
 """
 
 from __future__ import annotations
@@ -169,7 +169,7 @@ def assign_vertical_line_ids(df_vert: pd.DataFrame, line_id_offset: int) -> pd.D
 def assign_reading_order(
     df_words: pd.DataFrame,
     df_shapes: pd.DataFrame | None = None,
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Assign line_id to every word using gutter-aware spatial sorting.
 
@@ -183,14 +183,17 @@ def assign_reading_order(
 
     Returns
     -------
-    df_words with line_id (and center_bucket) populated.
+    (df_words, df_gutters) — df_words with line_id (and center_bucket)
+    populated; df_gutters is empty if gutter detection did not run (gutter
+    columns were already present on df_words).
     """
     if df_words is None or df_words.empty:
         out = (df_words.copy() if df_words is not None else pd.DataFrame())
         out["line_id"] = pd.Series(dtype="Int64")
-        return out
+        return out, pd.DataFrame()
 
     df = df_words.copy()
+    df_gutters = pd.DataFrame()
 
     gutter_cols_present = (
         "gutter_id_right" in df.columns
@@ -198,7 +201,7 @@ def assign_reading_order(
     )
     if not gutter_cols_present:
         from .gutter_detector import detect_gutters
-        df, _ = detect_gutters(df, df_shapes)
+        df, df_gutters = detect_gutters(df, df_shapes)
 
     # Split horizontal (LTR/default) vs vertical (TTB/BTT)
     if "text_orientation" in df.columns:
@@ -234,10 +237,11 @@ def assign_reading_order(
     non_empty = [p for p in all_parts if not p.empty]
     if not non_empty:
         df["line_id"] = pd.Series(dtype="Int64")
-        return df
+        return df, df_gutters
 
-    return (
+    df_out = (
         pd.concat(non_empty, ignore_index=True)
         .sort_values(["page_number", "y_top", "x_left"], kind="mergesort")
         .reset_index(drop=True)
     )
+    return df_out, df_gutters
