@@ -336,7 +336,7 @@ def _build_tables(df_table_cells: pd.DataFrame | None) -> list[Table]:
                 col=int(crow.get("col_start", 0)),
                 rowspan=int(crow.get("rowspan", 1)),
                 colspan=int(crow.get("colspan", 1)),
-                role=str(crow.get("role", "")),
+                role=str(crow.get("table_cell_role", "")),
                 text=str(crow.get("text", "")),
                 bbox=_bbox(crow),
             ))

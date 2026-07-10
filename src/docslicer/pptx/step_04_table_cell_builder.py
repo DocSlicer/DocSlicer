@@ -27,6 +27,7 @@ from .step_02_run_extractor import (
     _TABLE_GRAPHIC_URI,
     _notes_part_for,
 )
+from .._utils.df_schemas import TABLE_CELLS_COLS, conform_table_cells
 from .._utils.table_utils import detect_cell_roles
 
 
@@ -189,25 +190,11 @@ def _collect_cell_geoms(
 # Public API
 # ---------------------------------------------------------------------------
 
-_OUTPUT_COLS = [
-    "page_number",
-    "slide_index",
-    "table_id",
-    "table_row_id",
-    "table_cell_id",
-    "row_start",
-    "col_start",
-    "rowspan",
-    "colspan",
-    "role",
-    "text",
-]
-
-
 def build_table_cells(
     package: PptxPackage,
     run_df: pd.DataFrame,
     include_notes: bool = True,
+    debug: bool = False,
 ) -> pd.DataFrame:
     """
     Build df_table_cells from a PPTX package and its run-level DataFrame.
@@ -217,22 +204,23 @@ def build_table_cells(
         run_df: Run-level DataFrame (from step 02). Must use the same
             include_notes setting.
         include_notes: Match the setting used in extract_runs.
+        debug: Keep the detect_cell_roles diagnostic columns (table_row_style,
+            hdr_*) in the output.
 
     Returns:
-        DataFrame with one row per logical table cell:
-            page_number, slide_index, table_id, table_row_id, table_cell_id,
-            row_start, col_start, rowspan, colspan, role, text
+        DataFrame with the canonical df_table_cells schema (TABLE_CELLS_COLS).
+        page_number carries the slide number.
 
         rowspan = 0 means the cell is covered by a vertically spanning cell
         above it (vMerge). colspan = 0 means covered by a horizontal span
         (hMerge). Values >= 1 are the actual span extents.
     """
     if run_df.empty:
-        return pd.DataFrame(columns=_OUTPUT_COLS)
+        return pd.DataFrame(columns=TABLE_CELLS_COLS)
 
     geoms = _collect_cell_geoms(package, include_notes)
     if not geoms:
-        return pd.DataFrame(columns=_OUTPUT_COLS)
+        return pd.DataFrame(columns=TABLE_CELLS_COLS)
 
     geom_df = pd.DataFrame(
         [
@@ -265,12 +253,11 @@ def build_table_cells(
     result["text"] = result["text"].fillna("")
     result = result.drop(columns=["_first_row_style"])
 
-    result = pd.concat(
-        [detect_cell_roles(grp, with_row_label=False) for _, grp in result.groupby("table_id", sort=False)],
-        ignore_index=True,
-    )
+    # detect_cell_roles processes every table in one vectorized pass, grouping
+    # internally on (table_id, row_start).
+    result = detect_cell_roles(result, with_row_label=False)
 
-    return result[_OUTPUT_COLS].reset_index(drop=True)
+    return result #conform_table_cells(result, debug=debug)
 
 
 __all__ = ["build_table_cells"]

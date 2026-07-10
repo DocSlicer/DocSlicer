@@ -195,16 +195,25 @@ def is_currency_symbol(text: object) -> bool:
 # NUMERIC VALUE TOKENS
 # ==================================================
 
-# Numeric value token: number body with thousands/decimal separators, optional
-# currency prefix, optional % / currency suffix, the whole thing optionally
-# parenthesized (accounting negatives) — 123 / 1,234.5 / $5 / 12% / (123) /
-# (2%) / ($1.2).
-_NUMERIC_VALUE_RE = re.compile(
-    rf'^\(?{_CURRENCY_SYM_CLASS}?\s?\d[\d,\.]*\s?(?:{_CURRENCY_SYM_CLASS}|%)?\)?$'
-)
-
-# Dash placeholders used for "no value" cells in financial tables.
+# Dash placeholders used for "no value" cells in financial tables, and reused
+# below as the set of valid range separators ("10.3 – 11.2").
 _DASH_TOKENS: frozenset[str] = frozenset({"-", "–", "—", "−"})
+
+# Numeric value token: any run of digits, whitespace, and "numeric punctuation"
+# (thousands/decimal separators, dash ranges, brackets, currency, %), as long
+# as it contains at least one digit — 123 / 1,234.5 / $5 / 12% / (123) /
+# 57 (42, 72) / 15.4% (10.6, 20.2) / 10.3 - 11.2. A structured token-by-token
+# grammar was tried here before and had multiple overlapping-optional spots
+# (e.g. a comma could be "thousands separator" or "list separator", or a
+# space could be matched by two adjacent `\s?`s) that made the regex engine
+# backtrack combinatorially on non-matching input, taking whole seconds on a
+# single cell. A flat character class has no such ambiguity — it's a single
+# linear scan — and a unit word like "mg" still correctly fails the match
+# since letters aren't in the class.
+_NUMERIC_PUNCT = ",.()[]%" + "".join(_DASH_TOKENS) + _CURRENCY_SYMBOLS_STR
+_NUMERIC_VALUE_RE = re.compile(
+    rf'^(?=.*\d)[\s\d{re.escape(_NUMERIC_PUNCT)}]+$'
+)
 
 # NA-style "no value" placeholders, same role as the dashes ("Revenue  NA
 # 1,234  5%"). Matched case-insensitively (NA / n/a / N.A.).

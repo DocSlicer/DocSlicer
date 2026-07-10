@@ -288,7 +288,7 @@ def _format_table_markdown(table_df: pd.DataFrame) -> str:
         text = str(cell.get("text", "")).strip()
         colspan = int(cell.get("colspan", 1))
         rowspan = int(cell.get("rowspan", 1))
-        role = cell.get("role", "")
+        role = cell.get("table_cell_role", "")
         
         # Track last header row
         if role == "header":
@@ -340,8 +340,8 @@ def _format_table_jsonl(table_df: pd.DataFrame) -> str:
         table_df = table_df.copy()
         table_df["colspan"] = 1
 
-    headers_df = table_df[table_df["role"] == "header"]
-    data_df = table_df[table_df["role"] != "header"].copy()
+    headers_df = table_df[table_df["table_cell_role"] == "header"]
+    data_df = table_df[table_df["table_cell_role"] != "header"].copy()
 
     if headers_df.empty:
         return "[Table: no headers found]"
@@ -373,7 +373,7 @@ def _format_table_jsonl(table_df: pd.DataFrame) -> str:
 
     # groupby replaces repeated boolean filtering (data_df[data_df["row_start"] == row])
     for row, row_data in data_df.groupby("row_start", sort=True):
-        value_cells = row_data[row_data["role"] == "data"]
+        value_cells = row_data[row_data["table_cell_role"] == "data"]
 
         if value_cells["_text"].eq("").all():
             label_cells = row_data[row_data["col_start"] == 0]
@@ -417,8 +417,8 @@ def _format_table_melted(table_df: pd.DataFrame) -> str:
         table_df = table_df.copy()
         table_df["colspan"] = 1
 
-    headers_df = table_df[table_df["role"] == "header"]
-    data_df = table_df[table_df["role"] != "header"].copy()
+    headers_df = table_df[table_df["table_cell_role"] == "header"]
+    data_df = table_df[table_df["table_cell_role"] != "header"].copy()
 
     # Build header paths using numpy arrays (avoids iterrows overhead)
     header_rows_sorted = sorted(headers_df["row_start"].unique())
@@ -447,10 +447,10 @@ def _format_table_melted(table_df: pd.DataFrame) -> str:
 
     # groupby replaces repeated boolean filtering (data_df[data_df["row_start"] == row])
     for row, row_data in data_df.groupby("row_start", sort=True):
-        row_label_rows = row_data[row_data["role"] == "row_label"]
+        row_label_rows = row_data[row_data["table_cell_role"] == "row_label"]
         row_label = row_label_rows.iloc[0]["_text"] if not row_label_rows.empty else f"row_{row}"
 
-        value_cells = row_data[row_data["role"] == "data"]
+        value_cells = row_data[row_data["table_cell_role"] == "data"]
 
         if value_cells["_text"].eq("").all():
             if row_label.strip():

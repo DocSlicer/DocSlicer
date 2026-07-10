@@ -11,6 +11,9 @@ import warnings
 import numpy as np
 import pandas as pd
 
+from .._utils.df_aggregation.registry_aggregator import aggregate_to
+from .._utils.df_aggregation.text_merge import merge_text_within_line
+from .._utils.df_schemas import TABLE_CELLS_COLS, conform_table_cells
 from .._utils.table_utils import detect_cell_roles
 from .._utils.text_utils import numeric_value_mask
 
@@ -518,6 +521,21 @@ def _assign_is_numeric_like(df_cells: pd.DataFrame) -> pd.DataFrame:
 _SPARSE_GRID_ROW_MIN_COMPLETE = 3
 
 
+def _grid_partially_covers_table(grp: pd.DataFrame) -> bool:
+    """
+    True when the table has genuine, complete, multi-cell data lines both with
+    and without a table_grid_id -- the ruling grid only covers part of the
+    table (e.g. a single shaded/ruled cell in an otherwise unruled table), so
+    it can't be trusted as the row structure for the lines it misses.
+    """
+    cells_per_line = grp.groupby("line_id")["cell_id"].transform("count")
+    is_data_line = grp["row_complete"].fillna(False).astype(bool) & (cells_per_line > 1)
+    has_grid = grp["table_grid_id"].notna()
+    gridded = (is_data_line & has_grid).any()
+    ungridded = (is_data_line & ~has_grid).any()
+    return bool(gridded and ungridded)
+
+
 def _assign_grid_trustworthy(df_cells: pd.DataFrame) -> pd.DataFrame:
     """
     Tag every cell with ``grid_trustworthy`` (nullable boolean): whether the
@@ -525,10 +543,14 @@ def _assign_grid_trustworthy(df_cells: pd.DataFrame) -> pd.DataFrame:
     Only meaningful for tables that actually have a detected grid; cells in a
     grid-less table (or outside any table) get NA.
 
-    Per table_id:
-      1. If the table's gridded rows don't all share one table_grid_id (the
-         layout spans more than one detected grid), it's not trustworthy.
-         Rows with no table_grid_id (subheadings, footnotes) are ignored here.
+    Per table_id (a table can legitimately span more than one detected grid,
+    e.g. a header grid and a body grid, so grid_id count alone says nothing
+    about trust):
+      1. If the ruling grid only covers part of the table -- some genuine,
+         multi-cell, complete data lines have a table_grid_id and others don't
+         -- it's not trustworthy: a grid drawn over only a corner or column of
+         the table (e.g. a single shaded header cell) isn't a reliable row
+         structure for the rest, so the whole grid is rejected.
       2. Otherwise, trustworthy only when there is at least one qualifying data
          band and no band is over-packed: if any grid_row_start holds
          >= _SPARSE_GRID_ROW_MIN_COMPLETE distinct complete lines (row_complete)
@@ -552,10 +574,9 @@ def _assign_grid_trustworthy(df_cells: pd.DataFrame) -> pd.DataFrame:
 
     in_table = result["table_id"].notna()
     for _, grp in result.loc[in_table].groupby("table_id", sort=False):
-        grid_ids = grp["table_grid_id"].dropna().unique()
-        if len(grid_ids) == 0:
+        if grp["table_grid_id"].isna().all():
             continue  # no detected grid -> not applicable, leave NA
-        if len(grid_ids) > 1:
+        if _grid_partially_covers_table(grp):
             trust = False
         else:
             # Count only complete, multi-cell lines below the top band: a
@@ -753,33 +774,25 @@ def _assign_table_cell_ids(df_cells: pd.DataFrame) -> pd.DataFrame:
 # Table cells frame
 # ============================================================
 
-# df_table_cells output columns, in order. table_cell_role is reserved for
-# detect_cell_roles and left NA for now.
-_TABLE_CELLS_COLS = [
-    "page_number", "page_label", "layout_id", "table_id", "table_cell_id",
-    "text", "row_start", "col_start", "rowspan", "colspan", "table_cell_role",
-]
-
-
-def _build_table_cells_df(df_cells: pd.DataFrame) -> pd.DataFrame:
+def _build_table_cells_df(df_cells: pd.DataFrame, debug: bool = False) -> pd.DataFrame:
     """
     Fold df_cells down to one row per logical table cell (table_cell_id):
-    fragment texts join with a newline in reading order (line_id, then x_left),
-    rowspan/colspan take the max across fragments (the widest claim wins, same
-    policy as _reconcile_colspan), everything else is constant within a cell
-    and takes the first value. Rows are ordered by table_cell_id, which is
-    itself reading order.
+    fragment texts join with a newline in reading order (line_id, then x_left)
+    via merge_text_within_line, rowspan/colspan take the max across fragments
+    (the widest claim wins, same policy as _reconcile_colspan), everything
+    else is constant within a cell and takes the first value.
+    table_header_flag/bold_ratio (and the is_bold recomputed from it) are
+    re-aggregated via aggregate_to. Rows are ordered by table_cell_id, which
+    is itself reading order.
     """
     if "table_cell_id" not in df_cells.columns or not df_cells["table_cell_id"].notna().any():
-        return pd.DataFrame(columns=_TABLE_CELLS_COLS)
+        return pd.DataFrame(columns=TABLE_CELLS_COLS)
 
     sub = df_cells.loc[df_cells["table_cell_id"].notna()].copy()
     sort_cols = [c for c in ("table_cell_id", "line_id", "x_left") if c in sub.columns]
     sub = sub.sort_values(sort_cols, kind="stable")
 
-    agg: dict[str, tuple[str, object]] = {
-        "text": ("text", lambda s: "\n".join(s.dropna().astype(str))),
-    }
+    agg: dict[str, tuple[str, object]] = {}
     for col in ("page_number", "page_label", "layout_id", "table_id",
                 "row_start", "col_start"):
         if col in sub.columns:
@@ -793,12 +806,26 @@ def _build_table_cells_df(df_cells: pd.DataFrame) -> pd.DataFrame:
         .agg(**agg)
         .reset_index()
     )
-    out["table_cell_role"] = pd.array([pd.NA] * len(out), dtype="string")
+    out["text"] = out["table_cell_id"].map(
+        merge_text_within_line(sub["text"], sub["table_cell_id"], sep="\n")
+    )
 
-    for col in _TABLE_CELLS_COLS:
-        if col not in out.columns:
-            out[col] = pd.NA
-    return out[_TABLE_CELLS_COLS]
+    style_cols = [c for c in ("table_header_flag", "bold_ratio", "char_count")
+                  if c in sub.columns]
+    if style_cols:
+        style = aggregate_to(sub[["table_cell_id", *style_cols]],
+                              by="table_cell_id")
+        out = out.merge(style.drop(columns=["char_count"], errors="ignore"),
+                         on="table_cell_id", how="left")
+
+    if not out.empty and "table_id" in out.columns:
+        # detect_cell_roles processes every table in one vectorized pass,
+        # grouping internally on (table_id, row_start).
+        out = detect_cell_roles(out)
+    else:
+        out["table_cell_role"] = pd.array([pd.NA] * len(out), dtype="string")
+
+    return out #conform_table_cells(out, debug=debug)
 
 
 # ============================================================
@@ -808,6 +835,7 @@ def _build_table_cells_df(df_cells: pd.DataFrame) -> pd.DataFrame:
 def build_tables(
     df_cells: pd.DataFrame,
     df_grid_cells: pd.DataFrame,
+    debug: bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
 
     df_cells = _merge_grid_cell_layout(df_cells, df_grid_cells)
@@ -822,6 +850,6 @@ def build_tables(
     df_cells = _assign_row_layout(df_cells)
     df_cells = _assign_table_cell_ids(df_cells)
 
-    df_table_cells = _build_table_cells_df(df_cells)
+    df_table_cells = _build_table_cells_df(df_cells, debug=debug)
 
     return df_cells, df_table_cells

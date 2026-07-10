@@ -27,6 +27,7 @@ from .step_02_run_extractor import (
     _content_part_specs,
     _iter_part_roots,
 )
+from .._utils.df_schemas import TABLE_CELLS_COLS, conform_table_cells
 from .._utils.table_utils import detect_cell_roles
 
 
@@ -296,27 +297,12 @@ def _find_captions(run_df: pd.DataFrame) -> dict[int, str]:
 # Public API
 # ---------------------------------------------------------------------------
 
-_OUTPUT_COLS = [
-    "page_number",
-    "page_label",
-    "table_id",
-    "caption",
-    "table_row_id",
-    "table_cell_id",
-    "row_start",
-    "col_start",
-    "rowspan",
-    "colspan",
-    "role",
-    "text",
-]
-
-
 def build_table_cells(
     package: DocxPackage,
     run_df: pd.DataFrame,
     include_headers_footers: bool = True,
     include_notes_comments: bool = True,
+    debug: bool = False,
 ) -> pd.DataFrame:
     """
     Build df_table_cells from a DOCX package and its run-level DataFrame.
@@ -327,21 +313,21 @@ def build_table_cells(
             include_headers_footers / include_notes_comments settings.
         include_headers_footers: Match the setting used in extract_runs.
         include_notes_comments: Match the setting used in extract_runs.
+        debug: Keep the detect_cell_roles diagnostic columns (table_row_style,
+            hdr_*) in the output.
 
     Returns:
-        DataFrame with one row per logical table cell:
-            page_number, page_label, table_id, caption, table_row_id,
-            table_cell_id, row_start, col_start, rowspan, colspan, role, text
+        DataFrame with the canonical df_table_cells schema (TABLE_CELLS_COLS).
 
         rowspan = 0 means the cell is covered by a vertically spanning cell
         above it (w:vMerge continuation). rowspan >= 1 is the actual span.
     """
     if run_df.empty:
-        return pd.DataFrame(columns=_OUTPUT_COLS)
+        return pd.DataFrame(columns=TABLE_CELLS_COLS)
 
     geoms = _collect_cell_geoms(package, include_headers_footers, include_notes_comments)
     if not geoms:
-        return pd.DataFrame(columns=_OUTPUT_COLS)
+        return pd.DataFrame(columns=TABLE_CELLS_COLS)
 
     rowspans = _compute_rowspans(geoms)
 
@@ -391,14 +377,13 @@ def build_table_cells(
             lambda s: s.ffill().bfill()
         )
 
-    # Fold DOCX-specific header signals into a `th` column for detect_cell_roles.
-    # w:tblHeader and style names containing "header" both count.
+    # Fold DOCX-specific header signals into table_header_flag for
+    # detect_cell_roles. w:tblHeader and style names containing "header" count.
     style_is_header = result["_para_style"].str.lower().str.contains("header", na=False)
-    result["th"] = result["_tbl_header"] | style_is_header
+    result["table_header_flag"] = result["_tbl_header"] | style_is_header
     result = result.drop(columns=["_tbl_header", "_para_style"])
-    result = pd.concat(
-        [detect_cell_roles(grp, with_row_label=False) for _, grp in result.groupby("table_id", sort=False)],
-        ignore_index=True,
-    )
+    # detect_cell_roles processes every table in one vectorized pass, grouping
+    # internally on (table_id, row_start).
+    result = detect_cell_roles(result, with_row_label=False)
 
-    return result[_OUTPUT_COLS].reset_index(drop=True)
+    return result #conform_table_cells(result, debug=debug)

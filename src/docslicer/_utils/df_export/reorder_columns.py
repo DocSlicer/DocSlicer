@@ -152,7 +152,9 @@ MASTER_COLUMN_ORDER: List[str] = [
     "rowspan", 
     "colspan",
     "band_total_cols",
-    "role",                 # header / data / row_label
+    "table_cell_role",      # header / data / row_label
+
+    
 
     "row_complete",
     "is_last_tr_below",
@@ -342,10 +344,24 @@ MASTER_COLUMN_ORDER: List[str] = [
     "link_dest",
     "link_type",
     "ixbrl_id",
+    "ix",
     "html_data_attrs",
     "bookmark_id",          # docx  — single bookmark on this run
     "bookmark_ids",         # docx  — all bookmark IDs on paragraph
     "bookmark_names",       # docx  — all bookmark names on paragraph
+
+    # Header-detection features from detect_cell_roles (row-level, broadcast to cells)
+    "table_row_style",
+    "hdr_n_populated",
+    "hdr_frac_numeric",
+    "hdr_frac_bold",
+    "hdr_frac_th",
+    "hdr_has_year",
+    "hdr_has_date",
+    "hdr_is_currency_unit",
+    "hdr_has_unit_phrase",
+    "hdr_col0_blank",
+    "hdr_in_row0_span",
 
     # Shape overlaps / decorations (pdf)
     "has_horizontal_grid_line",

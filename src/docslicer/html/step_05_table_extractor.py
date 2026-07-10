@@ -21,7 +21,8 @@ Pipeline:
 
 Output columns (mirrors DOCX step_03_table_cell_builder + ix):
     page_number, page_label, table_id, table_row_id, table_cell_id,
-    row_start, col_start, rowspan, colspan, role, text, ix
+    row_start, col_start, rowspan, colspan, table_cell_role, text, ix,
+    table_header_flag, bold_ratio, is_bold
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ import numpy as np
 import pandas as pd
 from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 
+from .._utils.df_schemas import conform_table_cells
 from .._utils.table_utils import detect_cell_roles
 from .._utils.text_utils import _CURRENCY_SYMBOLS
 
@@ -51,24 +53,6 @@ _RPAREN_CHARS = frozenset({")", "]", "}", "%"})
 # Matches a fully-parenthesized expression with no nested parens, optional trailing %.
 # Used to recognise footnote-ref cells like (1), (n.m.) that sit in an rparen column.
 _FULL_PAREN_RE = re.compile(r"^\([^()]*\)%?$")
-
-_OUTPUT_COLS = [
-    "page_number",
-    "page_label",
-    "table_id",
-    "table_row_id",
-    "table_cell_id",
-    "row_start",
-    "col_start",
-    "rowspan",
-    "colspan",
-    "role",
-    "text",
-    "ix",
-    "max_cols",
-    "initial_col_indices",
-]
-
 
 def _norm_ws(s: str) -> str:
     s = _WS_RE.sub(" ", (s or "").replace("\xa0", " ")).strip()
@@ -517,6 +501,27 @@ def _table_page_info(df_lines: pd.DataFrame) -> dict[int, tuple]:
     return info
 
 
+def _table_row_style_info(df_lines: pd.DataFrame) -> dict[tuple[int, int], tuple]:
+    """
+    Return {(table_id, table_row_id): (table_header_flag, bold_ratio, is_bold)}.
+
+    line_merger merges every box in a table row into a single line_id, so each
+    (table_id, table_row_id) pair maps to exactly one df_lines row — safe to
+    pick the first value per group.
+    """
+    style_cols = ["table_header_flag", "bold_ratio", "is_bold"]
+    if not all(c in df_lines.columns for c in style_cols):
+        return {}
+    valid = df_lines[
+        df_lines["table_id"].notna() & df_lines["table_row_id"].notna()
+    ][["table_id", "table_row_id", *style_cols]].drop_duplicates(["table_id", "table_row_id"])
+    info: dict[tuple[int, int], tuple] = {}
+    for row in valid.itertuples(index=False):
+        key = (int(row.table_id), int(row.table_row_id))
+        info[key] = (row.table_header_flag, row.bold_ratio, row.is_bold)
+    return info
+
+
 def _table_row_ids(df_lines: pd.DataFrame) -> dict[int, list[int]]:
     """Return {final_table_id: [table_row_id, ...]} sorted by row appearance."""
     row_ids: dict[int, list[int]] = {}
@@ -567,6 +572,7 @@ def _combine_table_parts(parts: list[pd.DataFrame]) -> pd.DataFrame:
 def extract_table_cells(
     df_lines: pd.DataFrame,
     rendered_html: str,
+    debug: bool = False,
 ) -> Optional[pd.DataFrame]:
     """
     Extract and normalize HTML tables into a cell-level DataFrame whose
@@ -584,10 +590,12 @@ def extract_table_cells(
         df_lines:      Line-level DataFrame from step 04. Must have
                        original_table_id and table_id columns.
         rendered_html: Rendered HTML string for parsing table structure.
-        df_boxes:      Unused; kept for call-site compatibility.
+        debug:         Keep the detect_cell_roles diagnostic columns
+                       (table_row_style, hdr_*) in the output.
 
     Returns:
-        DataFrame with one row per logical table cell, or None if no tables found.
+        DataFrame with the canonical df_table_cells schema (TABLE_CELLS_COLS),
+        or None if no tables found.
     """
     if not rendered_html or df_lines is None:
         return None
@@ -603,6 +611,7 @@ def extract_table_cells(
 
     page_info = _table_page_info(df_lines)
     row_ids_by_table = _table_row_ids(df_lines)
+    row_style_info = _table_row_style_info(df_lines)
 
     # Build a lookup: JS table_id → <table> element, using the
     # data-docslicer-table-id attribute stamped by extract_boxes.js.
@@ -648,9 +657,6 @@ def extract_table_cells(
         if df.empty:
             continue
 
-        # Detect cell roles
-        df = detect_cell_roles(df, with_row_label=True)
-
         # Assign global cell_ids (sequential across all tables)
         n = len(df)
         df["table_cell_id"] = range(global_cell_id, global_cell_id + n)
@@ -667,20 +673,28 @@ def extract_table_cells(
         }
         df["table_row_id"] = df["row_start"].map(row_to_rid)
 
+        # Pick up table_header_flag / bold_ratio / is_bold from the df_lines row
+        # each table row derives from (line_merger merges a table row into one line_id).
+        style = df["table_row_id"].map(
+            lambda rid: row_style_info.get((final_tid, int(rid)))
+            if pd.notna(rid)
+            else None
+        )
+        df["table_header_flag"] = style.map(lambda s: s[0] if s is not None else None)
+        df["bold_ratio"] = style.map(lambda s: s[1] if s is not None else None)
+        df["is_bold"] = style.map(lambda s: s[2] if s is not None else None)
+
+        # Detect cell roles (needs table_header_flag / is_bold in place)
+        df = detect_cell_roles(df, with_row_label=True)
+
         pn, pl = page_info.get(final_tid, (None, None))
         df["page_number"] = pn
         df["page_label"] = pl
 
-        present = [c for c in _OUTPUT_COLS if c in df.columns]
-        all_cells.append(df[present])
+        all_cells.append(df)
 
     if not all_cells:
         return None
 
     result = pd.concat(all_cells, ignore_index=True)
-
-    for col in _OUTPUT_COLS:
-        if col not in result.columns:
-            result[col] = None
-
-    return result[_OUTPUT_COLS].reset_index(drop=True)
+    return result #conform_table_cells(result, debug=debug)
