@@ -58,6 +58,7 @@ _DEFAULT_VIEWPORT_WIDTH = 1280
 # <span>/<font> are excluded — too frequent on CSS-styled pages, causes fragmentation.
 _SEGMENT_SPLIT_TAGS: frozenset[str] = frozenset({
     "strong", "b", "em", "i", "u", "a", "mark", "s", "del", "ins",
+    "strike", "sup", "sub",  # strike → strikethrough; sup/sub → script_type
 })
 
 
@@ -122,6 +123,8 @@ def _resolve_style(el: Tag) -> Dict[str, Any]:
     bold = False
     italic = False
     underline = False
+    strikethrough = False
+    script_type = ""   # "superscript" | "subscript" | ""
     text_align: Optional[str] = None
     color: Optional[str] = None
 
@@ -132,6 +135,13 @@ def _resolve_style(el: Tag) -> Dict[str, Any]:
         # Semantic signals
         if tag in ("b", "strong"):
             bold = True
+        if tag in ("s", "strike", "del"):
+            strikethrough = True
+        # Innermost sup/sub wins (walk runs innermost → outermost)
+        if not script_type and tag == "sup":
+            script_type = "superscript"
+        if not script_type and tag == "sub":
+            script_type = "subscript"
         if tag in _HEADING_FONT_PX:
             # h1-h6 are bold and have a default font size in every browser stylesheet
             bold = True
@@ -169,10 +179,18 @@ def _resolve_style(el: Tag) -> Dict[str, Any]:
             if fs in ("italic", "oblique"):
                 italic = True
 
-        if not underline:
-            td = (props.get("text-decoration", "") or props.get("text-decoration-line", "")).lower()
-            if "underline" in td:
-                underline = True
+        td = (props.get("text-decoration", "") or props.get("text-decoration-line", "")).lower()
+        if not underline and "underline" in td:
+            underline = True
+        if not strikethrough and "line-through" in td:
+            strikethrough = True
+
+        if not script_type:
+            va = props.get("vertical-align", "").lower()
+            if va == "super":
+                script_type = "superscript"
+            elif va == "sub":
+                script_type = "subscript"
 
         # Legacy align attribute
         if text_align is None and node.get("align"):
@@ -190,6 +208,8 @@ def _resolve_style(el: Tag) -> Dict[str, Any]:
         "bold": bold,
         "italic": italic,
         "underline": underline,
+        "strikethrough": strikethrough,
+        "script_type": script_type,
         "text_align": text_align or "",
         "color": color or "",
     }
@@ -232,10 +252,15 @@ def _style_anchor(el: Tag) -> Tag:
 # Ancestor metadata
 # ---------------------------------------------------------------------------
 
-def _ancestor_meta(el: Tag) -> Dict[str, List[str]]:
-    ids, classes, tags, roles = [], [], [], []
-    node: Any = el.parent
+def _ancestor_meta(el: Tag, dom_order: Dict[int, int]) -> Dict[str, List[Any]]:
+    ids, classes, tags, tag_ids, roles = [], [], [], [], []
+    # Start at el itself so struct_ancestors INCLUDES the box's own tag as the last entry.
+    node: Any = el
     while node is not None and isinstance(node, Tag) and node.name:
+        # Skip the BeautifulSoup '[document]' pseudo-root — it is a parser artifact,
+        # not a real ancestor element, and has no dom_order id.
+        if node.name == "[document]":
+            break
         if node.get("id"):
             ids.append(str(node["id"]))
         cls = node.get("class")
@@ -244,16 +269,22 @@ def _ancestor_meta(el: Tag) -> Dict[str, List[str]]:
                 classes.extend(cls)
             else:
                 classes.extend(str(cls).split())
+        # struct_ancestors / struct_ancestor_ids stay index-parallel (one entry per
+        # ancestor element). tag_id is a document-order unique id, so two boxes under
+        # the same ancestor share its id. Whitelist gate intentionally absent here.
         tags.append(node.name.lower())
+        tag_ids.append(dom_order.get(id(node), -1))
         role = node.get("role") or node.get("aria-role")
         if role:
             roles.append(str(role).strip().lower())
         node = node.parent
+    # Reverse so arrays run highest-ancestor → direct-parent (matches JS extractor)
     return {
-        "ancestor_ids": ids,
-        "ancestor_classes": classes,
-        "ancestor_tags": tags,
-        "ancestor_aria_roles": roles,
+        "ancestor_ids": ids[::-1],
+        "ancestor_classes": classes[::-1],
+        "struct_ancestors": tags[::-1],
+        "struct_ancestor_ids": tag_ids[::-1],
+        "ancestor_aria_roles": roles[::-1],
     }
 
 
@@ -354,6 +385,7 @@ def _base_box(
     structure_tag_id: int,
     table_id_map: Dict[int, int],
     row_id_map: Dict[int, int],
+    dom_order: Dict[int, int],
 ) -> Dict[str, Any]:
     """Fields common to all box types."""
     style = _resolve_style(_style_anchor(el))
@@ -361,7 +393,7 @@ def _base_box(
     dom_class = " ".join(dom_class_raw) if isinstance(dom_class_raw, list) else str(dom_class_raw or "")
     return {
         "box_id": structure_tag_id,
-        "structure_tag_id": structure_tag_id,
+        "struct_tag_id": structure_tag_id,
         "x_left": _resolve_x_left(el),
         "x_right": 0.0,
         "y_top": 0.0,
@@ -379,7 +411,7 @@ def _base_box(
         "page_height": 0,
         "page_format": "html_static",
         **_table_context(el, table_id_map, row_id_map),
-        **_ancestor_meta(el),
+        **_ancestor_meta(el, dom_order),
         # style fields — caller may override
         "_style": style,
     }
@@ -493,7 +525,7 @@ def extract_boxes_static(html: str) -> List[Dict[str, Any]]:
         struct_counter += 1
         if kind in ("hr", "img"):
             box_counter += 1
-            base = _base_box(el, struct_counter, table_id_map, row_id_map)
+            base = _base_box(el, struct_counter, table_id_map, row_id_map, dom_order)
             base["box_id"] = box_counter
             base.pop("_style")
 
@@ -504,12 +536,13 @@ def extract_boxes_static(html: str) -> List[Dict[str, Any]]:
                 )
                 boxes.append({
                     **base,
-                    "structure_tag": "hr",
+                    "struct_tag": "hr",
                     "wrapping_tag": "hr",
                     "split_reason": "horizontal_rule",
                     "text": f"[[HR: {hr_width}]]" if hr_width else "[[HR]]",
                     "font_size": "", "font_family": "", "font_weight": 400,
                     "bold_ratio": 0.0, "italic_ratio": 0.0, "underlined_ratio": 0.0,
+                    "strikethrough_ratio": 0.0, "is_strikethrough": False, "script_type": "",
                     "non_stroking_color": "", "text_align": "",
                     "link_url": "", "img_alt": "", "img_src": "",
                 })
@@ -517,12 +550,13 @@ def extract_boxes_static(html: str) -> List[Dict[str, Any]]:
                 alt = str(el.get("alt", "") or "")
                 boxes.append({
                     **base,
-                    "structure_tag": "img",
+                    "struct_tag": "img",
                     "wrapping_tag": "img",
                     "split_reason": "image",
                     "text": f"[[IMAGE: {alt}]]" if alt else "[[IMAGE]]",
                     "font_size": "", "font_family": "", "font_weight": 400,
                     "bold_ratio": 0.0, "italic_ratio": 0.0, "underlined_ratio": 0.0,
+                    "strikethrough_ratio": 0.0, "is_strikethrough": False, "script_type": "",
                     "non_stroking_color": "", "text_align": "",
                     "link_url": _link_url(el),
                     "img_alt": alt, "img_src": str(el.get("src", "") or ""),
@@ -537,7 +571,7 @@ def extract_boxes_static(html: str) -> List[Dict[str, Any]]:
             dom_class_raw = el.get("class", [])
             dom_class = " ".join(dom_class_raw) if isinstance(dom_class_raw, list) else str(dom_class_raw or "")
             shared = {
-                "structure_tag": tag,
+                "struct_tag": tag,
                 "x_left": _resolve_x_left(el),
                 "x_right": 0.0, "y_top": 0.0, "y_bottom": 0.0,
                 "width": 0.0, "height": 0.0,
@@ -551,7 +585,7 @@ def extract_boxes_static(html: str) -> List[Dict[str, Any]]:
                 "page_height": 0,
                 "page_format": "html_static",
                 **_table_context(el, table_id_map, row_id_map),
-                **_ancestor_meta(el),
+                **_ancestor_meta(el, dom_order),
             }
 
             for seg_text, seg_anchor, seg_split_reason in segments:
@@ -570,7 +604,7 @@ def extract_boxes_static(html: str) -> List[Dict[str, Any]]:
                 boxes.append({
                     **shared,
                     "box_id": box_counter,
-                    "structure_tag_id": struct_counter,
+                    "struct_tag_id": struct_counter,
                     "ixbrl_id": _ixbrl_id(seg_anchor),
                     "wrapping_tag": wrapping,
                     "split_reason": seg_split_reason,
@@ -581,6 +615,9 @@ def extract_boxes_static(html: str) -> List[Dict[str, Any]]:
                     "bold_ratio": 1.0 if style["bold"] else 0.0,
                     "italic_ratio": 1.0 if style["italic"] else 0.0,
                     "underlined_ratio": 1.0 if style["underline"] else 0.0,
+                    "strikethrough_ratio": 1.0 if style["strikethrough"] else 0.0,
+                    "is_strikethrough": bool(style["strikethrough"]),
+                    "script_type": style["script_type"],
                     "non_stroking_color": style["color"],
                     "text_align": style["text_align"],
                     "link_url": _link_url(seg_anchor if seg_anchor is not el else el),

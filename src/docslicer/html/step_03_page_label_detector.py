@@ -53,13 +53,13 @@ class FormattingSignature:
     height: float
     font_size: float
     font_weight: str
-    structure_tag: str
+    struct_tag: str
     has_table_id: bool
     has_dash_wrapper: bool
     has_paren_wrapper: bool
     
     def __hash__(self):
-        return hash((self.height, self.font_size, self.font_weight, self.structure_tag, self.has_table_id, 
+        return hash((self.height, self.font_size, self.font_weight, self.struct_tag, self.has_table_id, 
                      self.has_dash_wrapper, self.has_paren_wrapper))
 
 @dataclass
@@ -87,7 +87,7 @@ class PageLabelCandidate:
     height: float
     font_size: float
     font_weight: str
-    structure_tag: str
+    struct_tag: str
     text_align: str
     # Table context
     has_table_id: bool
@@ -97,7 +97,7 @@ class PageLabelCandidate:
     
     def get_signature(self) -> FormattingSignature:
         return FormattingSignature(self.height, self.font_size, 
-                                   self.font_weight, self.structure_tag, self.has_table_id,
+                                   self.font_weight, self.struct_tag, self.has_table_id,
                                    self.has_dash_wrapper, self.has_paren_wrapper)
 
 # -------- Stage 2: Validated Output ------- #
@@ -181,7 +181,7 @@ def assign_page_labels(
 
     Required columns in df:
       - box_id, y_top, page_number, text
-      - structure_tag, height, font_size, font_weight, text_align
+      - struct_tag, height, font_size, font_weight, text_align
 
     Optional columns:
       - has_link    — improves TOC detection
@@ -221,7 +221,7 @@ def assign_page_labels(
         - page_label_groups: List of PageLabelGroup objects (one per sequence).
     """
     required = {"box_id", "y_top", "page_number", "text", 
-                "structure_tag", "height", "font_size", "font_weight", "text_align"}
+                "struct_tag", "height", "font_size", "font_weight", "text_align"}
     missing = required - set(df.columns)
     if missing:
         raise ValueError(f"df missing required columns: {sorted(missing)}")
@@ -541,7 +541,7 @@ def _build_page_label_token_inventory(df: pd.DataFrame, page_label_config) -> pd
     Requires df columns:
       - text
     Optional but commonly present:
-      - box_id, y_top, x_left, structure_tag, has_link (not required here)
+      - box_id, y_top, x_left, struct_tag, has_link (not required here)
     
     Args:
         df: DataFrame with text column
@@ -655,7 +655,7 @@ def _filter_page_label_tokens(
       - row belongs to a top band with total character length > 50 (likely text content)
 
     Requirements in df:
-      - box_id, y_top, page_number, structure_tag
+      - box_id, y_top, page_number, struct_tag
     Optional:
       - has_link (if present, used to filter TOC entries)
       - ixbrl_id (if present, rows with non-blank ixbrl_id are excluded)
@@ -671,7 +671,7 @@ def _filter_page_label_tokens(
     Returns:
         Series of normalized tokens (or None) indexed like df
     """
-    required = {"box_id", "y_top", "page_number", "structure_tag"}
+    required = {"box_id", "y_top", "page_number", "struct_tag"}
     missing = required - set(df.columns)
     if missing:
         raise ValueError(f"df missing required columns: {sorted(missing)}")
@@ -783,7 +783,7 @@ def _build_candidates_from_df(df: pd.DataFrame, page_label_config) -> List[PageL
 
     Requirements in df:
       - box_id, page_label_token, _raw_token
-      - structure_tag, height, font_size, font_weight, text_align
+      - struct_tag, height, font_size, font_weight, text_align
       - _has_dash_wrapper, _has_paren_wrapper (temporary wrapper columns)
     Optional:
       - table_id (for has_table_id detection)
@@ -797,7 +797,7 @@ def _build_candidates_from_df(df: pd.DataFrame, page_label_config) -> List[PageL
     """
     required = {
         "box_id", "page_label_token", "_raw_token",
-        "structure_tag", "height", "font_size", "font_weight", "text_align",
+        "struct_tag", "height", "font_size", "font_weight", "text_align",
         "_has_dash_wrapper", "_has_paren_wrapper",
     }
     missing = required - set(df.columns)
@@ -833,7 +833,7 @@ def _build_candidates_from_df(df: pd.DataFrame, page_label_config) -> List[PageL
             height=float(row["height"]),
             font_size=float(str(row["font_size"]).replace("px", "")),
             font_weight=str(row["font_weight"]),
-            structure_tag=str(row["structure_tag"]),
+            struct_tag=str(row["struct_tag"]),
             text_align=str(row["text_align"]),
             has_table_id=has_table_id,
             has_dash_wrapper=has_dash_wrapper,
@@ -1800,7 +1800,7 @@ def _propagate_page_labels_upward(df: pd.DataFrame) -> pd.DataFrame:
     Fill page_label upwards according to two rules:
 
     - **First label** (lowest box_id): propagate upward until hitting
-      ``structure_tag='hr'`` or a "table of contents" text row (inclusive stop —
+      ``struct_tag='hr'`` or a "table of contents" text row (inclusive stop —
       the stop row and everything above it remain unlabeled).
     - **All other labels**: propagate upward until hitting the prior page_label
       (i.e., each unlabeled gap between two consecutive labels is filled with the
@@ -1810,12 +1810,12 @@ def _propagate_page_labels_upward(df: pd.DataFrame) -> pd.DataFrame:
     followed by a single boundary-clipping step for the first-label rule.
 
     Args:
-        df: DataFrame with ``box_id``, ``page_label``, and ``structure_tag`` columns.
+        df: DataFrame with ``box_id``, ``page_label``, and ``struct_tag`` columns.
 
     Returns:
         DataFrame with ``page_label`` (and ``page_label_type`` if present) filled upward.
     """
-    if "page_label" not in df.columns or "box_id" not in df.columns or "structure_tag" not in df.columns:
+    if "page_label" not in df.columns or "box_id" not in df.columns or "struct_tag" not in df.columns:
         return df
 
     out = df.copy().sort_values("box_id")
@@ -1836,7 +1836,7 @@ def _propagate_page_labels_upward(df: pd.DataFrame) -> pd.DataFrame:
     first_box_id = labeled_rows["box_id"].min()
     before_first = out["box_id"] < first_box_id
 
-    cutoff_candidates = out.loc[before_first & (out["structure_tag"] == "hr"), "box_id"]
+    cutoff_candidates = out.loc[before_first & (out["struct_tag"] == "hr"), "box_id"]
 
     if "text" in out.columns:
         toc_mask = before_first & (

@@ -1,7 +1,7 @@
 # step_02_box_cleaner.py
 # Cleans raw extracted boxes by (1) dropping boilerplate elements based on HTML ancestor
 # context (nav/header/footer, cookie banners, social widgets, ads, etc.), (2) normalising
-# font sizes, (3) merging fragments that share a structure_tag_id, and (4) re-ordering
+# font sizes, (3) merging fragments that share a struct_tag_id, and (4) re-ordering
 # boxes by DOM position so that downstream steps receive a clean, sorted box list.
 
 from __future__ import annotations
@@ -14,9 +14,10 @@ import numpy as np
 import pandas as pd
 
 from docslicer._utils.text_utils import add_calculated_text_features
-from docslicer._utils.df_aggregation.hierarchical_aggregator import (
-    build_standard_agg_spec,
-    aggregate_hierarchical,
+from docslicer._utils.df_aggregation.registry_aggregator import Agg, aggregate_to, group_join
+from docslicer._utils.df_aggregation.text_merge import (
+    apply_inline_markup,
+    merge_text_within_line,
 )
 
 # =======================================================================================================================
@@ -31,7 +32,7 @@ from docslicer._utils.df_aggregation.hierarchical_aggregator import (
 class AncestorDropConfig:
     col_ids: str = "ancestor_ids"
     col_classes: str = "ancestor_classes"
-    col_tags: str = "ancestor_tags"
+    col_tags: str = "struct_ancestors"
     col_roles: str = "ancestor_aria_roles"
     col_dom_id: str = "dom_id"
     col_dom_class: str = "dom_class"
@@ -223,8 +224,8 @@ def _drop_boilerplate_by_ancestors(
 
     # Exception: never drop <h1> elements, even when nested inside chrome
     is_h1 = pd.Series([False] * len(out), index=out.index)
-    if "structure_tag" in out.columns:
-        is_h1 = out["structure_tag"].fillna("").str.lower() == "h1"
+    if "struct_tag" in out.columns:
+        is_h1 = out["struct_tag"].fillna("").str.lower() == "h1"
     elif "wrapping_tag" in out.columns:
         is_h1 = out["wrapping_tag"].fillna("").str.lower() == "h1"
 
@@ -253,64 +254,90 @@ def _drop_boilerplate_by_ancestors(
 # STEP 2: Merge Boxes by Structure Tag ID
 # =======================================================================================================================
 
+def _collapse_consecutive_script_runs(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Collapse consecutive fragments that share a ``struct_tag_id`` and
+    ``script_type`` into a single row (text concatenated, no separator), so
+    :func:`apply_inline_markup` wraps each run once instead of once per
+    fragment — three single-char superscript boxes "[", "15", "]" become one
+    "[15]" row -> "[^[15]]", instead of "[^[][^15][^]]".
+
+    ``df`` must already be sorted in join (box_id) order. Uses pandas'
+    vectorized ``groupby().first()`` plus :func:`group_join` for the text
+    concatenation, so no per-row Python loop.
+    """
+    if df.empty:
+        return df
+
+    script = df["script_type"].astype("string").fillna("").to_numpy()
+    key = df["struct_tag_id"].to_numpy()
+    is_script = script != ""
+    # Plain-text rows never join a run (they keep the normal word-spaced join
+    # downstream); only consecutive fragments of the *same* non-empty script
+    # collapse together.
+    boundary = np.ones(len(df), dtype=bool)
+    boundary[1:] = ~(is_script[1:] & (script[1:] == script[:-1]) & (key[1:] == key[:-1]))
+    run_id = pd.Series(np.cumsum(boundary), index=df.index)
+
+    out = df.groupby(run_id, sort=False).first()
+    out["text"] = group_join(df["text"], run_id, sep="").to_numpy()
+    return out.reset_index(drop=True)
+
+
 def _merge_boxes_by_structure_tag(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Merge boxes that share the same ``structure_tag_id``, EXCEPT when ``split_reason = 'br_tag'``.
+    Merge boxes that share the same ``struct_tag_id``, EXCEPT when ``split_reason = 'br_tag'``.
 
     Boxes split by a ``<br>`` tag remain separate because they represent intentional line breaks.
     The merged box inherits the minimum ``box_id`` of its group so that downstream DOM ordering
     is preserved.
 
     Args:
-        df: DataFrame with box data including ``structure_tag_id`` and ``split_reason``.
+        df: DataFrame with box data including ``struct_tag_id`` and ``split_reason``.
 
     Returns:
         DataFrame with merged boxes.
     """
-    if df.empty or "structure_tag_id" not in df.columns:
+    if df.empty or "struct_tag_id" not in df.columns:
         return df
 
-    # Boxes that must NOT be merged: intentional <br> splits or no valid structure_tag_id
-    br_mask = df.get("split_reason", pd.Series([None] * len(df))) == "br_tag"
-    no_struct_id_mask = df["structure_tag_id"].isna() | (df["structure_tag_id"] < 0)
+    # Boxes that must NOT be merged: intentional <br> splits or no valid struct_tag_id
+    br_mask = df.get("split_reason", pd.Series([None] * len(df), index=df.index)) == "br_tag"
+    no_struct_id_mask = df["struct_tag_id"].isna() | (df["struct_tag_id"] < 0)
     no_merge_mask = br_mask | no_struct_id_mask
 
+    # Passed-through boxes (<br> splits / orphans): bake inline markup straight into
+    # their text so they match the merged boxes and script_type can be dropped.
     df_no_merge = df[no_merge_mask].copy()
+    df_no_merge["text"] = apply_inline_markup(df_no_merge)
+    df_no_merge = df_no_merge.drop(columns=["script_type"], errors="ignore")
+
     df_to_merge = df[~no_merge_mask].copy()
-
     if df_to_merge.empty:
-        return df
+        return df_no_merge.sort_values("box_id").reset_index(drop=True)
 
-    df_to_merge["_min_box_id"] = df_to_merge.groupby("structure_tag_id")["box_id"].transform("min")
+    # Fragments of one element must join in DOM (reading) order; box_id is that order.
+    df_to_merge = df_to_merge.sort_values("box_id", kind="mergesort")
 
-    agg_spec = build_standard_agg_spec(
-        identity_cols=["page_number", "page_width", "page_height", "page_format"],
-        include_geometry=True,
-        include_style=True,
-        include_counts=True,
-        include_metadata=True,
-        include_table=True,
-        include_html_provenance=True,
-        extra_first=[
-            "_min_box_id",
-            "img_alt",
-            "img_src",
-            "underlined_ratio",
-        ],
-        extra_agg={
-            "text": lambda s: " ".join(str(t) for t in s if t and str(t).strip()),
+    # Consecutive same-script fragments (e.g. several adjacent <sup> reference marks,
+    # often single-char boxes) collapse into one run so apply_inline_markup wraps them
+    # once instead of once per fragment ("[^[15][16]]" rather than "[^[15]][^[16]]").
+    # Ordinal superscripts ("15th", "2nd") are handled by apply_inline_markup itself,
+    # which leaves them unwrapped as plain typography.
+    df_to_merge = _collapse_consecutive_script_runs(df_to_merge)
+
+    fmt_text = apply_inline_markup(df_to_merge)
+    merged_text = merge_text_within_line(fmt_text, df_to_merge["struct_tag_id"])
+
+    df_merged = aggregate_to(
+        df_to_merge,
+        by="struct_tag_id",
+        overrides={
+            "box_id": Agg.MIN,        # inherit the min box_id → preserves DOM ordering
+            "struct_tag": Agg.FIRST,  # element tag is shared by all fragments
         },
     )
-
-    df_merged = aggregate_hierarchical(
-        df_to_merge,
-        group_col="structure_tag_id",
-        agg_spec=agg_spec,
-        compute_derived=True,
-    )
-
-    df_merged["box_id"] = df_merged["_min_box_id"]
-    df_merged = df_merged.drop(columns=["_min_box_id"])
+    df_merged["text"] = df_merged["struct_tag_id"].map(merged_text)
 
     result = pd.concat([df_merged, df_no_merge], ignore_index=True)
     result = result.sort_values("box_id").reset_index(drop=True)
@@ -337,10 +364,10 @@ def clean_boxes(
        based on HTML ancestor context (see :func:`drop_boilerplate_by_ancestors`).
     2. **Text features** – compute derived text metrics (character counts, whitespace ratios, …).
     3. **Font size normalisation** – strip CSS units so ``"18.6667px"`` becomes ``18.6667``.
-    4. **Merge fragments** – collapse boxes that share a ``structure_tag_id`` into a single row,
+    4. **Merge fragments** – collapse boxes that share a ``struct_tag_id`` into a single row,
        preserving ``<br>``-split boxes as separate entries.
     5. **DOM ordering** – reassign ``box_id`` in reading order: regular content sorted by
-       ``structure_tag_id``; ``<hr>`` and ``<img>`` elements inserted by ``y_top`` position
+       ``struct_tag_id``; ``<hr>`` and ``<img>`` elements inserted by ``y_top`` position
        (skipped when ``reorder_by_coordinates=False`` — use for static extraction where
        y_top is always 0 and DOM order is already correct).
     6. **Block role** – populate ``block_type`` for structural elements (``"hr"``, ``"image"``).
@@ -367,19 +394,19 @@ def clean_boxes(
     if "font_size" in df_clean.columns:
         df_clean["font_size"] = df_clean["font_size"].apply(_normalize_font_size)
 
-    # 4) Merge boxes that share a structure_tag_id (br_tag splits are kept separate)
+    # 4) Merge boxes that share a struct_tag_id (br_tag splits are kept separate)
     df_clean = _merge_boxes_by_structure_tag(df_clean)
 
-    # 5) Reassign box_id in DOM order: regular content by structure_tag_id,
+    # 5) Reassign box_id in DOM order: regular content by struct_tag_id,
     #    hr/img elements inserted by y_top (skipped for static extraction)
-    if "box_id" in df_clean.columns and "structure_tag" in df_clean.columns:
-        is_special = df_clean["structure_tag"].isin(["hr", "img"])
+    if "box_id" in df_clean.columns and "struct_tag" in df_clean.columns:
+        is_special = df_clean["struct_tag"].isin(["hr", "img"])
         special_rows = df_clean[is_special].copy()
         regular_rows = df_clean[~is_special].copy()
 
         if reorder_by_coordinates and not special_rows.empty and not regular_rows.empty and "y_top" in df_clean.columns:
-            if "structure_tag_id" in regular_rows.columns:
-                regular_rows = regular_rows.sort_values("structure_tag_id").reset_index(drop=True)
+            if "struct_tag_id" in regular_rows.columns:
+                regular_rows = regular_rows.sort_values("struct_tag_id").reset_index(drop=True)
             special_rows = special_rows.sort_values("y_top").reset_index(drop=True)
 
             # Assign float sort keys so special rows slot in before the first regular row
@@ -398,18 +425,18 @@ def clean_boxes(
                 .reset_index(drop=True)
             )
         else:
-            # Static extraction: DOM order is already correct — sort everything by structure_tag_id
-            if "structure_tag_id" in df_clean.columns:
-                df_clean = df_clean.sort_values("structure_tag_id").reset_index(drop=True)
+            # Static extraction: DOM order is already correct — sort everything by struct_tag_id
+            if "struct_tag_id" in df_clean.columns:
+                df_clean = df_clean.sort_values("struct_tag_id").reset_index(drop=True)
             else:
                 df_clean = df_clean.reset_index(drop=True)
 
         df_clean["box_id"] = range(1, len(df_clean) + 1)  # 1-based
 
     # 6) Assign block_type for structural element types
-    if "structure_tag" in df_clean.columns:
+    if "struct_tag" in df_clean.columns:
         df_clean["block_type"] = None
-        df_clean.loc[df_clean["structure_tag"] == "hr", "block_type"] = "hr"
-        df_clean.loc[df_clean["structure_tag"] == "img", "block_type"] = "image"
+        df_clean.loc[df_clean["struct_tag"] == "hr", "block_type"] = "hr"
+        df_clean.loc[df_clean["struct_tag"] == "img", "block_type"] = "image"
 
     return df_clean

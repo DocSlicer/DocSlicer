@@ -126,11 +126,10 @@ MASTER_COLUMN_ORDER: List[str] = [
     "paragraph_ids",        # docx, pptx  — list of paragraph_id values aggregated here
     "raw_shape_ids",
 
-    
 
-    # Secondary / structural IDs HTML
-    "structure_tag",
-    "structure_tag_id",
+
+    # NOTE: HTML struct_tag / struct_tag_id are ordered in the shared struct-tree
+    # provenance block below (they now share names with the PDF pipeline).
 
     # Aggregated hierarchical counts
     "run_count",            # docx, pptx  — runs collapsed into this paragraph
@@ -401,9 +400,9 @@ MASTER_COLUMN_ORDER: List[str] = [
     "dom_class",
     "wrapping_tag",
     "split_reason",
+    # struct_ancestors / struct_ancestor_ids are ordered in the struct-tree block above
     "ancestor_ids",
     "ancestor_classes",
-    "ancestor_tags",
     "ancestor_aria_roles",
 
     # ===== 12. Style inheritance =====

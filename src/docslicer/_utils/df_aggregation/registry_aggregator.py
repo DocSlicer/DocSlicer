@@ -124,6 +124,10 @@ COLUMN_REGISTRY: Dict[str, Agg] = {
     "page_label_wrapper": Agg.DROP,
     "page_label_score": Agg.DROP,
     "page_label_series_id": Agg.DROP,
+    # HTML page-label detector debug outputs (box-level detail, debug mode only)
+    "page_label_token": Agg.DROP,
+    "page_label_group_id": Agg.DROP,
+    "alternation_mode": Agg.DROP,
 
     # --- OCR internals: word-level detail, consumed upstream -------------------
     "background_non_stroking_color_hex_raw": Agg.DROP,
@@ -149,6 +153,7 @@ COLUMN_REGISTRY: Dict[str, Agg] = {
     "stream_group_id": Agg.FIRST,
     "sentence_score": Agg.FIRST,
     "center_bucket": Agg.FIRST,
+    "top_bucket": Agg.DROP,        # line_merger y-band internal; consumed by line_id
     "line_number_flag": Agg.DROP,   # pdf line-number margin flag; word-level detail
     "line_class": Agg.FIRST,
     "line_score": Agg.MAX,
@@ -259,15 +264,15 @@ COLUMN_REGISTRY: Dict[str, Agg] = {
     "nested_table_depth": Agg.FIRST,
 
     # --- HTML provenance -----------------------------------------------------------------
-    "structure_tag_id": Agg.FIRST,
-    "structure_tag": Agg.FIRST,
+    # NOTE: HTML struct_tag / struct_tag_id / struct_ancestors share names with the
+    # PDF struct-tree keys below (single policy): dropped at line level — all HTML
+    # consumers of struct_tag are box-level and run before the line builder.
     "wrapping_tag": Agg.FIRST,
     "split_reason": Agg.FIRST,
     "dom_id": Agg.FIRST,
     "dom_class": Agg.FIRST,
     "ancestor_ids": Agg.FIRST,
     "ancestor_classes": Agg.FIRST,
-    "ancestor_tags": Agg.FIRST,
     "ancestor_aria_roles": Agg.FIRST,
     
     "img_alt": Agg.FIRST,

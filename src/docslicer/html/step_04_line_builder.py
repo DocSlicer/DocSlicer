@@ -1,54 +1,56 @@
 # step_04_line_merger.py
 
 import re
+import numpy as np
 import pandas as pd
 
 from docslicer._utils.layout.line_merger import assign_line_id, LineMergerConfig
-from docslicer._utils.df_aggregation.hierarchical_aggregator import (
-    aggregate_hierarchical,
-    build_standard_agg_spec,
+from docslicer._utils.df_aggregation.registry_aggregator import aggregate_to
+from docslicer._utils.df_aggregation.text_merge import (
+    merge_table_rows,
+    merge_text_within_line,
 )
 
 
 # =================================
-# PRIVATE FUNCTIONS
+# Build Line Text
 # =================================
 
-def _create_line_text(df: pd.DataFrame) -> dict:
+def _build_line_text(df: pd.DataFrame) -> pd.Series:
     """
-    Create text for each line by sorting boxes by x_left.
+    Build the text for each line: boxes sorted by x_left, non-table lines joined
+    with spaces, table lines joined with pipes so downstream shared stages see a
+    row-shaped representation. Inline markup (script/strikethrough) is already
+    baked into box text by the box cleaner.
 
-    Non-table lines are joined with spaces. Table lines are joined with pipes so
-    downstream shared stages see a row-shaped representation.
-    
     Returns:
-        Dict mapping line_id -> text string
+        Series of joined text indexed by line_id.
     """
-    if "line_id" not in df.columns or "text" not in df.columns:
-        return {}
+    ordered = df.sort_values(["line_id", "x_left"], kind="stable")
+    texts = ordered["text"].astype("string").fillna("").str.strip().astype(str)
 
-    # Operate on the full DataFrame at once instead of per-group
-    cols = ["line_id", "x_left", "text"]
-    if "table_id" in df.columns:
-        cols.append("table_id")
-    working = df[cols].copy()
-    working = working[working["text"].notna()]
-    working["text"] = working["text"].astype(str).str.strip()
-    working = working[working["text"] != ""]
+    prose_text = merge_text_within_line(texts, ordered["line_id"])
 
-    working = working.sort_values(["line_id", "x_left"])
+    if "table_id" not in ordered.columns:
+        return prose_text
 
-    if "table_id" not in working.columns:
-        return working.groupby("line_id", sort=False)["text"].agg(" ".join).to_dict()
+    tid = ordered["table_id"]
+    is_tagged = tid.notna() & (tid.astype(str).str.strip() != "")
+    if not is_tagged.any():
+        return prose_text
 
-    text_map = {}
-    for line_id, group in working.groupby("line_id", sort=False):
-        table_id = group["table_id"].iloc[0]
-        has_table = pd.notna(table_id) and str(table_id).strip() != ""
-        sep = " | " if has_table else " "
-        text_map[line_id] = sep.join(group["text"].tolist())
-    return text_map
+    # A line is a table row if any of its boxes carries a table_id; pipe-join
+    # all boxes on such lines and splice those rows over the prose default.
+    table_line = is_tagged.groupby(ordered["line_id"]).transform("any")
+    table_text = merge_table_rows(texts[table_line], ordered.loc[table_line, "line_id"])
+    line_text = prose_text.copy()
+    line_text.loc[table_text.index] = table_text
+    return line_text
 
+
+# =================================
+# Table vs Text
+# =================================
 
 _STARTS_WITH_NUMBER_OR_PARENS = re.compile(r'^(\d|\([a-zA-Z0-9]+\)|[•◦▪▸·‣⁃●○►▶◆◇□■])')
 
@@ -158,65 +160,131 @@ def _remove_single_row_tables(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+# =================================
+# Layout ID
+# =================================
+
+# Style columns compared line-to-line for layout grouping (x_left is compared
+# separately, rounded to whole points).
+_LAYOUT_STYLE_COLS = [
+    "font_family",
+    "font_size",
+    "text_align",
+    "non_stroking_color",
+    "is_bold",
+    "is_italic",
+    "is_uppercase",
+]
+
+# Vertical gap (pt) between one line's y_bottom and the next line's y_top at or
+# above which the next line starts a new layout. A negative gap (moving back up
+# the page, e.g. a column jump) also breaks.
+_LAYOUT_GAP_PT = 10.0
+
+_LIST_TAGS = frozenset({"ul", "ol"})
+_HEADING_TAGS = frozenset({"h1", "h2", "h3", "h4", "h5", "h6"})
+
+
+def _struct_layout_groups(df: pd.DataFrame) -> pd.Series:
+    """
+    Per line, a grouping key from the deepest list (ul/ol) or heading (h1-h6)
+    struct ancestor: ``"list_<id>"`` / ``"heading_<id>"``, else None.
+
+    Ancestors run root -> leaf, so the last matching tag is the innermost one —
+    items of a nested <ol> group under the nested list's id, and a heading
+    inside a list item groups under whichever of the two sits deeper.
+    Consecutive lines sharing a key are kept in one layout by _add_layout_id.
+    """
+    keys = np.full(len(df), None, dtype=object)
+    if "struct_ancestors" not in df.columns or "struct_ancestor_ids" not in df.columns:
+        return pd.Series(keys, index=df.index)
+
+    anc_arr = df["struct_ancestors"].to_numpy(dtype=object)
+    aid_arr = df["struct_ancestor_ids"].to_numpy(dtype=object)
+
+    for i in range(len(df)):
+        ancs = anc_arr[i] if isinstance(anc_arr[i], (list, tuple)) else []
+        aids = aid_arr[i] if isinstance(aid_arr[i], (list, tuple)) else []
+        key = None
+        for tag, id_ in zip(ancs, aids):
+            if tag in _LIST_TAGS:
+                key = f"list_{id_}"
+            elif tag in _HEADING_TAGS:
+                key = f"heading_{id_}"
+        keys[i] = key
+    return pd.Series(keys, index=df.index)
+
+
 def _add_layout_id(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Add layout_id column based on page changes, table groups, and line boundaries.
-    
+    Add layout_id column grouping consecutive lines into layouts.
+
     Rules:
     1. Start at 1 for the very first line
-    2. Increment when page_number changes
-    3. Rows with same table_id get same layout_id (increment at start/end of table groups)
-    4. For non-table lines, increment for every new line (each row gets its own layout_id)
-    
+    2. New id when page_number changes
+    3. Grouped lines share one layout_id for consecutive runs of the same
+       group key (new id when entering/leaving/switching groups). A line's
+       group key is, in order of precedence:
+       - its table_id
+       - its deepest ul/ol or h1-h6 struct ancestor (see
+         :func:`_struct_layout_groups`), so list items and multi-line
+         headings stay together
+    4. Ungrouped lines continue the previous line's layout unless:
+       - block_type changes from the previous line (hr, image, page label, ...)
+       - the style set changes: x_left (rounded to whole pt), font_family,
+         font_size, text_align, non_stroking_color, is_bold, is_italic,
+         is_uppercase
+       - the vertical gap to the previous line is >= 10pt or negative
+
     Args:
         df: DataFrame with lines
-        
+
     Returns:
         DataFrame with layout_id column added
     """
     if df is None or df.empty:
         return df
-    
+
     df = df.copy()
-    
-    layout_ids = []
-    current_layout_id = 1
-    prev_page = None
-    prev_table_id = None
-    
-    for _, row in df.iterrows():
-        page = row.get("page_number")
-        table_id = row.get("table_id")
-        
-        # Rule 2: Increment when page_number changes
-        if prev_page is not None and page != prev_page:
-            current_layout_id += 1
-            prev_table_id = None
-        
-        has_table = pd.notna(table_id)
-        
-        if has_table:
-            # Rule 3: Handle table groups
-            if table_id != prev_table_id:
-                # Entering a new table group
-                if prev_page is not None:  # Not the first row
-                    current_layout_id += 1
-                prev_table_id = table_id
-        else:
-            # Non-table line
-            if prev_table_id is not None:
-                # Exiting a table group
-                current_layout_id += 1
-                prev_table_id = None
-            else:
-                # Rule 4: Every new non-table line gets a new layout_id
-                if prev_page is not None:
-                    current_layout_id += 1
-        
-        layout_ids.append(current_layout_id)
-        prev_page = page
-    
-    df["layout_id"] = layout_ids
+    prev = df.shift(1)
+    false = pd.Series(False, index=df.index)
+
+    def _neq(cur: pd.Series, prv: pd.Series) -> pd.Series:
+        """NaN-safe inequality: NaN == NaN counts as equal."""
+        return ~((cur == prv) | (cur.isna() & prv.isna()))
+
+    # Rule 2: page change always breaks (and splits groups spanning pages)
+    new_page = _neq(df["page_number"], prev["page_number"]) if "page_number" in df.columns else false
+
+    # Rule 3: group key — table_id wins over the struct list/heading group
+    group_key = _struct_layout_groups(df)
+    if "table_id" in df.columns:
+        has_table = df["table_id"].notna()
+        group_key = group_key.mask(has_table, "table_" + df["table_id"].astype(str))
+    prev_key = group_key.shift(1)
+    grouped = group_key.notna()
+    group_break = grouped & _neq(group_key, prev_key)
+
+    # Rule 4: ungrouped lines break on block_type / style / vertical jump
+    style_change = false.copy()
+    if "block_type" in df.columns:
+        style_change |= _neq(df["block_type"], prev["block_type"])
+    if "x_left" in df.columns:
+        style_change |= _neq(df["x_left"].round(0), prev["x_left"].round(0))
+    for col in _LAYOUT_STYLE_COLS:
+        if col in df.columns:
+            style_change |= _neq(df[col], prev[col])
+
+    gap_break = false
+    if "y_top" in df.columns and "y_bottom" in df.columns:
+        gap = df["y_top"] - prev["y_bottom"]
+        gap_break = ((gap >= _LAYOUT_GAP_PT) | (gap < 0)).fillna(False)
+
+    ungrouped_break = ~grouped & (prev_key.notna() | style_change | gap_break)
+
+    breaks = (new_page | group_break | ungrouped_break).astype(bool)
+    breaks.iloc[0] = True  # Rule 1
+    df["layout_id"] = breaks.cumsum()
     return df
 
 
@@ -231,8 +299,8 @@ def merge_boxes_to_lines(
     """
     Merge boxes into lines:
     1. Assign line_id using line_merger
-    2. Sort text within each line by x_left
-    3. Aggregate using hierarchical_aggregator
+    2. Merge text within each line (sorted by x_left) via text_merge
+    3. Aggregate the remaining columns via the registry aggregator
     4. Optionally remove single-row tables and reindex
     5. Add layout_id
 
@@ -282,39 +350,25 @@ def merge_boxes_to_lines(
 
     boxes_with_lines = assign_line_id(boxes_df, y_alignment="top")
     
-    # Step 2: Create text for each line (sorted by x_left, joined with spaces)
-    line_text_map = _create_line_text(boxes_with_lines)
-    
-    # Step 3: Build aggregation spec
-    agg_spec = build_standard_agg_spec(
-        include_hierarchy=True,
-        include_geometry=True,
-        include_style=True,
-        include_counts=True,
-        include_metadata=True,
-        include_table=True,
-        include_html_provenance=True,
-        count_col="box_id",
-    )
-    
-    # Step 4: Aggregate
-    lines_df = aggregate_hierarchical(
-        df=boxes_with_lines,
-        group_col="line_id",
-        agg_spec=agg_spec,
-        rename_group_col="line_id",
-        rename_count_col={"box_id": "box_count"},
-        compute_derived=True,
-    )
-    
-    # Step 5: Add the text column
-    lines_df["text"] = lines_df["line_id"].map(line_text_map)
+    # Step 2: Create text for each line (sorted by x_left, joined with spaces,
+    # pipe-joined on table lines). Text is merged from the x-sorted view while
+    # aggregation runs on the frame in document order, so "first"/dominant
+    # columns keep picking the same source boxes as before.
+    line_text = _build_line_text(boxes_with_lines)
 
-    # Step 6: Remove single-row tables if requested
+    # Step 3: Aggregate everything else via the central column registry
+    lines_df = aggregate_to(
+        boxes_with_lines,
+        by="line_id",
+        size_as="box_count",
+    )
+    lines_df["text"] = lines_df["line_id"].map(line_text)
+
+    # Step 4: Remove single-row tables if requested
     if remove_single_row_tables:
         lines_df = _remove_single_row_tables(lines_df)
 
-    # Step 7: Add layout_id column
+    # Step 5: Add layout_id column
     lines_df = _add_layout_id(lines_df)
     
     return lines_df

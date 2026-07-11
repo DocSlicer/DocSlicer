@@ -46,6 +46,12 @@ from .registry_aggregator import group_join
 # fragment with no intervening space.
 _SCRIPT_PREFIXES = ("[^", "[_")
 
+# Superscript fragments that are typography, not reference marks — ordinal
+# suffixes ("15th", "2nd") and trademark/copyright glyphs ("FINTEPLA®").
+# apply_inline_markup leaves these unwrapped so they read "15th" / "FINTEPLA®",
+# not "15[^th]" / "FINTEPLA[^®]".
+_PLAIN_SUPERSCRIPTS = frozenset({"st", "nd", "rd", "th", "®", "™", "©"})
+
 
 # ==================================================
 # INLINE MARKUP  (per-fragment, vectorized)
@@ -70,6 +76,10 @@ def apply_inline_markup(
     are left untouched. Missing columns are skipped, so the same call works for
     HTML / PDF / DOCX / PPTX regardless of which markup columns they carry.
 
+    Ordinal suffixes ("th"/"st"/"nd"/"rd") and trademark/copyright glyphs
+    ("®"/"™"/"©") marked as superscript are typography, not a reference mark,
+    so they are left unwrapped (plain "th"/"®", not "[^th]"/"[^®]").
+
     Vectorized (boolean masks + string concat) so it can be computed once on the
     full DataFrame before a groupby aggregation::
 
@@ -87,7 +97,8 @@ def apply_inline_markup(
 
     if script_col in df.columns:
         script = df[script_col].astype("string")
-        sup = (script == "superscript").fillna(False) & nonblank
+        is_plain = df[text_col].astype("string").fillna("").str.strip().str.lower().isin(_PLAIN_SUPERSCRIPTS)
+        sup = (script == "superscript").fillna(False) & nonblank & ~is_plain
         sub = (script == "subscript").fillna(False) & nonblank
         out = out.mask(sup, "[^" + out + "]")
         out = out.mask(sub, "[_" + out + "]")

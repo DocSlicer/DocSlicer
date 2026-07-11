@@ -23,16 +23,17 @@
   const INLINE_SPLIT_TAGS = new Set([
     "STRONG", "B", "EM", "I", "U", "MARK",
     "A", "CODE", "KBD", "SAMP", "VAR",
-    "DEL", "INS", "S", "STRIKE", "SMALL", "BIG", 
+    "DEL", "INS", "S", "STRIKE", "SMALL", "BIG",
     "SPAN", "FONT", "TT", "LABEL",
+    "SUP", "SUB",  // split so script_type (superscript/subscript) can be tagged per box
     "BR"  // BR always creates a split
   ]);
-  
+
   // BUCKET 3: INLINE TRANSPARENT TAGS
   // These inline tags do NOT cause splits (transparent to box creation)
   // Text flows through these as if they weren't there
   const INLINE_TRANSPARENT_TAGS = new Set([
-    "SUP", "SUB", "WBR", "ABBR", "TIME",
+    "WBR", "ABBR", "TIME",
     "Q", "CITE", "DFN", "BDI", "BDO", "NOBR"
   ]);
 
@@ -44,6 +45,10 @@
   const normalize = (s) => stripZeroWidth(s).replace(/\s+/g, " ").trim();
   
   const _csCache = new WeakMap();
+  // Document-order unique id per element. Populated once in extractAll and read
+  // by extractHierarchy so struct_ancestor_ids can reference the *same* ancestor
+  // instance consistently across every box beneath it.
+  const _elemUid = new WeakMap();
   const getCS = (el) => {
     if (!el) return null;
     let cs = _csCache.get(el);
@@ -581,18 +586,22 @@
     const ancestorIds = [];
     const ancestorClasses = [];
     const ancestorTags = [];
+    const ancestorTagIds = [];
     const ancestorAriaRoles = [];
-    
+
+    // Start at the element itself so struct_ancestors INCLUDES the box's own tag
+    // as the last entry, then walk the full chain up to the document root (includes
+    // body and html). The document node has no tagName and is skipped by `if (tag)`.
     let parent = node.nodeType === Node.TEXT_NODE ? node.parentElement : node;
-    
-    while (parent && parent !== document.body) {
+
+    while (parent) {
       const tag = parent.tagName ? parent.tagName.toUpperCase() : "";
-      
+
       // Collect IDs
       if (parent.id) {
         ancestorIds.push(parent.id);
       }
-      
+
       // Collect classes
       if (parent.className && typeof parent.className === 'string') {
         const classes = parent.className.trim();
@@ -600,22 +609,27 @@
           ancestorClasses.push(classes);
         }
       }
-      
-      // Collect all ancestor tags
-      if (ANCESTOR_TAGS.has(tag)) {
+
+      // Collect ALL ancestor tags. NOTE: the ANCESTOR_TAGS whitelist gate is
+      // temporarily disabled so we can inspect the full, unfiltered ancestry.
+      // struct_ancestor_ids / struct_ancestors / ancestor_aria_roles stay index-parallel.
+      if (tag) {
         ancestorTags.push(tag.toLowerCase());
+        ancestorTagIds.push(_elemUid.has(parent) ? _elemUid.get(parent) : -1);
+        // aria roles stay sparse (like ancestor_ids / ancestor_classes) — only real roles
         const role = parent.getAttribute("role") || "";
-        ancestorAriaRoles.push(role);
+        if (role) ancestorAriaRoles.push(role);
       }
-      
+
       parent = parent.parentElement;
     }
-    
+
     // Reverse arrays so they go from highest (body) to lowest (box)
     return {
       ancestor_ids: ancestorIds.reverse(),
       ancestor_classes: ancestorClasses.reverse(),
-      ancestor_tags: ancestorTags.reverse(),
+      struct_ancestors: ancestorTags.reverse(),
+      struct_ancestor_ids: ancestorTagIds.reverse(),
       ancestor_aria_roles: ancestorAriaRoles.reverse()
     };
   };
@@ -698,10 +712,10 @@
     
     return {
       box_id: boxIdObj.value++,
-      structure_tag: "hr",
+      struct_tag: "hr",
       wrapping_tag: "hr",
       split_reason: "horizontal_rule",
-      structure_tag_id: -1, // Will be set later if needed
+      struct_tag_id: -1, // Will be set later if needed
       text: text,
       x_left: rect.left,
       x_right: rect.right,
@@ -716,6 +730,9 @@
       bold_ratio: 0,
       italic_ratio: 0,
       underlined_ratio: 0,
+      strikethrough_ratio: 0,
+      is_strikethrough: false,
+      script_type: "",
       non_stroking_color: "",
       stroking_color: "",
       text_align: "",
@@ -737,7 +754,8 @@
       page_format: pageContext.page_format,
       ancestor_ids: hierarchy.ancestor_ids,
       ancestor_classes: hierarchy.ancestor_classes,
-      ancestor_tags: hierarchy.ancestor_tags,
+      struct_ancestors: hierarchy.struct_ancestors,
+      struct_ancestor_ids: hierarchy.struct_ancestor_ids,
       ancestor_aria_roles: hierarchy.ancestor_aria_roles
     };
   };
@@ -786,10 +804,10 @@
     
     return {
       box_id: boxIdObj.value++,
-      structure_tag: "img",
+      struct_tag: "img",
       wrapping_tag: "img",
       split_reason: "image",
-      structure_tag_id: -1, // Will be set later if needed
+      struct_tag_id: -1, // Will be set later if needed
       text: text,
       x_left: rect.left,
       x_right: rect.right,
@@ -804,6 +822,9 @@
       bold_ratio: 0,
       italic_ratio: 0,
       underlined_ratio: 0,
+      strikethrough_ratio: 0,
+      is_strikethrough: false,
+      script_type: "",
       non_stroking_color: "",
       stroking_color: "",
       text_align: "",
@@ -825,7 +846,8 @@
       page_format: pageContext.page_format,
       ancestor_ids: hierarchy.ancestor_ids,
       ancestor_classes: hierarchy.ancestor_classes,
-      ancestor_tags: hierarchy.ancestor_tags,
+      struct_ancestors: hierarchy.struct_ancestors,
+      struct_ancestor_ids: hierarchy.struct_ancestor_ids,
       ancestor_aria_roles: hierarchy.ancestor_aria_roles
     };
   };
@@ -909,6 +931,40 @@
       }
       return { tag: structTag, element: structEl };
     };
+
+    // Walk from an inline element up to structEl (inclusive) detecting decorations
+    // that apply over descendant text via tag semantics or CSS (which is painted
+    // over descendants, so getComputedStyle on the child alone would miss it).
+    const detectStrikethrough = (startEl) => {
+      let n = startEl;
+      while (n) {
+        const t = n.tagName ? n.tagName.toUpperCase() : "";
+        if (t === "S" || t === "STRIKE" || t === "DEL") return true;
+        const cs = getCS(n);
+        if (cs) {
+          const td = (cs.textDecorationLine || cs.textDecoration || "").toLowerCase();
+          if (td.includes("line-through")) return true;
+        }
+        if (n === structEl) break;
+        n = n.parentElement;
+      }
+      return false;
+    };
+    const detectScriptType = (startEl) => {
+      let n = startEl;
+      while (n) {
+        const t = n.tagName ? n.tagName.toUpperCase() : "";
+        if (t === "SUP") return "superscript";
+        if (t === "SUB") return "subscript";
+        const cs = getCS(n);
+        const va = cs ? (cs.verticalAlign || "").toLowerCase() : "";
+        if (va === "super") return "superscript";
+        if (va === "sub") return "subscript";
+        if (n === structEl) break;
+        n = n.parentElement;
+      }
+      return "";
+    };
     
     const flushBox = (rangeEnd) => {
       const text = normalize(currentText);
@@ -932,17 +988,21 @@
         if (rect.width > 0 && rect.height > 0) {
           // Extract styles from current context element
           const styles = extractStyles(currentInlineElement, currentInlineTag);
-          
+
+          // Strikethrough / script (super/subscript) — ancestor-aware, bounded to structEl
+          const isStrike = detectStrikethrough(currentInlineElement);
+          const scriptType = detectScriptType(currentInlineElement);
+
           // Extract DOM metadata from the inline element
           const domMeta = extractDomMetadata(currentInlineElement);
           
           
           boxes.push({
             box_id: boxIdObj.value++,
-            structure_tag: structTag.toLowerCase(),
+            struct_tag: structTag.toLowerCase(),
             wrapping_tag: currentInlineTag.toLowerCase(),
             split_reason: splitReason,
-            structure_tag_id: structureTagId,
+            struct_tag_id: structureTagId,
             text: finalText,
             x_left: rect.left,
             x_right: rect.right,
@@ -957,6 +1017,9 @@
             bold_ratio: styles.bold_ratio,
             italic_ratio: styles.italic_ratio,
             underlined_ratio: styles.underlined_ratio,
+            strikethrough_ratio: isStrike ? 1.0 : 0.0,
+            is_strikethrough: isStrike,
+            script_type: scriptType,
             non_stroking_color: styles.non_stroking_color,
             stroking_color: styles.stroking_color,
             text_align: structTextAlign,
@@ -978,7 +1041,8 @@
             page_format: pageContext.page_format,
             ancestor_ids: hierarchy.ancestor_ids,
             ancestor_classes: hierarchy.ancestor_classes,
-            ancestor_tags: hierarchy.ancestor_tags,
+            struct_ancestors: hierarchy.struct_ancestors,
+            struct_ancestor_ids: hierarchy.struct_ancestor_ids,
             ancestor_aria_roles: hierarchy.ancestor_aria_roles
           });
         }
@@ -1049,7 +1113,7 @@
           // Create image box
           const imageBox = extractImageBox(node, boxIdObj);
           if (imageBox) {
-            imageBox.structure_tag_id = structureTagId;
+            imageBox.struct_tag_id = structureTagId;
             // Check if image is inside a link
             const linkUrl = findLinkUrl(node);
             if (linkUrl) {
@@ -1077,7 +1141,7 @@
           // Create HR box
           const hrBox = extractHrBox(node, boxIdObj);
           if (hrBox) {
-            hrBox.structure_tag_id = structureTagId;
+            hrBox.struct_tag_id = structureTagId;
             boxes.push(hrBox);
           }
           
@@ -1163,7 +1227,19 @@
     const boxes = [];
     const boxIdObj = { value: 1 };
     let structureTagId = 1;
-    
+
+    // Stamp every element with a document-order unique id so struct_ancestor_ids
+    // can reference shared ancestor instances consistently. Elements-only order
+    // yields the expected gapped sequence (e.g. [0, 1, 2, 90, 92, 93, 94]) because
+    // an ancestor chain skips over all the intervening sibling subtrees.
+    // Stamp the whole document (html + head + body + descendants) so that body and
+    // html — which are ancestors of every box — also receive ids.
+    let _uidCounter = 0;
+    _elemUid.set(document.documentElement, _uidCounter++);
+    for (const el of document.documentElement.querySelectorAll("*")) {
+      _elemUid.set(el, _uidCounter++);
+    }
+
     // Scan document and assign page numbers
     assignPageNumbers(root);
     
@@ -1187,7 +1263,7 @@
         processedHrs.add(hr);
       }
       
-      // Only increment structure_tag_id if boxes were actually created
+      // Only increment struct_tag_id if boxes were actually created
       if (structBoxes.length > 0) {
         boxes.push(...structBoxes);
         structureTagId++;
@@ -1201,7 +1277,7 @@
       
       const imageBox = extractImageBox(img, boxIdObj);
       if (imageBox) {
-        imageBox.structure_tag_id = structureTagId++;
+        imageBox.struct_tag_id = structureTagId++;
         
         // Check if image is inside a link
         const linkUrl = findLinkUrl(img);
@@ -1220,7 +1296,7 @@
 
       const hrBox = extractHrBox(hr, boxIdObj);
       if (hrBox) {
-        hrBox.structure_tag_id = structureTagId++;
+        hrBox.struct_tag_id = structureTagId++;
         boxes.push(hrBox);
       }
     }

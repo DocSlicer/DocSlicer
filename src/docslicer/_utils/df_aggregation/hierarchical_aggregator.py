@@ -273,9 +273,11 @@ def build_standard_agg_spec(
 
         spec.update({
             "is_underlined": "max",
+            "is_strikethrough": "max",
+            "script_type": "first",
             "has_vertical_line": "max",
             "inside_rect_shape": "max",
-            
+
         })
     
     # Counts (sum across group)
@@ -296,6 +298,7 @@ def build_standard_agg_spec(
             "_bold_char_est": "sum",
             "_italic_char_est": "sum",
             "_underlined_char_est": "sum",
+            "_strikethrough_char_est": "sum",
         })
 
         
@@ -326,8 +329,8 @@ def build_standard_agg_spec(
     # HTML Provenance
     if include_html_provenance:
         spec.update({
-            "structure_tag_id": "first",
-            "structure_tag": "first",
+            "struct_tag_id": "first",
+            "struct_tag": "first",
             "wrapping_tag": "first",
             "split_reason": "first",
             "dom_id": "first",
@@ -337,7 +340,8 @@ def build_standard_agg_spec(
         spec.update({ #NOTE: TBD if needed
             "ancestor_ids": "first",
             "ancestor_classes": "first",
-            "ancestor_tags": "first",
+            "struct_ancestors": "first",
+            "struct_ancestor_ids": "first",
             "ancestor_aria_roles": "first",
         })
     
@@ -399,6 +403,9 @@ def aggregate_hierarchical(
 
     if "underlined_ratio" in df.columns and "char_count" in df.columns:
         df["_underlined_char_est"] = df["underlined_ratio"].fillna(0.0) * df["char_count"].fillna(0.0)
+
+    if "strikethrough_ratio" in df.columns and "char_count" in df.columns:
+        df["_strikethrough_char_est"] = df["strikethrough_ratio"].fillna(0.0) * df["char_count"].fillna(0.0)
 
     # -------------------------
     # AGGREGATION: Filter spec to existing columns and aggregate
@@ -507,7 +514,12 @@ def aggregate_hierarchical(
         total_chars = grouped["char_count"].replace(0, np.nan)
         grouped["underlined_ratio"] = (grouped["_underlined_char_est"] / total_chars).fillna(0.0)
         grouped = grouped.drop(columns=["_underlined_char_est"])
-    
+
+    if "_strikethrough_char_est" in grouped.columns and "char_count" in grouped.columns:
+        total_chars = grouped["char_count"].replace(0, np.nan)
+        grouped["strikethrough_ratio"] = (grouped["_strikethrough_char_est"] / total_chars).fillna(0.0)
+        grouped = grouped.drop(columns=["_strikethrough_char_est"])
+
     # -------------------------
     # DERIVED FLAGS
     # -------------------------
@@ -519,6 +531,9 @@ def aggregate_hierarchical(
     
     if "underlined_ratio" in grouped.columns:
         grouped["is_underlined"] = grouped["underlined_ratio"] > 0.75
+
+    if "strikethrough_ratio" in grouped.columns:
+        grouped["is_strikethrough"] = grouped["strikethrough_ratio"] > 0.75
 
     #TODO: Add new logic for is_uppercase:
     
