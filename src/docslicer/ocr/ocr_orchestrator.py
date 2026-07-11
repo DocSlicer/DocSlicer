@@ -199,7 +199,7 @@ def run_ocr_pipeline(
 
     # 4) Assign reading order (gutter-aware)
     with timed_step("Reading order", logger=logger):
-        df_words, df_gutters = assign_reading_order(df_words, df_shapes)
+        df_words, df_gutters = assign_reading_order(df_words, df_shapes, df_grid_cells)
         df_words = df_words.drop(columns=["center_bucket"], errors="ignore")
 
         # Flag the leftmost word in each line (useful for OCR noise correction,
@@ -214,10 +214,13 @@ def run_ocr_pipeline(
         df_words = df_words[df_words["text"].fillna("").str.strip() != ""].reset_index(drop=True)
         df_words = add_calculated_text_features(df_words)
 
-    # 6) Estimate font size (per horizontal band, too noisy on a line level)
+    # 6) Estimate font size (per layout, too noisy on a line level)
     with timed_step("Font size estimation", logger=logger):
         df_words = assign_layouts(df_words, line_level=False)
         df_words = estimate_ocr_font_sizes(df_words, method="word")
+        
+        # Drop the layout_id column (will later be assessed more accurately, this one was just to set the font sizes)
+        df_words = df_words.drop(columns=["layout_id"], errors="ignore")
 
     return df_words, df_shapes, df_grid_cells, df_gutters
 

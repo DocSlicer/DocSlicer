@@ -5,7 +5,7 @@ Used by the OCR pipeline (sole method) and the PDF pipeline (when text_object_id
 is absent).
 
 Public API:
-    df_words, df_gutters = assign_reading_order(df_words, df_shapes)
+    df_words, df_gutters = assign_reading_order(df_words, df_shapes, df_grid_cells)
     df_vert               = assign_vertical_line_ids(df_vert, line_id_offset)
 """
 
@@ -169,6 +169,7 @@ def assign_vertical_line_ids(df_vert: pd.DataFrame, line_id_offset: int) -> pd.D
 def assign_reading_order(
     df_words: pd.DataFrame,
     df_shapes: pd.DataFrame | None = None,
+    df_grid_cells: pd.DataFrame | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Assign line_id to every word using gutter-aware spatial sorting.
@@ -180,6 +181,9 @@ def assign_reading_order(
     ----------
     df_words  : word-level DataFrame with at least page_number, x_left, y_top.
     df_shapes : shape DataFrame passed to gutter detection when needed.
+    df_grid_cells : reconstructed table cells (process_shapes); each
+                table_grid_id becomes one gutter-detection obstacle, so no
+                gutter can originate inside a detected table grid.
 
     Returns
     -------
@@ -201,7 +205,7 @@ def assign_reading_order(
     )
     if not gutter_cols_present:
         from .gutter_detector import detect_gutters
-        df, df_gutters = detect_gutters(df, df_shapes)
+        df, df_gutters = detect_gutters(df, df_shapes, df_grid_cells=df_grid_cells, debug=True) #NOTE Remove debug when done
 
     # Split horizontal (LTR/default) vs vertical (TTB/BTT)
     if "text_orientation" in df.columns:

@@ -41,9 +41,9 @@ from .step_03_shape_extractor import extract_shapes
 from .step_04_link_extractor import extract_links
 from .step_05_struct_group import assign_struct_group_id
 from .step_06_style_prefiller import prefill_styles
-from .step_07_word_relationships import add_word_relationships
-from .step_08_stream_group import assign_stream_group_id
-from .step_09_reading_order import assign_reading_order
+from .step_07_stream_group import assign_stream_group_id
+from .step_08_reading_order import assign_reading_order
+from .step_09_word_relationships import add_word_relationships
 from .step_10_cell_builder import build_cells
 from .step_11_page_label_detector import detect_pdf_page_labels
 from .step_12_cell_grouper import group_multiline_cells
@@ -209,7 +209,7 @@ def run_pipeline(
             # back to spatial line ordering instead.
             if "struct_group_id" not in df_words.columns or df_words["struct_group_id"].isna().all():
                 # Step 08(b) - Stream Group Assignment - Fallback
-                df_words, df_gutters = assign_reading_order_fallback(df_words, df_shapes)
+                df_words, df_gutters = assign_reading_order_fallback(df_words, df_shapes, df_grid_cells)
             else:
                 # Step 06 - Prefill Styles
                 df_words = prefill_styles(df_words)
