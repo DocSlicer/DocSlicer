@@ -141,6 +141,7 @@ def build_paragraphs(
     if "header_footer_type" in para_df.columns:
         para_df.loc[para_df["header_footer_type"] == "footnote", "block_type"] = "footnote"
         para_df.loc[para_df["header_footer_type"] == "endnote", "block_type"] = "endnote"
+        para_df.loc[para_df["header_footer_type"] == "comment", "block_type"] = "comment"
     if include_headers_footers and "header_footer_type" in para_df.columns:
         para_df.loc[para_df["header_footer_type"] == "header", "block_type"] = "header"
         para_df.loc[para_df["header_footer_type"] == "footer", "block_type"] = "footer"

@@ -93,7 +93,7 @@ def _build_line_text(df: pd.DataFrame) -> pd.Series:
 # block_type values whose consecutive lines are held together in one layout
 # (but never mixed: a run of footnotes and an adjacent run of footers stay
 # in separate layouts because their keys differ).
-_LAYOUT_GROUP_BLOCK_TYPES = frozenset({"footnote", "footer", "header"})
+_LAYOUT_GROUP_BLOCK_TYPES = frozenset({"footnote", "footer", "header", "comment"})
 
 
 def _layout_group_key(df: pd.DataFrame) -> pd.Series:
@@ -103,8 +103,8 @@ def _layout_group_key(df: pd.DataFrame) -> pd.Series:
     their own layout.
 
     Precedence (highest last so it wins the mask): special block_type
-    (footnote/footer/header) < list (same list_num_id AND list_level) < table
-    (same table_id).
+    (footnote/footer/header/comment) < list (same list_num_id AND list_level) <
+    table (same table_id).
     """
     keys = pd.Series(pd.NA, index=df.index, dtype=object)
 
@@ -134,8 +134,8 @@ def _add_layout_id(df: pd.DataFrame) -> pd.DataFrame:
     2. New layout whenever page_number changes.
     3. Grouped lines (see :func:`_layout_group_key`) share one layout_id across a
        consecutive run of the same key — a table (same table_id), a list (same
-       list_num_id AND list_level), or a header/footer/footnote run (same
-       block_type). Entering, leaving, or switching a group key breaks.
+       list_num_id AND list_level), or a header/footer/footnote/comment run
+       (same block_type). Entering, leaving, or switching a group key breaks.
     4. Ungrouped lines get their own layout_id each.
     """
     if df is None or df.empty:

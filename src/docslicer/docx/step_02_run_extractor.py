@@ -339,6 +339,22 @@ def _children(parent: etree._Element | None, name: str) -> list[etree._Element]:
     return list(parent.findall(f"w:{name}", namespaces=NS))
 
 
+def _index_children(parent: etree._Element | None) -> dict[str, etree._Element]:
+    """Map ``{ns}tag`` -> first direct child element with that tag.
+
+    Property extraction needs many named children of the same ``rPr``/``pPr``;
+    a single pass over the children beats issuing one ``.find()`` scan per name.
+    """
+    out: dict[str, etree._Element] = {}
+    if parent is None:
+        return out
+    for child in parent:
+        tag = child.tag
+        if isinstance(tag, str) and tag not in out:
+            out[tag] = child
+    return out
+
+
 def _attr(elem: etree._Element | None, name: str) -> str | None:
     if elem is None:
         return None
@@ -411,23 +427,17 @@ def _ratio_from_bool(value: Any) -> float:
 
 
 def _extract_p_pr_props(p_pr: etree._Element | None) -> dict[str, Any]:
-    p_style = _child(p_pr, "pStyle")
-    num_pr = _child(p_pr, "numPr")
-    list_num_id = _child(num_pr, "numId")
-    ilvl = _child(num_pr, "ilvl")
-    outline = _child(p_pr, "outlineLvl")
-    page_break_before = _child(p_pr, "pageBreakBefore")
-    text_direction = _child(p_pr, "textDirection")
-    justification = _child(p_pr, "jc")
+    kids = _index_children(p_pr)
+    num_pr = kids.get(f"{W}numPr")
 
     return _drop_none({
-        "paragraph_style_id": _attr(p_style, "val"),
-        "list_num_id": _attr(list_num_id, "val"),
-        "list_level": _attr(ilvl, "val"),
-        "outline_level": _attr(outline, "val"),
-        "page_break_before": _bool_val(page_break_before),
-        "text_orientation": _attr(text_direction, "val"),
-        "text_align": _normalize_text_align(_attr(justification, "val")),
+        "paragraph_style_id": _attr(kids.get(f"{W}pStyle"), "val"),
+        "list_num_id": _attr(_child(num_pr, "numId"), "val"),
+        "list_level": _attr(_child(num_pr, "ilvl"), "val"),
+        "outline_level": _attr(kids.get(f"{W}outlineLvl"), "val"),
+        "page_break_before": _bool_val(kids.get(f"{W}pageBreakBefore")),
+        "text_orientation": _attr(kids.get(f"{W}textDirection"), "val"),
+        "text_align": _normalize_text_align(_attr(kids.get(f"{W}jc"), "val")),
     })
 
 
@@ -450,21 +460,18 @@ def _script_type(elem: etree._Element | None) -> str | None:
 
 
 def _extract_r_pr_props(r_pr: etree._Element | None) -> dict[str, Any]:
-    r_style = _child(r_pr, "rStyle")
-    color = _child(r_pr, "color")
-    size = _child(r_pr, "sz")
-    font = _child(r_pr, "rFonts")
+    kids = _index_children(r_pr)
 
     return _drop_none({
-        "character_style_id": _attr(r_style, "val"),
-        "is_bold": _bool_val(_child(r_pr, "b")),
-        "is_italic": _bool_val(_child(r_pr, "i")),
-        "is_underlined": _underline_val(_child(r_pr, "u")),
-        "is_strikethrough": _bool_val(_child(r_pr, "strike")),
-        "script_type": _script_type(_child(r_pr, "vertAlign")),
-        "font_size": _font_size(size),
-        "font_name": _font_name(font),
-        "color": _normalize_color(_attr(color, "val")),
+        "character_style_id": _attr(kids.get(f"{W}rStyle"), "val"),
+        "is_bold": _bool_val(kids.get(f"{W}b")),
+        "is_italic": _bool_val(kids.get(f"{W}i")),
+        "is_underlined": _underline_val(kids.get(f"{W}u")),
+        "is_strikethrough": _bool_val(kids.get(f"{W}strike")),
+        "script_type": _script_type(kids.get(f"{W}vertAlign")),
+        "font_size": _font_size(kids.get(f"{W}sz")),
+        "font_name": _font_name(kids.get(f"{W}rFonts")),
+        "color": _normalize_color(_attr(kids.get(f"{W}color"), "val")),
     })
 
 
@@ -962,37 +969,61 @@ def _add_page_labels_from_sections(
 
     footer_page_field_cache: dict[str, bool] = {}
 
-    for idx, row in out.loc[body_mask].iterrows():
-        section_id = int(row["section_id"])
-        page_number = int(row["page_number"])
+    # Every label attribute is a pure function of the (section_id, page_number)
+    # pair, of which there are only a handful (one per page) even though there
+    # are thousands of run rows. Compute once per unique pair, then assign the
+    # results back with whole-column writes — avoids iterrows plus ~6N scalar
+    # `.at` setitems, which dominated this step's runtime.
+    label_cols = [
+        "page_label_footer_part",
+        "page_label_footer_type",
+        "page_label_format",
+        "page_label",
+        "page_label_type",
+        "page_label_source",
+    ]
+
+    def _labels_for_pair(section_key: Any, page_number_val: Any) -> tuple:
+        section_id = int(section_key)
+        page_number = int(page_number_val)
         info = section_infos.get(section_id)
-        section_first_page = int(section_first_pages.get(row["section_id"], page_number))
+        section_first_page = int(section_first_pages.get(section_key, page_number))
         footer_part, footer_type = _select_footer_part(info, page_number, section_first_page)
+        fmt = (info.page_number_format or "decimal") if info is not None else None
 
-        out.at[idx, "page_label_footer_part"] = footer_part
-        out.at[idx, "page_label_footer_type"] = footer_type
-        if info is not None:
-            out.at[idx, "page_label_format"] = info.page_number_format or "decimal"
+        page_label = None
+        page_label_type = None
+        page_label_source = None
+        if footer_part:
+            if footer_part not in footer_page_field_cache:
+                footer_page_field_cache[footer_part] = _part_has_page_field(package, footer_part)
+            if footer_page_field_cache[footer_part]:
+                label_number = section_label_starts.get(section_id, page_number) + (
+                    page_number - section_first_page
+                )
+                page_label = _format_page_label(
+                    label_number,
+                    info.page_number_format if info is not None else None,
+                )
+                if page_label_config is not None:
+                    page_label_type = _classify_page_label(page_label, page_label_config)
+                page_label_source = "section_footer_page_field"
 
-        if not footer_part:
-            continue
-        if footer_part not in footer_page_field_cache:
-            footer_page_field_cache[footer_part] = _part_has_page_field(package, footer_part)
-        if not footer_page_field_cache[footer_part]:
-            continue
+        return (footer_part, footer_type, fmt, page_label, page_label_type, page_label_source)
 
-        label_number = section_label_starts.get(section_id, page_number) + (
-            page_number - section_first_page
+    body_idx = out.index[body_mask]
+    body_pairs = list(
+        zip(out.loc[body_idx, "section_id"], out.loc[body_idx, "page_number"])
+    )
+    pair_cache: dict[tuple, tuple] = {}
+    for key in body_pairs:
+        if key not in pair_cache:
+            pair_cache[key] = _labels_for_pair(key[0], key[1])
+
+    for col_pos, col in enumerate(label_cols):
+        out.loc[body_idx, col] = pd.Series(
+            [pair_cache[key][col_pos] for key in body_pairs], index=body_idx
         )
-
-        label = _format_page_label(
-            label_number,
-            info.page_number_format if info is not None else None,
-        )
-        out.at[idx, "page_label"] = label
-        if page_label_config is not None:
-            out.at[idx, "page_label_type"] = _classify_page_label(label, page_label_config)
-        out.at[idx, "page_label_source"] = "section_footer_page_field"
 
     return out
 
@@ -1010,15 +1041,18 @@ def _assign_page_numbers(run_df: pd.DataFrame) -> pd.Series:
     page_number = 1
     content_since_break = True
 
-    for row in run_df.itertuples(index=False):
-        run_type = getattr(row, "run_type")
-        text = getattr(row, "text", "")
-        has_visible_content = run_type not in {
-            "page_break",
-            "rendered_page_break",
-            "section_break",
-            "field_marker",
-        } and bool(str(text).strip())
+    # Materialise the columns to plain object arrays first: iterating the
+    # Arrow-backed `text` column row-by-row (ArrowStringArray.__iter__) was the
+    # bulk of this otherwise-cheap sequential scan.
+    run_types = run_df["run_type"].to_numpy()
+    if "text" in run_df.columns:
+        texts = run_df["text"].to_numpy()
+    else:
+        texts = [""] * len(run_df)
+
+    _break_types = {"page_break", "rendered_page_break", "section_break", "field_marker"}
+    for run_type, text in zip(run_types, texts):
+        has_visible_content = run_type not in _break_types and bool(str(text).strip())
 
         if run_type == "page_break":
             page_number += 1
@@ -1154,6 +1188,12 @@ def _run_events(r: etree._Element) -> list[tuple[str, str, etree._Element | None
             en_id = child.get(f"{W}id")
             if en_id is not None:
                 events.append(("endnote_reference", en_id, child))
+        elif child.tag == f"{W}commentReference":
+            # Sits at the END of the commented range; used only as an inlining
+            # anchor (dropped at paragraph building, so it leaves no body marker).
+            c_id = child.get(f"{W}id")
+            if c_id is not None:
+                events.append(("comment_reference", c_id, child))
     return events
 
 
@@ -1540,9 +1580,13 @@ def _walk_container(
     ancestors: list[etree._Element] | None = None,
 ) -> None:
     ancestors = ancestors or []
+    is_body = ctx.header_footer_type == "body"
     for child in container:
         child_ctx = ctx
-        if ctx.header_footer_type == "body":
+        # Only allocate a new context when the tracked section actually differs
+        # from the inherited one — dataclasses.replace is costly and the section
+        # is unchanged for the vast majority of children (e.g. within a cell).
+        if is_body and ctx.section_id != section_tracker.current_section_id:
             child_ctx = replace(ctx, section_id=section_tracker.current_section_id)
 
         if child.tag == f"{W}p":
@@ -1591,22 +1635,27 @@ def _walk_container(
 
 def _inline_footnotes(run_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Reorder footnote and endnote content rows to appear immediately after their
-    in-body reference markers, inheriting the reference's page context columns.
+    Reorder footnote, endnote and comment content rows to appear immediately
+    after their in-body reference markers, inheriting the reference's page
+    context columns.
 
-    footnote_reference / endnote_reference rows carry the referenced id in ``text``.
-    Content rows from footnotes.xml / endnotes.xml carry the matching id in
-    ``footnote_id`` / ``endnote_id``.
+    footnote_reference / endnote_reference / comment_reference rows carry the
+    referenced id in ``text``. Content rows from footnotes.xml / endnotes.xml /
+    comments.xml carry the matching id in ``footnote_id`` / ``endnote_id`` /
+    ``comment_id``. A comment_reference sits at the END of the commented range,
+    so the comment lands after the paragraph it annotates (or after the whole
+    table, via the table-anchor logic below).
 
-    The first text run of each footnote/endnote is prefixed with a bracketed
-    label ("[Footnote] " / "[Endnote] ") so RAG pipelines and LLMs can
-    unambiguously identify inline footnote content.
+    The first text run of each note is prefixed with a bracketed label
+    ("[Footnote] " / "[Endnote] " / "[Comment] ") so RAG pipelines and LLMs can
+    unambiguously identify the inline content.
 
     Special DOCX separator footnotes (id <= 0) have no body reference and are dropped.
     """
     fn_ref_mask = run_df["run_type"] == "footnote_reference"
     en_ref_mask = run_df["run_type"] == "endnote_reference"
-    if not fn_ref_mask.any() and not en_ref_mask.any():
+    cm_ref_mask = run_df["run_type"] == "comment_reference"
+    if not fn_ref_mask.any() and not en_ref_mask.any() and not cm_ref_mask.any():
         return run_df
 
     # For footnotes referenced from inside a table, inline the note AFTER the
@@ -1686,6 +1735,7 @@ def _inline_footnotes(run_df: pd.DataFrame) -> pd.DataFrame:
 
     fn_ref_map = _build_ref_map(fn_ref_mask)
     en_ref_map = _build_ref_map(en_ref_mask)
+    cm_ref_map = _build_ref_map(cm_ref_mask)
 
     # Word renders footnotes/endnotes with a sequential counter in reference
     # (document) order, not the internal w:id we extract — so a body whose first
@@ -1705,6 +1755,7 @@ def _inline_footnotes(run_df: pd.DataFrame) -> pd.DataFrame:
 
     fn_display = _display_map(fn_ref_mask)
     en_display = _display_map(en_ref_mask)
+    cm_display = _display_map(cm_ref_mask)
 
     # Drop DOCX special separator footnotes/endnotes (id <= 0, e.g. "-1", "0")
     fn_part_mask = run_df["source_part"].str.endswith("footnotes.xml", na=False)
@@ -1723,6 +1774,7 @@ def _inline_footnotes(run_df: pd.DataFrame) -> pd.DataFrame:
     # Recompute part masks on trimmed df
     fn_part_mask = df["source_part"].str.endswith("footnotes.xml", na=False)
     en_part_mask = df["source_part"].str.endswith("endnotes.xml", na=False)
+    cm_part_mask = df["source_part"].str.endswith("comments.xml", na=False)
 
     has_page_label = "page_label" in df.columns
     has_section_id = "section_id" in df.columns
@@ -1763,6 +1815,7 @@ def _inline_footnotes(run_df: pd.DataFrame) -> pd.DataFrame:
 
     _assign_order(fn_part_mask, "footnote_id", fn_ref_map, "Footnote", fn_display)
     _assign_order(en_part_mask, "endnote_id", en_ref_map, "Endnote", en_display)
+    _assign_order(cm_part_mask, "comment_id", cm_ref_map, "Comment", cm_display)
 
     # Rewrite in-body reference markers from the internal w:id to the displayed
     # sequential number so the [^N] marker matches the [Footnote N] definition.

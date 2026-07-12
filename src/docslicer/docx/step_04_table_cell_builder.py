@@ -369,15 +369,31 @@ def build_table_cells(
     cell_text_runs = cell_text_runs.sort_values(
         ["table_cell_id", "paragraph_id", "order_index"]
     )
-    para_text = (
-        cell_text_runs.groupby(["table_cell_id", "paragraph_id"], sort=False)["text"]
-        .apply(lambda xs: "".join(xs))
-    )
-    text_agg = (
-        para_text.groupby(level="table_cell_id", sort=False)
-        .apply(lambda ps: " ".join(s for s in (p.strip() for p in ps) if s))
-        .rename("text")
-    )
+    # Rows are now sorted so every cell (and every paragraph within it) is
+    # contiguous. A single linear pass over the arrays joins runs -> paragraphs
+    # -> cell text; this avoids the two-level groupby.apply, whose per-group
+    # object construction dominated this step on table-heavy documents.
+    _cids = cell_text_runs["table_cell_id"].to_numpy()
+    _pids = cell_text_runs["paragraph_id"].to_numpy()
+    _txts = cell_text_runs["text"].to_numpy()
+    _n = len(_cids)
+    _cell_text: dict[int, str] = {}
+    _i = 0
+    while _i < _n:
+        cid = _cids[_i]
+        para_strs: list[str] = []
+        while _i < _n and _cids[_i] == cid:
+            pid = _pids[_i]
+            parts: list[str] = []
+            while _i < _n and _cids[_i] == cid and _pids[_i] == pid:
+                parts.append(_txts[_i])
+                _i += 1
+            s = "".join(parts).strip()
+            if s:
+                para_strs.append(s)
+        _cell_text[int(cid)] = " ".join(para_strs)
+    text_agg = pd.Series(_cell_text, name="text")
+    text_agg.index.name = "table_cell_id"
     page_agg = table_runs.groupby("table_cell_id").agg(
         page_number=("page_number", "first"),
         page_label=("page_label", "first"),

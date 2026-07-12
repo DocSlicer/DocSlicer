@@ -37,7 +37,7 @@ _FORBIDDEN_BLOCK_TYPES = {
     # Out-of-flow / peripheral regions
     "header", "footer", "footnote", "speaker_notes",
     # Verbatim / non-prose content
-    "code", "block_quote", "shape", "form_field",
+    "code", "block_quote", "shape", "form_field", "comment",
     # Structured / reference blocks
     "table", "chart", "toc", "exhibits", 
     }
