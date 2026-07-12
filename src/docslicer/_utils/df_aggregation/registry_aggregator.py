@@ -246,9 +246,8 @@ COLUMN_REGISTRY: Dict[str, Agg] = {
     "link_url": Agg.UNIQUE_LIST,
     "link_dest": Agg.DOMINANT,
     "link_type": Agg.DOMINANT,
-    "hyperlink_url": Agg.UNIQUE_LIST,
     "ixbrl_id": Agg.UNIQUE_LIST,
-    "html_data_attrs": Agg.MERGE_DICTS,
+    "html_data_attrs": Agg.DROP, #Agg.MERGE_DICTS, -- Merge dicts is an expensive op
 
     # --- tables ------------------------------------------------------------------------
     "table_id": Agg.FIRST,
@@ -262,7 +261,7 @@ COLUMN_REGISTRY: Dict[str, Agg] = {
     "table_row_count": Agg.FIRST,
     "row_start": Agg.FIRST,
     "col_start": Agg.FIRST,
-    "nested_table_depth": Agg.FIRST,
+    "nested_table_depth": Agg.DROP,
 
     # --- HTML provenance -----------------------------------------------------------------
     # NOTE: HTML struct_tag / struct_tag_id / struct_ancestors share names with the
@@ -328,25 +327,39 @@ COLUMN_REGISTRY: Dict[str, Agg] = {
     "list_level": Agg.FIRST,
     "list_label": Agg.FIRST,
     "outline_level": Agg.FIRST,
-    "page_break_before": Agg.FIRST,
-    "section_break_type": Agg.FIRST,
-    "section_break_after": Agg.ANY,
-    "bookmark_ids": Agg.FIRST,
-    "bookmark_names": Agg.FIRST,
+    "page_break_before": Agg.DROP,
+    "section_break_type": Agg.DROP,
+    "section_break_after": Agg.DROP,
+    "bookmark_ids": Agg.DROP,
+    "bookmark_names": Agg.DROP,
+    "hyperlink_url": Agg.DROP,
     "comment_id": Agg.FIRST,
     "footnote_id": Agg.FIRST,
     "endnote_id": Agg.FIRST,
     "style_id": Agg.FIRST,
     "style_name": Agg.FIRST,
-    "paragraph_style_id": Agg.FIRST,
+    "paragraph_style_id": Agg.FIRST, # Needed for style prefiller
     "paragraph_style_name": Agg.FIRST,
-    "effective_paragraph_style_id": Agg.FIRST,
-    "effective_paragraph_style_name": Agg.FIRST,
-    "character_style_id": Agg.DOMINANT,
-    "character_style_name": Agg.DOMINANT,
-    "effective_character_style_id": Agg.DOMINANT,
-    "effective_character_style_name": Agg.DOMINANT,
-    "shape_id": Agg.FIRST,
+    "effective_paragraph_style_id": Agg.DROP,
+    "effective_paragraph_style_name": Agg.DROP,
+    "character_style_id": Agg.DROP,
+    "character_style_name": Agg.DROP,
+    "effective_character_style_id": Agg.DROP,
+    "effective_character_style_name": Agg.DROP,
+
+    # --- DOCX run-level detail: per-run state, not meaningful once merged --------
+    "run_index": Agg.DROP,          # per-run ordinal within a paragraph
+    "hyperlink_id": Agg.DROP,       # rel id; the url is carried by hyperlink_url/link_url
+    "bookmark_id": Agg.DROP,        # hyperlink anchor target
+    "field_id": Agg.DROP,           # field-code run state
+    "field_type": Agg.DROP,
+    "field_phase": Agg.DROP,
+    "event_tag": Agg.DROP,          # run event marker
+    "chart_rel_id": Agg.DROP,       # embedded-chart rel id; consumed by chart point builder
+    "is_deleted_revision": Agg.ANY, # tracked-change flags OR across the group
+    "is_inserted_revision": Agg.ANY,
+
+    "shape_id": Agg.FIRST, # TODO This is NOT docx only but also pdf df_shapes
     "shape_name": Agg.FIRST,
     "shape_type": Agg.FIRST,
     "placeholder_type": Agg.FIRST,
@@ -365,7 +378,7 @@ COLUMN_REGISTRY: Dict[str, Agg] = {
     "line_ids": Agg.DROP,          # line_id, already combined (mcid cells)
     "block_id": Agg.DROP,
     "paragraph_id": Agg.UNIQUE_LIST,
-    "order_index": Agg.DROP,
+    "order_index": Agg.FIRST, # IMPORTANT: NEVER DROP - or docx footnotes will not be inlined
     "script_type": Agg.DROP,
 
     # --- cell grouper (vstack / grouped-row) diagnostics: consumed upstream, ---
@@ -584,9 +597,12 @@ def _agg_merge_dicts(df: pd.DataFrame, by: str, col: str) -> pd.Series:
     if sub.empty:
         return pd.Series(dtype=object, name=col)
 
-    return sub.groupby(by, sort=False, observed=True)[col].agg(
-        lambda dicts: {k: v for d in dicts for k, v in d.items()} or None
-    )
+    # Collect each group's dicts with pandas' Cython ``agg(list)`` kernel, then union
+    # in a ``.map`` over the grouped result (one call per group). Passing the dict-union
+    # lambda straight to ``.agg`` instead forces pandas' slow pure-Python per-group path.
+    # Mirrors the fast pattern used by UNIQUE_LIST above.
+    raw = sub.groupby(by, sort=False, observed=True)[col].agg(list)
+    return raw.map(lambda dicts: {k: v for d in dicts for k, v in d.items()} or None)
 
 
 def _merge_on_key(grouped: pd.DataFrame, by: str, series: pd.Series, col: str) -> pd.DataFrame:

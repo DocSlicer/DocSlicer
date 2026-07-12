@@ -43,6 +43,7 @@ from .._config import ParseConfig, DEFAULT_CONFIG
 def run_pipeline(
     lines_df: pd.DataFrame,
     df_table_cells: Optional[pd.DataFrame] = None,
+    chart_points_df: Optional[pd.DataFrame] = None,
     on_stage: Optional[Callable[[str], None]] = None,
     config: ParseConfig = None,
     metadata: Dict[str, Any] = None,
@@ -58,6 +59,8 @@ def run_pipeline(
     Args:
         lines_df: DataFrame with lines from HTML or PDF orchestrator
         df_table_cells: Optional DataFrame with table cells
+        chart_points_df: Optional DataFrame with chart datapoints (docx/pptx),
+            used by the block merger to render "chart" blocks
         on_stage: Optional callback for progress updates
         config: ParseConfig with optimal_chars, max_chars, etc.
         metadata: Document metadata to attach to output
@@ -119,6 +122,7 @@ def run_pipeline(
     df_blocks = merge_blocks(
         df,
         df_table_cells,
+        chart_points_df,
         table_representation=config.table_representation,
     )
 

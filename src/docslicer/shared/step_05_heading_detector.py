@@ -31,13 +31,22 @@ import pandas as pd
 # Pre-filter forbidden heading line formats (text that will never be a heading)
 # ================================================================================
 
-_FORBIDDEN_BLOCK_TYPES = {"table", "image", "hr", "page_label", "navigation", "toc", "exhibits", "speaker_notes", "shape", "chart", "vertical_text", "header", "footer"}
+_FORBIDDEN_BLOCK_TYPES = {
+    # Page furniture
+    "image", "hr", "page_label", "navigation", "vertical_text", 
+    # Out-of-flow / peripheral regions
+    "header", "footer", "footnote", "speaker_notes",
+    # Verbatim / non-prose content
+    "code", "block_quote", "shape", "form_field",
+    # Structured / reference blocks
+    "table", "chart", "toc", "exhibits", 
+    }
 
 _FORBIDDEN_SUBSTRINGS = {
     # signature indicators
     "/s/", "signed:",
     # urls
-    "http:", "https", "www.",
+    "http:", "https", "www.", ".com",
     # other
     "page"
 }

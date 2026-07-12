@@ -10,10 +10,11 @@ import pandas as pd
 from .._utils.io.config import load_compiled_page_label_config
 from .step_01_package_reader import DocxPackage, read_docx_package
 from .step_02_run_extractor import expand_header_footer_runs, extract_runs
-from .step_03_table_cell_builder import build_table_cells
-from .step_04_paragraph_builder import build_paragraphs
-from .step_05_line_builder import build_lines
-from .step_06_style_prefiller import prefill_block_types
+from .step_03_chart_point_builder import build_chart_points
+from .step_04_table_cell_builder import build_table_cells
+from .step_05_paragraph_builder import build_paragraphs
+from .step_06_line_builder import build_lines
+from .step_07_style_prefiller import prefill_block_types
 
 
 class DocxPipelineResult(NamedTuple):
@@ -21,6 +22,7 @@ class DocxPipelineResult(NamedTuple):
 
     package: DocxPackage
     df_runs: pd.DataFrame
+    df_chart_points: pd.DataFrame
     df_table_cells: pd.DataFrame
     df_paragraphs: pd.DataFrame
     df_lines: pd.DataFrame
@@ -48,6 +50,8 @@ def run_pipeline(
             package: Parsed DOCX package.
             df_runs: Run-level DataFrame (one row per text/control/image run event).
                 Header/footer rows are always present here.
+            df_chart_points: Datapoint-level DataFrame (one row per plotted
+                point of each embedded chart).
             df_table_cells: Cell-level DataFrame (one row per logical table cell).
             df_paragraphs: Paragraph-level DataFrame (runs aggregated by paragraph_id).
             df_lines: Shared-compatible line DataFrame, ready for shared/ steps.
@@ -61,6 +65,7 @@ def run_pipeline(
         include_notes_comments=include_notes_comments,
         page_label_config=page_label_config,
     )
+    df_chart_points = build_chart_points(package, df_runs)
     df_table_cells = build_table_cells(
         package,
         df_runs,
@@ -77,6 +82,7 @@ def run_pipeline(
     return DocxPipelineResult(
         package=package,
         df_runs=df_runs,
+        df_chart_points=df_chart_points,
         df_table_cells=df_table_cells,
         df_paragraphs=df_paragraphs,
         df_lines=df_lines,

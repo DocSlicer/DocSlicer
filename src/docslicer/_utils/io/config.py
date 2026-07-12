@@ -5,8 +5,8 @@ import yaml
 
 from .yaml_compilers.page_label_patterns import load_and_compile_patterns, PageLabelPatternConfig
 
-# Config directory contains YAML pattern files
-CONFIG_DIR = Path(__file__).parent.parent / "config"
+# Config directory contains YAML pattern files (src/docslicer/config)
+CONFIG_DIR = Path(__file__).parent.parent.parent / "config"
 
 
 def load_page_label_config() -> Dict[str, Any]:

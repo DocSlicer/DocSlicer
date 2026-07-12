@@ -30,10 +30,12 @@ NS = {
     "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
     "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
     "wp": "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing",
+    "c": "http://schemas.openxmlformats.org/drawingml/2006/chart",
 }
 
 W = f"{{{NS['w']}}}"
 R = f"{{{NS['r']}}}"
+C = f"{{{NS['c']}}}"
 
 
 _CONTENT_PARTS = (
@@ -58,6 +60,7 @@ class _Counters:
     table_cell_id: int = 0
     field_id: int = 0
     order_index: int = 0
+    chart_id: int = 0
 
 
 @dataclass
@@ -456,7 +459,7 @@ def _extract_r_pr_props(r_pr: etree._Element | None) -> dict[str, Any]:
         "character_style_id": _attr(r_style, "val"),
         "is_bold": _bool_val(_child(r_pr, "b")),
         "is_italic": _bool_val(_child(r_pr, "i")),
-        "is_underline": _underline_val(_child(r_pr, "u")),
+        "is_underlined": _underline_val(_child(r_pr, "u")),
         "is_strikethrough": _bool_val(_child(r_pr, "strike")),
         "script_type": _script_type(_child(r_pr, "vertAlign")),
         "font_size": _font_size(size),
@@ -712,8 +715,7 @@ def expand_header_footer_runs(
     other_df = run_df[~hf_mask]
 
     body_mask = other_df["header_footer_type"].eq("body")
-    body_df = other_df[body_mask]
-    non_body_df = other_df[~body_mask]  # footnotes, endnotes, comments
+    body_df = other_df[body_mask]  # used only to derive per-page metadata
 
     # Build per-page metadata from first body run of each page (body rows have
     # correct page_number, section_id, and page_label from prior pipeline steps).
@@ -796,17 +798,35 @@ def expand_header_footer_runs(
         if footer_part and footer_part in hf_by_part:
             page_footer_chunks[page_num] = _clone_for_page(hf_by_part[footer_part], meta)
 
-    # Rebuild: for each page [header_rows][body_rows][footer_rows], then non-body
+    # ``other_df`` holds every non-header/footer row (body plus footnotes,
+    # endnotes and comments already interleaved into reading order by
+    # ``_inline_footnotes``).  Sort by order_index so that interleaving is
+    # preserved when we slice per page.
+    content_df = other_df.sort_values("order_index", kind="stable")
+
+    # Rebuild page by page: [header][body + inlined notes][footer].  Content rows
+    # whose page has no body metadata (e.g. unattached comments) are appended at
+    # the end so nothing is dropped.
+    known_pages = set(page_meta)
     ordered: list[pd.DataFrame] = []
     for page_num in sorted(page_meta):
         if page_num in page_header_chunks:
             ordered.append(page_header_chunks[page_num])
-        ordered.append(body_df[body_df["page_number"] == page_num])
+        ordered.append(content_df[content_df["page_number"] == page_num])
         if page_num in page_footer_chunks:
             ordered.append(page_footer_chunks[page_num])
 
-    ordered.append(non_body_df)
-    return pd.concat(ordered, ignore_index=True)
+    leftover = content_df[~content_df["page_number"].isin(known_pages)]
+    if not leftover.empty:
+        ordered.append(leftover)
+
+    result = pd.concat(ordered, ignore_index=True)
+    # Reindex order_index to match the rebuilt row order: headers take the first
+    # slots of each page and footers the last, with body/notes in between.  The
+    # raw indices carried by cloned header/footer runs are extraction-order
+    # artifacts (e.g. footers at 5245) and must not survive.
+    result["order_index"] = range(1, len(result) + 1)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1078,6 +1098,15 @@ def _extract_hyperlink_context(
     return None, None, None
 
 
+def _chart_rel_id(elem: etree._Element) -> str | None:
+    """Return the relationship id of an embedded DrawingML chart, if the drawing
+    wraps a ``c:chart`` reference. None for non-chart drawings (pictures, etc.)."""
+    chart = elem.find(f".//{C}chart")
+    if chart is None:
+        return None
+    return chart.get(f"{R}id")
+
+
 def _image_alt_text(elem: etree._Element) -> str:
     doc_pr = elem.find(".//wp:docPr", namespaces=NS)
     if doc_pr is not None:
@@ -1196,6 +1225,16 @@ def _append_run_row(
         or style_id
     )
 
+    chart_rel_id = (
+        _chart_rel_id(event_elem)
+        if run_type == "image_ref" and event_elem is not None
+        else None
+    )
+    chart_id: int | None = None
+    if chart_rel_id is not None:
+        counters.chart_id += 1
+        chart_id = counters.chart_id
+
     counters.run_id += 1
     counters.order_index += 1
     rows.append(
@@ -1230,12 +1269,13 @@ def _append_run_row(
             "effective_character_style_name": r_props.get("effective_character_style_name"),
             "is_bold": r_props.get("is_bold"),
             "is_italic": r_props.get("is_italic"),
-            "is_underline": r_props.get("is_underline"),
+            "is_underlined": r_props.get("is_underlined"),
             "is_strikethrough": r_props.get("is_strikethrough"),
             "script_type": r_props.get("script_type"),
             "bold_ratio": _ratio_from_bool(r_props.get("is_bold")),
             "italic_ratio": _ratio_from_bool(r_props.get("is_italic")),
-            "underlined_ratio": _ratio_from_bool(r_props.get("is_underline")),
+            "underlined_ratio": _ratio_from_bool(r_props.get("is_underlined")),
+            "strikethrough_ratio": _ratio_from_bool(r_props.get("is_strikethrough")),
             "font_size": r_props.get("font_size"),
             "font_name": r_props.get("font_name"),
             "non_stroking_color": r_props.get("color"),
@@ -1252,6 +1292,7 @@ def _append_run_row(
             "field_phase": field_state.get("phase"),
             "has_link": bool(hyperlink_id or p_props.get("bookmark_ids")),
             "link_type": "external" if hyperlink_url else ("internal" if hyperlink_id or p_props.get("bookmark_ids") else None),
+            "link_url": hyperlink_url or (p_props.get("bookmark_names") or None),
             "is_deleted_revision": any(a.tag == f"{W}del" for a in ancestors),
             "is_inserted_revision": any(a.tag == f"{W}ins" for a in ancestors),
             "list_num_id": p_props.get("list_num_id"),
@@ -1260,6 +1301,8 @@ def _append_run_row(
             "outline_level": p_props.get("outline_level"),
             "page_break_before": bool(p_props.get("page_break_before")),
             "event_tag": _local_name(event_elem) if event_elem is not None else None,
+            "chart_rel_id": chart_rel_id,
+            "chart_id": chart_id,
         }
     )
 
@@ -1309,12 +1352,13 @@ def _append_section_break_row(
             "effective_character_style_name": None,
             "is_bold": None,
             "is_italic": None,
-            "is_underline": None,
+            "is_underlined": None,
             "is_strikethrough": None,
             "script_type": None,
             "bold_ratio": 0.0,
             "italic_ratio": 0.0,
             "underlined_ratio": 0.0,
+            "strikethrough_ratio": 0.0,
             "font_size": None,
             "font_name": None,
             "non_stroking_color": None,
@@ -1331,6 +1375,7 @@ def _append_section_break_row(
             "field_phase": None,
             "has_link": bool(p_props.get("bookmark_ids")),
             "link_type": "internal" if p_props.get("bookmark_ids") else None,
+            "link_url": p_props.get("bookmark_names") or None,
             "is_deleted_revision": False,
             "is_inserted_revision": False,
             "list_num_id": p_props.get("list_num_id"),
@@ -1564,22 +1609,102 @@ def _inline_footnotes(run_df: pd.DataFrame) -> pd.DataFrame:
     if not fn_ref_mask.any() and not en_ref_mask.any():
         return run_df
 
-    # Build maps: id_str → (ref_order_index, page_number, page_label, section_id, page_width, page_height)
-    def _build_ref_map(mask: pd.Series) -> dict[str, tuple]:
-        m: dict[str, tuple] = {}
-        for _, row in run_df[mask].iterrows():
-            m[str(row["text"])] = (
-                float(row["order_index"]),
-                row["page_number"],
-                row.get("page_label"),
-                row.get("section_id"),
-                row.get("page_width"),
-                row.get("page_height"),
+    # For footnotes referenced from inside a table, inline the note AFTER the
+    # whole table instead of right after the reference marker. Otherwise the note
+    # lands between two table rows, splitting the table block — and since each
+    # fragment renders by table_id, the entire table re-renders per fragment.
+    # Anchor on the table's last row (max order_index) and inherit its context.
+    def _table_anchor_map() -> dict[str, tuple]:
+        if "table_id" not in run_df.columns:
+            return {}
+        tbl = run_df[run_df["table_id"].notna()]
+        if tbl.empty:
+            return {}
+        anchors: dict[str, tuple] = {}
+        for tid, grp in tbl.groupby("table_id"):
+            last = grp.loc[grp["order_index"].astype(float).idxmax()]
+            anchors[str(tid)] = (
+                float(last["order_index"]),
+                last["page_number"],
+                last.get("page_label"),
+                last.get("section_id"),
+                last.get("page_width"),
+                last.get("page_height"),
             )
+        return anchors
+
+    table_anchors = _table_anchor_map()
+
+    def _has_table_id(value: object) -> bool:
+        return value is not None and not pd.isna(value) and str(value).strip() not in ("", "nan")
+
+    # Build maps: id_str → (base_order_index, slot_width, page_number, page_label,
+    # section_id, page_width, page_height). Content rows are placed at
+    # ``base + slot_width * offset/(n+1)``. Body footnotes get base=ref order_index
+    # and width=1 (right after the reference). Table footnotes are packed after the
+    # table's last row in reference order, each in its own 1/(k+1)-wide sub-slot so
+    # multiple notes from one table stay ordered and never interleave.
+    def _build_ref_map(mask: pd.Series) -> dict[str, tuple]:
+        refs = run_df[mask]
+
+        # Per table: ordered list of distinct referenced ids (by reference order).
+        per_table: dict[str, list[str]] = {}
+        for _, row in refs.sort_values("order_index", kind="stable").iterrows():
+            tid = row.get("table_id")
+            if _has_table_id(tid) and str(tid) in table_anchors:
+                ids = per_table.setdefault(str(tid), [])
+                rid = str(row["text"])
+                if rid not in ids:
+                    ids.append(rid)
+        table_rank: dict[str, tuple[str, int, int]] = {}
+        for tid, ids in per_table.items():
+            for j, rid in enumerate(ids, start=1):
+                table_rank[rid] = (tid, j, len(ids))
+
+        m: dict[str, tuple] = {}
+        for _, row in refs.iterrows():
+            rid = str(row["text"])
+            if rid in table_rank:
+                tid, j, k = table_rank[rid]
+                last_idx, page_number, page_label, section_id, pw, ph = table_anchors[tid]
+                m[rid] = (
+                    last_idx + j / (k + 1),   # base within (last_idx, last_idx+1)
+                    1.0 / (k + 1),            # sub-slot width
+                    page_number, page_label, section_id, pw, ph,
+                )
+            else:
+                m[rid] = (
+                    float(row["order_index"]),
+                    1.0,
+                    row["page_number"],
+                    row.get("page_label"),
+                    row.get("section_id"),
+                    row.get("page_width"),
+                    row.get("page_height"),
+                )
         return m
 
     fn_ref_map = _build_ref_map(fn_ref_mask)
     en_ref_map = _build_ref_map(en_ref_mask)
+
+    # Word renders footnotes/endnotes with a sequential counter in reference
+    # (document) order, not the internal w:id we extract — so a body whose first
+    # footnoteReference is w:id="2" still displays "1". Map each id to its 1-based
+    # position in reference order to reproduce the number the reader sees.
+    def _display_map(mask: pd.Series) -> dict[str, int]:
+        ordered_ids = (
+            run_df.loc[mask, ["order_index", "text"]]
+            .sort_values("order_index", kind="stable")["text"]
+            .astype(str)
+        )
+        m: dict[str, int] = {}
+        for rid in ordered_ids:
+            if rid not in m:
+                m[rid] = len(m) + 1
+        return m
+
+    fn_display = _display_map(fn_ref_mask)
+    en_display = _display_map(en_ref_mask)
 
     # Drop DOCX special separator footnotes/endnotes (id <= 0, e.g. "-1", "0")
     fn_part_mask = run_df["source_part"].str.endswith("footnotes.xml", na=False)
@@ -1605,18 +1730,18 @@ def _inline_footnotes(run_df: pd.DataFrame) -> pd.DataFrame:
 
     df["_sort_key"] = df["order_index"].astype(float)
 
-    def _assign_order(part_mask: pd.Series, id_col: str, ref_map: dict, label: str) -> None:
+    def _assign_order(part_mask: pd.Series, id_col: str, ref_map: dict, kind: str, display_map: dict) -> None:
         if not part_mask.any():
             return
         id_series = df[id_col].astype(str)
-        for ref_id, (ref_idx, ref_page, ref_pg_label, ref_section, ref_pw, ref_ph) in ref_map.items():
+        for ref_id, (ref_base, ref_width, ref_page, ref_pg_label, ref_section, ref_pw, ref_ph) in ref_map.items():
             positions = df.index[part_mask & (id_series == ref_id)]
             if positions.empty:
                 continue
             n = len(positions)
             offsets = pd.Series(range(1, n + 1), index=positions, dtype=float)
 
-            df.loc[positions, "_sort_key"]  = ref_idx + offsets / (n + 1)
+            df.loc[positions, "_sort_key"]  = ref_base + ref_width * offsets / (n + 1)
             df.loc[positions, "page_number"] = ref_page
             if has_page_label:
                 df.loc[positions, "page_label"] = ref_pg_label
@@ -1626,14 +1751,29 @@ def _inline_footnotes(run_df: pd.DataFrame) -> pd.DataFrame:
                 df.loc[positions, "page_width"]  = ref_pw
                 df.loc[positions, "page_height"] = ref_ph
 
-            # Prefix the first text run so LLMs/RAG identify it as a footnote.
+            # Prefix the first text run so LLMs/RAG identify it as a footnote,
+            # including the displayed note number when available (matches the
+            # inline [^N] reference marker in the body).
+            disp = display_map.get(str(ref_id))
+            label = f"[{kind} {disp}] " if disp is not None else f"[{kind}] "
             text_positions = df.index[part_mask & (id_series == ref_id) & (df["run_type"] == "text")]
             if not text_positions.empty:
                 first = text_positions[0]
                 df.at[first, "text"] = label + df.at[first, "text"]
 
-    _assign_order(fn_part_mask, "footnote_id", fn_ref_map, "[Footnote] ")
-    _assign_order(en_part_mask, "endnote_id", en_ref_map, "[Endnote] ")
+    _assign_order(fn_part_mask, "footnote_id", fn_ref_map, "Footnote", fn_display)
+    _assign_order(en_part_mask, "endnote_id", en_ref_map, "Endnote", en_display)
+
+    # Rewrite in-body reference markers from the internal w:id to the displayed
+    # sequential number so the [^N] marker matches the [Footnote N] definition.
+    def _relabel_refs(run_type: str, display_map: dict) -> None:
+        ref_rows = df["run_type"] == run_type
+        if ref_rows.any():
+            ids = df.loc[ref_rows, "text"].astype(str)
+            df.loc[ref_rows, "text"] = ids.map(lambda x: str(display_map.get(x, x)))
+
+    _relabel_refs("footnote_reference", fn_display)
+    _relabel_refs("endnote_reference", en_display)
 
     df = df.sort_values("_sort_key", kind="stable").reset_index(drop=True)
     df = df.drop(columns=["_sort_key"])
@@ -1642,9 +1782,29 @@ def _inline_footnotes(run_df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# Public API
+# Invisible artifact cleanup
 # ---------------------------------------------------------------------------
 
+def _drop_zero_width_adobe_runs(run_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Remove runs set in the ``ZWAdobeF`` ("Zero-Width Adobe Font") typeface.
+
+    Adobe tools (Acrobat/InDesign, PDF→DOCX conversions) inject tiny 1pt runs in
+    this zero-width font as invisible tagging markers — typically the "0F"-style
+    anchor that precedes a footnote reference. They render as nothing in Word but
+    otherwise leak into the extracted text, so drop them at the source.
+    """
+    if "font_name" not in run_df.columns:
+        return run_df
+    zw_mask = run_df["font_name"].astype("string").str.strip().str.casefold() == "zwadobef"
+    if not zw_mask.any():
+        return run_df
+    return run_df[~zw_mask.fillna(False)].reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
 def extract_runs(
     package: DocxPackage,
@@ -1701,6 +1861,8 @@ def extract_runs(
             )
 
     run_df = pd.DataFrame(rows)
+    if not run_df.empty:
+        run_df = _drop_zero_width_adobe_runs(run_df)
     if not run_df.empty:
         run_df["page_number"] = _assign_page_numbers(run_df)
         run_df = _add_page_labels_from_sections(run_df, package, page_label_config)

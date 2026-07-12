@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Iterable
 
 import numpy as np
 import pandas as pd
@@ -94,13 +93,17 @@ CFG = AncestorDropConfig()
 # Helper Functions
 # -------------------------
 
-def _to_list(v) -> list[str]:
-    if v is None or (isinstance(v, float) and pd.isna(v)):
-        return []
-    if isinstance(v, (list, tuple)):
-        return [str(x) for x in v if x is not None and not (isinstance(x, float) and pd.isna(x))]
-    s = str(v).strip()
-    return [s] if s else []
+def _join_field(v) -> str:
+    """Flatten a single ancestor/own-element field value into a space-joined string.
+
+    Tighter than ``" ".join(_to_list(v))`` — skips the intermediate list allocation
+    and the redundant per-element ``pd.isna`` on the (dominant) list/scalar-string paths.
+    """
+    if isinstance(v, (list, tuple, np.ndarray)):
+        return " ".join(str(x) for x in v if x is not None and x == x)  # x == x drops NaN
+    if v is None or (isinstance(v, float) and v != v):
+        return ""
+    return str(v).strip()
 
 
 def _build_row_strings(df: pd.DataFrame, cfg: AncestorDropConfig) -> pd.Series:
@@ -111,7 +114,7 @@ def _build_row_strings(df: pd.DataFrame, cfg: AncestorDropConfig) -> pd.Series:
     a ``pd.Series`` object for every row (as ``DataFrame.apply(axis=1)`` would do).
     """
     cols = [cfg.col_ids, cfg.col_classes, cfg.col_tags, cfg.col_roles, cfg.col_dom_id, cfg.col_dom_class]
-    parts = [df[col].apply(lambda v: " ".join(_to_list(v))) for col in cols if col in df.columns]
+    parts = [df[col].map(_join_field) for col in cols if col in df.columns]
     if not parts:
         return pd.Series("", index=df.index)
     combined = parts[0]
@@ -120,10 +123,16 @@ def _build_row_strings(df: pd.DataFrame, cfg: AncestorDropConfig) -> pd.Series:
     return combined.str.lower()
 
 
-def _any_exact_match(tokens: Iterable[str], exact_set: set[str]) -> bool:
-    for t in tokens:
-        if str(t).strip().lower() in exact_set:
-            return True
+def _has_exact_token(v, exact_set: set[str]) -> bool:
+    """True if any token in ``v`` (list/tuple/array or scalar) is in ``exact_set`` (lowercased).
+
+    Single pass, no intermediate lists — replaces the ``_to_list → lower → _any_exact_match``
+    apply chain.
+    """
+    if isinstance(v, (list, tuple, np.ndarray)):
+        return any(str(t).strip().lower() in exact_set for t in v if t is not None)
+    if isinstance(v, str):
+        return v.strip().lower() in exact_set
     return False
 
 
@@ -199,16 +208,13 @@ def _drop_boilerplate_by_ancestors(
     aria_roles_exact = {x.lower() for x in cfg.drop_aria_roles_exact}
     drop_kw = {x.lower() for x in cfg.drop_keywords}
 
-    # Rule 1 / 2: exact tag and ARIA role drops
-    tags_list = out.get(cfg.col_tags, pd.Series([[]] * len(out))).apply(_to_list).apply(
-        lambda lst: [x.lower() for x in lst]
-    )
-    roles_list = out.get(cfg.col_roles, pd.Series([[]] * len(out))).apply(_to_list).apply(
-        lambda lst: [x.lower() for x in lst]
-    )
+    # Rule 1 / 2: exact tag and ARIA role drops (one pass per column instead of the
+    # _to_list → lowercase → _any_exact_match apply chain)
+    tags_col = out.get(cfg.col_tags, pd.Series([[]] * len(out), index=out.index))
+    roles_col = out.get(cfg.col_roles, pd.Series([[]] * len(out), index=out.index))
 
-    hit_tag_exact = tags_list.apply(lambda toks: _any_exact_match(toks, tags_exact))
-    hit_role_exact = roles_list.apply(lambda toks: _any_exact_match(toks, aria_roles_exact))
+    hit_tag_exact = tags_col.map(lambda v: _has_exact_token(v, tags_exact))
+    hit_role_exact = roles_col.map(lambda v: _has_exact_token(v, aria_roles_exact))
 
     # Rule 3: keyword drops via substring matching (ancestors + own dom_id/dom_class)
     row_strings = _build_row_strings(out, cfg)

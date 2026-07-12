@@ -425,6 +425,7 @@ def _run_pipeline(
         file_size_bytes = None
 
     early_steps: dict[str, pd.DataFrame] = {}
+    df_chart_points: pd.DataFrame | None = None
 
     if content_type == "pdf":
         if not isinstance(content, bytes):
@@ -444,12 +445,12 @@ def _run_pipeline(
         from ._utils.password import decrypt_office, is_encrypted_office
         _was_encrypted = False
         try:
-            package, df_runs, df_table_cells, df_paragraphs, df_lines = _run_docx_pipeline(content)
+            package, df_runs, df_chart_points, df_table_cells, df_paragraphs, df_lines = _run_docx_pipeline(content)
         except zipfile.BadZipFile:
             if not is_encrypted_office(content):
                 raise
             content = decrypt_office(content, config.password, source_filename)
-            package, df_runs, df_table_cells, df_paragraphs, df_lines = _run_docx_pipeline(content)
+            package, df_runs, df_chart_points, df_table_cells, df_paragraphs, df_lines = _run_docx_pipeline(content)
             _was_encrypted = True
         discovered_metadata = extract_core_properties(package)
         if _was_encrypted:
@@ -465,6 +466,7 @@ def _run_pipeline(
         add_document_information(discovered_metadata, df_lines=df_lines)
         if config.debug:
             early_steps["runs"] = df_runs
+            early_steps["chart_points"] = df_chart_points
             early_steps["paragraphs"] = df_paragraphs
             early_steps["lines"] = df_lines
             if df_table_cells is not None:
@@ -543,6 +545,7 @@ def _run_pipeline(
     df_blocks, df_chunks = _run_shared_pipeline(
         lines_df=df_lines,
         df_table_cells=df_table_cells,
+        chart_points_df=df_chart_points,
         config=config,
     )
 

@@ -27,10 +27,13 @@ Classification of a block's content role. Set progressively through the shared p
 | `footer` | `docx/step_04_paragraph_builder` | Page footer text (bottom margin region); typically repeats across pages |
 | `watermark` | _(reserved)_ | Watermark / background text overlay |
 | `signature_block` | _(reserved)_ | Signature block at end of legal document |
+Footnote
+code
+FormField
+block_quote (picked up from pdf / html / docx) - can never be a heading
 
 
-- Add: Comments, Footnote, Math, FormField, code
-- block_quote (picked up from pdf / html / docx) - can never be a heading
+- TODO: Comments, Math, 
 - A toc can be both in table as well as text form
 - Maybe change navigation to bookmark
 - We don't have ListItem because it's not mutually exclusive

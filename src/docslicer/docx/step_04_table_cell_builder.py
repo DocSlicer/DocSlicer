@@ -351,10 +351,31 @@ def build_table_cells(
     table_runs = run_df[run_df["table_cell_id"].notna()].copy()
     table_runs["table_cell_id"] = table_runs["table_cell_id"].astype(int)
 
+    # Cell text: join runs within each paragraph (contiguous character runs, so
+    # no separator — explicit space runs are preserved), then join the cell's
+    # paragraphs with a space so multi-paragraph cells don't run together. A
+    # space (rather than a newline) keeps the cell on one physical line, which
+    # markdown table rows require. tab / line_break (<w:br/>) runs become a space.
+    _ref_types = {"footnote_reference", "endnote_reference"}
+    cell_text_runs = table_runs[
+        table_runs["run_type"].isin({"text", "tab", "line_break"} | _ref_types)
+    ].copy()
+    cell_text_runs["text"] = cell_text_runs["text"].fillna("").astype(str)
+    cell_text_runs.loc[cell_text_runs["run_type"].isin({"tab", "line_break"}), "text"] = " "
+    # Render note reference markers as [^N] (matching the paragraph builder) so a
+    # footnoted cell keeps its marker, e.g. "<5[^37]".
+    _ref_mask = cell_text_runs["run_type"].isin(_ref_types) & cell_text_runs["text"].str.strip().ne("")
+    cell_text_runs.loc[_ref_mask, "text"] = "[^" + cell_text_runs.loc[_ref_mask, "text"].str.strip() + "]"
+    cell_text_runs = cell_text_runs.sort_values(
+        ["table_cell_id", "paragraph_id", "order_index"]
+    )
+    para_text = (
+        cell_text_runs.groupby(["table_cell_id", "paragraph_id"], sort=False)["text"]
+        .apply(lambda xs: "".join(xs))
+    )
     text_agg = (
-        table_runs[table_runs["run_type"].isin({"text", "tab"})]
-        .groupby("table_cell_id")["text"]
-        .apply(lambda xs: "".join(str(x) for x in xs if pd.notna(x)))
+        para_text.groupby(level="table_cell_id", sort=False)
+        .apply(lambda ps: " ".join(s for s in (p.strip() for p in ps) if s))
         .rename("text")
     )
     page_agg = table_runs.groupby("table_cell_id").agg(
