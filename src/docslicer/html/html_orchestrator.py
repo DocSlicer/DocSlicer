@@ -9,8 +9,9 @@ Pipeline Steps:
     01. Box Extraction (Playwright) - Extract visual boxes from HTML
     02. Box Cleaning - Clean boxes, add text features
     03. Page Labels - Detect page numbers/labels
-    04. Table Extraction - Extract tables from HTML
-    05. Line Merger - Merge boxes into visual lines
+    04. Line Merger - Merge boxes into visual lines
+    05. Table Extraction - Extract tables from HTML
+    06. Style Prefiller - Assign block_type from struct_ancestors (code, heading, block_quote)
 
 Note: TOC, Exhibit, Doc Region, and Hierarchy detection are handled
 by the shared orchestrator.
@@ -27,6 +28,7 @@ from .step_02_box_cleaner import clean_boxes
 from .step_03_page_label_detector import assign_page_labels
 from .step_04_line_builder import merge_boxes_to_lines
 from .step_05_table_extractor import extract_table_cells
+from .step_06_style_prefiller import prefill_styles
 
 # Config loaders
 from .._utils.io.yaml_loader import load_yamls
@@ -222,6 +224,11 @@ def run_pipeline(
         df_lines=df_lines,
         rendered_html=rendered_html,
     )
+
+    # Step 06 - Style Prefiller (block_type from struct_ancestors: code, heading,
+    # block_quote). Runs after table extraction so table block_type is already set
+    # and preserved; only fills rows with no existing block_type.
+    df_lines = prefill_styles(df_lines)
 
     try:
         add_document_information(discovered_metadata, html_content=rendered_html, df_lines=df_lines)

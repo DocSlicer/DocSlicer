@@ -27,7 +27,15 @@ def _build_line_text(df: pd.DataFrame) -> pd.Series:
         Series of joined text indexed by line_id.
     """
     ordered = df.sort_values(["line_id", "x_left"], kind="stable")
-    texts = ordered["text"].astype("string").fillna("").str.strip().astype(str)
+    texts = ordered["text"].astype("string").fillna("")
+    # <pre> code-line boxes keep their leading whitespace — indentation is
+    # semantically meaningful in code. Everything else is stripped as before.
+    if "struct_tag" in ordered.columns:
+        is_pre = ordered["struct_tag"].astype("string").eq("pre").fillna(False)
+        texts = texts.str.strip().where(~is_pre, texts.str.rstrip())
+    else:
+        texts = texts.str.strip()
+    texts = texts.astype(str)
 
     prose_text = merge_text_within_line(texts, ordered["line_id"])
 
@@ -183,16 +191,19 @@ _LAYOUT_GAP_PT = 10.0
 
 _LIST_TAGS = frozenset({"ul", "ol"})
 _HEADING_TAGS = frozenset({"h1", "h2", "h3", "h4", "h5", "h6"})
+_PRE_TAGS = frozenset({"pre"})
 
 
 def _struct_layout_groups(df: pd.DataFrame) -> pd.Series:
     """
-    Per line, a grouping key from the deepest list (ul/ol) or heading (h1-h6)
-    struct ancestor: ``"list_<id>"`` / ``"heading_<id>"``, else None.
+    Per line, a grouping key from the deepest list (ul/ol), heading (h1-h6), or
+    code block (pre) struct ancestor: ``"list_<id>"`` / ``"heading_<id>"`` /
+    ``"pre_<id>"``, else None.
 
     Ancestors run root -> leaf, so the last matching tag is the innermost one —
     items of a nested <ol> group under the nested list's id, and a heading
-    inside a list item groups under whichever of the two sits deeper.
+    inside a list item groups under whichever of the two sits deeper. All code
+    lines of one <pre> share its id, so the block stays in a single layout.
     Consecutive lines sharing a key are kept in one layout by _add_layout_id.
     """
     keys = np.full(len(df), None, dtype=object)
@@ -211,6 +222,8 @@ def _struct_layout_groups(df: pd.DataFrame) -> pd.Series:
                 key = f"list_{id_}"
             elif tag in _HEADING_TAGS:
                 key = f"heading_{id_}"
+            elif tag in _PRE_TAGS:
+                key = f"pre_{id_}"
         keys[i] = key
     return pd.Series(keys, index=df.index)
 

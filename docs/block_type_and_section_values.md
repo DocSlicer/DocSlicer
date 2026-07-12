@@ -29,7 +29,7 @@ Classification of a block's content role. Set progressively through the shared p
 | `signature_block` | _(reserved)_ | Signature block at end of legal document |
 
 
-- Add: Comments, Footnote, Math, FormField
+- Add: Comments, Footnote, Math, FormField, code
 - block_quote (picked up from pdf / html / docx) - can never be a heading
 - A toc can be both in table as well as text form
 - Maybe change navigation to bookmark

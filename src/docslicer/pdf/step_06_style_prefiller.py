@@ -56,6 +56,14 @@ _TABLE_CELL = frozenset({"TD", "TH"})
 _HEADINGS   = frozenset({"H", "H1", "H2", "H3", "H4", "H5", "H6"})
 _TOC_TAGS   = frozenset({"TOC", "TOCI"})
 
+
+def _heading_level_from_tag(tag: object) -> Optional[int]:
+    """Parse the numeric level from a heading tag (``H2`` -> 2). Bare ``H`` -> None."""
+    if not isinstance(tag, str):
+        return None
+    digits = tag[1:]
+    return int(digits) if digits.isdigit() else None
+
 _TOC_HEADER_TEXTS: frozenset[str] = frozenset({
     "table of contents",
     "table of content",
@@ -217,6 +225,8 @@ def _assign_block_type(df: pd.DataFrame) -> None:
     n = len(df)
     block_types = np.empty(n, dtype=object)
     block_types[:] = None
+    heading_levels = np.empty(n, dtype=object)
+    heading_levels[:] = None
 
     for i in range(n):
         ancs     = _as_list(anc_arr[i])
@@ -254,6 +264,10 @@ def _assign_block_type(df: pd.DataFrame) -> None:
             is_toc_context = bool(ancs_set & _TOC_TAGS)
             is_toc_text    = text_arr[i] in _TOC_HEADER_TEXTS
             block_types[i] = "toc_heading" if (is_toc_context or is_toc_text) else "heading"
+            # Raw level from the deepest heading tag (ancestors run root -> leaf).
+            for tag in ancs:
+                if tag in _HEADINGS:
+                    heading_levels[i] = _heading_level_from_tag(tag)
             continue
 
         # 7. toc: TOC or TOCI in ancestor chain (but not the title heading itself)
@@ -311,6 +325,7 @@ def _assign_block_type(df: pd.DataFrame) -> None:
                             block_types[i] = "toc_heading"
 
     df["block_type"] = block_types
+    df["heading_level_raw"] = heading_levels
 
 
 def prefill_styles(df: pd.DataFrame) -> pd.DataFrame:

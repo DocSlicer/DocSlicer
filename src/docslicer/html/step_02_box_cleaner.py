@@ -20,6 +20,7 @@ from docslicer._utils.df_aggregation.text_merge import (
     merge_text_within_line,
 )
 
+
 # =======================================================================================================================
 # STEP 1: Drop Boilerplate by Ancestors
 # =======================================================================================================================
@@ -286,9 +287,12 @@ def _collapse_consecutive_script_runs(df: pd.DataFrame) -> pd.DataFrame:
 
 def _merge_boxes_by_structure_tag(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Merge boxes that share the same ``struct_tag_id``, EXCEPT when ``split_reason = 'br_tag'``.
+    Merge boxes that share the same ``struct_tag_id``, EXCEPT when ``split_reason`` is
+    ``'br_tag'`` or ``'code_line'``.
 
-    Boxes split by a ``<br>`` tag remain separate because they represent intentional line breaks.
+    Boxes split by a ``<br>`` tag remain separate because they represent intentional line
+    breaks; ``code_line`` boxes (one per line of a ``<pre>`` block) remain separate for the
+    same reason.
     The merged box inherits the minimum ``box_id`` of its group so that downstream DOM ordering
     is preserved.
 
@@ -301,8 +305,9 @@ def _merge_boxes_by_structure_tag(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty or "struct_tag_id" not in df.columns:
         return df
 
-    # Boxes that must NOT be merged: intentional <br> splits or no valid struct_tag_id
-    br_mask = df.get("split_reason", pd.Series([None] * len(df), index=df.index)) == "br_tag"
+    # Boxes that must NOT be merged: intentional line splits (<br>, <pre> code
+    # lines) or no valid struct_tag_id
+    br_mask = df.get("split_reason", pd.Series([None] * len(df), index=df.index)).isin(["br_tag", "code_line"])
     no_struct_id_mask = df["struct_tag_id"].isna() | (df["struct_tag_id"] < 0)
     no_merge_mask = br_mask | no_struct_id_mask
 
@@ -343,6 +348,50 @@ def _merge_boxes_by_structure_tag(df: pd.DataFrame) -> pd.DataFrame:
     result = result.sort_values("box_id").reset_index(drop=True)
 
     return result
+
+
+# =======================================================================================================================
+# Table Header Parsing
+# =======================================================================================================================
+
+
+_TABLE_CELL_TAGS = frozenset({"td", "th"})
+
+
+def _deepest_cell_is_th(ancestors) -> bool:
+    """True when the nearest (deepest) <td>/<th> ancestor is a <th>.
+
+    struct_ancestors runs root -> leaf, so the last cell tag in the chain is the
+    box's own cell. Non-table boxes (no td/th) return False.
+    """
+    if not isinstance(ancestors, (list, tuple, np.ndarray)):
+        return False
+    deepest = None
+    for tag in ancestors:
+        if tag in _TABLE_CELL_TAGS:
+            deepest = tag
+    return deepest == "th"
+
+
+def _assign_table_header_flag(df: pd.DataFrame) -> None:
+    """Add ``table_header_flag`` (bool) to *df* in-place, one value per box."""
+    n = len(df)
+    if not {"table_id", "table_row_id", "struct_ancestors"} <= set(df.columns):
+        df["table_header_flag"] = np.zeros(n, dtype=bool)
+        return
+
+    is_table = df["table_id"].notna()
+    cell_is_th = df["struct_ancestors"].map(_deepest_cell_is_th)
+    has_thead = df["struct_ancestors"].map(lambda a: "thead" in a if isinstance(a, (list, tuple, np.ndarray)) else False)
+
+    # Row is entirely <th>: all cells sharing (table_id, table_row_id) are <th>.
+    row_all_th = cell_is_th.groupby([df["table_id"], df["table_row_id"]]).transform("min").astype(bool)
+    # First row of each table (smallest table_row_id).
+    first_row = df["table_row_id"].groupby(df["table_id"]).transform("min")
+    is_first_row = df["table_row_id"].eq(first_row)
+
+    header = is_table & (has_thead | (row_all_th & is_first_row))
+    df["table_header_flag"] = header.fillna(False).astype(bool)
 
 
 # =======================================================================================================================
@@ -406,7 +455,10 @@ def clean_boxes(
 
         if reorder_by_coordinates and not special_rows.empty and not regular_rows.empty and "y_top" in df_clean.columns:
             if "struct_tag_id" in regular_rows.columns:
-                regular_rows = regular_rows.sort_values("struct_tag_id").reset_index(drop=True)
+                # box_id tiebreaker: boxes sharing a struct_tag_id (br_tag / code_line
+                # splits) must keep extraction order — a bare single-key sort_values
+                # uses an unstable quicksort and scrambles them.
+                regular_rows = regular_rows.sort_values(["struct_tag_id", "box_id"]).reset_index(drop=True)
             special_rows = special_rows.sort_values("y_top").reset_index(drop=True)
 
             # Assign float sort keys so special rows slot in before the first regular row
@@ -426,8 +478,9 @@ def clean_boxes(
             )
         else:
             # Static extraction: DOM order is already correct — sort everything by struct_tag_id
+            # (box_id tiebreaker keeps br_tag / code_line splits in extraction order)
             if "struct_tag_id" in df_clean.columns:
-                df_clean = df_clean.sort_values("struct_tag_id").reset_index(drop=True)
+                df_clean = df_clean.sort_values(["struct_tag_id", "box_id"]).reset_index(drop=True)
             else:
                 df_clean = df_clean.reset_index(drop=True)
 
@@ -439,4 +492,16 @@ def clean_boxes(
         df_clean.loc[df_clean["struct_tag"] == "hr", "block_type"] = "hr"
         df_clean.loc[df_clean["struct_tag"] == "img", "block_type"] = "image"
 
+    # 7) Table header rows (mirrors the PDF rule in pdf/step_06_style_prefiller):
+    #    a row is a header when a <thead> sits in its ancestor chain, OR the row
+    #    is entirely <th> AND it is the table's first row. Computed here, per box,
+    #    while the <th>/<td> distinction is still available — row cells later merge
+    #    into one line, so the flag is stamped on every cell of the row and carried
+    #    through the merge by the aggregator's "first" policy. A lone <th> row-label
+    #    therefore never flips a whole body row to a header.
+    _assign_table_header_flag(df_clean)
+
     return df_clean
+
+
+

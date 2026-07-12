@@ -187,6 +187,7 @@ COLUMN_REGISTRY: Dict[str, Agg] = {
     "heading_id": Agg.FIRST,
     "parent_heading_id": Agg.FIRST,
     "heading_level": Agg.FIRST,
+    "heading_level_raw": Agg.FIRST,
     "heading_type": Agg.FIRST,
     "heading_fp_id": Agg.FIRST,
     "heading_fingerprint": Agg.FIRST,

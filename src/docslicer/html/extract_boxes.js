@@ -37,6 +37,8 @@
     "Q", "CITE", "DFN", "BDI", "BDO", "NOBR"
   ]);
 
+  // NOTE: PRE and CODE handled separately
+
   // =========================
   // UTILITIES
   // =========================
@@ -485,7 +487,6 @@
     let parent = node.nodeType === Node.TEXT_NODE ? node.parentElement : node;
     let tableId = NaN;
     let tableRowId = NaN;
-    let tableHeaderFlag = false;
     let tableCellIndex = NaN;
     let tableRowCellCount = NaN;
 
@@ -493,17 +494,12 @@
     // Reset when we pass through a nested <table> boundary.
     let pendingCell = null;
     let pendingRow = null;
-    let pendingHeaderFlag = false;
 
     while (parent) {
       const tag = parent.tagName ? parent.tagName.toUpperCase() : "";
 
       if (!pendingCell && isTableCellTag(tag)) {
         pendingCell = parent;
-      }
-
-      if (!pendingHeaderFlag && tag === "TH") {
-        pendingHeaderFlag = true;
       }
 
       if (!pendingRow && tag === "TR") {
@@ -515,14 +511,12 @@
           // Nested layout table — skip it and reset pending context for outer level
           pendingCell = null;
           pendingRow = null;
-          pendingHeaderFlag = false;
         } else {
           // Outermost real table — commit context
           if (!tableIds.has(parent)) {
             tableIds.set(parent, tableCounter++);
           }
           tableId = tableIds.get(parent);
-          tableHeaderFlag = pendingHeaderFlag;
 
           if (pendingRow) {
             if (!rowIds.has(pendingRow)) {
@@ -542,7 +536,7 @@
       parent = parent.parentElement;
     }
 
-    return { tableId, tableRowId, tableHeaderFlag, tableCellIndex, tableRowCellCount };
+    return { tableId, tableRowId, tableCellIndex, tableRowCellCount };
   };
 
   // =========================
@@ -745,7 +739,6 @@
       ixbrl_id: ixbrlId,
       table_id: tableContext.tableId,
       table_row_id: tableContext.tableRowId,
-      table_header_flag: tableContext.tableHeaderFlag,
       table_cell_index: tableContext.tableCellIndex,
       table_row_cell_count: tableContext.tableRowCellCount,
       page_number: pageContext.page_number,
@@ -837,7 +830,6 @@
       ixbrl_id: ixbrlId,
       table_id: tableContext.tableId,
       table_row_id: tableContext.tableRowId,
-      table_header_flag: tableContext.tableHeaderFlag,
       table_cell_index: tableContext.tableCellIndex,
       table_row_cell_count: tableContext.tableRowCellCount,
       page_number: pageContext.page_number,
@@ -966,6 +958,145 @@
       return "";
     };
     
+    // =========================
+    // PRE / CODE BLOCKS
+    // =========================
+    // Inside <pre>, whitespace IS the layout: split boxes on newline characters
+    // (and <br>) instead of on inline tags, so syntax-highlighter token spans
+    // (shiki, Pygments, highlight.js) are transparent. Leading indentation is
+    // kept in the text; only zero-width chars and trailing whitespace are
+    // stripped. split_reason "code_line" tells step_02 not to re-merge these
+    // boxes by struct_tag_id (same contract as "br_tag").
+    if (structTag === "PRE") {
+      const styles = extractStyles(structEl, structTag);
+      const domMeta = extractDomMetadata(structEl);
+      const isStrike = detectStrikethrough(structEl);
+      const scriptType = detectScriptType(structEl);
+      const ixbrlId = findIxbrlId(structEl);
+
+      // Anchor ancestry on a direct <code> wrapper when present (pre > code is
+      // the standard highlighter structure), so struct_ancestors ends
+      // [..., "pre", "code"] instead of stopping at the <pre>.
+      const codeChild = structEl.querySelector(":scope > code");
+      const preHierarchy = codeChild ? extractHierarchy(codeChild) : hierarchy;
+      let lineStart = null; // { node, offset }
+      let lineText = "";
+
+      // end: { node, offset } at a "\n", { before: el } for <br>, or null at EOF
+      const flushCodeLine = (end) => {
+        const text = stripZeroWidth(lineText).replace(/\s+$/, "");
+        const start = lineStart;
+        lineText = "";
+        lineStart = null;
+        if (!start || !text.trim()) return;
+
+        try {
+          range.setStart(start.node, start.offset);
+          if (!end) {
+            range.setEndAfter(structEl.lastChild || structEl);
+          } else if (end.before) {
+            range.setEndBefore(end.before);
+          } else {
+            range.setEnd(end.node, end.offset);
+          }
+
+          const rect = range.getBoundingClientRect();
+          if (rect.width <= 0 || rect.height <= 0) return;
+
+          boxes.push({
+            box_id: boxIdObj.value++,
+            struct_tag: "pre",
+            wrapping_tag: "pre",
+            split_reason: "code_line",
+            struct_tag_id: structureTagId,
+            text: text,
+            x_left: rect.left,
+            x_right: rect.right,
+            y_top: rect.top,
+            y_bottom: rect.bottom,
+            width: rect.width,
+            height: rect.height,
+            text_orientation: textOrientation,
+            font_size: styles.font_size,
+            font_family: styles.font_family,
+            font_weight: styles.font_weight,
+            bold_ratio: styles.bold_ratio,
+            italic_ratio: styles.italic_ratio,
+            underlined_ratio: styles.underlined_ratio,
+            strikethrough_ratio: isStrike ? 1.0 : 0.0,
+            is_strikethrough: isStrike,
+            script_type: scriptType,
+            non_stroking_color: styles.non_stroking_color,
+            stroking_color: styles.stroking_color,
+            text_align: structTextAlign,
+            link_url: "",
+            img_alt: "",
+            img_src: "",
+            dom_id: domMeta.domId,
+            dom_class: domMeta.domClass,
+            html_data_attrs: domMeta.dataAttrs,
+            ixbrl_id: ixbrlId,
+            table_id: tableContext.tableId,
+            table_row_id: tableContext.tableRowId,
+            table_cell_index: tableContext.tableCellIndex,
+            table_row_cell_count: tableContext.tableRowCellCount,
+            page_number: pageContext.page_number,
+            page_width: pageContext.page_width,
+            page_height: pageContext.page_height,
+            page_format: pageContext.page_format,
+            ancestor_ids: preHierarchy.ancestor_ids,
+            ancestor_classes: preHierarchy.ancestor_classes,
+            struct_ancestors: preHierarchy.struct_ancestors,
+            struct_ancestor_ids: preHierarchy.struct_ancestor_ids,
+            ancestor_aria_roles: preHierarchy.ancestor_aria_roles
+          });
+        } catch (e) {
+          // Range error - skip this line
+        }
+      };
+
+      const preWalker = document.createTreeWalker(
+        structEl,
+        NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT,
+        {
+          acceptNode: (node) => {
+            if (node.nodeType === Node.ELEMENT_NODE) {
+              return node.tagName.toUpperCase() === "BR"
+                ? NodeFilter.FILTER_ACCEPT
+                : NodeFilter.FILTER_SKIP;
+            }
+            return NodeFilter.FILTER_ACCEPT;
+          }
+        }
+      );
+
+      while (preWalker.nextNode()) {
+        const node = preWalker.currentNode;
+
+        if (node.nodeType === Node.ELEMENT_NODE) { // <br>
+          flushCodeLine({ before: node });
+          continue;
+        }
+
+        const value = node.nodeValue || "";
+        let from = 0;
+        let idx;
+        while ((idx = value.indexOf("\n", from)) !== -1) {
+          if (!lineStart) lineStart = { node: node, offset: from };
+          lineText += value.slice(from, idx);
+          flushCodeLine({ node: node, offset: idx });
+          from = idx + 1;
+        }
+        if (from < value.length) {
+          if (!lineStart) lineStart = { node: node, offset: from };
+          lineText += value.slice(from);
+        }
+      }
+      flushCodeLine(null);
+
+      return boxes;
+    }
+
     const flushBox = (rangeEnd) => {
       const text = normalize(currentText);
       if (!text || !rangeStart) return;
@@ -1032,7 +1163,6 @@
             ixbrl_id: currentIxbrlId,
             table_id: tableContext.tableId,
             table_row_id: tableContext.tableRowId,
-            table_header_flag: tableContext.tableHeaderFlag,
             table_cell_index: tableContext.tableCellIndex,
             table_row_cell_count: tableContext.tableRowCellCount,
             page_number: pageContext.page_number,

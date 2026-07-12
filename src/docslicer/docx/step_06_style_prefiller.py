@@ -280,7 +280,7 @@ def prefill_block_types(df: pd.DataFrame) -> pd.DataFrame:
     fillable_heading = _unfilled(out) & is_heading
 
     out["docx_heading_candidate"] = is_heading
-    out["docx_heading_level"] = heading_levels
+    out["heading_level_raw"] = heading_levels
     out["docx_heading_suppressed"] = False
     out["docx_heading_suppressed_reason"] = pd.NA
 

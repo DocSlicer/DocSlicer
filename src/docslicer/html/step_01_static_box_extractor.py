@@ -303,8 +303,6 @@ def _table_context(
     tr = el.find_parent("tr")
     table_row_id = row_id_map.get(id(tr)) if tr else None
 
-    table_header_flag = bool(el.name and el.name.lower() == "th")
-
     cell_index = None
     row_cell_count = None
     if tr:
@@ -321,7 +319,6 @@ def _table_context(
     return {
         "table_id": table_id,
         "table_row_id": table_row_id,
-        "table_header_flag": table_header_flag,
         "table_cell_index": cell_index,
         "table_row_cell_count": row_cell_count,
     }
@@ -421,9 +418,40 @@ def _base_box(
 # Inline segment walker
 # ---------------------------------------------------------------------------
 
+def _pre_line_segments(el: Tag) -> List[tuple[str, Tag, str]]:
+    """
+    Segment a <pre> block into one segment per code line.
+
+    Inside <pre>, whitespace IS the layout: split on newline characters (and
+    <br>) instead of on inline tags, so syntax-highlighter token spans (shiki,
+    Pygments, highlight.js) are transparent. Leading indentation is preserved;
+    only trailing whitespace is stripped. split_reason "code_line" tells
+    step_02 not to re-merge these boxes by struct_tag_id (same contract as
+    "br_tag"), and step_04 skips leading-whitespace stripping for pre boxes.
+    """
+    parts: List[str] = []
+    for d in el.descendants:
+        if isinstance(d, Comment):
+            continue
+        if isinstance(d, NavigableString):
+            parts.append(str(d))
+        elif isinstance(d, Tag) and (d.name or "").lower() == "br":
+            parts.append("\n")
+
+    segments: List[tuple[str, Tag, str]] = []
+    for raw_line in "".join(parts).split("\n"):
+        line = raw_line.rstrip()
+        if line.strip():
+            segments.append((line, el, "code_line"))
+    return segments
+
+
 def _iter_inline_segments(el: Tag) -> List[tuple[str, Tag, str]]:
     """
     Walk el's content and return (text, style_anchor, split_reason) tuples.
+
+    <pre> blocks are delegated to :func:`_pre_line_segments` (one segment per
+    code line, indentation preserved).
 
     A new segment is started at:
     - <br>  → split_reason "br_tag"  (step_02 respects this and won't re-merge)
@@ -432,6 +460,9 @@ def _iter_inline_segments(el: Tag) -> List[tuple[str, Tag, str]]:
 
     Plain text runs between split tags use `el` (the block) as the style anchor.
     """
+    if (el.name or "").lower() == "pre":
+        return _pre_line_segments(el)
+
     segments: List[tuple[str, Tag, str]] = []
     current_parts: List[str] = []
 
@@ -568,6 +599,16 @@ def extract_boxes_static(html: str) -> List[Dict[str, Any]]:
                 continue
 
             tag = el.name.lower()
+
+            # For <pre> blocks, anchor ancestry on a direct <code> wrapper when
+            # present (pre > code is the standard highlighter structure), so
+            # struct_ancestors ends [..., "pre", "code"].
+            ancestor_el = el
+            if tag == "pre":
+                code_child = el.find("code", recursive=False)
+                if code_child is not None:
+                    ancestor_el = code_child
+
             dom_class_raw = el.get("class", [])
             dom_class = " ".join(dom_class_raw) if isinstance(dom_class_raw, list) else str(dom_class_raw or "")
             shared = {
@@ -585,7 +626,7 @@ def extract_boxes_static(html: str) -> List[Dict[str, Any]]:
                 "page_height": 0,
                 "page_format": "html_static",
                 **_table_context(el, table_id_map, row_id_map),
-                **_ancestor_meta(el, dom_order),
+                **_ancestor_meta(ancestor_el, dom_order),
             }
 
             for seg_text, seg_anchor, seg_split_reason in segments:

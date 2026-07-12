@@ -212,6 +212,7 @@ MASTER_COLUMN_ORDER: List[str] = [
 
     # Heading hierarchy
     "heading_level",
+    "heading_level_raw",
     "heading_score",
     "heading_score_debug",
     "hierarchy_marker",

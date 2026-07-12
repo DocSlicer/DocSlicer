@@ -1350,12 +1350,12 @@ def _suppress_headings(df: pd.DataFrame) -> pd.DataFrame:
             if c in out.columns:
                 out.loc[mask, c] = np.nan
 
-    # Rows declared as headings by an upstream parser (e.g. docx) are structural facts —
-    # scoring-based suppression does not apply to them.
+    # Rows declared as headings by an upstream parser (e.g. docx, html) are structural
+    # facts — scoring-based suppression does not apply to them.
     docx_heading = (
         out.get("heading_source", pd.Series(dtype="object"))
            .astype("string").str.strip().str.lower()
-           .eq("docx")
+           .isin(["docx", "html"])
            .fillna(False)
     )
 
