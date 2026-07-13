@@ -1151,7 +1151,7 @@ def _aggregate_merged_chunks_fields(group: pd.DataFrame) -> pd.Series:
         include_metadata=True,
         include_table=False,
         include_html_provenance=False,
-        extra_agg={"table_id": _collect_unique_list},
+        extra_agg={"table_id": _collect_unique_list, "chart_id": _collect_unique_list},
     )
     
     # Add chunk-specific fields
@@ -1682,7 +1682,7 @@ def build_chunks(
         include_table=True,
         count_col="block_id",
         extra_first=["layout_id", "layout_type"],
-        extra_agg={"table_id": _collect_unique_list},
+        extra_agg={"table_id": _collect_unique_list, "chart_id": _collect_unique_list},
     )
     
     chunks_df = aggregate_hierarchical(

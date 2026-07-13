@@ -13,9 +13,9 @@ from ._utils.safe_call import safe_enrich
 from .metadata.schema import DocumentMetadata
 from .pdf.pdf_orchestrator import run_pipeline as _run_pdf_pipeline
 from .shared.shared_orchestrator import run_pipeline as _run_shared_pipeline
-from .shared.step_07_block_merger import _format_table_markdown
+from .shared.step_07_block_merger import _format_chart_markdown, _format_table_markdown
 from ._config import ParseConfig, DEFAULT_CONFIG
-from ._result import BBox, Block, Chunk, HierarchyNode, HierarchyTree, ParseResult, Table, TableCell
+from ._result import BBox, Block, Chart, ChartPoint, Chunk, HierarchyNode, HierarchyTree, ParseResult, Table, TableCell
 
 _log = logging.getLogger(__name__)
 
@@ -275,6 +275,7 @@ def _build_chunks(df_chunks: pd.DataFrame, extra_fields: list[str] | None = None
             bbox=_bbox(row),
             link_url=_str_list(row, "link_url"),
             table_ids=_str_list(row, "table_id"),
+            chart_ids=_str_list(row, "chart_id"),
             extra=_extra(row, _extra_fields),
         ))
     return out
@@ -299,6 +300,7 @@ def _build_blocks(df_blocks: pd.DataFrame, extra_fields: list[str] | None = None
             bbox=_bbox(row),
             link_url=_str_list(row, "link_url"),
             table_ids=_str_list(row, "table_id"),
+            chart_ids=_str_list(row, "chart_id"),
             extra=_extra(row, _extra_fields),
         ))
     return out
@@ -355,11 +357,69 @@ def _build_tables(df_table_cells: pd.DataFrame | None) -> list[Table]:
     return out
 
 
+def _build_charts(df_chart_points: pd.DataFrame | None) -> list[Chart]:
+    if df_chart_points is None or df_chart_points.empty or "chart_id" not in df_chart_points.columns:
+        return []
+
+    def _opt_str(row: pd.Series, col: str) -> str | None:
+        v = row.get(col) if col in row.index else None
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return None
+        s = str(v).strip()
+        return s or None
+
+    def _opt_float(row: pd.Series, col: str) -> float | None:
+        v = row.get(col) if col in row.index else None
+        if v is None or pd.isna(v):
+            return None
+        return float(v)
+
+    out = []
+    for chart_id in df_chart_points["chart_id"].unique():
+        points_df = df_chart_points[df_chart_points["chart_id"] == chart_id]
+        first = points_df.iloc[0]
+
+        page_raw = first.get("page_number") if "page_number" in first.index else None
+        page = int(page_raw) if page_raw is not None and pd.notna(page_raw) else 0
+
+        points = []
+        for _, prow in points_df.iterrows():
+            points.append(ChartPoint(
+                series_index=int(prow.get("series_index", 0)),
+                series_name=_opt_str(prow, "series_name"),
+                point_index=int(prow.get("point_index", 0)),
+                category=_opt_str(prow, "category"),
+                label=_opt_str(prow, "label"),
+                value=_opt_float(prow, "value"),
+                x_value=_opt_float(prow, "x_value"),
+                y_value=_opt_float(prow, "y_value"),
+                bubble_size=_opt_float(prow, "bubble_size"),
+                percent=_opt_float(prow, "percent"),
+            ))
+
+        out.append(Chart(
+            id=str(int(chart_id)) if pd.notna(chart_id) else str(chart_id),
+            chart_type=str(first.get("chart_type", "")),
+            title=_opt_str(first, "chart_title"),
+            axis_x_title=_opt_str(first, "axis_x_title"),
+            axis_y_title=_opt_str(first, "axis_y_title"),
+            page_number=page,
+            page_label=_opt_str(first, "page_label"),
+            chunk_id="",
+            is_stacked=bool(first.get("is_stacked", False)),
+            bbox=_bbox(first),
+            markdown=_format_chart_markdown(points_df),
+            points=points,
+        ))
+    return out
+
+
 def _build_result(
     discovered_metadata: dict,
     df_blocks: pd.DataFrame,
     df_chunks: pd.DataFrame,
     df_table_cells: pd.DataFrame | None,
+    df_chart_points: pd.DataFrame | None,
     source_url: str | None,
     source_filename: str | None,
     file_size_bytes: int | None,
@@ -383,6 +443,7 @@ def _build_result(
     chunks = _build_chunks(df_chunks, config.extra_fields)
     blocks = _build_blocks(df_blocks, config.extra_fields)
     tables = _build_tables(df_table_cells)
+    charts = _build_charts(df_chart_points)
     hierarchy = _build_hierarchy(df_blocks, df_chunks)
 
     pipeline_steps: dict[str, pd.DataFrame] = {}
@@ -398,6 +459,7 @@ def _build_result(
         blocks=blocks,
         tables=tables,
         metadata=metadata,
+        charts=charts,
         hierarchy=hierarchy,
         pipeline_steps=pipeline_steps,
     )
@@ -590,6 +652,7 @@ def _run_pipeline(
         df_blocks,
         df_chunks,
         df_table_cells,
+        df_chart_points,
         source_url,
         source_filename,
         file_size_bytes,

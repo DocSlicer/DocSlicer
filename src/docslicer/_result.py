@@ -69,6 +69,7 @@ class Chunk:
     bbox: BBox | None                                 # PDF only
     link_url: list[str]                              # unique URLs found in chunk
     table_ids: list[str]                             # table IDs referenced in chunk
+    chart_ids: list[str] = field(default_factory=list)  # chart IDs referenced in chunk (docx/pptx)
     extra: dict = field(default_factory=dict)        # caller-requested extra fields from the pipeline df
 
     @classmethod
@@ -88,6 +89,7 @@ class Chunk:
             bbox=BBox.from_dict(d.get("bbox")),
             link_url=d.get("link_url", []),
             table_ids=[_norm_id(v) for v in d.get("table_ids", [])],
+            chart_ids=[_norm_id(v) for v in d.get("chart_ids", [])],
             extra=d.get("extra", {}),
         )
 
@@ -108,6 +110,7 @@ class Block:
     bbox: BBox | None                                 # PDF only
     link_url: list[str]                              # unique URLs found in block
     table_ids: list[str]                             # table IDs referenced in block
+    chart_ids: list[str] = field(default_factory=list)  # chart IDs referenced in block (docx/pptx)
     extra: dict = field(default_factory=dict)        # caller-requested extra fields from the pipeline df
 
     @classmethod
@@ -124,6 +127,7 @@ class Block:
             bbox=BBox.from_dict(d.get("bbox")),
             link_url=d.get("link_url", []),
             table_ids=[_norm_id(v) for v in d.get("table_ids", [])],
+            chart_ids=[_norm_id(v) for v in d.get("chart_ids", [])],
             extra=d.get("extra", {}),
         )
 
@@ -184,6 +188,87 @@ class Table:
     def to_dataframe(self) -> "pd.DataFrame":
         import pandas as pd
         return pd.DataFrame([asdict(c) for c in self.cells])
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass
+class ChartPoint:
+    series_index: int                                 # 0-indexed series position
+    series_name: str | None                           # e.g. "Revenue 2024"
+    point_index: int                                  # 0-indexed point position within the series
+    category: str | None                              # category-axis label, e.g. "Q1"
+    label: str | None                                 # explicit data label attached to the point
+    value: float | None                               # plotted value (None for non-numeric caches)
+    x_value: float | None                             # scatter/bubble charts only
+    y_value: float | None                             # scatter/bubble charts only
+    bubble_size: float | None                         # bubble charts only
+    percent: float | None                             # share of series total; pie/doughnut only
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "ChartPoint":
+        return cls(
+            series_index=d.get("series_index", 0),
+            series_name=d.get("series_name"),
+            point_index=d.get("point_index", 0),
+            category=d.get("category"),
+            label=d.get("label"),
+            value=d.get("value"),
+            x_value=d.get("x_value"),
+            y_value=d.get("y_value"),
+            bubble_size=d.get("bubble_size"),
+            percent=d.get("percent"),
+        )
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass
+class Chart:
+    id: str
+    chart_type: str                                   # barChart | lineChart | pieChart | scatterChart | …
+    title: str | None
+    axis_x_title: str | None
+    axis_y_title: str | None
+    page_number: int
+    page_label: str | None
+    chunk_id: str
+    is_stacked: bool
+    bbox: BBox | None                                 # PPTX only — shape geometry on the slide
+    markdown: str                                     # convenience — chart data as a markdown table
+    points: list[ChartPoint]
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Chart":
+        return cls(
+            id=d["id"],
+            chart_type=d.get("chart_type", ""),
+            title=d.get("title"),
+            axis_x_title=d.get("axis_x_title"),
+            axis_y_title=d.get("axis_y_title"),
+            page_number=d.get("page_number", 0),
+            page_label=d.get("page_label"),
+            chunk_id=d.get("chunk_id", ""),
+            is_stacked=d.get("is_stacked", False),
+            bbox=BBox.from_dict(d.get("bbox")),
+            markdown=d.get("markdown", ""),
+            points=[ChartPoint.from_dict(p) for p in d.get("points", [])],
+        )
+
+    @property
+    def series_names(self) -> list[str]:
+        """Unique series names in plot order (None-named series excluded)."""
+        seen: dict[str, None] = {}
+        for p in sorted(self.points, key=lambda p: p.series_index):
+            if p.series_name is not None:
+                seen.setdefault(p.series_name, None)
+        return list(seen)
+
+    def to_dataframe(self) -> "pd.DataFrame":
+        import pandas as pd
+        return pd.DataFrame([asdict(p) for p in self.points])
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -429,6 +514,31 @@ def _prettify_table(markdown: str) -> str:
     return "\n".join(out)
 
 
+def _prettify_embedded_tables(text: str) -> str:
+    """Prettify pipe-table sections within mixed text, passing other lines through.
+
+    Chart blocks may carry a title line before the table, or a non-table
+    representation (jsonl/melted) with no pipe lines at all — only contiguous
+    runs of pipe lines are realigned.
+    """
+    out: list[str] = []
+    buf: list[str] = []
+
+    def _flush() -> None:
+        if buf:
+            out.append(_prettify_table("\n".join(buf)))
+            buf.clear()
+
+    for line in text.splitlines():
+        if line.strip().startswith("|"):
+            buf.append(line)
+        else:
+            _flush()
+            out.append(line)
+    _flush()
+    return "\n".join(out)
+
+
 def _to_parquet(df: "pd.DataFrame", path: Path) -> None:
     try:
         df.to_parquet(path, index=False)
@@ -449,6 +559,7 @@ class ParseResult:
     blocks: list[Block]
     tables: list[Table]
     metadata: DocumentMetadata
+    charts: list[Chart] = field(default_factory=list)  # docx/pptx only for now
     hierarchy: HierarchyTree = field(default_factory=lambda: HierarchyTree(roots=[]))
     pipeline_steps: dict[str, "pd.DataFrame"] = field(default_factory=dict)
 
@@ -460,6 +571,7 @@ class ParseResult:
             blocks=[Block.from_dict(b) for b in d.get("blocks", [])],
             tables=[Table.from_dict(t) for t in d.get("tables", [])],
             metadata=DocumentMetadata.from_dict(d.get("metadata", {})),
+            charts=[Chart.from_dict(c) for c in d.get("charts", [])],
             hierarchy=HierarchyTree.from_dict(d.get("hierarchy", [])),
         )
 
@@ -482,6 +594,7 @@ class ParseResult:
             "chunks": [c.to_dict() for c in self.chunks],
             "blocks": [b.to_dict() for b in self.blocks],
             "tables": [t.to_dict() for t in self.tables],
+            "charts": [c.to_dict() for c in self.charts],
             "hierarchy": self.hierarchy.to_dict(),
         }
 
@@ -540,6 +653,9 @@ class ParseResult:
                     table = tables_by_id.get(block.table_ids[0]) if block.table_ids else None
                     raw = table.markdown if table else text
                     parts.append(_prettify_table(raw) if prettify else raw)
+            elif block.type == "chart":
+                if text:
+                    parts.append(_prettify_embedded_tables(text) if prettify else text)
             elif text:
                 parts.append(text)
 
@@ -652,6 +768,15 @@ class ParseResult:
                 writer.writerow([])
                 writer.writerow([])
 
+    def export_charts_csv(self, path: str | Path, encoding: str = "utf-8") -> None:
+        """Save all chart datapoints as one flat CSV (one row per point).
+
+        Pass encoding="utf-8-sig" for Excel-friendly output (adds BOM).
+        """
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.charts_df().to_csv(path, index=False, encoding=encoding)
+
     def export_chunks_csv(self, path: str | Path, encoding: str = "utf-8") -> None:
         """Save chunks as CSV. Pass encoding="utf-8-sig" for Excel-friendly output (adds BOM)."""
         import pandas as pd
@@ -689,6 +814,22 @@ class ParseResult:
     def tables_df(self) -> "pd.DataFrame":
         import pandas as pd
         return pd.DataFrame([t.to_dict() for t in self.tables])
+
+    def charts_df(self) -> "pd.DataFrame":
+        """One row per chart datapoint, with chart-level metadata repeated."""
+        import pandas as pd
+        rows = []
+        for chart in self.charts:
+            for point in chart.points:
+                rows.append({
+                    "chart_id": chart.id,
+                    "chart_type": chart.chart_type,
+                    "title": chart.title,
+                    "page_number": chart.page_number,
+                    "page_label": chart.page_label,
+                    **point.to_dict(),
+                })
+        return pd.DataFrame(rows)
 
     # ── Hierarchy navigation ──────────────────────────────────────────────────
 
@@ -767,6 +908,29 @@ class ParseResult:
             return []
         return [t for t in self.tables if t.id in table_ids]
 
+    def charts_under(self, heading: HierarchyNode | int, recursive: bool = True) -> list[Chart]:
+        """Return all charts referenced under a heading.
+
+        Uses chunk.chart_ids when chunks are available; falls back to
+        block.chart_ids when chunking was disabled.
+
+        Args:
+            heading: A HierarchyNode or heading_id int.
+            recursive: Include charts from descendant headings (default True).
+        """
+        node = self._resolve_heading(heading)
+        if node is None:
+            return []
+        relevant_chunks = self.chunks_under(node, recursive=recursive)
+        if relevant_chunks:
+            chart_ids = {cid for c in relevant_chunks for cid in c.chart_ids}
+        else:
+            relevant_blocks = self.blocks_under(node, recursive=recursive)
+            chart_ids = {cid for b in relevant_blocks for cid in b.chart_ids}
+        if not chart_ids:
+            return []
+        return [c for c in self.charts if c.id in chart_ids]
+
     # ── Page navigation ───────────────────────────────────────────────────────
 
     def chunks_by_page(self, page: int | str) -> list[Chunk]:
@@ -787,6 +951,12 @@ class ParseResult:
             return [t for t in self.tables if t.page_label == page]
         return [t for t in self.tables if t.page_number == page]
 
+    def charts_by_page(self, page: int | str) -> list[Chart]:
+        """Return charts on a given page. Pass int for page_number, str for page_label."""
+        if isinstance(page, str):
+            return [c for c in self.charts if c.page_label == page]
+        return [c for c in self.charts if c.page_number == page]
+
     def save(self, path: str | Path) -> None:
         """Save parse results to disk.
 
@@ -802,7 +972,7 @@ class ParseResult:
             result.save("output/tables.parquet")    # tables as parquet
             result.save("metadata.json")            # metadata only
 
-        Supported stems: chunks, blocks, tables, metadata.
+        Supported stems: chunks, blocks, tables, charts, metadata.
         Supported formats: .json, .jsonl, .csv, .parquet.
         Unknown stems fall back to chunks.
         """
@@ -816,6 +986,8 @@ class ParseResult:
             _to_parquet(self.chunks_df(), path / "chunks.parquet")
             _to_parquet(self.blocks_df(), path / "blocks.parquet")
             _to_parquet(self.tables_df(), path / "tables.parquet")
+            if self.charts:
+                _to_parquet(self.charts_df(), path / "charts.parquet")
             (path / "metadata.json").write_text(
                 json.dumps(self.metadata.to_dict(), indent=2, ensure_ascii=False)
             )
@@ -830,6 +1002,7 @@ class ParseResult:
             "chunks": lambda: [c.to_dict() for c in self.chunks],
             "blocks": lambda: [b.to_dict() for b in self.blocks],
             "tables": lambda: [t.to_dict() for t in self.tables],
+            "charts": lambda: [c.to_dict() for c in self.charts],
         }
 
         if stem == "metadata":
@@ -841,7 +1014,7 @@ class ParseResult:
         # Unknown stem (e.g. "result") → full document export
         if stem not in level_map:
             if suffix != ".json":
-                raise ValueError(f"Unknown stem {stem!r}: use chunks/blocks/tables/metadata, or a .json path for a full export")
+                raise ValueError(f"Unknown stem {stem!r}: use chunks/blocks/tables/charts/metadata, or a .json path for a full export")
             path.write_text(json.dumps(self.to_dict(), indent=2, ensure_ascii=False))
             return
 

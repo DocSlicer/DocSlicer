@@ -15,7 +15,7 @@ except Exception:
     __version__ = "0.1.0"
 
 from ._config import ParseConfig
-from ._result import ParseResult, Chunk, Block, Table, TableCell, BBox, HierarchyNode, HierarchyTree
+from ._result import ParseResult, Chunk, Block, Table, TableCell, Chart, ChartPoint, BBox, HierarchyNode, HierarchyTree
 from .metadata.schema import DocumentMetadata
 from ._orchestrator import _run_pipeline
 
@@ -33,6 +33,8 @@ __all__ = [
     "Block",
     "Table",
     "TableCell",
+    "Chart",
+    "ChartPoint",
     "DocumentMetadata",
     "BBox",
     "HierarchyNode",
