@@ -64,6 +64,9 @@ step_07b_stream_group_order.py
 """
 
 # NOTE: This algo is left to right biased. For slides that have a columnar layout, a new algo should be added
+# NOTE: A generalized copy of _PageSolver/order_group_boxes lives in
+# _utils/layout/group_order.py (used by the PPTX pipeline). This module still
+# runs its own copy for now; migrate here when convenient.
 
 from __future__ import annotations
 

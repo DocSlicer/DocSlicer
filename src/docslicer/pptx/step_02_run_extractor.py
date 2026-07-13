@@ -11,6 +11,7 @@ downstream steps (paragraph builder, line builder, hierarchy) work unchanged.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -30,17 +31,24 @@ NS = {
     "c": "http://schemas.openxmlformats.org/drawingml/2006/chart",
     "p": "http://schemas.openxmlformats.org/presentationml/2006/main",
     "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+    "mc": "http://schemas.openxmlformats.org/markup-compatibility/2006",
+    "a14": "http://schemas.microsoft.com/office/drawing/2010/main",
+    "m": "http://schemas.openxmlformats.org/officeDocument/2006/math",
 }
 
 A = f"{{{NS['a']}}}"
 C = f"{{{NS['c']}}}"
 P = f"{{{NS['p']}}}"
 R = f"{{{NS['r']}}}"
+MC = f"{{{NS['mc']}}}"
+A14 = f"{{{NS['a14']}}}"
+M = f"{{{NS['m']}}}"
 
 _TABLE_GRAPHIC_URI = "http://schemas.openxmlformats.org/drawingml/2006/table"
 _REL_NOTES_SLIDE = (
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide"
 )
+_PRESENTATION_PART = "ppt/presentation.xml"
 
 # Placeholder types that carry title-level content
 _TITLE_PH_TYPES = frozenset({"title", "ctrTitle"})
@@ -107,6 +115,58 @@ class _Box:
 
 
 @dataclass(frozen=True)
+class _Transform:
+    """Composed affine map from a group's child (chOff/chExt) space to slide EMUs.
+
+    A p:grpSp's children store a:off/a:ext in the group's local chOff/chExt
+    coordinate system, not slide-absolute EMUs. Nested groups compose their
+    transforms, so a shape several groups deep needs the full chain applied
+    to land on its true slide position.
+    """
+    scale_x: float = 1.0
+    scale_y: float = 1.0
+    offset_x: float = 0.0
+    offset_y: float = 0.0
+
+    def apply_point(self, x: float, y: float) -> tuple[float, float]:
+        return self.offset_x + self.scale_x * x, self.offset_y + self.scale_y * y
+
+    def apply_extent(self, cx: float, cy: float) -> tuple[float, float]:
+        return self.scale_x * cx, self.scale_y * cy
+
+
+_IDENTITY_TRANSFORM = _Transform()
+
+
+def _child_transform(parent: _Transform, grp_sp_pr: etree._Element) -> _Transform:
+    """Derive the transform for a p:grpSp's children from its grpSpPr/a:xfrm."""
+    xfrm = grp_sp_pr.find(f"{A}xfrm")
+    if xfrm is None:
+        return parent
+    off = xfrm.find(f"{A}off")
+    ext = xfrm.find(f"{A}ext")
+    ch_off = xfrm.find(f"{A}chOff")
+    ch_ext = xfrm.find(f"{A}chExt")
+    if off is None or ext is None or ch_off is None or ch_ext is None:
+        return parent
+    try:
+        off_x, off_y = float(off.get("x")), float(off.get("y"))
+        ext_cx, ext_cy = float(ext.get("cx")), float(ext.get("cy"))
+        ch_off_x, ch_off_y = float(ch_off.get("x")), float(ch_off.get("y"))
+        ch_ext_cx, ch_ext_cy = float(ch_ext.get("cx")), float(ch_ext.get("cy"))
+    except (TypeError, ValueError):
+        return parent
+    if ch_ext_cx == 0 or ch_ext_cy == 0:
+        return parent
+
+    scale_x = parent.scale_x * (ext_cx / ch_ext_cx)
+    scale_y = parent.scale_y * (ext_cy / ch_ext_cy)
+    offset_x = parent.offset_x + parent.scale_x * off_x - scale_x * ch_off_x
+    offset_y = parent.offset_y + parent.scale_y * off_y - scale_y * ch_off_y
+    return _Transform(scale_x, scale_y, offset_x, offset_y)
+
+
+@dataclass(frozen=True)
 class _Context:
     source_part: str
     slide_index: int
@@ -121,6 +181,8 @@ class _Context:
     table_row_id: int | None = None
     table_cell_id: int | None = None
     box: _Box | None = None
+    # Enclosing p:grpSp ancestry, outermost → innermost, as (id, name) pairs.
+    group_path: tuple[tuple[str, str], ...] = ()
 
 
 class _PptxListResolver:
@@ -162,6 +224,20 @@ class _PptxListResolver:
 # XML helpers
 # ---------------------------------------------------------------------------
 
+_MULTISPACE_RE = re.compile(r"\s{2,}")
+
+
+def _collapse_spaces(text: str) -> str:
+    """Fold runs of 2+ whitespace into a single space.
+
+    Authors sometimes pad a run with many spaces to fake alignment or a line
+    break (e.g. "Less Administrative      Burden"). That padding is visual, not
+    semantic, so collapse it — but keep a single space so runs that are just a
+    separator between two styled runs survive.
+    """
+    return _MULTISPACE_RE.sub(" ", text)
+
+
 def _bool_attr(val: str | None) -> bool | None:
     """Parse a DrawingML boolean attribute (absent = inherit → None)."""
     if val is None:
@@ -182,12 +258,17 @@ def _emu_to_pt(value: str | int | float | None) -> float | None:
         return None
 
 
-def _extract_xfrm_box(elem: etree._Element) -> _Box | None:
+def _extract_xfrm_box(
+    elem: etree._Element,
+    transform: _Transform = _IDENTITY_TRANSFORM,
+) -> _Box | None:
     """
     Extract a DrawingML transform box as points.
 
     PPTX coordinates are EMUs. Converting to points keeps these geometry
-    columns close to the PDF pipeline's coordinate scale.
+    columns close to the PDF pipeline's coordinate scale. `transform` maps
+    the shape's own a:off/a:ext (expressed in its parent p:grpSp's local
+    chOff/chExt space, if any) into slide-absolute EMUs before conversion.
     """
     xfrm = elem.find(f".//{A}xfrm")
     if xfrm is None:
@@ -200,10 +281,18 @@ def _extract_xfrm_box(elem: etree._Element) -> _Box | None:
     if off is None or ext is None:
         return None
 
-    x_left = _emu_to_pt(off.get("x"))
-    y_top = _emu_to_pt(off.get("y"))
-    width = _emu_to_pt(ext.get("cx"))
-    height = _emu_to_pt(ext.get("cy"))
+    try:
+        raw_x, raw_y = float(off.get("x")), float(off.get("y"))
+        raw_cx, raw_cy = float(ext.get("cx")), float(ext.get("cy"))
+    except (TypeError, ValueError):
+        return None
+    abs_x, abs_y = transform.apply_point(raw_x, raw_y)
+    abs_cx, abs_cy = transform.apply_extent(raw_cx, raw_cy)
+
+    x_left = _emu_to_pt(abs_x)
+    y_top = _emu_to_pt(abs_y)
+    width = _emu_to_pt(abs_cx)
+    height = _emu_to_pt(abs_cy)
     if None in (x_left, y_top, width, height):
         return None
 
@@ -358,7 +447,35 @@ def _normalize_bullet_char(p_pr: etree._Element, char: str | None) -> str:
     bu_font = p_pr.find(f"{A}buFont")
     typeface = (bu_font.get("typeface") if bu_font is not None else None) or ""
     normalized_typeface = typeface.strip().lower()
+
+    # Symbol/Wingdings fonts often encode glyphs in the U+F000–U+F0FF private-use
+    # area (e.g. U+F0FC for the Wingdings check). Fold to the low byte so a single
+    # map entry (keyed on the plain char) covers both encodings.
+    if len(char) == 1 and 0xF000 <= ord(char) <= 0xF0FF:
+        folded = chr(ord(char) - 0xF000)
+        if (normalized_typeface, folded) in _SYMBOL_BULLET_MAP:
+            return _SYMBOL_BULLET_MAP[(normalized_typeface, folded)]
+
     return _SYMBOL_BULLET_MAP.get((normalized_typeface, char), char)
+
+
+def _script_type(baseline: str | None) -> str | None:
+    """Map a DrawingML rPr baseline (percentage) to super/subscript.
+
+    baseline is a percentage of the run's font size; positive raises the text
+    (superscript), negative lowers it (subscript), absent/zero is neither.
+    """
+    if baseline is None:
+        return None
+    try:
+        value = int(baseline)
+    except ValueError:
+        return None
+    if value > 0:
+        return "superscript"
+    if value < 0:
+        return "subscript"
+    return None
 
 
 def _extract_color(elem: etree._Element) -> str | None:
@@ -390,12 +507,17 @@ def _extract_r_props(r_pr: etree._Element | None) -> dict[str, Any]:
     # Keep theme font references (+mj-lt, +mn-lt, etc.) as-is; callers resolve them.
 
     u_val = r_pr.get("u")
-    is_underline = None if u_val is None else (u_val != "none")
+    is_underlined = None if u_val is None else (u_val != "none")
+
+    strike_val = r_pr.get("strike")
+    is_strikethrough = None if strike_val is None else (strike_val != "noStrike")
 
     return _drop_none({
         "is_bold": _bool_attr(r_pr.get("b")),
         "is_italic": _bool_attr(r_pr.get("i")),
-        "is_underline": is_underline,
+        "is_underlined": is_underlined,
+        "is_strikethrough": is_strikethrough,
+        "script_type": _script_type(r_pr.get("baseline")),
         "font_size": font_size,
         "font_name": font_name,
         "non_stroking_color": _extract_color(r_pr),
@@ -509,6 +631,42 @@ def _resolve_font_name(font_name: str | None, theme_fonts: dict[str, str]) -> st
     return font_name
 
 
+def _resolve_font_name_with_fallback(
+    raw_font_name: str | None,
+    theme_fonts: dict[str, str],
+    default_style_r_props: dict[int, dict[str, Any]],
+    level: int,
+) -> str | None:
+    """Resolve a (possibly theme-referenced) font name, falling back to
+    presentation.xml's p:defaultTextStyle when the theme's fontScheme has a
+    blank major/minor typeface for that slot (seen when authors clear it)."""
+    resolved = _resolve_font_name(raw_font_name, theme_fonts)
+    if resolved:
+        return resolved
+    fallback_font = default_style_r_props.get(level, {}).get("font_name")
+    if fallback_font:
+        return _resolve_font_name(fallback_font, theme_fonts)
+    return None
+
+
+def _tx_styles_element(
+    master_root: etree._Element | None,
+    placeholder_type: str | None,
+) -> etree._Element | None:
+    """Select the p:txStyles style block that applies to a placeholder type."""
+    if master_root is None:
+        return None
+    tx_styles = master_root.find(f"{P}txStyles")
+    if tx_styles is None:
+        return None
+
+    if placeholder_type in _TITLE_PH_TYPES:
+        return tx_styles.find(f"{P}titleStyle")
+    if placeholder_type == "body":
+        return tx_styles.find(f"{P}bodyStyle")
+    return tx_styles.find(f"{P}otherStyle")
+
+
 def _extract_tx_styles_r_props(
     master_root: etree._Element | None,
     placeholder_type: str | None,
@@ -520,19 +678,7 @@ def _extract_tx_styles_r_props(
     the placeholder lstStyle in the inheritance chain and is the source of font
     size / name when placeholder lstStyles are empty.
     """
-    if master_root is None:
-        return {}
-    tx_styles = master_root.find(f"{P}txStyles")
-    if tx_styles is None:
-        return {}
-
-    if placeholder_type in _TITLE_PH_TYPES:
-        style_elem = tx_styles.find(f"{P}titleStyle")
-    elif placeholder_type in {"body", None}:
-        style_elem = tx_styles.find(f"{P}bodyStyle")
-    else:
-        style_elem = tx_styles.find(f"{P}otherStyle")
-
+    style_elem = _tx_styles_element(master_root, placeholder_type)
     if style_elem is None:
         return {}
 
@@ -545,6 +691,64 @@ def _extract_tx_styles_r_props(
         r_props = _extract_r_props(child.find(f"{A}defRPr"))
         if r_props:
             props_by_level[level] = r_props
+    return props_by_level
+
+
+def _extract_default_text_style_r_props(
+    presentation_root: etree._Element | None,
+) -> dict[int, dict[str, Any]]:
+    """
+    Read per-level defRPr from p:defaultTextStyle in presentation.xml.
+
+    This is the outermost fallback in the run-property inheritance chain —
+    below master p:txStyles — and is where authoring tools often stash a
+    literal font name (e.g. "Arial") even when the theme's fontScheme itself
+    has blank major/minor typefaces. Applies uniformly regardless of
+    placeholder type, since it's the presentation-wide default for any text.
+    """
+    if presentation_root is None:
+        return {}
+    style_elem = presentation_root.find(f"{P}defaultTextStyle")
+    if style_elem is None:
+        return {}
+
+    props_by_level: dict[int, dict[str, Any]] = {}
+    for child in style_elem:
+        local_name = etree.QName(child).localname
+        level = _LIST_STYLE_LEVEL_TAGS.get(local_name)
+        if level is None:
+            continue
+        r_props = _extract_r_props(child.find(f"{A}defRPr"))
+        if r_props:
+            props_by_level[level] = r_props
+    return props_by_level
+
+
+def _extract_tx_styles_p_props(
+    master_root: etree._Element | None,
+    placeholder_type: str | None,
+) -> dict[int, dict[str, Any]]:
+    """
+    Read per-level list/paragraph props from p:txStyles in the master slide.
+
+    Body placeholders usually inherit their bullet/auto-number definition from
+    p:txStyles (bodyStyle), not from a placeholder lstStyle. This is the base of
+    the list-property inheritance chain — the counterpart to the r-props reader.
+    """
+    style_elem = _tx_styles_element(master_root, placeholder_type)
+    if style_elem is None:
+        return {}
+
+    props_by_level: dict[int, dict[str, Any]] = {}
+    for child in style_elem:
+        local_name = etree.QName(child).localname
+        level = _LIST_STYLE_LEVEL_TAGS.get(local_name)
+        if level is None:
+            continue
+        props = _extract_p_props(child)
+        props.pop("outline_level", None)
+        if props:
+            props_by_level[level] = props
     return props_by_level
 
 
@@ -657,7 +861,7 @@ def _append_row(
 ) -> None:
     list_label = p_props.get("list_label")
     if (
-        run_type == "text"
+        run_type in ("text", "math")
         and list_label
         and not p_props.get("_list_label_applied")
         and str(text).strip()
@@ -671,7 +875,8 @@ def _append_row(
     counters.order_index += 1
     is_bold = r_props.get("is_bold")
     is_italic = r_props.get("is_italic")
-    is_underline = r_props.get("is_underline")
+    is_underlined = r_props.get("is_underlined")
+    is_strikethrough = r_props.get("is_strikethrough")
     rows.append({
         "run_id": counters.run_id,
         "paragraph_id": paragraph_id,
@@ -691,6 +896,9 @@ def _append_row(
         "table_id": ctx.table_id,
         "table_row_id": ctx.table_row_id,
         "table_cell_id": ctx.table_cell_id,
+        "group_ids": [gid for gid, _ in ctx.group_path],
+        "group_names": [name for _, name in ctx.group_path],
+        "group_depth": len(ctx.group_path),
         **_box_columns(ctx.box),
         "list_num_id": p_props.get("list_num_id"),
         "list_level": p_props.get("list_level"),
@@ -699,10 +907,13 @@ def _append_row(
         "text_align": p_props.get("text_align"),
         "is_bold": is_bold,
         "is_italic": is_italic,
-        "is_underline": is_underline,
+        "is_underlined": is_underlined,
+        "is_strikethrough": is_strikethrough,
+        "script_type": r_props.get("script_type"),
         "bold_ratio": 1.0 if is_bold is True else 0.0,
         "italic_ratio": 1.0 if is_italic is True else 0.0,
-        "underlined_ratio": 1.0 if is_underline is True else 0.0,
+        "underlined_ratio": 1.0 if is_underlined is True else 0.0,
+        "strikethrough_ratio": 1.0 if is_strikethrough is True else 0.0,
         "font_size": r_props.get("font_size"),
         "font_name": r_props.get("font_name"),
         "non_stroking_color": r_props.get("non_stroking_color"),
@@ -710,6 +921,7 @@ def _append_row(
         "hyperlink_url": hyperlink_url,
         "has_link": bool(hyperlink_id),
         "link_type": "external" if hyperlink_url else ("internal" if hyperlink_id else None),
+        "link_url": hyperlink_url,
     })
 
 
@@ -725,25 +937,32 @@ def _walk_txbody(
     package: PptxPackage,
     inherited_txbodies: list[etree._Element] | None = None,
     tx_styles_r_props: dict[int, dict[str, Any]] | None = None,
+    tx_styles_p_props: dict[int, dict[str, Any]] | None = None,
     theme_fonts: dict[str, str] | None = None,
+    default_text_style_r_props: dict[int, dict[str, Any]] | None = None,
 ) -> None:
-    # Merge lstStyle r-props in inheritance order (least → most specific):
+    # Merge lstStyle props in inheritance order (least → most specific):
     #   p:txStyles base → master lstStyle → layout lstStyle → slide lstStyle
     # inherited_txbodies is [layout_txbody, master_txbody], so reversed = master first.
+    # Per-level merges (not wholesale replace) so a higher lstStyle that only sets
+    # e.g. indentation doesn't wipe the bullet inherited from p:txStyles.
     inherited_level_r_props: dict[int, dict[str, Any]] = {
         lvl: dict(props) for lvl, props in (tx_styles_r_props or {}).items()
     }
-    list_style_props: dict[int, dict[str, Any]] = {}
+    list_style_props: dict[int, dict[str, Any]] = {
+        lvl: dict(props) for lvl, props in (tx_styles_p_props or {}).items()
+    }
     for itxbody in reversed(inherited_txbodies or []):
-        list_style_props.update(_extract_list_style_props(itxbody))
+        for lvl, props in _extract_list_style_props(itxbody).items():
+            list_style_props.setdefault(lvl, {}).update(props)
         for lvl, props in _extract_list_style_r_props(itxbody).items():
-            if lvl not in inherited_level_r_props:
-                inherited_level_r_props[lvl] = {}
-            inherited_level_r_props[lvl].update(props)
-    list_style_props.update(_extract_list_style_props(txbody))
+            inherited_level_r_props.setdefault(lvl, {}).update(props)
+    for lvl, props in _extract_list_style_props(txbody).items():
+        list_style_props.setdefault(lvl, {}).update(props)
     level_r_props = _extract_list_style_r_props(txbody)
     list_resolver = _PptxListResolver()
     tf = theme_fonts or {}
+    default_style_r_props = default_text_style_r_props or {}
 
     for p_elem in txbody.findall(f"{A}p"):
         counters.paragraph_id += 1
@@ -757,7 +976,9 @@ def _walk_txbody(
             inherited_level_r_props,
             level_r_props,
         )
-        default_r_props["font_name"] = _resolve_font_name(default_r_props.get("font_name"), tf)
+        default_r_props["font_name"] = _resolve_font_name_with_fallback(
+            default_r_props.get("font_name"), tf, default_style_r_props, level
+        )
         if p_props.get("list_type") == "auto" and _has_visible_paragraph_text(p_elem):
             p_props["list_label"] = list_resolver.next_label(p_props)
 
@@ -766,10 +987,12 @@ def _walk_txbody(
                 r_pr = child.find(f"{A}rPr")
                 r_props = _merge_props(default_r_props, _extract_r_props(r_pr))
                 # Run's own rPr may also carry a theme font reference; resolve it too.
-                r_props["font_name"] = _resolve_font_name(r_props.get("font_name"), tf)
+                r_props["font_name"] = _resolve_font_name_with_fallback(
+                    r_props.get("font_name"), tf, default_style_r_props, level
+                )
                 hyperlink_id, hyperlink_url = _extract_hyperlink(r_pr, ctx, package)
                 t_elem = child.find(f"{A}t")
-                text = (t_elem.text or "") if t_elem is not None else ""
+                text = _collapse_spaces((t_elem.text or "") if t_elem is not None else "")
                 _append_row(rows, counters, ctx, paragraph_id,
                             "text", text, p_props, r_props, hyperlink_id, hyperlink_url)
             elif child.tag == f"{A}br":
@@ -777,9 +1000,24 @@ def _walk_txbody(
                             "line_break", "\n", p_props, default_r_props, None, None)
             elif child.tag == f"{A}fld":
                 t_elem = child.find(f"{A}t")
-                text = (t_elem.text or "") if t_elem is not None else ""
+                text = _collapse_spaces((t_elem.text or "") if t_elem is not None else "")
                 _append_row(rows, counters, ctx, paragraph_id,
                             "field_marker", text, p_props, default_r_props, None, None)
+            elif child.tag == f"{A14}m":
+                # OMML equation (a14:m/m:oMath). The m:t leaves already hold the
+                # rendered unicode glyphs (e.g. math-italic alpha), so flatten
+                # them into a plain text run inline with the surrounding a:r runs.
+                math_text = _collapse_spaces("".join(
+                    t.text or "" for t in child.findall(f".//{M}t")
+                ))
+                if math_text:
+                    m_r_pr = child.find(f".//{A}rPr")
+                    r_props = _merge_props(default_r_props, _extract_r_props(m_r_pr))
+                    r_props["font_name"] = _resolve_font_name_with_fallback(
+                        r_props.get("font_name"), tf, default_style_r_props, level
+                    )
+                    _append_row(rows, counters, ctx, paragraph_id,
+                                "math", math_text, p_props, r_props, None, None)
 
 
 def _table_cell_boxes(tbl: etree._Element, table_box: _Box | None) -> dict[int, _Box]:
@@ -875,10 +1113,19 @@ def _walk_table(
                 table_row_id=row_id,
                 table_cell_id=cell_id,
                 box=cell_boxes.get(table_cell_index, ctx.box),
+                group_path=ctx.group_path,
             )
             txbody = tc.find(f"{A}txBody")
             if txbody is not None:
                 _walk_txbody(txbody, cell_ctx, counters, rows, package)
+
+
+def _group_identity(grp_sp: etree._Element) -> tuple[str, str]:
+    """Return (id, name) for a p:grpSp from its p:nvGrpSpPr/p:cNvPr."""
+    cnv_pr = grp_sp.find(f"{P}nvGrpSpPr/{P}cNvPr")
+    if cnv_pr is None:
+        return "", ""
+    return cnv_pr.get("id", ""), cnv_pr.get("name", "")
 
 
 def _walk_sp_tree(
@@ -888,19 +1135,37 @@ def _walk_sp_tree(
     counters: _Counters,
     rows: list[dict[str, Any]],
     package: PptxPackage,
+    group_path: tuple[tuple[str, str], ...] = (),
+    transform: _Transform = _IDENTITY_TRANSFORM,
 ) -> None:
     for child in sp_tree:
         if child.tag == f"{P}sp":
-            _walk_sp(child, slide, is_notes, counters, rows, package)
+            _walk_sp(child, slide, is_notes, counters, rows, package, group_path, transform)
         elif child.tag == f"{P}graphicFrame":
-            _walk_graphic_frame(child, slide, is_notes, counters, rows, package)
+            _walk_graphic_frame(child, slide, is_notes, counters, rows, package, group_path, transform)
         elif child.tag == f"{P}grpSp":
-            # Recurse into shape groups
-            inner_tree = child.find(f"{P}spTree")
-            inner = inner_tree if inner_tree is not None else child
-            _walk_sp_tree(inner, slide, is_notes, counters, rows, package)
+            # Recurse into shape groups, extending the ancestry path. A p:grpSp
+            # holds its children directly (no nested p:spTree), so iterate it.
+            # Children's a:off/a:ext are expressed in this group's chOff/chExt
+            # space, not slide-absolute EMUs, so compose the transform too.
+            grp_sp_pr = child.find(f"{P}grpSpPr")
+            child_transform = (
+                _child_transform(transform, grp_sp_pr) if grp_sp_pr is not None else transform
+            )
+            _walk_sp_tree(child, slide, is_notes, counters, rows, package,
+                          group_path + (_group_identity(child),), child_transform)
         elif child.tag == f"{P}pic":
-            _walk_pic(child, slide, is_notes, counters, rows, package)
+            _walk_pic(child, slide, is_notes, counters, rows, package, group_path, transform)
+        elif child.tag == f"{MC}AlternateContent":
+            # Equation-bearing shapes (a14:m) are wrapped in mc:AlternateContent
+            # with a richer mc:Choice (Requires="a14") and a rasterized/blank
+            # mc:Fallback for older readers. Prefer Choice; both wrap ordinary
+            # p:sp/p:graphicFrame/p:grpSp/p:pic children, so recurse the same way.
+            target = child.find(f"{MC}Choice")
+            if target is None:
+                target = child.find(f"{MC}Fallback")
+            if target is not None:
+                _walk_sp_tree(target, slide, is_notes, counters, rows, package, group_path, transform)
 
 
 def _walk_sp(
@@ -910,6 +1175,8 @@ def _walk_sp(
     counters: _Counters,
     rows: list[dict[str, Any]],
     package: PptxPackage,
+    group_path: tuple[tuple[str, str], ...] = (),
+    transform: _Transform = _IDENTITY_TRANSFORM,
 ) -> None:
     nv = sp.find(f"{P}nvSpPr")
     if nv is None:
@@ -938,7 +1205,7 @@ def _walk_sp(
 
     inherited_sps = _find_placeholder_shapes(slide, package, ph)
     sp_pr = sp.find(f"{P}spPr")
-    box = _extract_xfrm_box(sp_pr) if sp_pr is not None else None
+    box = _extract_xfrm_box(sp_pr, transform) if sp_pr is not None else None
     if box is None:
         for isp in inherited_sps:
             isp_pr = isp.find(f"{P}spPr")
@@ -956,6 +1223,7 @@ def _walk_sp(
         placeholder_type=placeholder_type,
         is_notes=is_notes,
         box=box,
+        group_path=group_path,
     )
 
     txbody = sp.find(f"{P}txBody")
@@ -966,6 +1234,10 @@ def _walk_sp(
     master_root = package.get_xml(slide.master_part_name) if slide.master_part_name else None
     theme_fonts = _extract_theme_fonts(package.get_xml(slide.theme_part_name) if slide.theme_part_name else None)
     tx_styles_r_props = _extract_tx_styles_r_props(master_root, placeholder_type)
+    tx_styles_p_props = _extract_tx_styles_p_props(master_root, placeholder_type)
+    default_text_style_r_props = _extract_default_text_style_r_props(
+        package.get_xml(_PRESENTATION_PART)
+    )
     if txbody is None:
         if shape_type != "placeholder" and box is not None:
             counters.paragraph_id += 1
@@ -974,7 +1246,9 @@ def _walk_sp(
         return
 
     row_count_before = len(rows)
-    _walk_txbody(txbody, ctx, counters, rows, package, inherited_txbodies, tx_styles_r_props, theme_fonts)
+    _walk_txbody(txbody, ctx, counters, rows, package, inherited_txbodies,
+                 tx_styles_r_props, tx_styles_p_props, theme_fonts,
+                 default_text_style_r_props)
     if len(rows) == row_count_before and shape_type != "placeholder" and box is not None:
         counters.paragraph_id += 1
         _append_row(rows, counters, ctx, counters.paragraph_id,
@@ -988,6 +1262,8 @@ def _walk_graphic_frame(
     counters: _Counters,
     rows: list[dict[str, Any]],
     package: PptxPackage,
+    group_path: tuple[tuple[str, str], ...] = (),
+    transform: _Transform = _IDENTITY_TRANSFORM,
 ) -> None:
     nv = frame.find(f"{P}nvGraphicFramePr")
     cnv_pr = nv.find(f"{P}cNvPr") if nv is not None else None
@@ -1000,7 +1276,7 @@ def _walk_graphic_frame(
 
     counters.shape_id += 1
     source_part = slide.part_name if not is_notes else _notes_part_for(slide, package)
-    box = _extract_xfrm_box(frame)
+    box = _extract_xfrm_box(frame, transform)
 
     if uri == _TABLE_GRAPHIC_URI:
         ctx = _Context(
@@ -1013,6 +1289,7 @@ def _walk_graphic_frame(
             placeholder_type=None,
             is_notes=is_notes,
             box=box,
+            group_path=group_path,
         )
         _walk_table(frame, ctx, counters, rows, package)
     elif chart_elem is not None:
@@ -1032,6 +1309,7 @@ def _walk_graphic_frame(
             placeholder_type=None,
             is_notes=is_notes,
             box=box,
+            group_path=group_path,
         )
         _append_row(rows, counters, ctx, counters.paragraph_id,
                     "chart_ref", shape_name, {}, {}, None, None)
@@ -1048,6 +1326,7 @@ def _walk_graphic_frame(
             placeholder_type=None,
             is_notes=is_notes,
             box=box,
+            group_path=group_path,
         )
         _append_row(rows, counters, ctx, counters.paragraph_id,
                     "graphic_ref", shape_name, {}, {}, None, None)
@@ -1060,6 +1339,8 @@ def _walk_pic(
     counters: _Counters,
     rows: list[dict[str, Any]],
     package: PptxPackage,
+    group_path: tuple[tuple[str, str], ...] = (),
+    transform: _Transform = _IDENTITY_TRANSFORM,
 ) -> None:
     nv = pic.find(f"{P}nvPicPr")
     cnv_pr = nv.find(f"{P}cNvPr") if nv is not None else None
@@ -1081,7 +1362,8 @@ def _walk_pic(
         shape_type="image",
         placeholder_type=None,
         is_notes=is_notes,
-        box=_extract_xfrm_box(sp_pr) if sp_pr is not None else None,
+        box=_extract_xfrm_box(sp_pr, transform) if sp_pr is not None else None,
+        group_path=group_path,
     )
     _append_row(rows, counters, ctx, counters.paragraph_id,
                 "image_ref", descr, {}, {}, None, None)

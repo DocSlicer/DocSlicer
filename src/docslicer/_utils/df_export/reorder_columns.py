@@ -77,8 +77,7 @@ MASTER_COLUMN_ORDER: List[str] = [
     "run_type",             # docx, pptx  — text / tab / image_ref / chart_ref / …
     "run_index",            # docx, pptx  — position within parent paragraph
     "order_index",          # docx, pptx  — global sequential position in document
-    "source_part",          # docx, pptx  — XML part: body / footnotes / endnotes / header / footer / …
-    "source_part_id",       # docx, pptx  — ID of the item within that part
+    
     "header_footer_type",   # docx        — body / header / footer
     "nested_table_depth",   # docx        — 0 for top-level, >0 for tables inside table cells
     "page_break_before",    # docx        — paragraph-level page break flag
@@ -97,7 +96,7 @@ MASTER_COLUMN_ORDER: List[str] = [
     "shape_id",             # pdf, pptx
     "link_id",              # pdf, html
     "chart_id",             # pptx
-    "placeholder_type",     # pptx        — title / body / subtitle / …
+    
 
     # Mid-pipeline IDs (pdf + html)
     "cell_id",
@@ -125,6 +124,9 @@ MASTER_COLUMN_ORDER: List[str] = [
     "run_ids",              # docx, pptx  — list of run_id values aggregated here
     "paragraph_ids",        # docx, pptx  — list of paragraph_id values aggregated here
     "raw_shape_ids",
+    "group_ids", # PPTX element grouping
+    "container_shape_ids", # PPTX element grouping
+    "container_group_ids", # PPTX element grouping
 
 
 
@@ -408,6 +410,13 @@ MASTER_COLUMN_ORDER: List[str] = [
 
     # ===== 12. Style inheritance =====
     # (docx: resolved through the style-inheritance chain)
+
+    "source_part",          # docx, pptx  — XML part: body / footnotes / endnotes / header / footer / …
+    "source_part_id",       # docx, pptx  — ID of the item within that part
+
+    "placeholder_type",     # pptx        — title / body / subtitle / …
+    "shape_name", # PPTX
+
     "paragraph_style_id",
     "paragraph_style_name",
     "effective_paragraph_style_id",

@@ -12,7 +12,9 @@ from .step_02_run_extractor import extract_runs
 from .step_03_chart_point_builder import extract_chart_points
 from .step_04_table_cell_builder import build_table_cells
 from .step_05_paragraph_builder import build_paragraphs
-from .step_06_line_builder import build_lines
+from .step_06_reading_order import assign_reading_order
+from .step_07_line_builder import build_lines
+from .step_08_style_prefiller import prefill_styles
 
 
 class PptxPipelineResult(NamedTuple):
@@ -46,7 +48,9 @@ def run_pipeline(
     df_chart_points = extract_chart_points(package, df_runs)
     df_table_cells = build_table_cells(package, df_runs, include_notes=include_notes)
     df_paragraphs = build_paragraphs(df_runs, include_notes=include_notes)
+    df_paragraphs = assign_reading_order(df_paragraphs, df_runs)
     df_lines = build_lines(df_paragraphs)
+    df_lines = prefill_styles(df_lines)
 
     return PptxPipelineResult(
         package=package,

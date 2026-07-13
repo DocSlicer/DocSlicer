@@ -13,52 +13,51 @@ from __future__ import annotations
 
 import pandas as pd
 
-from .._utils.df_aggregation.hierarchical_aggregator import (
-    ALPHA_WEIGHTED_STYLE,
-    _collect_unique_list,
-    aggregate_hierarchical,
-    build_standard_agg_spec,
+from .._utils.df_aggregation.registry_aggregator import aggregate_to, group_join
+from .._utils.df_aggregation.text_merge import apply_inline_markup
+
+
+# Run types eligible to become paragraph content. Eligible is not the same as
+# guaranteed to survive: build_paragraphs additionally drops any paragraph
+# that has no "text"/"math" content AND isn't an image_ref/chart_ref (see
+# _text_para_ids / _ref_para_ids below) — so a shape_ref or graphic_ref run
+# only survives when its paragraph also carries text, an image, or a chart.
+# A shape_ref/graphic_ref alone in its paragraph (the common case for
+# decorative, textless shapes) is dropped before aggregation.
+_CONTENT_RUN_TYPES = frozenset(
+    {"text", "math", "image_ref", "shape_ref", "chart_ref", "graphic_ref"}
 )
 
-
-# Identity columns that are constant across all runs in a paragraph.
-_PARA_IDENTITY_COLS = [
-    "page_number",
-    "slide_index",
-    "header_footer_type",
-    "source_part",
-    "source_part_id",
-    "text_align",
-    "table_id",
-    "table_row_id",
-    "table_cell_id",
-    "list_num_id",
-    "list_level",
-    "list_label",
-    "outline_level",
-    "shape_id",
-    "shape_name",
-    "shape_type",
-    "placeholder_type",
-]
-
-# Run types that represent self-contained paragraph content.
-_CONTENT_RUN_TYPES = frozenset({"text", "image_ref", "shape_ref", "chart_ref", "graphic_ref"})
+# Run types that keep their paragraph alive even with no text content.
+# NOTE: shape_ref/graphic_ref are deliberately excluded here — see the
+# _CONTENT_RUN_TYPES comment above.
+_SELF_SUFFICIENT_REF_TYPES = frozenset({"image_ref", "chart_ref"})
 
 
 def _paragraph_text(run_df: pd.DataFrame) -> pd.Series:
     """
-    Build paragraph text from the full run DataFrame.
+    Build paragraph text from the full run DataFrame (all run_types).
 
-    text runs contribute their content; line_break runs contribute a newline
-    so intra-paragraph breaks produce a natural separator. field_marker runs
-    and other types are discarded. Leading/trailing whitespace is stripped.
+    text and math runs contribute their content; line_break runs contribute a
+    literal newline so intra-paragraph breaks produce a natural separator.
+    field_marker runs and other types are discarded.
+
+    Superscript/subscript/strikethrough runs (equations frequently carry
+    baseline-shifted rPr, e.g. the subscript in g_s) are wrapped as inline
+    markup (``[^x]`` / ``[_x]`` / ``~~x~~``) via :func:`apply_inline_markup`
+    before the join, matching the HTML/PDF/DOCX text output. PPTX runs within
+    a paragraph are contiguous character runs like DOCX, so fragments are
+    concatenated with no separator (``sep=""``) — script tokens attach cleanly
+    and no spurious spaces appear between styled runs. Leading/trailing
+    whitespace is stripped from the result.
     """
-    mask = run_df["run_type"].isin({"text", "line_break"})
-    working = run_df.loc[mask, ["paragraph_id", "order_index", "text"]].copy()
+    mask = run_df["run_type"].isin({"text", "math", "line_break"})
+    cols = ["paragraph_id", "order_index", "text", "script_type", "is_strikethrough"]
+    working = run_df.loc[mask, [c for c in cols if c in run_df.columns]].copy()
     working["text"] = working["text"].fillna("").astype(str)
+    working["text"] = apply_inline_markup(working)
     working = working.sort_values(["paragraph_id", "order_index"])
-    result = working.groupby("paragraph_id", sort=False)["text"].agg("".join)
+    result = group_join(working["text"], working["paragraph_id"], sep="")
     return result.str.strip()
 
 
@@ -69,10 +68,15 @@ def build_paragraphs(
     """
     Aggregate run-level rows into paragraph-level rows.
 
-    Keeps run_type in {"text", "image_ref", "shape_ref", "chart_ref",
-    "graphic_ref"} and groups by paragraph_id. Style is weighted by character
-    count; bold/italic/underlined ratios are recomputed from sums. A block_type
-    column is derived post-aggregation.
+    Considers run_type in _CONTENT_RUN_TYPES {"text", "math", "image_ref",
+    "shape_ref", "chart_ref", "graphic_ref"}, but only keeps a paragraph if it
+    has non-blank text/math OR a self-sufficient ref (image_ref/chart_ref —
+    see _SELF_SUFFICIENT_REF_TYPES). A paragraph containing only a shape_ref
+    or graphic_ref run (no text, image, or chart alongside it) is dropped
+    before aggregation, even though shape_ref/graphic_ref are themselves
+    "content" run types. Groups by paragraph_id; style is weighted by
+    character count, bold/italic/underlined ratios are recomputed from sums,
+    and a block_type column is derived post-aggregation.
 
     Args:
         run_df: Output of extract_runs.
@@ -95,17 +99,20 @@ def build_paragraphs(
     if content_runs.empty:
         return pd.DataFrame()
 
-    # Drop paragraphs whose text is empty/whitespace, unless they carry an image.
+    # Drop paragraphs whose text is empty/whitespace, unless they carry a
+    # self-sufficient ref (image/chart). shape_ref/graphic_ref runs are NOT
+    # self-sufficient: a paragraph containing only one of those (no text, no
+    # image, no chart) is dropped here — see _SELF_SUFFICIENT_REF_TYPES.
     _text_para_ids = set(
         content_runs.loc[
-            (content_runs["run_type"] == "text")
+            content_runs["run_type"].isin({"text", "math"})
             & content_runs["text"].fillna("").str.strip().astype(bool),
             "paragraph_id",
         ]
     )
     _ref_para_ids = set(
         content_runs.loc[
-            content_runs["run_type"].isin({"image_ref", "chart_ref"}), "paragraph_id"
+            content_runs["run_type"].isin(_SELF_SUFFICIENT_REF_TYPES), "paragraph_id"
         ]
     )
     content_runs = content_runs[
@@ -125,32 +132,22 @@ def build_paragraphs(
             content_runs["run_type"].isin({"shape_ref", "graphic_ref"}), "paragraph_id"
         ]
     )
+    # Math block_type requires the *whole* paragraph to be math runs — a
+    # paragraph mixing prose and a single math run (e.g. an inline variable
+    # like "at large 𝛼′") is still prose, not a math block.
+    para_run_types = content_runs.groupby("paragraph_id")["run_type"].agg(set)
+    para_has_math = set(para_run_types[para_run_types == {"math"}].index)
 
     content_runs["char_count"] = content_runs["text"].fillna("").str.len()
     content_runs["alpha_count"] = content_runs["text"].fillna("").str.count(r"[a-zA-Z]")
 
     para_text = _paragraph_text(run_df)
 
-    agg_spec = build_standard_agg_spec(
-        identity_cols=_PARA_IDENTITY_COLS,
-        include_geometry=True,
-        include_hierarchy=False,
-        include_style=True,
-        include_counts=True,
-        include_metadata=True,
-        extra_agg={
-            "hyperlink_url": _collect_unique_list,
-            "chart_id": "first",
-        },
-        count_col="run_id",
-    )
-
-    para_df = aggregate_hierarchical(
-        df=content_runs,
-        group_col="paragraph_id",
-        agg_spec=agg_spec,
-        rename_count_col={"run_id": "run_count"},
-        compute_derived=True,
+    para_df = aggregate_to(
+        content_runs,
+        by="paragraph_id",
+        size_as="run_count",
+        on_unknown="raise",
     )
 
     para_df["text"] = para_df["paragraph_id"].map(para_text)
@@ -167,7 +164,8 @@ def build_paragraphs(
             mask = para_df["table_id"].isin(single_cell_ids)
             para_df.loc[mask, ["table_id", "table_row_id", "table_cell_id"]] = None
 
-    # Derive block_type in ascending priority (table wins over all).
+    # Derive block_type in ascending priority (table wins over all; math is
+    # lowest priority, filling only paragraphs still unassigned afterwards).
     para_df["block_type"] = None
     if "shape_type" in para_df.columns:
         para_df.loc[para_df["shape_type"] == "speaker_notes", "block_type"] = "speaker_notes"
@@ -179,6 +177,11 @@ def build_paragraphs(
         para_df.loc[para_df["paragraph_id"].isin(para_has_chart), "block_type"] = "chart"
     if "table_id" in para_df.columns:
         para_df.loc[para_df["table_id"].notna(), "block_type"] = "table"
+    # math is lowest priority: only fills paragraphs left unassigned above
+    # (e.g. a formula-only paragraph with no shape/image/chart/table context).
+    if para_has_math:
+        mask = para_df["paragraph_id"].isin(para_has_math) & para_df["block_type"].isna()
+        para_df.loc[mask, "block_type"] = "math"
 
     return para_df
 

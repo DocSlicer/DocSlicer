@@ -363,6 +363,23 @@ COLUMN_REGISTRY: Dict[str, Agg] = {
     "shape_name": Agg.FIRST,
     "shape_type": Agg.FIRST,
     "placeholder_type": Agg.FIRST,
+    # PPTX p:grpSp ancestry: identical for every run in a paragraph (same
+    # enclosing shape), so FIRST is exact, not an approximation.
+    "group_ids": Agg.FIRST,
+    "group_names": Agg.FIRST,
+    "group_depth": Agg.FIRST,
+    # Bbox-containment visual grouping (pptx step_06_reading_order): identical
+    # for every paragraph in the same shape, so FIRST is exact, not an
+    # approximation.
+    "container_shape_ids": Agg.FIRST,
+    # pptx step_06_reading_order debug/intermediate columns: consumed while
+    # computing order_index, not meaningful once lines are built.
+    "container_group_ids": Agg.DROP,
+    "reading_group_key": Agg.DROP,
+    "reading_group_order": Agg.DROP,
+    "reading_group_path": Agg.DROP,
+    "reading_group_bboxes": Agg.DROP,
+    "reading_group_rank": Agg.DROP,
 
     # --- child-level detail: consumed before aggregation, not propagated -----------------------
     # Override at the call site to collect them (e.g. {"word_id": list}).
@@ -370,7 +387,7 @@ COLUMN_REGISTRY: Dict[str, Agg] = {
     "word_id": Agg.DROP,
     "word_ids": Agg.DROP,          # word_id, already combined (mcid cells)
     "run_id": Agg.DROP,
-    "run_type": Agg.DROP,
+    "run_type": Agg.FIRST,
     "box_id": Agg.DROP,
     "cell_id": Agg.DROP,
     "cell_ids": Agg.DROP,

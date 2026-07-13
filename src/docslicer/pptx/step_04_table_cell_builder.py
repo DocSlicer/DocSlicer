@@ -244,7 +244,7 @@ def build_table_cells(
     table_runs["table_cell_id"] = table_runs["table_cell_id"].astype(int)
 
     text_agg = (
-        table_runs[table_runs["run_type"].isin({"text", "tab"})]
+        table_runs[table_runs["run_type"].isin({"text", "math", "tab"})]
         .groupby("table_cell_id")["text"]
         .apply(lambda xs: "".join(str(x) for x in xs if pd.notna(x)))
         .rename("text")
