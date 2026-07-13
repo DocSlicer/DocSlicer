@@ -535,7 +535,7 @@ class ParseResult:
                 level = level_map.get(text, 2)
                 prefix = "#" * max(1, min(6, level))
                 parts.append(f"{prefix} {text}")
-            elif block.type == "table":
+            elif block.type == "table" or (block.type in ("toc", "toc_heading") and block.table_ids):
                 if include_tables:
                     table = tables_by_id.get(block.table_ids[0]) if block.table_ids else None
                     raw = table.markdown if table else text
@@ -575,7 +575,7 @@ class ParseResult:
             if block.type in _HEADING_ROLES:
                 if text:
                     parts.append(text)
-            elif block.type == "table":
+            elif block.type == "table" or (block.type in ("toc", "toc_heading") and block.table_ids):
                 if include_tables:
                     table = tables_by_id.get(block.table_ids[0]) if block.table_ids else None
                     parts.append(table.markdown if table else text)
@@ -590,16 +590,22 @@ class ParseResult:
         Renders blocks with type ``toc_heading`` or ``toc`` in document order.
         Returns an empty string when no TOC was detected.
         """
+        tables_by_id = {t.id: t for t in self.tables}
         parts: list[str] = []
         for block in self.blocks:
-            if block.type == "toc_heading":
+            if block.type == "toc_heading" and not block.table_ids:
                 text = block.text.strip()
                 if text:
                     parts.append(f"# {text}")
-            elif block.type == "toc":
-                text = block.text.strip()
-                if text:
-                    parts.append(text)
+            elif block.type in ("toc", "toc_heading"):
+                if block.table_ids:
+                    table = tables_by_id.get(block.table_ids[0])
+                    raw = table.markdown if table else block.text.strip()
+                    parts.append(_prettify_table(raw))
+                else:
+                    text = block.text.strip()
+                    if text:
+                        parts.append(text)
         return "\n\n".join(parts)
 
     def export_tables_csv(self, path: str | Path, encoding: str = "utf-8") -> None:

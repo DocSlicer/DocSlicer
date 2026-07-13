@@ -28,8 +28,9 @@ by the shared orchestrator.
 """
 import tempfile
 from pathlib import Path
+from typing import Callable, NamedTuple, Optional, Dict, Any
+
 import pandas as pd
-from typing import Callable, Optional, Tuple, Dict, Any
 import logging
 
 logger = logging.getLogger(__name__)
@@ -61,7 +62,18 @@ from .._utils.layout.layouts import assign_layouts
 from .._utils.layout.reading_order import assign_reading_order as assign_reading_order_fallback
 from .._utils.layout.line_number_detector import detect_line_numbers
 from .._utils.io.yaml_loader import load_yamls
+from .._utils.timing import timed_step
+from .._utils.safe_call import safe_enrich
 from ..metadata import add_page_and_ocr_info, add_document_information
+
+
+class PdfPipelineResult(NamedTuple):
+    """Structured result of :func:`run_pipeline`."""
+
+    discovered_metadata: Dict[str, Any]
+    df_lines: pd.DataFrame
+    df_table_cells: Optional[pd.DataFrame]
+    debug_steps: Dict[str, pd.DataFrame]
 
 
 def run_pipeline(
@@ -71,7 +83,8 @@ def run_pipeline(
     debug: bool = False,
     password: str | None = None,
     source_filename: str | None = None,
-) -> Tuple[Dict[str, Any], pd.DataFrame, Optional[pd.DataFrame], Dict[str, pd.DataFrame]]:
+    max_workers: int | None = None,
+) -> PdfPipelineResult:
     """
     Run PDF-specific document processing steps.
 
@@ -79,22 +92,24 @@ def run_pipeline(
         pdf_bytes: Raw PDF file content
         source_url: Original URL (optional, for metadata)
         on_stage: Optional callback for progress updates
+        max_workers: Process-pool width for word extraction, cell building,
+            and OCR (None -> auto performance-core count; 1 -> disable
+            intra-document parallelism).
 
     Returns:
-        Tuple of (discovered_metadata, df_lines, df_table_cells, debug_steps).
+        PdfPipelineResult(discovered_metadata, df_lines, df_table_cells, debug_steps).
         debug_steps is an ordered dict of intermediate DataFrames when debug=True,
         empty dict otherwise.
     """
     page_label_dict, page_label_config, _, _ = load_yamls()
 
-    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-        tmp.write(pdf_bytes)
-        pdf_path = Path(tmp.name)
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        pdf_path = Path(tmp_dir) / "input.pdf"
+        pdf_path.write_bytes(pdf_bytes)
 
-    try:
         # ── Stage: Extraction ────────────────────────────────────────────────
         if on_stage:
-            on_stage("parsing")
+            on_stage("extract_elements")
 
         # Step 00 - Structure context (single pikepdf open, before any pdfium call)
         # Building it here means one pikepdf pass feeds words, images and shapes.
@@ -114,26 +129,31 @@ def run_pipeline(
             _is_password_protected = True
 
         # Step 00 - Parse Struct Tree (pikepdf)
-        try:
-            struct_ctx = build_struct_context(pdf_path)
-        except pikepdf.PasswordError:
-            # Encrypted with no/other password — try the common-password candidates.
-            pdf_bytes = decrypt_pdf(pdf_bytes, None, source_filename)
-            pdf_path.write_bytes(pdf_bytes)
-            _is_password_protected = True
-            struct_ctx = build_struct_context(pdf_path)
+        with timed_step("struct_context_pikepdf", logger=logger):
+            try:
+                struct_ctx = build_struct_context(pdf_path)
+            except pikepdf.PasswordError:
+                # Encrypted with no/other password — try the common-password candidates.
+                pdf_bytes = decrypt_pdf(pdf_bytes, None, source_filename)
+                pdf_path.write_bytes(pdf_bytes)
+                _is_password_protected = True
+                struct_ctx = build_struct_context(pdf_path)
 
         # Step 01 - Word Extraction (pypdfium2)
-        df_words = extract_words(pdf_path, struct_ctx=struct_ctx)
+        with timed_step("word_extraction", logger=logger):
+            df_words = extract_words(pdf_path, struct_ctx=struct_ctx, max_workers=max_workers)
 
         # Step 02 - Image Extraction (struct-enriched by shared struct_index)
-        df_images = extract_images(pdf_path, struct_index=struct_ctx.struct_index)
+        with timed_step("image_extraction", logger=logger):
+            df_images = extract_images(pdf_path, struct_index=struct_ctx.struct_index)
 
         # Step 03 - Shape Extraction (pypdfium2, struct-enriched)
-        df_shapes = extract_shapes(pdf_path, struct_index=struct_ctx.struct_index)
+        with timed_step("shape_extraction", logger=logger):
+            df_shapes = extract_shapes(pdf_path, struct_index=struct_ctx.struct_index)
 
         # Step 04 - Link Extraction (pypdfium2)
-        df_links = extract_links(pdf_path)
+        with timed_step("link_extraction", logger=logger):
+            df_links = extract_links(pdf_path)
 
         # ── OCR check (before enrichment, before cell construction) ─────────
         discovered_metadata: Dict[str, Any] = {}
@@ -146,12 +166,10 @@ def run_pipeline(
             # Sophisticated detection: low char count + high image coverage per page
             if "char_count" not in df_words.columns:
                 df_words["char_count"] = df_words["text"].str.len().fillna(0).astype(int)
-            try:
-                add_page_and_ocr_info(discovered_metadata, df_words, df_images=df_images)
-            except Exception as e:
-                logger.error(f"Error in add_page_and_ocr_info: {e}", exc_info=True)
-                discovered_metadata.setdefault("page_count", 1)
-                discovered_metadata.setdefault("has_ocr", False)
+            safe_enrich(
+                add_page_and_ocr_info, discovered_metadata, df_words, df_images=df_images,
+                fallback={"page_count": 1, "has_ocr": False}, logger=logger,
+            )
 
         if discovered_metadata.get("needs_ocr"):
             import warnings
@@ -161,15 +179,21 @@ def run_pipeline(
                 "Install pytesseract and opencv-python if not already: "
                 "pip install 'docslicer[ocr]'"
             )
-            from ..ocr.ocr_orchestrator import run_ocr_pipeline
-            df_words, df_shapes, df_grid_cells, df_gutters = run_ocr_pipeline(pdf_bytes)
+            from ..ocr.ocr_orchestrator import run_ocr_pipeline, OCRPipelineConfig
+            with timed_step("ocr_pipeline", logger=logger):
+                df_words, df_shapes, df_grid_cells, df_gutters = run_ocr_pipeline(
+                    pdf_bytes, config=OCRPipelineConfig(ocr_workers=max_workers), on_stage=on_stage,
+                )
             discovered_metadata["has_ocr"] = True
 
         if df_words.empty:
             # No text even after OCR — nothing to parse
-            return discovered_metadata, pd.DataFrame(), None, {}
+            return PdfPipelineResult(discovered_metadata, pd.DataFrame(), None, {})
 
         df_gutters = pd.DataFrame()
+
+        if on_stage:
+            on_stage("process_layouts")
 
         # The OCR pipeline already produces its own line_id via gutter-aware
         # reading order and strips its own margin line numbers, so struct-tree-based
@@ -178,115 +202,113 @@ def run_pipeline(
         if not discovered_metadata.get("has_ocr"):
 
             # ── Stage: Raw df cleanups ────────────────────────────────────────────────
-            if on_stage:
-                on_stage("df cleanup")
-
             # Cleanup 1 - Shape Merging, Role Assignment & Grid Cells
-            df_shapes, df_grid_cells = process_shapes(df_shapes)
+            with timed_step("shape_merging_grid_cells", logger=logger):
+                df_shapes, df_grid_cells = process_shapes(df_shapes)
 
             # Cleanup 2 - Line Number Detection & Removal
             # Line numbers are margin artefacts that must be removed entirely — unlike
             # other annotations they cannot be represented as a meaningful block_type.
-            df_words = detect_line_numbers(df_words)
+            with timed_step("line_number_detection", logger=logger):
+                df_words = detect_line_numbers(df_words)
 
-            # NOTE: This operation removes rows from the df
-            if "line_number_flag" in df_words.columns:
-                n_removed = df_words["line_number_flag"].sum()
-                if n_removed:
-                    logger.debug("Dropping %d line-number word(s) from df_words", n_removed)
-                df_words = df_words[~df_words["line_number_flag"]].copy()
+                # NOTE: This operation removes rows from the df
+                if "line_number_flag" in df_words.columns:
+                    n_removed = df_words["line_number_flag"].sum()
+                    if n_removed:
+                        logger.debug("Dropping %d line-number word(s) from df_words", n_removed)
+                    df_words = df_words[~df_words["line_number_flag"]].copy()
 
 
             # ── Stage: Reading Order ────────────────────────────────────────────────
-            if on_stage:
-                on_stage("reading order")
-
             # Step 05 - Struct group assignment
-            df_words = assign_struct_group_id(df_words)
+            with timed_step("struct_group_assignment", logger=logger):
+                df_words = assign_struct_group_id(df_words)
 
             # If struct_group_id is blank across the whole df, structure-tree data
             # wasn't available — skip stream grouping / reading order and fall
             # back to spatial line ordering instead.
             if "struct_group_id" not in df_words.columns or df_words["struct_group_id"].isna().all():
                 # Step 08(b) - Stream Group Assignment - Fallback
-                df_words, df_gutters = assign_reading_order_fallback(df_words, df_shapes, df_grid_cells)
+                with timed_step("reading_order_fallback", logger=logger):
+                    df_words, df_gutters = assign_reading_order_fallback(df_words, df_shapes, df_grid_cells)
             else:
                 # Step 06 - Prefill Styles
-                df_words = prefill_styles(df_words)
+                with timed_step("prefill_styles", logger=logger):
+                    df_words = prefill_styles(df_words)
                 # Step 07 - Stream Group Assignment
-                df_words = assign_stream_group_id(df_words)
+                with timed_step("stream_group_assignment", logger=logger):
+                    df_words = assign_stream_group_id(df_words)
                 # Step 08(a) - Stream Group Assignment
-                df_words = assign_reading_order(df_words)
+                with timed_step("reading_order", logger=logger):
+                    df_words = assign_reading_order(df_words)
 
 
         # ── Stage: DF Enrichment (word level) ────────────────────────────────────────────────
-            if on_stage:
-                on_stage("df enrichment")
-
         # Step 07 - - Word relationships: links, background rects, grid-cell
         # containment, underline/strikethrough and table rules. Also enriches
         # df_shapes with the hl_ KPI/classification columns.
-        df_words, df_shapes = add_word_relationships(
-            df_words, df_links, df_shapes, df_grid_cells)
+        with timed_step("word_relationships", logger=logger):
+            df_words, df_shapes = add_word_relationships(
+                df_words, df_links, df_shapes, df_grid_cells)
 
         # ── Stage: Cell / Line / Layout Construction ─────────────────────────────────
-        if on_stage:
-            on_stage("layout")
-
         # Step 09 - Cell Builder
         # OCR font sizes are estimated per glyph and too noisy for the size/
         # baseline heuristics, so suppress sub/superscript detection on OCR pages.
-        df_cells, df_words = build_cells(
-            df_words, detect_scripts=not discovered_metadata.get("has_ocr")
-        )
+        with timed_step("cell_building", logger=logger):
+            df_cells, df_words = build_cells(
+                df_words, detect_scripts=not discovered_metadata.get("has_ocr"), max_workers=max_workers
+            )
 
         # Step 10 - Page Labels
         if page_label_config:
-            df_cells = detect_pdf_page_labels(df_cells, page_label_config)
-
-        ###############################
-        # NOTE Next steps
-        ###############################
+            with timed_step("page_label_detection", logger=logger):
+                df_cells = detect_pdf_page_labels(df_cells, page_label_config)
 
         if not discovered_metadata.get("has_ocr"):
-
             # Step 12 - Group Multiline Cells
-            df_cells, df_words = group_multiline_cells(df_cells, df_words)
+            with timed_step("group_multiline_cells", logger=logger):
+                df_cells, df_words = group_multiline_cells(df_cells, df_words)
 
         # Step 13 - Line Builder
-        df_lines = build_lines(df_cells)
+        with timed_step("line_building", logger=logger):
+            df_lines = build_lines(df_cells)
 
         # Step 14 - Layout Assignment (layout_id, layout_type - table vs text, layout_score)
-        df_lines = assign_layouts(df_lines)
+        with timed_step("layout_assignment", logger=logger):
+            df_lines = assign_layouts(df_lines)
 
-        # Merge layout_id onto df_cells
-        line_layout = df_lines.set_index("line_id")[
-            ["layout_id", "layout_type", "layout_score"]
-        ]
-        df_cells["layout_id"]    = df_cells["line_id"].map(line_layout["layout_id"])
-        df_cells["layout_type"]  = df_cells["line_id"].map(line_layout["layout_type"])
-        df_cells["layout_score"] = df_cells["line_id"].map(line_layout["layout_score"])
+            # Merge layout_id onto df_cells
+            line_layout = df_lines.set_index("line_id")[
+                ["layout_id", "layout_type", "layout_score"]
+            ]
+            df_cells["layout_id"]    = df_cells["line_id"].map(line_layout["layout_id"])
+            df_cells["layout_type"]  = df_cells["line_id"].map(line_layout["layout_type"])
+            df_cells["layout_score"] = df_cells["line_id"].map(line_layout["layout_score"])
 
         # ── Stage: Table Construction ─────────────────────────────────
         if on_stage:
-            on_stage("table")
+            on_stage("extract_tables")
 
         # Step 10 - Table Builder
-        df_cells, df_table_cells = build_tables(df_cells, df_grid_cells)
+        with timed_step("table_building", logger=logger):
+            df_cells, df_table_cells = build_tables(df_cells, df_grid_cells)
 
         # Optional - Convert Y coordinates from page-relative to global
         #df_cells = convert_to_global_y_coordinates(df_cells)
 
         # ── Document Information ─────────────────────────────────────────────
-        try:
-            add_document_information(discovered_metadata, pdf_path=pdf_path, df_lines=df_lines)
-        except Exception as e:
-            logger.error(f"Error in add_document_information: {e}", exc_info=True)
-            discovered_metadata.setdefault("author_meta", None)
-            discovered_metadata.setdefault("author_text", None)
-            discovered_metadata.setdefault("title_meta", None)
-            discovered_metadata.setdefault("title_text", None)
-            discovered_metadata.setdefault("language", "unknown")
+        with timed_step("document_metadata", logger=logger):
+            safe_enrich(
+                add_document_information, discovered_metadata, pdf_path=pdf_path, df_lines=df_lines,
+                fallback={
+                    "author_meta": None, "author_text": None,
+                    "title_meta": None, "title_text": None,
+                    "language": "unknown",
+                },
+                logger=logger,
+            )
 
         discovered_metadata["is_password_protected"] = _is_password_protected
 
@@ -301,10 +323,4 @@ def run_pipeline(
             if not df_gutters.empty:
                 debug_steps["gutters"] = df_gutters
 
-        return discovered_metadata, df_lines, df_table_cells, debug_steps
-
-    finally:
-        try:
-            pdf_path.unlink()
-        except Exception:
-            pass
+        return PdfPipelineResult(discovered_metadata, df_lines, df_table_cells, debug_steps)

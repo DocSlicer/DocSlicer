@@ -5,10 +5,11 @@ import json
 import logging
 import time
 import uuid
-from typing import Literal
+from typing import Callable, Literal, Optional
 
 import pandas as pd
 
+from ._utils.safe_call import safe_enrich
 from .metadata.schema import DocumentMetadata
 from .pdf.pdf_orchestrator import run_pipeline as _run_pdf_pipeline
 from .shared.shared_orchestrator import run_pipeline as _run_shared_pipeline
@@ -413,6 +414,7 @@ def _run_pipeline(
     config: ParseConfig,
     source_filename: str | None = None,
     session=None,
+    on_stage: Optional[Callable[[str], None]] = None,
 ) -> ParseResult:
     _t0 = time.perf_counter()
 
@@ -433,6 +435,7 @@ def _run_pipeline(
         discovered_metadata, df_lines, df_table_cells, early_steps = _run_pdf_pipeline(
             pdf_bytes=content, source_url=source_url, debug=config.debug,
             password=config.password, source_filename=source_filename,
+            max_workers=config.max_workers, on_stage=on_stage,
         )
         discovered_metadata["content_type"] = "pdf"
     elif content_type == "docx":
@@ -445,12 +448,24 @@ def _run_pipeline(
         from ._utils.password import decrypt_office, is_encrypted_office
         _was_encrypted = False
         try:
-            package, df_runs, df_chart_points, df_table_cells, df_paragraphs, df_lines = _run_docx_pipeline(content)
+            package, df_runs, df_chart_points, df_table_cells, df_paragraphs, df_lines = _run_docx_pipeline(
+                content,
+                include_headers_footers=config.include_headers_footers,
+                include_footnotes=config.include_footnotes,
+                include_comments=config.include_comments,
+                on_stage=on_stage,
+            )
         except zipfile.BadZipFile:
             if not is_encrypted_office(content):
                 raise
             content = decrypt_office(content, config.password, source_filename)
-            package, df_runs, df_chart_points, df_table_cells, df_paragraphs, df_lines = _run_docx_pipeline(content)
+            package, df_runs, df_chart_points, df_table_cells, df_paragraphs, df_lines = _run_docx_pipeline(
+                content,
+                include_headers_footers=config.include_headers_footers,
+                include_footnotes=config.include_footnotes,
+                include_comments=config.include_comments,
+                on_stage=on_stage,
+            )
             _was_encrypted = True
         discovered_metadata = extract_core_properties(package)
         if _was_encrypted:
@@ -463,7 +478,15 @@ def _run_pipeline(
                 if not df_runs.empty and "page_number" in df_runs.columns
                 else 0
             )
-        add_document_information(discovered_metadata, df_lines=df_lines)
+        safe_enrich(
+            add_document_information, discovered_metadata, df_lines=df_lines,
+            fallback={
+                "author_meta": None, "author_text": None,
+                "title_meta": None, "title_text": None,
+                "language": "unknown",
+            },
+            logger=_log,
+        )
         if config.debug:
             early_steps["runs"] = df_runs
             early_steps["chart_points"] = df_chart_points
@@ -481,12 +504,12 @@ def _run_pipeline(
         from ._utils.password import decrypt_office, is_encrypted_office
         _was_encrypted = False
         try:
-            package, df_runs, df_chart_points, df_table_cells, df_paragraphs, df_lines = _run_pptx_pipeline(content)
+            package, df_runs, df_chart_points, df_table_cells, df_paragraphs, df_lines = _run_pptx_pipeline(content, include_speaker_notes=config.include_speaker_notes, on_stage=on_stage)
         except zipfile.BadZipFile:
             if not is_encrypted_office(content):
                 raise
             content = decrypt_office(content, config.password, source_filename)
-            package, df_runs, df_chart_points, df_table_cells, df_paragraphs, df_lines = _run_pptx_pipeline(content)
+            package, df_runs, df_chart_points, df_table_cells, df_paragraphs, df_lines = _run_pptx_pipeline(content, include_speaker_notes=config.include_speaker_notes, on_stage=on_stage)
             _was_encrypted = True
         discovered_metadata = extract_core_properties(package)
         if _was_encrypted:
@@ -499,7 +522,15 @@ def _run_pipeline(
                 if not df_runs.empty and "page_number" in df_runs.columns
                 else 0
             )
-        add_document_information(discovered_metadata, df_lines=df_lines)
+        safe_enrich(
+            add_document_information, discovered_metadata, df_lines=df_lines,
+            fallback={
+                "author_meta": None, "author_text": None,
+                "title_meta": None, "title_text": None,
+                "language": "unknown",
+            },
+            logger=_log,
+        )
         if config.debug:
             early_steps["runs"] = df_runs
             early_steps["chart_points"] = df_chart_points
@@ -510,16 +541,20 @@ def _run_pipeline(
     elif content_type == "html":
         if content is not None and not isinstance(content, str):
             raise TypeError("HTML content must be a string")
-        try:
-            from playwright.sync_api import sync_playwright as _pw  # noqa: F401
-        except ImportError:
-            raise ImportError(
-                "HTML parsing requires playwright. Install it with: "
-                "pip install 'docslicer[html]' && playwright install"
-            )
+        if config.use_browser:
+            try:
+                from playwright.sync_api import sync_playwright as _pw  # noqa: F401
+            except ImportError:
+                raise ImportError(
+                    "HTML parsing requires playwright. Install it with: "
+                    "pip install 'docslicer[html]' && playwright install\n"
+                    "Or pass use_browser=False to use the faster, lower-fidelity "
+                    "static (non-Playwright) box extractor instead."
+                )
         from .html.html_orchestrator import run_pipeline as _run_html_pipeline
         discovered_metadata, df_lines, df_table_cells, html_steps = _run_html_pipeline(
-            html=content, source_url=source_url, debug=config.debug, session=session
+            html=content, source_url=source_url, debug=config.debug, session=session,
+            use_browser=config.use_browser, on_stage=on_stage,
         )
         discovered_metadata["content_type"] = "html"
         if config.debug:
@@ -547,6 +582,7 @@ def _run_pipeline(
         df_table_cells=df_table_cells,
         chart_points_df=df_chart_points,
         config=config,
+        on_stage=on_stage,
     )
 
     return _build_result(

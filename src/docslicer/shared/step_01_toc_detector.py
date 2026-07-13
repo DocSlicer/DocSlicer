@@ -273,6 +273,9 @@ def _remove_toc_pointers(df: pd.DataFrame) -> pd.DataFrame:
 
     A TOC pointer is a row whose text is exactly "table of contents" and has a hyperlink.
     These are navigation artifacts, not real content.
+
+    Requires at least 3 matches before marking any of them: a single linked "table of
+    contents" heading is often just a bookmark on the real TOC heading, not a pointer.
     """
     if "text" not in df.columns or "has_link" not in df.columns:
         return df
@@ -283,6 +286,8 @@ def _remove_toc_pointers(df: pd.DataFrame) -> pd.DataFrame:
 
     text_lower = out["text"].astype(str).str.strip().str.lower()
     is_pointer = (text_lower == "table of contents") & out["has_link"].map(_as_bool)
+    if is_pointer.sum() < 3:
+        return out
     out.loc[is_pointer, "block_type"] = "navigation"
     return out
 

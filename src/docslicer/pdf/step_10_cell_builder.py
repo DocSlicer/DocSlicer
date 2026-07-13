@@ -1132,6 +1132,7 @@ def build_cells(
     df_shapes: pd.DataFrame | None = None,
     config: CellBuildConfig = CONFIG,
     detect_scripts: bool = True,
+    max_workers: int | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Words -> Cells.
@@ -1186,7 +1187,7 @@ def build_cells(
     pages = sorted(df["page_number"].unique())
     n_workers = 1
     if len(pages) >= PARALLEL_PAGE_THRESHOLD:
-        n_workers = resolve_worker_count(None, n_items=len(pages))
+        n_workers = resolve_worker_count(max_workers, n_items=len(pages))
 
     if n_workers > 1:
         h_parts:  list[pd.DataFrame] = []

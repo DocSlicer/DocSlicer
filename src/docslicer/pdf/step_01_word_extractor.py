@@ -934,6 +934,7 @@ def extract_words(
     pdf_path: str | Path,
     pages_to_process: Optional[List[int]] = None,
     struct_ctx: Optional[StructContext] = None,
+    max_workers: Optional[int] = None,
 ) -> pd.DataFrame:
     """
     Extract all words from a PDF, emitting superscript and subscript characters as
@@ -980,7 +981,7 @@ def extract_words(
 
     n_workers = 1
     if len(page_numbers_list) >= PARALLEL_PAGE_THRESHOLD:
-        n_workers = resolve_worker_count(None, n_items=len(page_numbers_list))
+        n_workers = resolve_worker_count(max_workers, n_items=len(page_numbers_list))
 
     all_dfs: List[pd.DataFrame] = []
 

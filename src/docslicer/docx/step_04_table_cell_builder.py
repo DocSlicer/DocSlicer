@@ -137,14 +137,17 @@ def _walk_container(
 def _collect_cell_geoms(
     package: DocxPackage,
     include_headers_footers: bool,
-    include_notes_comments: bool,
+    include_footnotes: bool,
+    include_comments: bool,
 ) -> list[_CellGeom]:
     counters = _Counters()
     geoms: list[_CellGeom] = []
     for part_name, part_type, _ in _content_part_specs(package):
         if part_type in {"header", "footer"} and not include_headers_footers:
             continue
-        if part_type in {"footnote", "endnote", "comment"} and not include_notes_comments:
+        if part_type in {"footnote", "endnote"} and not include_footnotes:
+            continue
+        if part_type == "comment" and not include_comments:
             continue
         root = package.get_xml(part_name)
         if root is None:
@@ -301,7 +304,8 @@ def build_table_cells(
     package: DocxPackage,
     run_df: pd.DataFrame,
     include_headers_footers: bool = True,
-    include_notes_comments: bool = True,
+    include_footnotes: bool = True,
+    include_comments: bool = False,
     debug: bool = False,
 ) -> pd.DataFrame:
     """
@@ -310,9 +314,10 @@ def build_table_cells(
     Args:
         package: Parsed DOCX package (from step 01).
         run_df: Run-level DataFrame (from step 02). Must use the same
-            include_headers_footers / include_notes_comments settings.
+            include_headers_footers / include_footnotes / include_comments settings.
         include_headers_footers: Match the setting used in extract_runs.
-        include_notes_comments: Match the setting used in extract_runs.
+        include_footnotes: Match the setting used in extract_runs.
+        include_comments: Match the setting used in extract_runs.
         debug: Keep the detect_cell_roles diagnostic columns (table_row_style,
             hdr_*) in the output.
 
@@ -325,7 +330,7 @@ def build_table_cells(
     if run_df.empty:
         return pd.DataFrame(columns=TABLE_CELLS_COLS)
 
-    geoms = _collect_cell_geoms(package, include_headers_footers, include_notes_comments)
+    geoms = _collect_cell_geoms(package, include_headers_footers, include_footnotes, include_comments)
     if not geoms:
         return pd.DataFrame(columns=TABLE_CELLS_COLS)
 

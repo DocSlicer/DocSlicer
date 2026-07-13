@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import atexit
+import dataclasses
 import io
 import zipfile
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
-from typing import Iterator, Union
+from typing import Callable, Iterator, Optional, Union
 
 try:
     from importlib.metadata import version as _pkg_version
@@ -155,6 +158,13 @@ def parse_pdf(
     debug: bool = False,
     extra_fields: list[str] | None = None,
     password: str | None = None,
+    max_workers: int | None = None,
+    use_browser: bool = True,
+    include_headers_footers: bool = False,
+    include_footnotes: bool = True,
+    include_comments: bool = False,
+    include_speaker_notes: bool = True,
+    on_stage: Optional[Callable[[str], None]] = None,
 ) -> ParseResult:
     """Parse a PDF document and return a ParseResult.
 
@@ -179,6 +189,24 @@ def parse_pdf(
         extra_fields: Additional pipeline DataFrame columns to attach to each
             Block and Chunk under their ``.extra`` dict, e.g.
             ["is_bold", "font_name", "font_size"]. Unknown columns get None.
+        max_workers: Process-pool width for word extraction, cell building,
+            and OCR within this document (default None -> auto, sized to the
+            machine's performance cores). Set to 1 to keep this document
+            single-process — e.g. when parsing many documents concurrently
+            yourself and you want to avoid nested process pools.
+        use_browser: Accepted for API consistency with parse_html; the PDF
+            pipeline never uses a browser, so this is unused.
+        include_headers_footers: Accepted for API consistency with parse_docx;
+            unused for PDF.
+        include_footnotes: Accepted for API consistency with parse_docx;
+            unused for PDF.
+        include_comments: Accepted for API consistency with parse_docx;
+            unused for PDF.
+        include_speaker_notes: Accepted for API consistency with parse_pptx;
+            unused for PDF.
+        on_stage: Optional callback invoked with a stage name (e.g.
+            "extract_elements", "process_layouts", "extract_tables") as the
+            pipeline progresses, for driving a progress indicator.
     """
     config = ParseConfig(
         max_chunk_size=max_chunk_size,
@@ -191,10 +219,16 @@ def parse_pdf(
         debug=debug,
         extra_fields=extra_fields or [],
         password=password,
+        max_workers=max_workers,
+        use_browser=use_browser,
+        include_headers_footers=include_headers_footers,
+        include_footnotes=include_footnotes,
+        include_comments=include_comments,
+        include_speaker_notes=include_speaker_notes,
     )
     source_filename = _extract_filename(source)
     content = _load_bytes(source)
-    return _run_pipeline(content, "pdf", source_url=None, config=config, source_filename=source_filename)
+    return _run_pipeline(content, "pdf", source_url=None, config=config, source_filename=source_filename, on_stage=on_stage)
 
 
 def parse_docx(
@@ -209,6 +243,13 @@ def parse_docx(
     debug: bool = False,
     extra_fields: list[str] | None = None,
     password: str | None = None,
+    max_workers: int | None = None,
+    use_browser: bool = True,
+    include_headers_footers: bool = False,
+    include_footnotes: bool = True,
+    include_comments: bool = False,
+    include_speaker_notes: bool = True,
+    on_stage: Optional[Callable[[str], None]] = None,
 ) -> ParseResult:
     """Parse a DOCX document and return a ParseResult.
 
@@ -228,6 +269,22 @@ def parse_docx(
         debug: Populate result.pipeline_steps with intermediate DataFrames.
         extra_fields: Additional pipeline DataFrame columns to attach to each
             Block and Chunk under their ``.extra`` dict. Unknown columns get None.
+        max_workers: Accepted for API consistency with parse_pdf; the DOCX
+            pipeline has no intra-document parallel steps, so this is unused.
+        use_browser: Accepted for API consistency with parse_html; the DOCX
+            pipeline never uses a browser, so this is unused.
+        include_headers_footers: Include header and footer content as blocks
+            with block_type "header" / "footer" (default False).
+        include_footnotes: Include footnotes and endnotes as extracted content
+            (default True).
+        include_comments: Include reviewer comments as extracted content
+            (default False) — these are review annotations, not document
+            content.
+        include_speaker_notes: Accepted for API consistency with parse_pptx;
+            unused for DOCX.
+        on_stage: Optional callback invoked with a stage name (e.g.
+            "extract_elements", "process_layouts") as the pipeline progresses,
+            for driving a progress indicator.
     """
     config = ParseConfig(
         max_chunk_size=max_chunk_size,
@@ -240,10 +297,16 @@ def parse_docx(
         debug=debug,
         extra_fields=extra_fields or [],
         password=password,
+        max_workers=max_workers,
+        use_browser=use_browser,
+        include_headers_footers=include_headers_footers,
+        include_footnotes=include_footnotes,
+        include_comments=include_comments,
+        include_speaker_notes=include_speaker_notes,
     )
     source_filename = _extract_filename(source)
     content = _load_bytes(source)
-    return _run_pipeline(content, "docx", source_url=None, config=config, source_filename=source_filename)
+    return _run_pipeline(content, "docx", source_url=None, config=config, source_filename=source_filename, on_stage=on_stage)
 
 
 def parse_pptx(
@@ -258,6 +321,13 @@ def parse_pptx(
     debug: bool = False,
     extra_fields: list[str] | None = None,
     password: str | None = None,
+    max_workers: int | None = None,
+    use_browser: bool = True,
+    include_headers_footers: bool = False,
+    include_footnotes: bool = True,
+    include_comments: bool = False,
+    include_speaker_notes: bool = True,
+    on_stage: Optional[Callable[[str], None]] = None,
 ) -> ParseResult:
     """Parse a PPTX document and return a ParseResult.
 
@@ -277,6 +347,21 @@ def parse_pptx(
         debug: Populate result.pipeline_steps with intermediate DataFrames.
         extra_fields: Additional pipeline DataFrame columns to attach to each
             Block and Chunk under their ``.extra`` dict. Unknown columns get None.
+        max_workers: Accepted for API consistency with parse_pdf; the PPTX
+            pipeline has no intra-document parallel steps, so this is unused.
+        use_browser: Accepted for API consistency with parse_html; the PPTX
+            pipeline never uses a browser, so this is unused.
+        include_headers_footers: Accepted for API consistency with parse_docx;
+            unused for PPTX.
+        include_footnotes: Accepted for API consistency with parse_docx;
+            unused for PPTX.
+        include_comments: Accepted for API consistency with parse_docx;
+            unused for PPTX.
+        include_speaker_notes: Include speaker notes as extracted content
+            (default True). Set to False to exclude them.
+        on_stage: Optional callback invoked with a stage name (e.g.
+            "extract_elements", "process_layouts") as the pipeline progresses,
+            for driving a progress indicator.
     """
     config = ParseConfig(
         max_chunk_size=max_chunk_size,
@@ -289,10 +374,16 @@ def parse_pptx(
         debug=debug,
         extra_fields=extra_fields or [],
         password=password,
+        max_workers=max_workers,
+        use_browser=use_browser,
+        include_headers_footers=include_headers_footers,
+        include_footnotes=include_footnotes,
+        include_comments=include_comments,
+        include_speaker_notes=include_speaker_notes,
     )
     source_filename = _extract_filename(source)
     content = _load_bytes(source)
-    return _run_pipeline(content, "pptx", source_url=None, config=config, source_filename=source_filename)
+    return _run_pipeline(content, "pptx", source_url=None, config=config, source_filename=source_filename, on_stage=on_stage)
 
 
 def parse_html(
@@ -307,6 +398,14 @@ def parse_html(
     exact_tokens: bool = False,
     debug: bool = False,
     extra_fields: list[str] | None = None,
+    password: str | None = None,
+    max_workers: int | None = None,
+    use_browser: bool = True,
+    include_headers_footers: bool = False,
+    include_footnotes: bool = True,
+    include_comments: bool = False,
+    include_speaker_notes: bool = True,
+    on_stage: Optional[Callable[[str], None]] = None,
 ) -> ParseResult:
     """Parse an HTML document and return a ParseResult.
 
@@ -318,7 +417,7 @@ def parse_html(
             URL parsing requires two steps: ``pip install 'docslicer[html]'`` to
             install the Python package, then ``playwright install`` to download
             the browser binaries. Without the second step, parsing a URL raises
-            an error even if the package is installed.
+            an error even if the package is installed — unless use_browser=False.
         source_url: Original URL of the page (used for link normalisation when
             source is an HTML string or file, not a URL).
         max_chunk_size: Maximum characters per chunk (default 3200).
@@ -335,6 +434,33 @@ def parse_html(
         debug: Populate result.pipeline_steps with intermediate DataFrames.
         extra_fields: Additional pipeline DataFrame columns to attach to each
             Block and Chunk under their ``.extra`` dict. Unknown columns get None.
+        password: Accepted for API consistency with parse_pdf; unused for HTML.
+        max_workers: Accepted for API consistency with parse_pdf; the HTML
+            pipeline has no intra-document parallel steps, so this is unused.
+        use_browser: Default True renders via Playwright (full JS execution,
+            layout coordinates, CSS-resolved styling). Set to False to skip
+            Playwright entirely and use the static (BeautifulSoup) box
+            extractor instead — no browser launch, ~15x faster, and works
+            without Playwright installed. Tradeoffs: no layout coordinates
+            (x_right/y_top/y_bottom/width/height are all 0.0) and only
+            inline-style + semantic-tag typography is resolved (no CSS class
+            rules or external stylesheets, no JS-rendered content). URL
+            sources are still fetched over plain HTTP — SEC/Congress URLs use
+            the same rate-limited fetcher either way. Works well for
+            inline-style-heavy documents (SEC filings, Word-exported HTML,
+            legal documents); degrades on CSS-class-heavy modern pages. See
+            docslicer.html.step_01_static_box_extractor for details.
+        include_headers_footers: Accepted for API consistency with parse_docx;
+            unused for HTML.
+        include_footnotes: Accepted for API consistency with parse_docx;
+            unused for HTML.
+        include_comments: Accepted for API consistency with parse_docx;
+            unused for HTML.
+        include_speaker_notes: Accepted for API consistency with parse_pptx;
+            unused for HTML.
+        on_stage: Optional callback invoked with a stage name (e.g.
+            "extract_elements", "process_layouts", "extract_tables") as the
+            pipeline progresses, for driving a progress indicator.
     """
     config = ParseConfig(
         max_chunk_size=max_chunk_size,
@@ -346,13 +472,20 @@ def parse_html(
         exact_tokens=exact_tokens,
         debug=debug,
         extra_fields=extra_fields or [],
+        password=password,
+        max_workers=max_workers,
+        use_browser=use_browser,
+        include_headers_footers=include_headers_footers,
+        include_footnotes=include_footnotes,
+        include_comments=include_comments,
+        include_speaker_notes=include_speaker_notes,
     )
     # URL passed as source — route through the fetch pipeline
     if isinstance(source, str) and _is_url(source):
-        return _run_pipeline(None, "html", source_url=source, config=config)
+        return _run_pipeline(None, "html", source_url=source, config=config, on_stage=on_stage)
     source_filename = _extract_filename(source)
     content = _load_text(source)
-    return _run_pipeline(content, "html", source_url=source_url, config=config, source_filename=source_filename)
+    return _run_pipeline(content, "html", source_url=source_url, config=config, source_filename=source_filename, on_stage=on_stage)
 
 
 def parse_document(
@@ -477,6 +610,30 @@ def parse_all(
             yield item, exc
 
 
+_worker_parser: "DocumentParser | None" = None
+
+
+def _init_document_parser_worker(config: ParseConfig) -> None:
+    """ProcessPoolExecutor initializer: build one DocumentParser per worker process.
+
+    A DocumentParser can hold a live Playwright Browser once it has parsed HTML,
+    and Browser objects aren't picklable, so worker processes each build their
+    own instance (and their own browser, lazily) rather than inheriting the
+    parent's. atexit closes it so a Chromium subprocess isn't orphaned when the
+    pool shuts the worker down.
+    """
+    global _worker_parser
+    _worker_parser = DocumentParser(config)
+    atexit.register(_worker_parser.close)
+
+
+def _document_parser_worker_parse(source: "_Source"):
+    try:
+        return source, _worker_parser.parse(source)
+    except Exception as exc:
+        return source, exc
+
+
 class DocumentParser:
     """Reusable parser that holds a fixed ParseConfig across multiple documents.
 
@@ -489,10 +646,23 @@ class DocumentParser:
         with DocumentParser(config) as parser:
             for path, result in parser.parse_all(paths):
                 ...
+
+    Pass ``workers`` to parse multiple whole documents in parallel processes
+    (in addition to, or instead of, intra-document parallelism controlled by
+    ``config.max_workers``). Each worker process builds its own DocumentParser
+    (and its own browser, if it hits HTML). To avoid oversubscribing the
+    machine with nested process pools, a worker's own ``config.max_workers``
+    defaults to 1 when ``workers`` is set and the caller hasn't explicitly
+    picked a value::
+
+        with DocumentParser(config, workers=4) as parser:
+            for path, result in parser.parse_all(paths):
+                ...
     """
 
-    def __init__(self, config: ParseConfig | None = None) -> None:
+    def __init__(self, config: ParseConfig | None = None, workers: int | None = None) -> None:
         self.config = config or ParseConfig()
+        self.workers = workers
         self._session = None
 
     def _get_session(self):
@@ -522,10 +692,22 @@ class DocumentParser:
     def __exit__(self, *exc) -> None:
         self.close()
 
-    def parse(self, source: _Source, source_url: str | None = None) -> ParseResult:
-        """Parse a single document, reusing this instance's config and browser."""
+    def parse(
+        self,
+        source: _Source,
+        source_url: str | None = None,
+        on_stage: Optional[Callable[[str], None]] = None,
+    ) -> ParseResult:
+        """Parse a single document, reusing this instance's config and browser.
+
+        on_stage: Optional callback invoked with a stage name as the pipeline
+            progresses. Only supported on this single-process path — the
+            parse_all(workers=N) fan-out can't forward callbacks across
+            process boundaries, the same way it can't share this instance's
+            browser session across processes either.
+        """
         from functools import partial
-        _run = partial(_run_pipeline, config=self.config, session=self._get_session())
+        _run = partial(_run_pipeline, config=self.config, session=self._get_session(), on_stage=on_stage)
 
         if isinstance(source, bytes):
             if source[:4] == b"%PDF":
@@ -594,15 +776,36 @@ class DocumentParser:
         return _run(str(source), "html", source_url=source_url)
 
     def parse_all(self, sources: list[_Source], /) -> "Iterator[tuple[_Source, ParseResult | Exception]]":
-        """Parse multiple documents lazily, reusing this instance's config and browser.
+        """Parse multiple documents, reusing this instance's config and browser.
 
         Yields ``(source, ParseResult)`` on success, ``(source, Exception)`` on
-        failure — a failed file never aborts the batch. The browser is reused
-        across all sources; call :meth:`close` (or use the parser as a context
-        manager) when done to release it.
+        failure — a failed file never aborts the batch.
+
+        With ``workers`` unset (default), documents are parsed one at a time in
+        this process, lazily, reusing a single browser across all sources; call
+        :meth:`close` (or use the parser as a context manager) when done to
+        release it.
+
+        With ``workers`` set, documents are fanned out across that many worker
+        processes (each with its own browser) via a ``ProcessPoolExecutor``, and
+        results arrive in submission order once the whole batch is scheduled —
+        this path is not lazy per-document the way the single-worker path is.
         """
-        for source in sources:
-            try:
-                yield source, self.parse(source)
-            except Exception as exc:
-                yield source, exc
+        if self.workers is None or self.workers <= 1:
+            for source in sources:
+                try:
+                    yield source, self.parse(source)
+                except Exception as exc:
+                    yield source, exc
+            return
+
+        worker_config = self.config
+        if worker_config.max_workers is None:
+            worker_config = dataclasses.replace(worker_config, max_workers=1)
+
+        with ProcessPoolExecutor(
+            max_workers=self.workers,
+            initializer=_init_document_parser_worker,
+            initargs=(worker_config,),
+        ) as ex:
+            yield from ex.map(_document_parser_worker_parse, sources)

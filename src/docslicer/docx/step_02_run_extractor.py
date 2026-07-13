@@ -1862,7 +1862,8 @@ def _drop_zero_width_adobe_runs(run_df: pd.DataFrame) -> pd.DataFrame:
 def extract_runs(
     package: DocxPackage,
     include_headers_footers: bool = True,
-    include_notes_comments: bool = True,
+    include_footnotes: bool = True,
+    include_comments: bool = False,
     page_label_config: PageLabelPatternConfig | None = None,
 ) -> pd.DataFrame:
     """
@@ -1871,7 +1872,8 @@ def extract_runs(
     Args:
         package: Parsed DOCX package.
         include_headers_footers: Include word/header*.xml and word/footer*.xml.
-        include_notes_comments: Include footnotes, endnotes, and comments.
+        include_footnotes: Include footnotes and endnotes.
+        include_comments: Include reviewer comments (word/comments.xml).
         page_label_config: Compiled page label patterns; when provided, populates page_label_type.
 
     Returns:
@@ -1886,7 +1888,9 @@ def extract_runs(
     for part_name, part_type, part_item_id in _content_part_specs(package):
         if part_type in {"header", "footer"} and not include_headers_footers:
             continue
-        if part_type in {"footnote", "endnote", "comment"} and not include_notes_comments:
+        if part_type in {"footnote", "endnote"} and not include_footnotes:
+            continue
+        if part_type == "comment" and not include_comments:
             continue
 
         root = package.get_xml(part_name)

@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 import warnings
 from dataclasses import dataclass
-from typing import List, Tuple, Optional
+from typing import Callable, List, Tuple, Optional
 
 import pypdfium2 as pdfium
 import numpy as np
@@ -94,12 +94,14 @@ def run_ocr_pipeline(
     file_bytes: bytes,
     *,
     config: OCRPipelineConfig = OCRPipelineConfig(),
+    on_stage: Optional[Callable[[str], None]] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     Production entrypoint.
 
     Input:
       - file_bytes: PDF bytes (scanned doc detector decides when to call this)
+      - on_stage: Optional callback for progress updates.
 
     Output:
       - df_words: words-level dataframe, includes line_id and is_line_start.
@@ -114,12 +116,18 @@ def run_ocr_pipeline(
     # Pipeline in PX
     # --------------------
 
+    if on_stage:
+        on_stage("render_images")
+
     # Render PDF to images
-    with timed_step("PDF rendering", logger=logger):
+    with timed_step("pdf_rendering", logger=logger):
         images_bgr = _render_pdf_bytes_to_images_bgr(file_bytes, dpi_scale=config.dpi_scale)
 
+    if on_stage:
+        on_stage("extract_elements")
+
     # 1) Words (Tesseract, page-level parallel)
-    with timed_step("OCR word extraction", logger=logger):
+    with timed_step("ocr_word_extraction", logger=logger):
         ocr_workers = resolve_worker_count(config.ocr_workers, n_items=len(images_bgr))
         df_words = extract_words_from_images(
             images_bgr,
@@ -128,7 +136,7 @@ def run_ocr_pipeline(
         )
 
     # 2) Colorize words and add ink coverage
-    with timed_step("Word colorization", logger=logger):
+    with timed_step("word_colorization", logger=logger):
         df_words = colorize_words_df(df_words, images_bgr, config=config.colorizer, max_workers=ocr_workers)
         ink_cov = df_words["ink_coverage"].to_numpy(dtype=float)
         median_ink = float(np.median(ink_cov[ink_cov > 0])) if np.any(ink_cov > 0) else 0.0
@@ -140,14 +148,17 @@ def run_ocr_pipeline(
         df_words = df_words[df_words["non_stroking_color"].notna()].reset_index(drop=True)
 
     # 3) Extract rule shapes (horizontal/vertical lines)
-    with timed_step("Shape extraction", logger=logger):
+    with timed_step("shape_extraction", logger=logger):
         df_shapes = extract_shapes_df(images_bgr, config=config.shapes)
 
     # --------------------
     # Pipeline in PT (convert from pixels to points)
     # --------------------
 
-    with timed_step("Conversion PX -> PT", logger=logger):
+    if on_stage:
+        on_stage("process_layouts")
+
+    with timed_step("conversion_px_to_pt", logger=logger):
         # Convert words bbox from PX to PT
         bbox_cols_words = ['x_left', 'x_right', 'y_top', 'y_bottom', 'width', 'height']
         for col in bbox_cols_words:
@@ -182,7 +193,7 @@ def run_ocr_pipeline(
         df_shapes = df_shapes.drop(columns=[c for c in cols_to_drop if c in df_shapes.columns])
 
     # Detect and remove line numbers
-    with timed_step("Line number detection", logger=logger):
+    with timed_step("line_number_detection", logger=logger):
         df_words = detect_line_numbers(df_words, config=OCR_LINE_NUMBER_CONFIG)
 
         # NOTE: This operation removes rows from the df
@@ -194,11 +205,11 @@ def run_ocr_pipeline(
 
 
     # Enrich df_shapes for the gutter detector
-    with timed_step("Shape processing", logger=logger):
+    with timed_step("shape_processing", logger=logger):
         df_shapes, df_grid_cells = process_shapes(df_shapes)
 
     # 4) Assign reading order (gutter-aware)
-    with timed_step("Reading order", logger=logger):
+    with timed_step("reading_order", logger=logger):
         df_words, df_gutters = assign_reading_order(df_words, df_shapes, df_grid_cells)
         df_words = df_words.drop(columns=["center_bucket"], errors="ignore")
 
@@ -208,14 +219,14 @@ def run_ocr_pipeline(
         df_words["is_line_start"] = (df_words["x_left"] == min_x).astype(int)
 
     # 5) Text cleaning (runs after is_line_start is available for bullet detection)
-    with timed_step("Text cleaning", logger=logger):
+    with timed_step("text_cleaning", logger=logger):
         df_words = clean_words_df(df_words, df_shapes)
         # Remove all blanked out words
         df_words = df_words[df_words["text"].fillna("").str.strip() != ""].reset_index(drop=True)
         df_words = add_calculated_text_features(df_words)
 
     # 6) Estimate font size (per layout, too noisy on a line level)
-    with timed_step("Font size estimation", logger=logger):
+    with timed_step("font_size_estimation", logger=logger):
         df_words = assign_layouts(df_words, line_level=False)
         df_words = estimate_ocr_font_sizes(df_words, method="word")
         

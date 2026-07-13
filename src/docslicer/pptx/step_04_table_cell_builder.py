@@ -158,7 +158,7 @@ def _walk_sp_tree_geom(
 
 def _collect_cell_geoms(
     package: PptxPackage,
-    include_notes: bool,
+    include_speaker_notes: bool,
 ) -> list[_CellGeom]:
     counters = _Counters()
     geoms: list[_CellGeom] = []
@@ -172,7 +172,7 @@ def _collect_cell_geoms(
                     sp_tree, slide.slide_number, slide.slide_index, counters, geoms
                 )
 
-        if include_notes:
+        if include_speaker_notes:
             notes_part = _notes_part_for(slide, package)
             if notes_part:
                 notes_root = package.get_xml(notes_part)
@@ -193,7 +193,7 @@ def _collect_cell_geoms(
 def build_table_cells(
     package: PptxPackage,
     run_df: pd.DataFrame,
-    include_notes: bool = True,
+    include_speaker_notes: bool = True,
     debug: bool = False,
 ) -> pd.DataFrame:
     """
@@ -202,8 +202,8 @@ def build_table_cells(
     Args:
         package: Parsed PPTX package (from step 01).
         run_df: Run-level DataFrame (from step 02). Must use the same
-            include_notes setting.
-        include_notes: Match the setting used in extract_runs.
+            include_speaker_notes setting.
+        include_speaker_notes: Match the setting used in extract_runs.
         debug: Keep the detect_cell_roles diagnostic columns (table_row_style,
             hdr_*) in the output.
 
@@ -218,7 +218,7 @@ def build_table_cells(
     if run_df.empty:
         return pd.DataFrame(columns=TABLE_CELLS_COLS)
 
-    geoms = _collect_cell_geoms(package, include_notes)
+    geoms = _collect_cell_geoms(package, include_speaker_notes)
     if not geoms:
         return pd.DataFrame(columns=TABLE_CELLS_COLS)
 

@@ -17,7 +17,7 @@ Note: TOC, Exhibit, Doc Region, and Hierarchy detection are handled
 by the shared orchestrator.
 """
 import logging
-from typing import Callable, Optional, Tuple, Dict, Any
+from typing import Callable, NamedTuple, Optional, Dict, Any
 
 import pandas as pd
 
@@ -32,12 +32,23 @@ from .step_06_style_prefiller import prefill_styles
 
 # Config loaders
 from .._utils.io.yaml_loader import load_yamls
+from .._utils.timing import timed_step
+from .._utils.safe_call import safe_enrich
 
 # Metadata utilities
 from ..metadata import add_page_and_ocr_info, add_document_information
 
 # Scraping
 from ..scraping.dispatcher import fetch_url, _is_sec_url
+
+
+class HtmlPipelineResult(NamedTuple):
+    """Structured result of :func:`run_pipeline`."""
+
+    discovered_metadata: Dict[str, Any]
+    df_lines: pd.DataFrame
+    df_table_cells: Optional[pd.DataFrame]
+    debug_steps: Dict[str, pd.DataFrame]
 
 
 def _inject_base_url(html: str, base_url: str) -> str:
@@ -57,7 +68,8 @@ def run_pipeline(
     on_stage: Optional[Callable[[str], None]] = None,
     debug: bool = False,
     session: "Any | None" = None,
-) -> Tuple[Dict[str, Any], pd.DataFrame, Optional[pd.DataFrame], Dict[str, pd.DataFrame]]:
+    use_browser: bool = True,
+) -> HtmlPipelineResult:
     """
     Run HTML-specific document processing steps.
 
@@ -70,9 +82,19 @@ def run_pipeline(
         source_url: URL to fetch/render, or None when html is provided.
         on_stage: Optional callback for progress updates.
         debug: When True, return intermediate DataFrames as a fourth tuple element.
+        use_browser: When False, skip Playwright entirely and use the static
+            (BeautifulSoup) box extractor, even if Playwright is installed —
+            ~15x faster, no browser launch, but x_right/y_top/y_bottom/width/
+            height are all 0.0 (no layout coordinates) and only inline-style +
+            semantic-tag typography is resolved (no CSS class rules / external
+            stylesheets). A URL source still needs plain HTTP fetching, which
+            happens automatically the same way it does for the no-Playwright
+            fallback. Best for inline-style-heavy documents (SEC filings,
+            Word-exported HTML, legal documents); degrades on CSS-class-heavy
+            modern pages.
 
     Returns:
-        Tuple of (discovered_metadata, df_lines, df_table_cells, debug_steps).
+        HtmlPipelineResult(discovered_metadata, df_lines, df_table_cells, debug_steps).
         debug_steps is an ordered dict of intermediate DataFrames when debug=True,
         empty dict otherwise.
     """
@@ -82,16 +104,19 @@ def run_pipeline(
     # Fetch step — resolve source_url to html bytes if needed
     # ============================================================
     if source_url and html is None:
-        if _is_sec_url(source_url):
-            # SEC: fetch bytes via rate-limited fetcher, render as static HTML.
-            # Inject <base href> so relative URLs resolve correctly in Playwright's
-            # about:blank context (otherwise parent.href returns "about:blank/...")
-            scraped = fetch_url(source_url)
-            html = scraped.raw_bytes.decode(scraped.encoding or "utf-8", errors="replace")
-            html = _inject_base_url(html, scraped.final_url)
+        if _is_sec_url(source_url) or not use_browser:
+            # SEC, or use_browser=False: fetch bytes via plain HTTP (rate-limited
+            # for SEC), render as static HTML. Without a browser there is no
+            # page.goto to do this fetch for us. Inject <base href> so relative
+            # URLs resolve correctly (Playwright's about:blank context otherwise
+            # returns "about:blank/..."; the static extractor never resolves them).
+            with timed_step("fetch_html_http", logger=logger):
+                scraped = fetch_url(source_url)
+                html = scraped.raw_bytes.decode(scraped.encoding or "utf-8", errors="replace")
+                html = _inject_base_url(html, scraped.final_url)
             source_url = None  # box extractor will use set_content
-        # else: non-SEC → keep source_url=source_url, html=None
-        #        box extractor will page.goto(source_url) for full JS rendering
+        # else: non-SEC, browser available → keep source_url=source_url, html=None
+        #       box extractor will page.goto(source_url) for full JS rendering
     elif source_url and html is not None:
         # Caller already fetched/provided HTML but still gave its original URL for
         # link resolution. Render via set_content, with a <base> tag for relative
@@ -103,20 +128,24 @@ def run_pipeline(
     # STAGE: PARSING (Steps 01-03)
     # ============================================================
     if on_stage:
-        on_stage("parsing")
+        on_stage("extract_elements")
 
     # Step 01 - Box Extraction
-    # Try Playwright first; if not installed, fall back to static extractor.
-    try:
-        from .step_01_box_extractor import BrowserSession, extract_boxes_with_playwright
-        _playwright_available = True
-    except ImportError:
-        logger.warning(
-            "Playwright is not installed — falling back to static box extractor. "
-            "Accuracy will be degraded: layout coordinates are unavailable and CSS-class styles are not resolved. "
-            "Bold or styled headings may go undetected, which can degrade chunk boundaries and hierarchy quality."
-        )
+    # Try Playwright first; if not installed (or the caller opted out via
+    # use_browser=False), fall back to the static extractor.
+    if not use_browser:
         _playwright_available = False
+    else:
+        try:
+            from .step_01_box_extractor import BrowserSession, extract_boxes_with_playwright
+            _playwright_available = True
+        except ImportError:
+            logger.warning(
+                "Playwright is not installed — falling back to static box extractor. "
+                "Accuracy will be degraded: layout coordinates are unavailable and CSS-class styles are not resolved. "
+                "Bold or styled headings may go undetected, which can degrade chunk boundaries and hierarchy quality."
+            )
+            _playwright_available = False
 
     # Reuse one browser across the extraction attempts below. When a caller
     # (e.g. DocumentParser) supplies a session, reuse it across documents too and
@@ -139,37 +168,40 @@ def run_pipeline(
         wait_until = "domcontentloaded"
 
         while True:
-            if _playwright_available:
-                try:
-                    boxes, rendered_html = extract_boxes_with_playwright(
-                        html, source_url, wait_until=wait_until, session=session
-                    )
-                except Exception as e:
-                    # Navigation failed: fetch the bytes ourselves and render them
-                    # statically. Drop source_url so we don't retry navigation.
-                    if not source_url:
-                        raise
-                    logger.warning(f"Playwright navigation failed for {source_url}, falling back to http_fetcher: {e}")
-                    scraped = fetch_url(source_url)
-                    html = scraped.raw_bytes.decode(scraped.encoding or "utf-8", errors="replace")
-                    html = _inject_base_url(html, scraped.final_url)
-                    source_url = None
-                    boxes, rendered_html = extract_boxes_with_playwright(html, source_url=None, session=session)
-            else:
-                if html is None:
-                    # No Playwright to navigate, must have HTML content to proceed.
-                    raise ValueError("Playwright is not installed and no HTML content was provided — cannot extract boxes.")
-                from .step_01_static_box_extractor import extract_boxes_static
-                boxes = extract_boxes_static(html)
-                rendered_html = html
+            step_name = f"box_extraction_{wait_until}" if _playwright_available else "box_extraction_static"
+            with timed_step(step_name, logger=logger):
+                if _playwright_available:
+                    try:
+                        boxes, rendered_html = extract_boxes_with_playwright(
+                            html, source_url, wait_until=wait_until, session=session
+                        )
+                    except Exception as e:
+                        # Navigation failed: fetch the bytes ourselves and render them
+                        # statically. Drop source_url so we don't retry navigation.
+                        if not source_url:
+                            raise
+                        logger.warning(f"Playwright navigation failed for {source_url}, falling back to http_fetcher: {e}")
+                        scraped = fetch_url(source_url)
+                        html = scraped.raw_bytes.decode(scraped.encoding or "utf-8", errors="replace")
+                        html = _inject_base_url(html, scraped.final_url)
+                        source_url = None
+                        boxes, rendered_html = extract_boxes_with_playwright(html, source_url=None, session=session)
+                else:
+                    if html is None:
+                        # No Playwright to navigate, must have HTML content to proceed.
+                        raise ValueError("Playwright is not installed and no HTML content was provided — cannot extract boxes.")
+                    from .step_01_static_box_extractor import extract_boxes_static
+                    boxes = extract_boxes_static(html)
+                    rendered_html = html
 
-            df_boxes = pd.DataFrame(boxes)
-            logger.info(f"Step 01 - Box extraction complete ({wait_until}), {len(df_boxes)} boxes")
+                df_boxes = pd.DataFrame(boxes)
+                logger.info(f"Step 01 - Box extraction complete ({step_name}), {len(df_boxes)} boxes")
 
             # Step 02 - Box Cleaning (skip when nothing was extracted).
             # Static extraction: hr/img are already in DOM order, skip y_top-based reordering.
             if not df_boxes.empty:
-                df_boxes = clean_boxes(df_boxes, keep_debug_cols=False, dry_run=False, reorder_by_coordinates=_playwright_available)
+                with timed_step("box_cleaning", logger=logger):
+                    df_boxes = clean_boxes(df_boxes, keep_debug_cols=False, dry_run=False, reorder_by_coordinates=_playwright_available)
 
             # Got usable boxes, or no retry strategy left → stop.
             if not df_boxes.empty or not (_playwright_available and source_url and wait_until != "networkidle"):
@@ -179,7 +211,7 @@ def run_pipeline(
 
         if df_boxes.empty:
             logger.warning("Empty DataFrame after box extraction/cleaning, returning early")
-            return {}, df_boxes, None, {}
+            return HtmlPipelineResult({}, df_boxes, None, {})
     finally:
         # The browser is only needed for box extraction above; release it (when we
         # own it) before the heavier downstream processing runs.
@@ -187,20 +219,20 @@ def run_pipeline(
             session.close()
 
     # Step 03 - Page Labels (runs on boxes — needs box_id)
-    df_boxes, page_labels, page_label_groups = assign_page_labels(
-        df_boxes, page_label_config, use_coordinate_filters=_playwright_available
-    )
+    with timed_step("page_label_detection", logger=logger):
+        df_boxes, page_labels, page_label_groups = assign_page_labels(
+            df_boxes, page_label_config, use_coordinate_filters=_playwright_available
+        )
 
     discovered_metadata: Dict[str, Any] = {}
     discovered_metadata["rendered_html"] = rendered_html
 
-    try:
-        add_page_and_ocr_info(discovered_metadata, df_boxes, df_images=pd.DataFrame())
-    except Exception as e:
-        logger.error(f"Error in add_page_and_ocr_info: {e}", exc_info=True)
-        discovered_metadata.setdefault("page_count", 1)
-        discovered_metadata.setdefault("is_password_protected", False)
-        discovered_metadata.setdefault("has_ocr", False)
+    with timed_step("page_count_ocr_detection", logger=logger):
+        safe_enrich(
+            add_page_and_ocr_info, discovered_metadata, df_boxes, df_images=pd.DataFrame(),
+            fallback={"page_count": 1, "is_password_protected": False, "has_ocr": False},
+            logger=logger,
+        )
 
     # Convert pixels to points (96 px = 72 pt)
     PX_TO_PT = 0.75
@@ -210,36 +242,42 @@ def run_pipeline(
             df_boxes[col] = df_boxes[col] * PX_TO_PT
 
     # ============================================================
-    # STAGE: HIERARCHY (Steps 04-05)
+    # STAGE: STRUCTURE (Steps 04-06)
     # ============================================================
     if on_stage:
-        on_stage("hierarchy")
+        on_stage("process_layouts")
 
     # Step 04 - Line Builder (boxes → lines); must run before table extractor
     # so that the final reindexed table_id values are available for ID matching.
-    df_lines = merge_boxes_to_lines(df_boxes, remove_single_row_tables=True, merge_by_coordinates=_playwright_available)
+    with timed_step("line_building", logger=logger):
+        df_lines = merge_boxes_to_lines(df_boxes, remove_single_row_tables=True, merge_by_coordinates=_playwright_available)
+
+    if on_stage:
+        on_stage("extract_tables")
 
     # Step 05 - Table Extractor (uses df_lines.original_table_id for table_id sync)
-    df_table_cells = extract_table_cells(
-        df_lines=df_lines,
-        rendered_html=rendered_html,
-    )
+    with timed_step("table_extraction", logger=logger):
+        df_table_cells = extract_table_cells(
+            df_lines=df_lines,
+            rendered_html=rendered_html,
+        )
 
     # Step 06 - Style Prefiller (block_type from struct_ancestors: code, heading,
     # block_quote). Runs after table extraction so table block_type is already set
     # and preserved; only fills rows with no existing block_type.
-    df_lines = prefill_styles(df_lines)
+    with timed_step("style_prefill", logger=logger):
+        df_lines = prefill_styles(df_lines)
 
-    try:
-        add_document_information(discovered_metadata, html_content=rendered_html, df_lines=df_lines)
-    except Exception as e:
-        logger.error(f"Error in add_document_information: {e}", exc_info=True)
-        discovered_metadata.setdefault("author_meta", None)
-        discovered_metadata.setdefault("author_text", None)
-        discovered_metadata.setdefault("title_meta", None)
-        discovered_metadata.setdefault("title_text", None)
-        discovered_metadata.setdefault("language", "unknown")
-        discovered_metadata.setdefault("profile", "unknown")
+    with timed_step("document_metadata", logger=logger):
+        safe_enrich(
+            add_document_information, discovered_metadata, html_content=rendered_html, df_lines=df_lines,
+            fallback={
+                "author_meta": None, "author_text": None,
+                "title_meta": None, "title_text": None,
+                "language": "unknown", "profile": "unknown",
+            },
+            logger=logger,
+        )
 
     # ============================================================
     # Finalize metadata
@@ -259,4 +297,4 @@ def run_pipeline(
         if df_table_cells is not None:
             debug_steps["table_cells"] = df_table_cells
 
-    return discovered_metadata, df_lines, df_table_cells, debug_steps
+    return HtmlPipelineResult(discovered_metadata, df_lines, df_table_cells, debug_steps)

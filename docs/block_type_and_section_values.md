@@ -42,6 +42,7 @@ block_quote (picked up from pdf / html / docx) - can never be a heading
     7.1 Deviations: -> <li> that is heading
         7.1.1 Completed and electronically-signed Deviation Request Forms are maintained... -> <li> that is paragraph
 - Same problem with caption: heading above a table, paragraph below a table (ambiguous)
+- TOC can be a table or text, which we can distinguish by the presence of a table_id
 
 **Noise types** (stripped before chunking): `hr`, `page_label`, `image`, `suppressed_repeated_heading`, `navigation`, `watermark`
 

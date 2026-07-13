@@ -1386,14 +1386,14 @@ def _notes_part_for(slide: PptxSlide, package: PptxPackage) -> str:
 
 def extract_runs(
     package: PptxPackage,
-    include_notes: bool = True,
+    include_speaker_notes: bool = True,
 ) -> pd.DataFrame:
     """
     Extract run-level content from a PPTX package.
 
     Args:
         package: Parsed PPTX package (from step 01).
-        include_notes: Include speaker notes slides.
+        include_speaker_notes: Include speaker notes slides.
 
     Returns:
         DataFrame with one row per text/control/image/chart/shape run event.
@@ -1411,7 +1411,7 @@ def extract_runs(
         if sp_tree is not None:
             _walk_sp_tree(sp_tree, slide, False, counters, rows, package)
 
-        if include_notes:
+        if include_speaker_notes:
             notes_part = _notes_part_for(slide, package)
             if notes_part:
                 notes_root = package.get_xml(notes_part)

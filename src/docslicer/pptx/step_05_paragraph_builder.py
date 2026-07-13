@@ -4,8 +4,8 @@ PPTX run → paragraph aggregator.
 Filters content runs and merges them by paragraph_id, producing one row per
 logical paragraph with concatenated text and character-count-weighted style.
 
-Speaker notes are included by default (include_notes=True) and can be
-excluded by passing include_notes=False, which filters out runs where
+Speaker notes are included by default (include_speaker_notes=True) and can be
+excluded by passing include_speaker_notes=False, which filters out runs where
 header_footer_type == "notes".
 """
 
@@ -63,7 +63,7 @@ def _paragraph_text(run_df: pd.DataFrame) -> pd.Series:
 
 def build_paragraphs(
     run_df: pd.DataFrame,
-    include_notes: bool = True,
+    include_speaker_notes: bool = True,
 ) -> pd.DataFrame:
     """
     Aggregate run-level rows into paragraph-level rows.
@@ -80,7 +80,7 @@ def build_paragraphs(
 
     Args:
         run_df: Output of extract_runs.
-        include_notes: When False, speaker-note paragraphs are excluded
+        include_speaker_notes: When False, speaker-note paragraphs are excluded
             (header_footer_type == "notes").
 
     Returns:
@@ -89,7 +89,7 @@ def build_paragraphs(
     if run_df.empty:
         return pd.DataFrame()
 
-    if not include_notes and "header_footer_type" in run_df.columns:
+    if not include_speaker_notes and "header_footer_type" in run_df.columns:
         run_df = run_df[run_df["header_footer_type"] != "notes"]
 
     if run_df.empty:
