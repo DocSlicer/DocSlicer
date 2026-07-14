@@ -144,7 +144,20 @@ def _extract_image_metadata(
         ext = _ext_from_filters(filters)
 
         # Display bbox: raw PDF-space bounds → rotation-aware screen coords
+        #
+        # get_bounds() only applies the image's own matrix, which is relative to
+        # its immediate parent (a Form XObject, if the image is nested in one) —
+        # it does NOT compose in the ancestor Form XObjects' own placement
+        # matrices. For images placed directly on the page (the common case)
+        # this is already page space and no correction is needed. For images
+        # nested inside one or more Form XObjects, we have to walk up the
+        # container chain and fold each ancestor's matrix in ourselves, or the
+        # bounds come out in the innermost form's local coordinate space.
         l, b, r, t = img.get_bounds()
+        container = obj.container
+        while container is not None:
+            l, b, r, t = container.get_matrix().on_rect(l, b, r, t)
+            container = container.container
         x_left, y_top, x_right, y_bottom = to_screen(float(l), float(b), float(r), float(t))
 
         display_width = x_right - x_left

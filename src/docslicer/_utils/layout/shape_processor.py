@@ -18,6 +18,8 @@ LINE_HEIGHT_MAX_PX = 4.2  # max height (or width) to reclassify a rect/curve as 
 _CURVE_SQUARE_TOL_PX = 1.0  # max |width - height| for a thin curve to still count as "square" (never a line)
 _CURVE_TO_LINE_MIN_LONG_SIDE_PX = 8.0  # min long-side length for a thin curve to reclassify as a line
 _PAGE_BG_COVERAGE = 0.80  # min fraction of page width AND height for a rect to count as page_background
+_BAND_MAJOR_COVERAGE = 0.80  # min fraction of page width (or height) along the band's long axis
+_BAND_MINOR_COVERAGE = 0.30  # min fraction of page height (or width) along the band's short axis
 _GRID_SNAP_TOL_PX = 3.0  # max gap for a horizontal and vertical line to count as touching (grid detection)
 _GRID_MIN_LINE_LEN_PX = 20.0  # min primary-axis length for a line to participate in a grid (rejects tiny fragments)
 
@@ -423,6 +425,39 @@ def _assign_page_background_roles(df: pd.DataFrame) -> None:
     df.loc[is_bg, "shape_role"] = "page_background"
 
 
+def _assign_background_band_roles(df: pd.DataFrame) -> None:
+    """
+    Tag rects covering a full-width or full-height band of the page as
+    'background_band' (in place).
+
+    A band spans >= _BAND_MAJOR_COVERAGE of the page along one dimension and
+    >= _BAND_MINOR_COVERAGE along the other -- e.g. a horizontal stripe
+    running edge-to-edge across the width but only partway down the height,
+    or the vertical mirror. Runs after page_background so it only claims
+    records still tagged the default 'other' (page_background already covers
+    the case where both dimensions are >= _PAGE_BG_COVERAGE). No-op when page
+    dimensions are absent (OCR path).
+    """
+    if "page_width" not in df.columns or "page_height" not in df.columns:
+        return
+    has_dims = df["page_width"].notna() & df["page_height"].notna()
+    is_horizontal_band = (
+        (df["width"]  >= _BAND_MAJOR_COVERAGE * df["page_width"])
+        & (df["height"] >= _BAND_MINOR_COVERAGE * df["page_height"])
+    )
+    is_vertical_band = (
+        (df["height"] >= _BAND_MAJOR_COVERAGE * df["page_height"])
+        & (df["width"]  >= _BAND_MINOR_COVERAGE * df["page_width"])
+    )
+    is_band = (
+        (df["shape_type"] == "rect")
+        & (df["shape_role"] == "other")
+        & has_dims
+        & (is_horizontal_band | is_vertical_band)
+    )
+    df.loc[is_band, "shape_role"] = "background_band"
+
+
 def _cluster_touching_lines(
     sel: np.ndarray,
     orient: np.ndarray,
@@ -624,6 +659,7 @@ def _assign_shape_roles(df: pd.DataFrame) -> None:
     'other', so roles never fight over the same shape.
     """
     _assign_page_background_roles(df)
+    _assign_background_band_roles(df)
     _assign_table_grid_roles(df, start_id=1)
     _assign_box_roles(df)
 
