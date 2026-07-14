@@ -272,28 +272,34 @@ def _pairwise_arrays(df_objs: pd.DataFrame) -> dict[str, np.ndarray]:
     # Forward vertical delta of the center: positive = obj_b is further down.
     dy_center = (yt_b + yb_b) * 0.5 - (yt_a + yb_a) * 0.5
 
+    same_line = same_line_pairwise(yt_a, yb_a, yt_b, yb_b)
+
     return {
-        "same_line":       same_line_pairwise(yt_a, yb_a, yt_b, yb_b),
+        "same_line":       same_line,
         "y_decreases":     dy_center < -_Y_DECREASE_TOL,
         "large_gap":       dy_center > _STREAM_GROUP_Y_JUMP,
         "same_struct":     _same_nonnull(a, b, "struct_group_id"),
         "same_table":      _same_nonnull(a, b, "table_id"),
         "new_textbox":     _differs(a, b, "textbox_id"),
-        "objects_between": _compute_objects_between(df_objs),
+        "objects_between": _compute_objects_between(df_objs, same_line),
     }
 
 
-def _compute_objects_between(df_objs: pd.DataFrame) -> np.ndarray:
+def _compute_objects_between(df_objs: pd.DataFrame, same_line: np.ndarray) -> np.ndarray:
     """Flag adjacent object pairs that have a third object sitting between them.
 
     Operates on the object-level frame (sorted by ``(page_number,
     text_object_id)``) and returns a boolean array of length ``len(df_objs) - 1``
     where entry ``i`` describes the gap between row ``i`` and row ``i + 1``.
-    Cross-page gaps are always ``False``.
+    ``same_line`` is the precomputed same-line pair feature, same length and
+    indexing. Cross-page gaps are always ``False``.
 
     A pair qualifies when BOTH:
-      1. the two objects are "far apart" — the horizontal gap
-         (``b.x_left - a.x_right``) or the vertical gap
+      1. the two objects are "far apart" — the forward horizontal gap
+         (``b.x_left - a.x_right``), the leftward gap (``a.x_left -
+         b.x_right``, counted only when the objects sit on the same text line
+         per :func:`same_line_pairwise`, so a carriage return to the next line
+         does not qualify), or the forward vertical gap
          (``b.y_top - a.y_bottom``) is at least ``_OBJECTS_BETWEEN_GAP`` pt; and
       2. some *other* object on the page has more than
          ``_OBJECTS_BETWEEN_AREA_FRAC`` of its own area inside the pair's
@@ -331,9 +337,19 @@ def _compute_objects_between(df_objs: pd.DataFrame) -> np.ndarray:
         cxr = np.maximum(pxr[:-1], pxr[1:])
         cyb = np.maximum(pyb[:-1], pyb[1:])
 
-        # Precondition: far apart on either axis.
+        # Precondition: far apart on either axis. The horizontal gap counts in
+        # both directions, but the leftward gap (a.x_left - b.x_right) only
+        # when the two objects sit on the same text line (raw bbox overlap is
+        # too loose, since tightly leaded lines can overlap by a fraction of a
+        # point). A leftward jump within the same line is suspicious, whereas
+        # a leftward jump onto the next line is just a normal carriage return
+        # (otherwise every table row's return-to-left would sweep up the
+        # previous row as "in between"). Pairs within the page block are the
+        # global gaps s .. e-2.
+        sl = same_line[s : e - 1]
         far = (
             (pxl[1:] - pxr[:-1] >= _OBJECTS_BETWEEN_GAP)
+            | ((pxl[:-1] - pxr[1:] >= _OBJECTS_BETWEEN_GAP) & sl)
             | (pyt[1:] - pyb[:-1] >= _OBJECTS_BETWEEN_GAP)
         )
 
@@ -405,6 +421,9 @@ def _differs(a: pd.DataFrame, b: pd.DataFrame, col: str) -> np.ndarray:
 # Per-word output columns added by assign_reading_order (all transition-into,
 # keyed to obj_b) plus the running-state shifted_left.
 _PAIR_FEATURE_COLS: tuple[str, ...] = (*_VECTOR_FEATURE_COLS, "shifted_left")
+
+# All debug columns: the pair features plus the post-pass encapsulation marker.
+_DEBUG_COLS: tuple[str, ...] = (*_PAIR_FEATURE_COLS, "encapsulation_split")
 
 
 def _decide_new_group(arr: dict[str, np.ndarray], i: int, shifted_left: bool) -> bool:
@@ -483,6 +502,105 @@ def _walk_streaming_groups(
     return group_id, shifted_left
 
 
+# ================================================================================
+# ENCAPSULATION SPLIT  (post-pass on finished groups)
+# ================================================================================
+#
+# A streaming group can end up fully *encapsulating* another group's bbox — e.g.
+# a table emitted first in the content stream whose header note ("As of ... (in
+# millions, ...)") is emitted last, as a separate group that sits geometrically
+# inside the table group's bbox. The big group must be broken where the small
+# group slots in vertically, so a later reordering stage can interleave them.
+#
+# Group A encapsulates group B when A's union bbox contains B's on all four
+# edges (non-strict; identical bboxes are ignored) AND A has real content at
+# both corners: some object of A sits at/left AND at/above B's top-left, and
+# some object of A sits at/right AND at/below B's bottom-right. The corner
+# requirement matters because the union bbox overstates an L-shaped group —
+# e.g. a group with text along its top and down its left side has a union bbox
+# that "contains" a column header sitting in the empty corner, yet nothing of
+# the group actually surrounds it.
+#
+# The break point is the first object of A, in stream order, whose y_top is
+# at/below B's y_top. This is a single pass over the walk's output — group
+# bboxes are not recomputed after a split, so nested encapsulations resolve
+# one level per call.
+
+def _split_encapsulating_groups(
+    df_objs: pd.DataFrame, group_id: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Break groups that truly encapsulate another group (bbox + corner objects).
+
+    Returns ``(new_group_id, encapsulation_split)``, both length
+    ``len(df_objs)``: the renumbered (still monotonic) group ids, and a boolean
+    marking each object where a break was inserted (the first object of the
+    newly split-off group).
+    """
+    n = len(df_objs)
+    encap_split = np.zeros(n, dtype=bool)
+    if n == 0:
+        return group_id.copy(), encap_split
+
+    page = df_objs["page_number"].to_numpy()
+    xl = df_objs["x_left"].to_numpy(float)
+    yt = df_objs["y_top"].to_numpy(float)
+    xr = df_objs["x_right"].to_numpy(float)
+    yb = df_objs["y_bottom"].to_numpy(float)
+
+    # Groups are contiguous runs in stream order (the walk assigns ids along
+    # consecutive objects and never reuses one), so reduceat over run starts
+    # gives each group's union bbox.
+    _, g_start = np.unique(group_id, return_index=True)
+    g_end = np.append(g_start[1:], n)
+    g_page = page[g_start]
+    g_xl = np.minimum.reduceat(xl, g_start)
+    g_yt = np.minimum.reduceat(yt, g_start)
+    g_xr = np.maximum.reduceat(xr, g_start)
+    g_yb = np.maximum.reduceat(yb, g_start)
+
+    for p in np.unique(g_page):
+        pg = np.flatnonzero(g_page == p)
+        if len(pg) < 2:
+            continue
+
+        A, B = pg[:, None], pg[None, :]
+        contains = (
+            (g_xl[A] <= g_xl[B]) & (g_yt[A] <= g_yt[B])
+            & (g_xr[A] >= g_xr[B]) & (g_yb[A] >= g_yb[B])
+        )
+        identical = (
+            (g_xl[A] == g_xl[B]) & (g_yt[A] == g_yt[B])
+            & (g_xr[A] == g_xr[B]) & (g_yb[A] == g_yb[B])
+        )
+        contains &= ~identical  # also clears the diagonal (A vs itself)
+
+        for i, j in zip(*np.nonzero(contains)):
+            big, small = pg[i], pg[j]
+            s, e = g_start[big], g_end[big]
+
+            # Union-bbox containment is only a prefilter: the big group must
+            # have an actual object at each corner of the small group, or its
+            # bbox is an L-shape that merely appears to surround it.
+            top_left = ((xl[s:e] <= g_xl[small]) & (yt[s:e] <= g_yt[small])).any()
+            bottom_right = ((xr[s:e] >= g_xr[small]) & (yb[s:e] >= g_yb[small])).any()
+            if not (top_left and bottom_right):
+                continue
+
+            below = np.flatnonzero(yt[s:e] >= g_yt[small])
+            # below[0] == 0 → the whole group sits at/under the small group's
+            # y_top, so there is nowhere to break.
+            if below.size and below[0] > 0:
+                encap_split[s + below[0]] = True
+
+    if not encap_split.any():
+        return group_id.copy(), encap_split
+
+    new_start = np.ones(n, dtype=bool)
+    new_start[1:] = group_id[1:] != group_id[:-1]
+    new_start |= encap_split
+    return np.cumsum(new_start).astype(np.int64), encap_split
+
+
 def assign_stream_group_id(df_words: pd.DataFrame, debug: bool = False) -> pd.DataFrame:
     """Assign ``stream_group_id`` to every word and attach its pair features.
 
@@ -494,26 +612,30 @@ def assign_stream_group_id(df_words: pd.DataFrame, debug: bool = False) -> pd.Da
         shifted_left        boolean — obj_b started left of the group's x-span
         <pair features>     boolean — same_line, y_decreases, large_gap,
                             same_struct, same_table, new_textbox, objects_between
+        encapsulation_split boolean — the word's text object is where a group
+                            was broken because its bbox fully encapsulated
+                            another group's bbox (post-pass marker)
 
     Every feature/shifted_left value describes the transition *into* the word's
     text object; the first object on each page has no predecessor, so those words
     get ``<NA>`` (a handy page-start marker). ``stream_group_id`` is always set.
 
-    If ``debug`` is False (the default), the intermediate pair-feature columns
-    (``shifted_left`` and ``<pair features>``) are omitted and only
-    ``stream_group_id`` is added.
+    If ``debug`` is False (the default), the intermediate debug columns
+    (``shifted_left``, ``<pair features>`` and ``encapsulation_split``) are
+    omitted and only ``stream_group_id`` is added.
     """
     if df_words is None or df_words.empty:
         out = df_words.copy() if df_words is not None else pd.DataFrame()
         out["stream_group_id"] = pd.Series(dtype="Int64")
         if debug:
-            for col in _PAIR_FEATURE_COLS:
+            for col in _DEBUG_COLS:
                 out[col] = pd.Series(dtype="boolean")
         return out
 
     df_objs = _collapse_to_objects(df_words)
     arr = _pairwise_arrays(df_objs)
     group_id, shifted_left = _walk_streaming_groups(df_objs, arr)
+    group_id, encap_split = _split_encapsulating_groups(df_objs, group_id)
 
     # Build a per-object result keyed by the null-safe object key. Pair features
     # (length n-1, indexed by gap i) attach to obj_b (object i+1); page-start
@@ -528,6 +650,7 @@ def assign_stream_group_id(df_words: pd.DataFrame, debug: bool = False) -> pd.Da
         "__obj_key": df_objs["text_object_id"].to_numpy(),
         "stream_group_id": group_id,
         "shifted_left": shifted_left,
+        "encapsulation_split": encap_split,
     })
     for name in _VECTOR_FEATURE_COLS:
         col = np.empty(n, dtype=object)
@@ -545,7 +668,7 @@ def assign_stream_group_id(df_words: pd.DataFrame, debug: bool = False) -> pd.Da
 
     out["stream_group_id"] = out["stream_group_id"].astype("Int64")
     if debug:
-        for col in _PAIR_FEATURE_COLS:
+        for col in _DEBUG_COLS:
             out[col] = out[col].astype("boolean")
 
     return out #df_words
