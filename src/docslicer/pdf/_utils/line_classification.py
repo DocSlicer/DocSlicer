@@ -160,6 +160,63 @@ def line_gap_stats(
 # 2. CLASSIFICATION  (prior; resolves unimodal lines only)
 # ================================================================================
 
+def _token_features(t: object) -> tuple[bool, bool, bool, bool, bool]:
+    """
+    Per-token boolean content features, the single definition behind both the
+    per-line content_stats() and the vectorised token_content_features().
+
+    Returns (is_stopword, has_alpha, cap_initial, has_punct, is_numeric):
+        is_stopword : lowercased, punctuation-stripped token is a prose stopword
+        has_alpha   : contains at least one alphabetic character
+        cap_initial : alpha token whose first letter is uppercase — title-case
+                      and ALL CAPS both count
+        has_punct   : alpha token containing sentence punctuation (.,;:).
+                      Only counted on alpha tokens, so numeric formatting
+                      ("1,000", "(2.5)") never reads as prose punctuation.
+        is_numeric  : nothing but digits and numeric punctuation. No digit is
+                      required, so bare "%", "-", "()" tokens also count.
+    """
+    s = str(t).strip()
+    if not s:
+        return False, False, False, False, False
+    is_stopword = s.lower().strip(_STRIP_CHARS) in _STOPWORDS
+    has_alpha   = any(c.isalpha() for c in s)
+    cap_initial = has_alpha and s[:1].isupper()
+    has_punct   = has_alpha and any(c in ".,;:" for c in s)
+    is_numeric  = all(c.isdigit() or c in ",.()-+%—– " for c in s)
+    return is_stopword, has_alpha, cap_initial, has_punct, is_numeric
+
+
+def token_content_features(texts) -> dict[str, np.ndarray]:
+    """
+    Vectorised :func:`_token_features` for a whole token array.
+
+    ``texts`` must already be strings (callers with a DataFrame column pass
+    ``df["text"].astype(str).to_numpy()``). Features are computed once per
+    unique token — word text repeats heavily ("the", digits, boilerplate) —
+    and broadcast back, so cost scales with distinct tokens, not rows.
+
+    Returns a dict of boolean arrays aligned with ``texts``:
+        is_stopword, has_alpha, cap_initial, has_punct, is_numeric
+    """
+    arr = np.asarray(texts, dtype=object)
+    uniques, codes = np.unique(arr, return_inverse=True)
+
+    m = len(uniques)
+    feats = {
+        "is_stopword": np.zeros(m, dtype=bool),
+        "has_alpha":   np.zeros(m, dtype=bool),
+        "cap_initial": np.zeros(m, dtype=bool),
+        "has_punct":   np.zeros(m, dtype=bool),
+        "is_numeric":  np.zeros(m, dtype=bool),
+    }
+    for i, u in enumerate(uniques):
+        (feats["is_stopword"][i], feats["has_alpha"][i], feats["cap_initial"][i],
+         feats["has_punct"][i], feats["is_numeric"][i]) = _token_features(u)
+
+    return {k: v[codes] for k, v in feats.items()}
+
+
 def content_stats(texts: list[str]) -> dict:
     """Cheap per-line content features computed straight from token text."""
     n = len(texts)
@@ -170,25 +227,12 @@ def content_stats(texts: list[str]) -> dict:
     alpha = numeric = caps = stop = 0
     has_punct = False
     for t in texts:
-        s = str(t).strip()
-        if not s:
-            continue
-        norm = s.lower().strip(_STRIP_CHARS)
-        if norm in _STOPWORDS:
-            stop += 1
-        has_alpha = any(c.isalpha() for c in s)
-        if has_alpha:
-            alpha += 1
-            if s[:1].isupper():   # first letter only: title-case and ALL CAPS both count
-                caps += 1
-            # Punctuation only counts on alpha tokens, so numeric formatting
-            # ("1,000", "(2.5)") never reads as prose punctuation.
-            if any(c in ".,;:" for c in s):
-                has_punct = True
-        # numeric-like token: nothing but digits and numeric punctuation. No
-        # digit is required, so bare "%", "-", "()" tokens also count.
-        if s and all(c.isdigit() or c in ",.()-+%—– " for c in s):
-            numeric += 1
+        is_stop, has_alpha, cap_initial, tok_punct, is_numeric = _token_features(t)
+        stop      += is_stop
+        alpha     += has_alpha
+        caps      += cap_initial
+        numeric   += is_numeric
+        has_punct  = has_punct or tok_punct
 
     return {
         "n": n,
@@ -200,9 +244,83 @@ def content_stats(texts: list[str]) -> dict:
     }
 
 
+def score_lines(
+    n_words:             np.ndarray,
+    stopword_hits:       np.ndarray,
+    has_punct:           np.ndarray,
+    alpha_ratio:         np.ndarray,
+    cap_ratio:           np.ndarray,
+    numeric_token_ratio: np.ndarray,
+    median_em:           np.ndarray,
+    jump_ratio:          np.ndarray,
+    is_bimodal:          np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Vectorised line classification over per-line feature arrays (the first six
+    are content_stats() fields, the last three line_gap_stats() fields).
+
+    Returns ``(labels, scores)``: labels is an object array of
+    "text" / "table" / "undetermined", scores the signed evidence sum
+    (negative => text, positive => table). Lines with <= 2 words (0-1 gaps)
+    are always "undetermined" with score 0.0 — too little geometry to say
+    anything meaningful.
+
+    This is the single scoring implementation; :func:`classify_line` delegates
+    here with length-1 arrays. Each additive term mirrors one signal:
+    ``(x >= a) + (x >= b)`` encodes the old two-tier "-1 / -2" ladders.
+    """
+    n    = np.asarray(n_words)
+    stop = np.asarray(stopword_hits)
+    ar   = np.asarray(alpha_ratio, dtype=float)
+    cr   = np.asarray(cap_ratio, dtype=float)
+    nr   = np.asarray(numeric_token_ratio, dtype=float)
+    med  = np.asarray(median_em, dtype=float)
+    jr   = np.asarray(jump_ratio, dtype=float)
+    bim  = np.asarray(is_bimodal, dtype=bool)
+    pun  = np.asarray(has_punct, dtype=bool)
+
+    score = (
+        # ── Sentence signals (push negative) ──────────────────────────────
+        # Word count: longer lines are more likely prose
+        - ((n >= 8).astype(float) + (n >= 11))
+        # Stopwords are a very strong prose indicator
+        - ((stop >= 1).astype(float) + (stop >= 2))
+        # Punctuation mid-line (comma, colon, etc.) is a prose indicator
+        - pun.astype(float)
+        # High alpha ratio means mostly real words, not numbers/codes
+        - ((ar >= 0.60).astype(float) + (ar >= 0.75))
+        # Mostly lowercase-initial tokens across several alpha words: prose-like
+        - ((n >= 4) & (ar > 0) & (cr <= 0.5)).astype(float)
+        # ── Table signals (push positive) ──────────────────────────────────
+        # Numeric-heavy content
+        + ((nr >= 0.20).astype(float) + (nr >= 0.35))
+        # Nearly every token capitalised (title-case or ALL CAPS — cap_ratio
+        # only checks the first letter) with no stopwords: header row / labels
+        + ((cr >= 0.8) & (stop == 0)).astype(float)
+        # Median em: wide typical spacing is a table signal
+        + ((med >= 1.0).astype(float) + (med >= 1.5) + (med >= 2.0))
+        # Gap geometry: jump_ratio measures the bimodal valley strength.
+        # is_bimodal=True means a clear word-space / column-gutter split
+        # exists (shallow valley still +1); unimodal near-flat spacing is
+        # prose-like.
+        + np.where(bim,
+                   1.0 + (jr >= 3.0) + (jr >= 5.0),
+                   -1.0 * (jr < 1.5) - 1.0 * (jr < 1.2))
+    )
+
+    # ── Decision ───────────────────────────────────────────────────────────
+    too_short = n <= 2
+    score  = np.where(too_short, 0.0, score)
+    labels = np.where(score >= 2.0, "table",
+             np.where(score <= -2.0, "text", "undetermined")).astype(object)
+    labels[too_short] = "undetermined"
+    return labels, score
+
+
 def classify_line(
     texts: list[str],
     gap_stats: dict,
+    content: dict | None = None,
 ) -> tuple[str, float]:
     """
     Classify ONE line, returning ``(label, score)`` with label one of
@@ -210,75 +328,31 @@ def classify_line(
 
     ``gap_stats`` is the dict produced by line_gap_stats() for the same words —
     passed in (rather than recomputed here) because every caller also consumes
-    the raw stats directly for its own feature columns.
+    the raw stats directly for its own feature columns. ``content`` optionally
+    takes a precomputed content_stats() dict for the same words, for callers
+    that already computed it for their own feature columns; omitted, it is
+    computed here.
 
-    Lines with <= 2 words (0-1 gaps) are always "undetermined" — too little
-    geometry to say anything meaningful.
-
-    For 3+ words: compute a signed score.
-        negative  =>  text
-        positive  =>  table
-    Signals are grouped into sentence evidence (drives score negative) and
-    table evidence (drives score positive).
+    Scoring lives in :func:`score_lines` (the vectorised implementation);
+    this is the scalar convenience wrapper.
     """
     n = len(texts)
     if n <= 2:
         return "undetermined", 0.0
 
-    c     = content_stats(texts)
-    score = 0.0
-
-    # ── Sentence signals (push negative) ──────────────────────────────────
-    # Word count: longer lines are more likely prose
-    if   n >= 11: score -= 2.0
-    elif n >= 8: score -= 1.0
-
-    # Stopwords are a very strong prose indicator
-    if   c["stopword_hits"] >= 2: score -= 2.0
-    elif c["stopword_hits"] == 1: score -= 1.0
-
-    # Punctuation mid-line (comma, colon, etc.) is a prose indicator
-    if c["has_punct"]: score -= 1.0
-
-    # High alpha ratio means mostly real words, not numbers/codes
-    if   c["alpha_ratio"] >= 0.75: score -= 2.0
-    elif c["alpha_ratio"] >= 0.60: score -= 1.0
-
-    # Mostly lowercase-initial tokens across several alpha words: prose-like
-    if n >= 4 and c["alpha_ratio"] > 0 and c["cap_ratio"] <= 0.5:
-        score -= 1.0
-
-    # ── Table signals (push positive) ─────────────────────────────────────
-    # Numeric-heavy content
-    if   c["numeric_token_ratio"] >= 0.35: score += 2.0
-    elif c["numeric_token_ratio"] >= 0.20: score += 1.0
-
-    # Nearly every token capitalised (title-case or ALL CAPS — cap_ratio only
-    # checks the first letter) with no stopwords: header row or label column
-    if c["cap_ratio"] >= 0.8 and c["stopword_hits"] == 0:
-        score += 1.0
-
-    # Median em: wide typical spacing is a table signal
-    med = gap_stats.get("median_em", 0.0)
-    if   med >= 2.0: score += 3.0
-    elif med >= 1.5: score += 2.0
-    elif med >= 1.0: score += 1.0
-
-    # Gap geometry: jump_ratio measures the bimodal valley strength.
-    # is_bimodal=True means a clear word-space / column-gutter split exists.
-    jr = gap_stats.get("jump_ratio", 1.0)
-    if gap_stats.get("is_bimodal"):
-        if   jr >= 5.0: score += 3.0
-        elif jr >= 3.0: score += 2.0
-        else:           score += 1.0   # bimodal but shallow valley
-    else:
-        if   jr < 1.2: score -= 2.0   # near-flat: very uniform spacing
-        elif jr < 1.5: score -= 1.0   # mildly varied but unimodal
-
-    # ── Decision ──────────────────────────────────────────────────────────
-    if score >=  2.0: return "table",        score
-    if score <= -2.0: return "text",         score
-    return              "undetermined",      score
+    c = content if content is not None else content_stats(texts)
+    labels, scores = score_lines(
+        np.array([n]),
+        np.array([c["stopword_hits"]]),
+        np.array([c["has_punct"]]),
+        np.array([c["alpha_ratio"]]),
+        np.array([c["cap_ratio"]]),
+        np.array([c["numeric_token_ratio"]]),
+        np.array([gap_stats.get("median_em", 0.0)]),
+        np.array([gap_stats.get("jump_ratio", 1.0)]),
+        np.array([bool(gap_stats.get("is_bimodal"))]),
+    )
+    return str(labels[0]), float(scores[0])
 
 
 # ================================================================================

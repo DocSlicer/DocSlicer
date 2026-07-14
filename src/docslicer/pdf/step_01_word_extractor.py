@@ -83,6 +83,13 @@ from ._utils.struct_tree import StructInfo
 from ._utils.form_fields import FormField
 from ._utils.struct_context import StructContext, build_struct_context
 from ._utils.page_rotation import make_rotation_transform
+from ._utils.script_thresholds import (
+    SCRIPT_SIZE_DOWN,
+    SCRIPT_SIZE_INV,
+    SCRIPT_SIZE_MIN,
+    SCRIPT_SIZE_UP,
+    SCRIPT_Y_FACTOR,
+)
 
 
 _WHITESPACE = frozenset(' \t\r\n\x0c\xa0​‌‍﻿')
@@ -166,13 +173,6 @@ def _orientation_from_centers(
     if abs(dx) >= abs(dy):
         return "LTR" if dx >= _THRESH else ("RTL" if dx <= -_THRESH else "UNKNOWN")
     return "TTB" if dy >= _THRESH else ("BTT" if dy <= -_THRESH else "UNKNOWN")
-
-# ── Script-detection thresholds ───────────────────────────────────────────────
-_SCRIPT_Y_FACTOR  = 0.20   # y-centre must shift > 20% of word font-size to be candidate
-_SCRIPT_SIZE_MIN  = 0.40   # incoming char must be ≥ 40% of word size (excludes drop caps)
-_SCRIPT_SIZE_DOWN = 0.82   # incoming char < 82% of word size  → entering script
-_SCRIPT_SIZE_INV  = 1.22   # incoming char > 122% of word size → current word was script
-_SCRIPT_SIZE_UP   = 0.88   # in script word: incoming ≥ 88% of ref_size → back to normal
 
 _GAP_FACTOR = 0.10
 
@@ -784,11 +784,11 @@ def _extract_words_for_page(
                 else:
                     # ── Script detection (fast-path: y-shift first) ───────────
                     y_shift = abs(char_baseline - word_first_baseline)
-                    if y_shift > _SCRIPT_Y_FACTOR * (word_size or 8.0):
+                    if y_shift > SCRIPT_Y_FACTOR * (word_size or 8.0):
                         char_size = _font_info(tp, i)[1]   # ctypes call – only here
 
                         if word_script_type is None:
-                            if _SCRIPT_SIZE_MIN * word_size < char_size < _SCRIPT_SIZE_DOWN * word_size:
+                            if SCRIPT_SIZE_MIN * word_size < char_size < SCRIPT_SIZE_DOWN * word_size:
                                 # Forward entry: normal → script
                                 direction = "superscript" if char_baseline < word_first_baseline else "subscript"
                                 _ref_sz = word_size
@@ -797,7 +797,7 @@ def _extract_words_for_page(
                                 _start_word(i, direction, _ref_sz, _ref_cy)
                                 word_first_baseline = char_baseline
 
-                            elif char_size > _SCRIPT_SIZE_INV * word_size:
+                            elif char_size > SCRIPT_SIZE_INV * word_size:
                                 # Retroactive entry: word started with script char,
                                 # now a normal char arrives. Tag before flush.
                                 direction = "superscript" if word_first_baseline < char_baseline else "subscript"
@@ -808,7 +808,7 @@ def _extract_words_for_page(
 
                         else:
                             # Exit: in script word, normal-sized char returns
-                            if char_size >= word_ref_size * _SCRIPT_SIZE_UP:
+                            if char_size >= word_ref_size * SCRIPT_SIZE_UP:
                                 _flush()
                                 _start_word(i)
                                 word_first_baseline = char_baseline
