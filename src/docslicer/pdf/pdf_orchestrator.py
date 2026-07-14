@@ -231,7 +231,9 @@ def run_pipeline(
             if "struct_group_id" not in df_words.columns or df_words["struct_group_id"].isna().all():
                 # Step 08(b) - Stream Group Assignment - Fallback
                 with timed_step("reading_order_fallback", logger=logger):
-                    df_words, df_gutters = assign_reading_order_fallback(df_words, df_shapes, df_grid_cells)
+                    df_words, df_gutters = assign_reading_order_fallback(
+                        df_words, df_shapes, df_grid_cells, max_workers=max_workers
+                    )
             else:
                 # Step 06 - Prefill Styles
                 with timed_step("prefill_styles", logger=logger):

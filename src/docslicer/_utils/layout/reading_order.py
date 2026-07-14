@@ -170,6 +170,7 @@ def assign_reading_order(
     df_words: pd.DataFrame,
     df_shapes: pd.DataFrame | None = None,
     df_grid_cells: pd.DataFrame | None = None,
+    max_workers: int | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Assign line_id to every word using gutter-aware spatial sorting.
@@ -184,6 +185,9 @@ def assign_reading_order(
     df_grid_cells : reconstructed table cells (process_shapes); each
                 table_grid_id becomes one gutter-detection obstacle, so no
                 gutter can originate inside a detected table grid.
+    max_workers : process-pool width for gutter rect enumeration, forwarded
+                to GutterConfig.enumeration_workers (None -> auto, 1 ->
+                disable intra-document parallelism there).
 
     Returns
     -------
@@ -204,8 +208,11 @@ def assign_reading_order(
         and df["gutter_id_right"].notna().any()
     )
     if not gutter_cols_present:
-        from .gutter_detector import detect_gutters
-        df, df_gutters = detect_gutters(df, df_shapes, df_grid_cells=df_grid_cells, debug=True) #NOTE Remove debug when done
+        from .gutter_detector import detect_gutters, GutterConfig
+        gutter_config = GutterConfig(enumeration_workers=max_workers or 0)
+        df, df_gutters = detect_gutters(
+            df, df_shapes, df_grid_cells=df_grid_cells, config=gutter_config, debug=True
+        )  # NOTE Remove debug when done
 
     # Split horizontal (LTR/default) vs vertical (TTB/BTT)
     if "text_orientation" in df.columns:

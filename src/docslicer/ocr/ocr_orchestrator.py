@@ -210,7 +210,9 @@ def run_ocr_pipeline(
 
     # 4) Assign reading order (gutter-aware)
     with timed_step("reading_order", logger=logger):
-        df_words, df_gutters = assign_reading_order(df_words, df_shapes, df_grid_cells)
+        df_words, df_gutters = assign_reading_order(
+            df_words, df_shapes, df_grid_cells, max_workers=config.ocr_workers
+        )
         df_words = df_words.drop(columns=["center_bucket"], errors="ignore")
 
         # Flag the leftmost word in each line (useful for OCR noise correction,

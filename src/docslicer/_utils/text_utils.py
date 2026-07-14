@@ -51,7 +51,8 @@ _ROMAN = (
 # Pre-compiled once; match is O(n) on token length, typically < 10 chars.
 _LIST_MARKER_RE = re.compile(
     r'^(?:'
-    r'\d+(?:\.\d+)*\.?'         # numbered:      1.  1.1.  2.3.1
+    r'\d+(?:\.\d+)*\.?(?:\([A-Za-z0-9]{1,4}\))+'  # numbered+paren combo: 4.3(a)  4.3(a)(i)
+    r'|\d+(?:\.\d+)*\.?'         # numbered:      1.  1.1.  2.3.1
     r'|\([A-Za-z0-9]{1,4}\)'    # parens alpha/numeric/roman: (a) (iv) (28) (aa)
     r'|\d{1,2}\)'               # half-open numbered:  1)  9)  28)
     r'|[A-Za-z]\)'              # half-open single alpha:  a)  A)
@@ -81,6 +82,7 @@ def is_list_marker(text: object) -> bool:
     Covers:
       - Symbol bullets  (•, ■, –, …)
       - Numbered tokens (1.  1.1.  2.3.1)
+      - Numbered+paren combo (4.3(a)  4.3(a)(i))
       - Parenthetical   ((a)  (iv)  (28)  (aa))
       - Half-open paren (1)  a)  iv)  28))
       - Bracketed       ([1])
