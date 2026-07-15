@@ -182,6 +182,7 @@ COLUMN_REGISTRY: Dict[str, Agg] = {
     "same_table": Agg.DROP,
     "shifted_left": Agg.DROP,
     "y_decreases": Agg.DROP,
+    "encapsulation_split": Agg.DROP,
 
     # --- heading hierarchy -----------------------------------------------------
     "heading_id": Agg.FIRST,

@@ -62,53 +62,53 @@ describe them:
                  when vstack_gap_em exceeds config.vstack_max_gap_em (the next
                  cell is then a separate block, not a continued line). A change
                  in font styling (font_family, font_size, non_stroking_color)
-                 between the two cells also breaks into a new id.
+                 between the two cells also breaks into a new id, as does a cell
+                 whose text ends in a subheading colon ("Race/Ethnicity:",
+                 "Race/Ethnicity:[^(a)]") — the next cell then starts a new id.
   vstack_width : the run's bounding-box width, max(x_right) - min(x_left) over
                  its cells (i.e. the width of the merged multi-line cell).
   vstack_n_cells: number of cells in the run (all runs, incl. size-1).
   vstack_n_lines: number of visible lines in the run = sum of each cell's
                  line_ids length (mcid: one cell can be several visible lines).
-                 This — not the cell count — drives the score_max_lines cap.
+                 This — not the cell count — feeds the score_line_tiers band.
   vstack_score : how table-cell-like a run is, scored only for runs with >= 2
-                 cells (else NaN). Excluded -> NaN when the run is too tall
-                 (> score_max_lines visible lines) or too wide (off the widest
-                 score_width_tiers row). Otherwise summed from:
+                 cells (else NaN). The ONLY thing that excludes a real stack
+                 (-> NaN) is the alone-in-y-band hard gate (see
+                 vstack_alone_in_band); every band below is a pure score.
+                 Summed from:
                    width tier (vstack_width vs page content span = max x_right -
                      min x_left, like the gutter extractor): see config
-                     score_width_tiers (default < 1/5 -> +3, < 1/4 -> +2,
-                     1/4..1/3 -> 0, 1/3..1/2 -> -1);
+                     score_width_tiers as lower bounds (ratio >= min): < 1/5 -> +3,
+                     >= 1/5 -> +2, >= 1/4 -> 0, >= 1/3 -> -3, >= 1/2 -> -6; a
+                     score, never an exclusion);
+                   line tier (vstack_n_lines): score_line_tiers — a table cell is
+                     a few lines (2-3 -> +3, 4 -> +2) and tall runs are penalised
+                     rather than excluded (>= 7 -> -2, >= 10 -> -3, >= 15 -> -5);
+                   grid: +score_grid_cell_match_bonus when every cell shares one
+                     non-null grid_cell_id (all in the same detected grid cell);
+                   table-rule: every cell sharing one non-null shape_id_tr_above
+                     scores +score_shape_tr_above_bonus, shape_id_tr_below the
+                     same, and both together score_shape_tr_both_bonus; but a
+                     shape_id that is below one cell and above another in the run
+                     is a divider cutting through it -> score_shape_tr_internal_penalty;
                    enter (both axes): +2 if entered UP+RIGHT, +1 if DOWN+LEFT;
                    exit  (both axes): +2 if it exits DOWN+LEFT, +2 if NONE+RIGHT.
+  vstack_alone_in_band: bool — the alone-in-y-band hard gate's verdict. True when
+                 the run is a >= 2-cell stack with no sibling cell beside it in the
+                 y-band it spans (a centered title/heading), which is exactly the
+                 case that blanks vstack_score to NaN. False otherwise, including
+                 every size-1 run. Makes the one exclusion auditable rather than a
+                 silent NaN. Gated by config.score_require_band_siblings.
 """
 
 from __future__ import annotations
 
 import ast
+import re
 from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
-
-
-def _count_line_ids(v) -> int:
-    """
-    Number of visible lines a cell represents = number of entries in its line_ids.
-
-    In-pipeline line_ids is a list; from a re-read CSV it is its string repr. Both
-    are handled. A missing/empty value counts as 1 (the cell is one line).
-    """
-    if isinstance(v, (list, tuple, set, np.ndarray, pd.Series)):
-        return len(v)
-    if isinstance(v, str):
-        s = v.strip()
-        if not s or s == "[]":
-            return 0
-        try:
-            parsed = ast.literal_eval(s)
-            return len(parsed) if hasattr(parsed, "__len__") else 1
-        except (ValueError, SyntaxError):
-            return s.count(",") + 1
-    return 1
 
 
 # ================================================================================
@@ -117,6 +117,11 @@ def _count_line_ids(v) -> int:
 
 @dataclass(frozen=True)
 class RowGroupConfig:
+
+    # --------------------
+    # V-stack assignment
+    # --------------------
+
     # |Δ y_center| <= this (pt) counts as "same height" -> y_movement NONE.
     # Also the slack for "shares a top/bottom edge". Catches alignment jitter
     # between side-by-side cells that share a row. Keep well below line spacing.
@@ -130,6 +135,13 @@ class RowGroupConfig:
     # (mcid-proof: independent of how many visual lines each cell spans). A normal
     # line continuation is ~0.2-0.3em; lower this later to split tighter.
     vstack_max_gap_em: float = 0.8
+    # Relaxed gap limit for a "bonded" step: when the two consecutive cells share
+    # strong table evidence — one non-blank grid_cell_id, OR the same non-blank
+    # shape_id_tr_above AND shape_id_tr_below together (both rules — one alone is
+    # not enough) — they sit inside the same detected cell / rule-bounded row band,
+    # so a wider vertical gap (e.g. a tall table cell) still continues the run.
+    # Applied only when it exceeds vstack_max_gap_em; a NaN gap never breaks.
+    vstack_bonded_gap_em: float = 2.0
 
     # A change in font styling (font_family, font_size, non_stroking_color)
     # between two otherwise-continuing cells starts a new vstack_id: a restyle
@@ -140,25 +152,54 @@ class RowGroupConfig:
     # not split a run. font_family and non_stroking_color compare exactly.
     vstack_style_font_size_tol: float = 0.1
 
+    # A cell whose text ends in a colon — optionally trailed by a footnote /
+    # reference marker like "[^(a)]" or "(a)" — is a table subheading (e.g.
+    # "Race/Ethnicity:"). The next cell then starts a new vstack_id even on an
+    # otherwise-continuing (DOWN, NONE) step. Fires ONLY when the colon cell is the
+    # first of its run (a subheading is a left-column start; a colon on a cell that
+    # continued from above is mid-value, not a boundary). Set False to ignore.
+    vstack_break_on_colon_subheading: bool = True
+
+    # --------------------
+    # V-stack scoring
+    # --------------------
+
     # --- vstack scoring (only runs with >= 2 cells are scored) ---
-    # A run taller than this many *visible lines* is body text, not a table cell
-    # -> excluded. Counts entries across each cell's line_ids (mcid means one cell
-    # can already be several visible lines), not the number of cells in the run.
-    score_max_lines: int = 6
-    # Width score table. Each row is (width_fraction, score), where width_fraction
-    # is vstack_width as a fraction of the page *content* span (max x_right -
-    # min x_left over the page, like the gutter extractor — NOT page_width).
-    # Read it as upper bounds, narrowest first: a run takes the score of the first
-    # row it is still narrower than (ratio < width_fraction). A run wider than
-    # every row — i.e. >= the widest fraction below — is excluded (no score).
-    # To tweak: edit a score next to its fraction, or change the widest fraction
-    # to move the exclude cutoff. Keep the rows sorted narrow -> wide.
+    # Visible-line score table (vstack_n_lines: summed line_ids entries across the
+    # run's cells, mcid-aware — one cell can already be several visible lines). Each
+    # row is (min_lines, score), read as lower bounds tallest-first: a run takes the
+    # score of the first row whose min_lines it still reaches (n_lines >= min_lines).
+    # A table cell is a few lines (+); a tall run is body text and scored down (-)
+    # rather than hard-excluded, so height is now a signal, not a gate. Keep sorted.
+    score_line_tiers: tuple[tuple[int, float], ...] = (
+        (30, -15.0),  # n_lines >= 30
+        (20, -10.0),   # n_lines >= 20
+        (15, -8.0),   # n_lines >= 15
+        (12, -6.0),   # n_lines >= 15
+        (10, -5.0),   # 10..14
+        (7,  -3.0),   # 7..9
+        (5,  +0.0),   # 5..6
+        (4,  +2.0),   # 4
+        (2,  +5.0),   # 2..3
+    )                 # n_lines < 2 -> 0 (never happens: scored runs have >= 2 cells)
+    # Width score table, same lower-bound shape as score_line_tiers. width_ratio is
+    # vstack_width as a fraction of the page *content* span (max x_right - min x_left
+    # over the page, like the gutter extractor — NOT page_width). Each row is
+    # (min_ratio, score): a run takes the score of the WIDEST tier it still reaches
+    # (ratio >= min_ratio). Width is a SCORE, not a gate — the widest tier just
+    # carries the most negative points, so a wide run is penalised, not excluded,
+    # and can still survive on other evidence (a wide table cell sharing one
+    # grid_cell_id, say). The (0.0, ...) row is the base for the narrowest runs; a
+    # NaN ratio (no page span) scores 0. Keep sorted narrow -> wide.
     score_width_tiers: tuple[tuple[float, float], ...] = (
-        (1 / 5, +3.0),   # ratio < 1/5 of the page span
-        (1 / 4, +2.0),   # 1/5 <= ratio < 1/4
-        (1 / 3,  0.0),   # 1/4 <= ratio < 1/3
-        (1 / 2, -3.0),   # 1/3 <= ratio < 1/2
-    )                    # ratio >= 1/2  ->  excluded (no score)
+        (0.0,   +3.0),   # ratio < 1/5   (narrowest — base)
+        (1 / 5, +2.0),   # ratio >= 1/5
+        (1 / 4,  0.0),   # ratio >= 1/4
+        (1 / 3, -3.0),   # ratio >= 1/3
+        (1 / 2, -4.0),   # ratio >= 1/2  (widest)
+        (2 / 3, -5.0),   # ratio >= 1/2  (widest)
+        (4 / 5, -6.0),   # ratio >= 1/2  (widest)
+    )
     # Movement bonuses. Entering: how the cell before the run moved into it.
     # Exiting: how the run's last cell then moves on. A real column-stack is
     # typically entered from above/right and resumes flow afterwards. Each bonus
@@ -167,17 +208,37 @@ class RowGroupConfig:
     score_enter_down_left_bonus: float = 1.0   # preceded by DOWN and LEFT
     score_exit_down_left_bonus:  float = 2.0   # followed by DOWN and LEFT
     score_exit_none_right_bonus: float = 2.0   # followed by NONE and RIGHT
-    # Reject a run whose merged bbox would be alone in the y-band it spans — no
-    # other cell sits beside it (entirely left/right) overlapping that band. That
-    # is a centered multi-line title/heading block, not a table cell. A genuine
-    # column header shares its band with sibling columns. See _runs_alone_in_y_band.
+    # Grid / table-rule bonuses. Each fires only when EVERY cell in the run shares
+    # one non-null value of the column (a cell missing the id, or two cells
+    # disagreeing, earns nothing). grid_cell_id: all cells fall in the same detected
+    # grid cell — a near-certain table cell. shape_id_tr_above / _below: all cells
+    # share the same table-rule line above / below; both rules together bound a real
+    # table row, so that is scored much higher than either edge alone (replaces, not
+    # adds to, the two single-side bonuses).
+    score_grid_cell_match_bonus: float = 20.0  # all cells share one grid_cell_id
+    score_shape_tr_above_bonus:  float = 2.0   # all cells share one shape_id_tr_above
+    score_shape_tr_below_bonus:  float = 2.0   # all cells share one shape_id_tr_below
+    score_shape_tr_both_bonus:   float = 10.0  # above AND below both matched
+    # Internal table-rule penalty. When one shape_id is a cell's shape_id_tr_below
+    # AND another cell's shape_id_tr_above within the SAME run, that rule line sits
+    # between two of the run's cells — a horizontal divider cutting through the
+    # stack, so the cells below it are a separate row and should not have merged.
+    score_shape_tr_internal_penalty: float = -10.0  # a rule line splits the run
+    # HARD GATE (not a score): reject a run whose merged bbox would be alone in the
+    # y-band it spans — no other cell sits beside it (entirely left/right)
+    # overlapping that band. That is a centered multi-line title/heading block, not
+    # a table cell; a genuine column header shares its band with sibling columns.
+    # This is the ONLY thing that blanks vstack_score to NaN for a real (>= 2 cell)
+    # stack; it is recorded per cell in the vstack_alone_in_band column so the
+    # rejection is auditable. Set False to disable the gate (nothing excluded).
+    # See _runs_alone_in_y_band.
     score_require_band_siblings: bool = True
 
     # --- final grouped-row decision (grouped_row_id) ---
     # A vstack *seeds* a logical-row group when its vstack_score is >= this. An
     # unscored (NaN) run never seeds. Seeds are the confident multi-line table
     # cells that survived scoring; grouping grows outward from them.
-    grouped_min_score: float = 0.0
+    grouped_min_score: float = 1.0
     # Two vstacks are "line-adjacent" (a precondition to joining one row) when
     # their line_id ranges are within this many lines of touching: 0 = the ranges
     # must overlap, 1 = also back-to-back reading lines. Keeps a row local — it
@@ -188,6 +249,14 @@ class RowGroupConfig:
     # Bottom-alignment is the usual table-row signal (baselines line up); top/mid
     # catch the other layouts. Keep around a line's worth of slack.
     grouped_align_tol: float = 2.0
+    # Merge-eligibility gate. When True, only *winning* (seed) and *un-annotated*
+    # (size-1, NaN-score) vstacks may join a row; a *losing* vstack (finite score
+    # below grouped_min_score — a real >= 2-cell stack that scored badly) and an
+    # *alone* vstack (vstack_alone_in_band, a centered title) are barred from every
+    # union. Stops a stray winning run from dragging in the losing column or title
+    # beside it — the seed is then alone and correctly rejected. False = no gate
+    # (any aligned, line-adjacent pair may merge, the old behaviour).
+    grouped_gate_ineligible: bool = True
 
 
 CONFIG = RowGroupConfig()
@@ -216,6 +285,14 @@ def _is_na_scalar(v) -> bool:
         return bool(pd.isna(v))
     except (TypeError, ValueError):
         return False
+    
+
+def _style_val_eq(x, y) -> bool:
+    """Equal styling values, treating two missing values as equal."""
+    x_na, y_na = _is_na_scalar(x), _is_na_scalar(y)
+    if x_na or y_na:
+        return x_na and y_na
+    return _norm_style_val(x) == _norm_style_val(y)
 
 
 def _same_style_next(seq: pd.DataFrame, font_size_tol: float) -> np.ndarray:
@@ -253,12 +330,52 @@ def _same_style_next(seq: pd.DataFrame, font_size_tol: float) -> np.ndarray:
     return same
 
 
-def _style_val_eq(x, y) -> bool:
-    """Equal styling values, treating two missing values as equal."""
-    x_na, y_na = _is_na_scalar(x), _is_na_scalar(y)
-    if x_na or y_na:
-        return x_na and y_na
-    return _norm_style_val(x) == _norm_style_val(y)
+# A subheading colon: the text ends in ':' — optionally followed by a footnote /
+# reference marker ('[^...]' or '(...)') and trailing whitespace — e.g.
+# "Race/Ethnicity:" or "Race/Ethnicity:[^(a)]".
+def _same_nonnull_next(seq: pd.DataFrame, col: str) -> np.ndarray:
+    """
+    Per position t: do cells t and t+1 carry the same *non-blank* value of ``col``?
+
+    True only when both cells have the column present (non-NA) and equal — a shared
+    non-null id spanning the pair (e.g. one grid_cell_id, or one table-rule shape
+    id). Either side missing, or the two disagreeing, is False; so is the last
+    position (no successor). Absent column -> all False.
+    """
+    n = len(seq)
+    if col not in seq.columns:
+        return np.zeros(n, dtype=bool)
+    cur = seq[col].to_numpy(object)
+    nxt = seq[col].shift(-1).to_numpy(object)
+    return np.array(
+        [not _is_na_scalar(a) and not _is_na_scalar(b)
+         and _norm_style_val(a) == _norm_style_val(b)
+         for a, b in zip(cur, nxt)],
+        dtype=bool,
+    )
+
+
+_COLON_SUBHEADING_RE = re.compile(r":\s*(?:\[\^[^\]]*\]|\([^)]*\))?\s*$")
+
+
+def _ends_in_colon_subheading(seq: pd.DataFrame) -> np.ndarray:
+    """
+    Per position t: does cell t's text end in a subheading colon?
+
+    True when the text ends in ':' — optionally trailed by a footnote/reference
+    marker ('[^...]' or '(...)') and whitespace (see _COLON_SUBHEADING_RE). Such a
+    cell is a table subheading, so the run breaks *after* it: the next cell starts
+    a new vstack_id even on an otherwise-continuing step. Missing text (or no
+    'text' column) counts as not a subheading.
+    """
+    n = len(seq)
+    if "text" not in seq.columns:
+        return np.zeros(n, dtype=bool)
+    return np.array(
+        [isinstance(t, str) and _COLON_SUBHEADING_RE.search(t) is not None
+         for t in seq["text"].to_numpy(object)],
+        dtype=bool,
+    )
 
 
 def _assign_vstack_ids(
@@ -273,10 +390,18 @@ def _assign_vstack_ids(
 
     A step t -> t+1 continues the current run when it goes straight down in the
     same column (y_movement DOWN, x_movement NONE) AND the cells are close enough
-    vertically — vstack_gap_em <= config.vstack_max_gap_em (a larger gap is a
-    separate block; a NaN gap never breaks). When config.vstack_break_on_style_change
+    vertically — vstack_gap_em <= its gap limit (a larger gap is a separate block;
+    a NaN gap never breaks). The limit is config.vstack_max_gap_em, raised to
+    config.vstack_bonded_gap_em for a "bonded" step whose two cells share strong
+    table evidence — one non-blank grid_cell_id, or the same non-blank
+    shape_id_tr_above AND shape_id_tr_below together — since such cells sit inside
+    one detected cell / rule-bounded band. When config.vstack_break_on_style_change
     is set, a change in font styling (font_family, font_size, non_stroking_color)
-    also breaks the run, so a restyle starts a new id even mid-column.
+    also breaks the run, so a restyle starts a new id even mid-column. When
+    config.vstack_break_on_colon_subheading is set, a cell whose text ends in a
+    subheading colon (see _ends_in_colon_subheading) breaks the run after it —
+    but only when that colon cell is itself the first of its run (a subheading is
+    a left-column start; a colon on a cell continued from above is not a boundary).
 
     Returns (new_run, vstack_id_seq): new_run marks each run's first position
     (also consumed by scoring), vstack_id_seq is the dense 1..N id per position.
@@ -287,12 +412,38 @@ def _assign_vstack_ids(
     # AND the cells are close enough vertically. A gap above vstack_max_gap_em
     # means the next cell is a separate block (new paragraph/row), so the run
     # breaks there even though the step is (DOWN, NONE). NaN gap never breaks.
-    gap_ok = ~(gap_em > config.vstack_max_gap_em)   # NaN -> True (don't break)
+    # A step's gap limit is normally vstack_max_gap_em, but rises to
+    # vstack_bonded_gap_em when the two cells share strong table evidence: one
+    # non-blank grid_cell_id, OR the same non-blank shape_id_tr_above AND
+    # shape_id_tr_below together (both rules — a rule-bounded row band). Such a
+    # pair is inside one detected cell, so a wider gap still continues the run.
+    gap_limit = np.full(n, config.vstack_max_gap_em, dtype=float)
+    if config.vstack_bonded_gap_em > config.vstack_max_gap_em:
+        bonded = (
+            _same_nonnull_next(seq, "grid_cell_id")
+            | (_same_nonnull_next(seq, "shape_id_tr_above")
+               & _same_nonnull_next(seq, "shape_id_tr_below"))
+        )
+        gap_limit[bonded] = config.vstack_bonded_gap_em
+    gap_ok = ~(gap_em > gap_limit)                  # NaN -> True (don't break)
     cont = (y_mov == "DOWN") & (x_mov == "NONE") & gap_ok
 
     # A restyle between two cells breaks the run even on a continuing step.
     if config.vstack_break_on_style_change:
         cont = cont & _same_style_next(seq, config.vstack_style_font_size_tol)
+
+    # A subheading colon ("Race/Ethnicity:") breaks the run after that cell, so
+    # the values below it start a fresh vstack_id even on a continuing step — but
+    # only when the colon cell is itself the FIRST of its run. A subheading is
+    # normally a left-column start: the step into it was a column jump, not a
+    # continuation. A colon on a cell that physically continued from above (an
+    # ongoing vstack) is not a subheading boundary and must not split the run.
+    # `cont` here already reflects the gap/style breaks, so a colon cell right
+    # after such a break still counts as a run-start.
+    if config.vstack_break_on_colon_subheading:
+        is_run_start = np.ones(n, dtype=bool)
+        is_run_start[1:] = ~cont[:-1]
+        cont = cont & ~(_ends_in_colon_subheading(seq) & is_run_start)
 
     # A new run begins at position 0 and wherever the previous step was not a
     # continuation; cumsum then numbers runs densely in reading order.
@@ -303,26 +454,8 @@ def _assign_vstack_ids(
 
 
 # ================================================================================
-# VSTACK SCORING
+# VSTACK EXCLUSION
 # ================================================================================
-
-def _width_tier_score(
-    ratio: np.ndarray,
-    tiers: tuple[tuple[float, float], ...],
-) -> np.ndarray:
-    """
-    Map each width ratio to its tier score (see RowGroupConfig.score_width_tiers).
-
-    A ratio takes the score of the narrowest tier it is still below (ratio <
-    fraction). Wider than every tier — or a NaN ratio — yields NaN, which the
-    caller reads as "excluded". Assigning widest-first lets the narrowest match
-    win by overwrite, so tier order in the config is not load-bearing.
-    """
-    out = np.full(np.shape(ratio), np.nan, dtype=float)
-    for fraction, score in sorted(tiers, reverse=True):   # widest -> narrowest
-        out[ratio < fraction] = score
-    return out
-
 
 def _runs_alone_in_y_band(
     starts:     np.ndarray, ends:       np.ndarray,
@@ -357,6 +490,116 @@ def _runs_alone_in_y_band(
     return alone
 
 
+# ================================================================================
+# VSTACK SCORING
+# ================================================================================
+
+def _count_line_ids(v) -> int:
+    """
+    Number of visible lines a cell represents = number of entries in its line_ids.
+
+    In-pipeline line_ids is a list; from a re-read CSV it is its string repr. Both
+    are handled. A missing/empty value counts as 1 (the cell is one line).
+    """
+    if isinstance(v, (list, tuple, set, np.ndarray, pd.Series)):
+        return len(v)
+    if isinstance(v, str):
+        s = v.strip()
+        if not s or s == "[]":
+            return 0
+        try:
+            parsed = ast.literal_eval(s)
+            return len(parsed) if hasattr(parsed, "__len__") else 1
+        except (ValueError, SyntaxError):
+            return s.count(",") + 1
+    return 1
+
+
+def _tier_score(
+    value: np.ndarray,
+    tiers: tuple[tuple[float, float], ...],
+) -> np.ndarray:
+    """
+    Map each value to its tier score against a lower-bound table.
+
+    Tiers are (min_value, score): a value takes the score of the HIGHEST tier it
+    still reaches (value >= min_value). Assigning smallest-first lets the largest
+    match win by overwrite, so tier order in the config is not load-bearing. A
+    value below every tier — or NaN (comparisons are all False) — scores 0.
+
+    Shared by the width and line bands (see RowGroupConfig.score_width_tiers /
+    score_line_tiers). Both are pure scores, never exclusions: the widest / tallest
+    tier just carries the most negative points, and the config's smallest tier is
+    the base for everything below it (e.g. a (0.0, +3) row rewards the narrowest
+    runs).
+    """
+    out = np.zeros(np.shape(value), dtype=float)
+    for min_value, score in sorted(tiers):                # smallest -> largest
+        out[value >= min_value] = score
+    return out
+
+
+def _run_all_same_nonnull(
+    seq:        pd.DataFrame,
+    col:        str,
+    run_of_pos: np.ndarray,
+    n_runs:     int,
+) -> np.ndarray:
+    """
+    Per run: do all its cells share one and the same non-null value of ``col``?
+
+    True only when every cell in the run carries the column and they all agree —
+    a single distinct non-null value spanning the whole run. A missing value on
+    any cell, or two cells disagreeing, is False. A run whose cells all share one
+    grid_cell_id (or one table-rule shape id) is strong table evidence.
+
+    ``run_of_pos`` is the run index (0..n_runs-1) of each sequence position; runs
+    are contiguous, so this is cumsum(new_run) - 1. Absent column -> all False.
+    """
+    size = np.bincount(run_of_pos, minlength=n_runs)
+    if col not in seq.columns:
+        return np.zeros(n_runs, dtype=bool)
+    grp = pd.Series(seq[col].to_numpy(object)).groupby(run_of_pos)
+    idx = range(n_runs)
+    n_distinct = grp.nunique(dropna=True).reindex(idx, fill_value=0).to_numpy()
+    n_present  = grp.count().reindex(idx, fill_value=0).to_numpy()   # excludes NA
+    return (n_distinct == 1) & (n_present == size)
+
+
+def _run_has_internal_rule(
+    seq:        pd.DataFrame,
+    above_col:  str,
+    below_col:  str,
+    run_of_pos: np.ndarray,
+    n_runs:     int,
+) -> np.ndarray:
+    """
+    Per run: does one shape_id sit *below* one cell and *above* another within the
+    same run — i.e. a table-rule line crossing between the run's cells?
+
+    A horizontal rule at some y is the shape_id_tr_below of the cell above it and
+    the shape_id_tr_above of the cell below it. So a shape_id present in BOTH the
+    run's below values and its above values is sandwiched between two of the run's
+    cells: the divider splits the stack into separate rows and the run should not
+    have merged across it. (The two edges of any single cell are different lines,
+    so a match always spans two distinct cells.) Missing values are ignored; either
+    column absent -> all False.
+    """
+    out = np.zeros(n_runs, dtype=bool)
+    if above_col not in seq.columns or below_col not in seq.columns:
+        return out
+    frame = pd.DataFrame({
+        "run":   run_of_pos,
+        "above": seq[above_col].to_numpy(object),
+        "below": seq[below_col].to_numpy(object),
+    })
+    for run, g in frame.groupby("run", sort=False):
+        above = {v for v in g["above"] if not _is_na_scalar(v)}
+        if above and above & {v for v in g["below"] if not _is_na_scalar(v)}:
+            out[run] = True
+    return out
+
+
 def _score_vstack_runs(
     seq:              pd.DataFrame,
     new_run:          np.ndarray,
@@ -367,16 +610,29 @@ def _score_vstack_runs(
     config:           RowGroupConfig = CONFIG,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Score each contiguous vstack run. Only runs with >= 2 cells are scored; the
-    rest (and runs excluded for being too tall/wide) get NaN.
+    Score each contiguous vstack run. A run is a candidate only if it is a real
+    stack (>= 2 cells); a size-1 run gets NaN. Every candidate's raw score is
+    computed from the bands below — width and height are pure scores, never gates.
 
     All inputs are aligned to the reading-order sequence positions. ``new_run``
     marks each run's first position, so runs are contiguous blocks of the
     sequence — start/end positions and per-run sizes follow directly.
 
-    Score = width tier + enter bonus + exit bonus:
-      width tier: config.score_width_tiers via _width_tier_score (vstack_width as
-          a fraction of the page content span; too wide -> excluded/NaN).
+    Score = width tier + line tier + grid/shape bonus + enter bonus + exit bonus:
+      width tier: config.score_width_tiers via _tier_score (vstack_width as a
+          fraction of the page content span). A pure score: the widest tier just
+          carries the most negative points, it does NOT exclude.
+      line tier: config.score_line_tiers via _tier_score (vstack_n_lines).
+          Never excludes — a tall run is scored down, not dropped.
+      grid: +score_grid_cell_match_bonus when every cell shares one non-null
+          grid_cell_id (all in the same detected grid cell).
+      table-rule: every cell sharing one non-null shape_id_tr_above scores
+          +score_shape_tr_above_bonus, shape_id_tr_below the same; when BOTH
+          match the run scores score_shape_tr_both_bonus instead of their sum.
+      internal rule: +score_shape_tr_internal_penalty when one shape_id is a
+          cell's shape_id_tr_below and another cell's shape_id_tr_above in the
+          same run (a divider line cuts through the stack; see
+          _run_has_internal_rule).
       enter (movement of the cell *before* the run into it; both axes required):
           UP   AND RIGHT -> +score_enter_up_right_bonus
           DOWN AND LEFT  -> +score_enter_down_left_bonus
@@ -384,16 +640,18 @@ def _score_vstack_runs(
           DOWN AND LEFT  -> +score_exit_down_left_bonus
           NONE AND RIGHT -> +score_exit_none_right_bonus
 
-    The tall-run cap is on *visible lines* (summed line_ids entries across the
-    run's cells), not the cell count — mcid means one cell can already be several
-    visible lines.
+    Visible-line and grid/shape signals count *visible lines* / per-cell ids over
+    the run — mcid means one cell can already be several visible lines.
 
-    A qualifying run is additionally rejected (NaN) when it would be alone in its
-    y-band (see _runs_alone_in_y_band) — a centered title/heading, not a table
-    cell. ``seq`` supplies the per-cell bboxes (and line_ids) those checks need.
+    The ONE hard gate (config.score_require_band_siblings) then blanks the score
+    to NaN for any candidate that would be alone in its y-band (see
+    _runs_alone_in_y_band) — a centered title/heading, not a table cell. That
+    rejection is returned separately as ``alone`` so the caller can surface it as
+    vstack_alone_in_band. ``seq`` supplies the per-cell bboxes those checks need.
 
-    Returns (n_cells, n_lines, score) arrays, each broadcast over the run's
+    Returns (n_cells, n_lines, score, alone) arrays, each broadcast over the run's
     positions and aligned to the sequence (callers map them back by cell_id).
+    ``alone`` is the band-sibling gate verdict (False for non-candidate runs).
     """
     n = len(new_run)
     starts = np.where(new_run)[0]
@@ -420,8 +678,31 @@ def _score_vstack_runs(
     next_y = y_mov[ends]
     next_x = x_mov[ends]
 
-    # Width tier (narrower is more table-cell-like). NaN here == excluded.
-    width_score = _width_tier_score(ratio, config.score_width_tiers)
+    # Width tier (narrower is more table-cell-like). A pure score: wide runs take
+    # the widest tier's negative points, never excluded.
+    width_score = _tier_score(ratio, config.score_width_tiers)
+    # Line tier (a few lines is table-cell-like; tall runs scored down, not cut).
+    line_score = _tier_score(n_lines, config.score_line_tiers)
+
+    # Grid / table-rule bonuses: every cell of the run sharing one non-null id.
+    run_of_pos = np.cumsum(new_run) - 1                   # run index per position
+    grid_match = _run_all_same_nonnull(seq, "grid_cell_id", run_of_pos, len(starts))
+    above_match = _run_all_same_nonnull(seq, "shape_id_tr_above", run_of_pos, len(starts))
+    below_match = _run_all_same_nonnull(seq, "shape_id_tr_below", run_of_pos, len(starts))
+    grid_bonus = np.where(grid_match, config.score_grid_cell_match_bonus, 0.0)
+    # Both rules together bound a real row -> flat _both_ bonus, not the sum.
+    shape_bonus = np.where(
+        above_match & below_match, config.score_shape_tr_both_bonus,
+        np.where(above_match, config.score_shape_tr_above_bonus, 0.0)
+        + np.where(below_match, config.score_shape_tr_below_bonus, 0.0),
+    )
+    # A rule line running between the run's cells (one shape_id both below one
+    # cell and above another) splits the stack into separate rows -> penalty.
+    internal_rule = _run_has_internal_rule(
+        seq, "shape_id_tr_above", "shape_id_tr_below", run_of_pos, len(starts)
+    )
+    internal_penalty = np.where(internal_rule, config.score_shape_tr_internal_penalty, 0.0)
+
     enter_bonus = (
         np.where((prev_y == "UP")   & (prev_x == "RIGHT"), config.score_enter_up_right_bonus,  0.0)
         + np.where((prev_y == "DOWN") & (prev_x == "LEFT"),  config.score_enter_down_left_bonus, 0.0)
@@ -430,19 +711,22 @@ def _score_vstack_runs(
         np.where((next_y == "DOWN") & (next_x == "LEFT"),  config.score_exit_down_left_bonus,  0.0)
         + np.where((next_y == "NONE") & (next_x == "RIGHT"), config.score_exit_none_right_bonus, 0.0)
     )
-    raw_score = width_score + enter_bonus + exit_bonus
-
-    # Qualify: >= 2 cells, within the visible-line cap, and a usable width tier
-    # (NaN width_score = no/over-wide span -> excluded).
-    scored = (
-        (n_cells >= 2)
-        & (n_lines <= config.score_max_lines)
-        & np.isfinite(width_score)
+    raw_score = (
+        width_score + line_score + grid_bonus + shape_bonus
+        + internal_penalty + enter_bonus + exit_bonus
     )
 
-    # Band-sibling exclusion: drop runs whose merged bbox would be alone in its
-    # y-band (a centered title/heading block, not a table cell). Only checked for
-    # runs that otherwise qualify, so it never resurrects an excluded run.
+    # A run is a scoring CANDIDATE when it is an actual stack (>= 2 cells). Width
+    # and height feed the raw score above but never gate — a size-1 run is the
+    # only thing the score bands themselves exclude.
+    candidate = n_cells >= 2
+
+    # ── Hard gate: alone in its y-band ─────────────────────────────────────────
+    # The one exclusion. A candidate whose merged bbox has no sibling cell beside
+    # it (a centered title/heading, not a table cell) is gated out. Computed for
+    # every candidate so `alone` is a full per-run verdict the caller surfaces as
+    # vstack_alone_in_band; a non-candidate run is never alone (False).
+    alone = np.zeros(len(starts), dtype=bool)
     if config.score_require_band_siblings:
         cell_top   = seq["y_top"].to_numpy(float)
         cell_bot   = seq["y_bottom"].to_numpy(float)
@@ -459,10 +743,10 @@ def _score_vstack_runs(
         alone = _runs_alone_in_y_band(
             starts, ends, run_top, run_bot, run_left, run_right, run_page,
             cell_top, cell_bot, cell_left, cell_right, cell_page,
-            candidate_mask=scored, x_tol=config.x_tol,
+            candidate_mask=candidate, x_tol=config.x_tol,
         )
-        scored = scored & ~alone
 
+    scored = candidate & ~alone
     run_score = np.where(scored, raw_score, np.nan)
 
     # Broadcast per-run values back over the sequence (runs are contiguous and
@@ -471,6 +755,7 @@ def _score_vstack_runs(
         np.repeat(n_cells, n_cells),
         np.repeat(n_lines, n_cells),
         np.repeat(run_score, n_cells),
+        np.repeat(alone, n_cells),
     )
 
 
@@ -550,6 +835,14 @@ def assign_grouped_rows(
       aligned        their top edges, bottom edges, OR vertical centers match
                      within config.grouped_align_tol.
 
+    ...and both are merge-ELIGIBLE (config.grouped_gate_ineligible). Only winning
+    (seed) and un-annotated (size-1, NaN-score — a lone single-line cell) vstacks
+    are eligible; a losing vstack (finite score below grouped_min_score, a real
+    >= 2-cell stack that scored badly) and an alone vstack (vstack_alone_in_band,
+    a centered title) never join a row. This is the gate that stops a stray
+    winning run from dragging in the losing column or centered title beside it —
+    the seed is then alone in its component and rejected below.
+
     Adjacency + alignment is transitive (union-find), so a whole row of
     side-by-side columns collapses into one group with one merged bbox — a
     multi-line column header (all bottom-aligned), or a header stub beside its
@@ -582,6 +875,13 @@ def assign_grouped_rows(
     page = (df["page_number"].to_numpy() if "page_number" in df.columns
             else np.zeros(len(df), dtype=int))
 
+    # vstack_alone_in_band marks a centered title/heading (the alone-in-band gate);
+    # absent when scoring's band gate was disabled -> nothing is alone.
+    if "vstack_alone_in_band" in df.columns:
+        alone_col = df["vstack_alone_in_band"].fillna(False).to_numpy(bool)
+    else:
+        alone_col = np.zeros(len(df), dtype=bool)
+
     cell = pd.DataFrame({
         "page":      page,
         "vstack_id": df["vstack_id"].to_numpy(),
@@ -592,15 +892,16 @@ def assign_grouped_rows(
         "line_lo":   line_lo,
         "line_hi":   line_hi,
         "score":     pd.to_numeric(df["vstack_score"], errors="coerce").to_numpy(float),
+        "alone":     alone_col,
     })
 
-    # Collapse to one row per (page, vstack): its bbox, line span, and score
-    # (score is uniform within a vstack; max just ignores the NaN duplicates).
+    # Collapse to one row per (page, vstack): its bbox, line span, score, and
+    # alone flag (all uniform within a vstack; max just ignores the NaN dups).
     vs = (cell.groupby(["page", "vstack_id"], sort=True)
               .agg(x_left=("x_left", "min"), x_right=("x_right", "max"),
                    y_top=("y_top", "min"),   y_bottom=("y_bottom", "max"),
                    line_lo=("line_lo", "min"), line_hi=("line_hi", "max"),
-                   score=("score", "max"))
+                   score=("score", "max"), alone=("alone", "max"))
               .reset_index())
     n = len(vs)
     y_top = vs["y_top"].to_numpy(float)
@@ -610,7 +911,21 @@ def assign_grouped_rows(
     l_hi  = vs["line_hi"].to_numpy(float)
     pg    = vs["page"].to_numpy()
     score = vs["score"].to_numpy(float)
+    alone = vs["alone"].to_numpy(bool)
     vsid  = vs["vstack_id"].to_numpy()
+
+    # Merge eligibility (the gate). A vstack falls in one of four buckets by its
+    # score: winning (finite, >= grouped_min_score — the seeds), losing (finite,
+    # < min — a real >= 2-cell stack that scored badly, e.g. a body-text column),
+    # un-annotated (NaN because it is a size-1 run: a lone single-line cell like a
+    # stub first column), and alone (vstack_alone_in_band — a centered title whose
+    # score was blanked by scoring's band gate). Only winning and un-annotated may
+    # merge; losing and alone vstacks never join a row. This stops a stray winning
+    # run from dragging in the losing column or centered title beside it — the seed
+    # is then alone in its component and correctly rejected below.
+    is_winning = np.isfinite(score) & (score >= config.grouped_min_score)
+    is_losing  = np.isfinite(score) & (score <  config.grouped_min_score)
+    eligible   = ~is_losing & ~alone if config.grouped_gate_ineligible else np.ones(n, bool)
 
     tol = config.grouped_align_tol
     gap = config.grouped_line_gap_max
@@ -627,6 +942,11 @@ def assign_grouped_rows(
             j = order[oj]
             if pg[j] != pg[i] or l_lo[j] > l_hi[i] + gap:
                 break
+            # Losing / alone vstacks never merge (see `eligible`). `continue`, not
+            # `break`: an ineligible vstack mid-window must not stop the scan from
+            # reaching an eligible pair further on.
+            if not (eligible[i] and eligible[j]):
+                continue
             aligned = (abs(y_top[i] - y_top[j]) <= tol
                        or abs(y_bot[i] - y_bot[j]) <= tol
                        or abs(y_cen[i] - y_cen[j]) <= tol)
@@ -638,8 +958,7 @@ def assign_grouped_rows(
     # A component becomes a logical row only if it holds a seed (survivor) AND
     # actually merged (>= 2 vstacks). A lone seed that grouped with no neighbour,
     # and any vstack outside a seeded component, is left blank (rejected here).
-    is_seed   = np.isfinite(score) & (score >= config.grouped_min_score)
-    seed_root = set(roots[is_seed].tolist())
+    seed_root = set(roots[is_winning].tolist())
     comp_size = np.bincount(roots, minlength=n)
     in_group  = np.array(
         [roots[i] in seed_root and comp_size[roots[i]] >= 2 for i in range(n)]
@@ -996,7 +1315,7 @@ def group_multiline_cells(
     else:
         page_span_seq = np.full(len(seq), cur_xr.max() - cur_xl.min(), dtype=float)
 
-    vstack_n_cells_seq, vstack_n_lines_seq, vstack_score_seq = _score_vstack_runs(
+    vstack_n_cells_seq, vstack_n_lines_seq, vstack_score_seq, vstack_alone_seq = _score_vstack_runs(
         seq, new_run, vstack_width_seq, page_span_seq, y_mov, x_mov, config
     )
 
@@ -1010,9 +1329,13 @@ def group_multiline_cells(
     df["vstack_n_cells"] = df["cell_id"].map(dict(zip(cell_ids, vstack_n_cells_seq)))
     df["vstack_n_lines"] = df["cell_id"].map(dict(zip(cell_ids, vstack_n_lines_seq)))
     df["vstack_score"]   = df["cell_id"].map(dict(zip(cell_ids, vstack_score_seq)))
+    df["vstack_alone_in_band"] = df["cell_id"].map(dict(zip(cell_ids, vstack_alone_seq)))
 
     # ── Final decision: merge scored vstacks into logical rows (grouped_row_id) ─
     df = assign_grouped_rows(df, config)
+
+
+    """
 
     # ── Fold groups into the id space: 1 vstack -> 1 cell_id, 1 group -> 1
     # line_id, both renumbered densely (originals in cell_id_orig/line_id_orig).
@@ -1025,5 +1348,7 @@ def group_multiline_cells(
 
     # ── Physically collapse each merged cell_id back to a single row.
     df = rebuild_merged_cells(df)
+
+    """
 
     return df if df_words is None else (df, df_words)

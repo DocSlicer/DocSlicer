@@ -66,6 +66,8 @@ MASTER_COLUMN_ORDER: List[str] = [
 
     # ===== 1. Document / page identifiers =====
     "page_number",
+    "vstack_score",     # NOTE: temp
+    "grouped_row_id",   # NOTE: temp
     "page_label",
     "section",
     "section_id",           # docx
