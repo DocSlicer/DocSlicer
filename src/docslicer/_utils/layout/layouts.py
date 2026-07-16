@@ -725,7 +725,10 @@ def _merge_untagged_table_lines(
           ``config.table_bridge_font_tol`` pt of the run's last multi-cell line,
           its non_stroking_color matches (see _colors_present_equal — exact, or
           perceptual under ocr_color_match), and every gap around the bridged
-          line(s) is <= ``config.max_single_cell_bridge_gap`` pt;
+          line(s) is <= ``config.max_single_cell_bridge_gap`` pt.  A bridge is
+          also refused when the multi-cell rows it would join carry *different*
+          (both present) table_grid_ids — they are separate detected grids;
+          a missing id on either side does not block the bridge;
         - a vertical gap (y_top - prev y_bottom) larger than
           ``config.max_table_row_gap`` pt breaks the run (likely a separate table);
         - a *decreasing* y_top from one line to the next breaks the run and is
@@ -752,6 +755,7 @@ def _merge_untagged_table_lines(
     has_font  = "font_size" in line_df.columns
     has_color = "non_stroking_color" in line_df.columns
     has_bt    = "block_type" in line_df.columns
+    has_grid  = "table_grid_id" in line_df.columns
 
     updates: dict[object, int] = {}   # original index label -> new layout_id
 
@@ -765,6 +769,10 @@ def _merge_untagged_table_lines(
         fs    = pdf["font_size"].to_numpy(dtype=float) if has_font  else np.full(len(pdf), np.nan)
         nsc   = pdf["non_stroking_color"].to_numpy(dtype=object) if has_color else np.full(len(pdf), None, dtype=object)
         tagged = pdf["table_id"].notna().to_numpy()    if has_table else np.zeros(len(pdf), dtype=bool)
+        grid  = (
+            pdf["table_grid_id"].to_numpy(dtype=object)
+            if has_grid else np.full(len(pdf), None, dtype=object)
+        )
         # Normalized like _band_new_flags so the block_type comparison matches the
         # upstream split rule (fillna -> str -> lower); "" when the column is absent.
         bt    = (
@@ -825,7 +833,16 @@ def _merge_untagged_table_lines(
                         _colors_present_equal(nsc[m], nsc[last_multi], config)
                         for m in range(j, k)
                     )
-                    if gaps_ok and bt_ok and font_ok and color_ok:
+                    # Two multi-cell rows carrying *different* grid ids belong to
+                    # separate detected tables — never bridge across that seam.
+                    # A missing id on either side says nothing, so it stays allowed.
+                    grid_ok = (
+                        not has_grid
+                        or _is_na_scalar(grid[last_multi])
+                        or _is_na_scalar(grid[k])
+                        or grid[last_multi] == grid[k]
+                    )
+                    if gaps_ok and bt_ok and font_ok and color_ok and grid_ok:
                         run.extend(range(j, k + 1))
                         last_multi = k
                         j = k + 1

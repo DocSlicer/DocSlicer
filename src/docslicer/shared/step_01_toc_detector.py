@@ -445,7 +445,11 @@ def _add_toc_row_candidates(
             continue
 
         text = (raw_text or "").strip()
-        if not text or len(text) > max_chars:
+        if not text:
+            continue
+        # max_chars excludes dot-leader runs: a long leader (". . . . . . 68")
+        # shouldn't disqualify an otherwise short title.
+        if len(_DOT_LEADERS_RE.sub("", text)) > max_chars:
             continue
 
         # extract trailing token and classify via YAML

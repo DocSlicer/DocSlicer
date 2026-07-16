@@ -280,9 +280,13 @@ def _reconcile_colspan(df_cells: pd.DataFrame) -> pd.DataFrame:
     Fold the available column-span estimates into the final ``colspan`` by
     taking the per-cell max across _COLSPAN_SOURCES (NA-aware: a source missing
     for a cell doesn't drag the max down; a cell with no source at all stays
-    NA). Sources absent from the frame entirely (e.g. struct_col_span before the
-    struct extraction lands) are simply skipped, so this degrades to
-    max(colspan, grid_colspan) today.
+    NA), then clamping that claim to the room the cell actually has on its line
+    (see _clamp_colspan_to_line). Sources absent from the frame entirely (e.g.
+    struct_col_span before the struct extraction lands) are simply skipped, so
+    this degrades to max(colspan, grid_colspan) today.
+
+    ``col_end`` is rewritten to follow the reconciled span so the three column
+    fields stay consistent (col_end == col_start + colspan - 1).
 
     NOTE (future): this only *widens* to the largest claimed span. It does not
     yet look at unoccupied column positions to pad top-row header cells over the
@@ -299,8 +303,72 @@ def _reconcile_colspan(df_cells: pd.DataFrame) -> pd.DataFrame:
     with warnings.catch_warnings():          # all-NaN column -> NaN, not a warning
         warnings.simplefilter("ignore", RuntimeWarning)
         merged = np.nanmax(stacked, axis=0)
+
+    merged = _clamp_colspan_to_line(result, merged)
     result["colspan"] = pd.array(merged, dtype="Int64")
+
+    if "col_start" in result.columns:
+        # NaN in either operand propagates, so cells with no layout stay NA.
+        result["col_end"] = pd.array(
+            pd.to_numeric(result["col_start"], errors="coerce").to_numpy(float)
+            + merged - 1,
+            dtype="Int64",
+        )
     return result
+
+
+def _clamp_colspan_to_line(df_cells: pd.DataFrame, merged: np.ndarray) -> np.ndarray:
+    """
+    Shrink each cell's claimed span back to what fits on its line.
+
+    grid_colspan / struct_col_span are per *grid* cell, not per text cell: when
+    two text cells share one grid cell (or the struct tree over-merges), every
+    one of them inherits the full merged span and the naive max hands them each
+    the same, impossibly wide claim. E.g. a 4-column band whose line holds a
+    cell over columns [0,1] and another over column [2], both mapped to a
+    grid cell of span 4: the max makes both span 4, for 8 columns on a 4-column
+    row.
+
+    The room a cell actually has is bounded by its neighbours: starting at its
+    col_start it can run right only up to the next cell's col_start (or the end
+    of the band, for the line's last cell). So the example resolves to span 2
+    for the first cell (blocked by the cell at column 2) and span 2 for the
+    second (free to the band edge). The layout-inferred colspan is a floor --
+    clamping only ever gives back the span x-overlap already established.
+
+    Cells with no table / no column layout, and lines whose geometry is missing,
+    pass through untouched.
+    """
+    needed = {"table_id", "line_id", "col_start", "band_total_cols"}
+    if not needed.issubset(df_cells.columns):
+        return merged
+
+    col_start = pd.to_numeric(df_cells["col_start"], errors="coerce")
+    band      = pd.to_numeric(df_cells["band_total_cols"], errors="coerce")
+    usable = (df_cells["table_id"].notna() & col_start.notna() & band.notna()
+              & pd.notna(merged)).to_numpy()
+    if not usable.any():
+        return merged
+
+    # Carry positions explicitly -- df_cells' index is not guaranteed unique.
+    sub = pd.DataFrame({
+        "pos":       np.flatnonzero(usable),
+        "table_id":  df_cells["table_id"].to_numpy()[usable],
+        "line_id":   df_cells["line_id"].to_numpy()[usable],
+        "col_start": col_start.to_numpy(float)[usable],
+        "band":      band.to_numpy(float)[usable],
+    }).sort_values(["table_id", "line_id", "col_start"])
+
+    # Exclusive right bound: the next cell's col_start, or the band edge.
+    nxt   = sub.groupby(["table_id", "line_id"], sort=False)["col_start"].shift(-1)
+    limit = nxt.fillna(sub["band"])
+    room  = (limit - sub["col_start"]).clip(lower=1).to_numpy(float)
+
+    out   = merged.copy()
+    floor = pd.to_numeric(df_cells["colspan"], errors="coerce").to_numpy(float)
+    pos   = sub["pos"].to_numpy()
+    out[pos] = np.fmax(np.minimum(out[pos], room), floor[pos])
+    return out
 
 
 # ============================================================
@@ -473,40 +541,60 @@ def _assign_is_subheading(df_cells: pd.DataFrame) -> pd.DataFrame:
 # Numeric-like rows
 # ============================================================
 
-def _assign_is_numeric_like(df_cells: pd.DataFrame) -> pd.DataFrame:
+def _assign_is_numeric_cell(df_cells: pd.DataFrame) -> pd.DataFrame:
     """
-    Tag every cell with ``is_numeric_like`` (bool, per line): whether its line
-    looks like a table data row -- at least 3 populated cells, the first
-    populated cell (by x_left) is text (not a numeric value), and at least 2 of
-    the remaining cells are numeric. "Numeric" is numeric_value_mask: numbers
-    in various formats ($ 802,873 / 10% / 1.29 / (100)), standalone $ or %,
-    and dash / NA-style placeholders (- / NA / N/A / n.a.).
+    Tag every cell with ``is_numeric_cell`` (bool): a single vectorized
+    numeric_value_mask pass over the whole ``text`` column -- numbers in
+    various formats ($ 802,873 / 10% / 1.29 / (100)), standalone $ or %, and
+    dash / NA-style placeholders (- / NA / N/A / n.a.). Downstream row/line
+    aggregations (e.g. _assign_is_numeric_line) reuse this column instead of
+    recomputing the mask.
+    """
+    result = df_cells.copy()
+    if "text" not in result.columns:
+        result["is_numeric_cell"] = False
+        return result
+
+    result["is_numeric_cell"] = numeric_value_mask(result["text"]).to_numpy()
+    return result
+
+
+def _assign_is_numeric_line(df_cells: pd.DataFrame) -> pd.DataFrame:
+    """
+    Tag every cell with ``is_numeric_line`` (bool, per line): whether its line
+    looks like a numeric table data row -- among the line's populated cells,
+    excluding the row-label column (col_start == 0), at least 50% are numeric.
+    "Numeric" is is_numeric_cell (numeric_value_mask): numbers in various
+    formats ($ 802,873 / 10% / 1.29 / (100)), standalone $, %, or *, and
+    dash / NA-style placeholders (- / NA / N/A / n.a.), including those paired
+    with a currency symbol or "%" (e.g. "— %").
     """
     result = df_cells.copy()
     if "text" not in result.columns or "line_id" not in result.columns:
-        result["is_numeric_like"] = False
+        result["is_numeric_line"] = False
         return result
 
     stripped = result["text"].fillna("").astype(str).str.strip()
     populated = stripped.ne("")
-    numeric = numeric_value_mask(result["text"])
+    if "is_numeric_cell" in result.columns:
+        numeric = result["is_numeric_cell"].fillna(False).astype(bool)
+    else:
+        numeric = numeric_value_mask(result["text"])
 
-    sub = result.loc[populated, ["line_id"]].copy()
-    sub["_num"] = numeric.loc[sub.index]
-    if "x_left" in result.columns:
-        sub["_x"] = result.loc[sub.index, "x_left"]
-        sub = sub.sort_values(["line_id", "_x"], kind="stable")
+    if "col_start" in result.columns:
+        col0 = result["col_start"].eq(0).fillna(False)
+    else:
+        col0 = pd.Series(False, index=result.index)
+    eligible = populated & ~col0
 
-    stats = sub.groupby("line_id")["_num"].agg(
-        n_populated="size", n_numeric="sum", first_numeric="first"
-    )
-    ok = (
-        (stats["n_populated"] >= 3)
-        & ~stats["first_numeric"].astype(bool)
-        & (stats["n_numeric"] >= 2)
-    )
-    result["is_numeric_like"] = (
-        result["line_id"].map(ok).fillna(False).astype(bool)
+    line_id = result["line_id"]
+    n_eligible = eligible.groupby(line_id).sum()
+    n_numeric = (numeric & eligible).groupby(line_id).sum()
+    frac_numeric = n_numeric / n_eligible.astype(float).replace(0.0, np.nan)
+    ok = frac_numeric.ge(0.5).fillna(False)
+
+    result["is_numeric_line"] = (
+        line_id.map(ok).fillna(False).astype(bool)
     )
     return result
 
@@ -515,87 +603,66 @@ def _assign_is_numeric_like(df_cells: pd.DataFrame) -> pd.DataFrame:
 # Grid trustworthiness
 # ============================================================
 
-# A grid_row_start holding this many complete rows means several table rows
-# collapsed into one detected grid band -- the ruling grid is too coarse for the
-# content, so it's not trustworthy as the row structure.
-_SPARSE_GRID_ROW_MIN_COMPLETE = 3
+# A grid cell holding this many numeric cells has swallowed several real data
+# rows: one logical cell carries one value, so a stack of numbers inside a
+# single ruled box means the ruling is too sparse for the content there.
+_UNTRUSTWORTHY_GRID_CELL_MIN_NUMERIC = 3
 
 
-def _grid_partially_covers_table(grp: pd.DataFrame) -> bool:
+def _assign_grid_trust(df_cells: pd.DataFrame) -> pd.DataFrame:
     """
-    True when the table has genuine, complete, multi-cell data lines both with
-    and without a table_grid_id -- the ruling grid only covers part of the
-    table (e.g. a single shaded/ruled cell in an otherwise unruled table), so
-    it can't be trusted as the row structure for the lines it misses.
-    """
-    cells_per_line = grp.groupby("line_id")["cell_id"].transform("count")
-    is_data_line = grp["row_complete"].fillna(False).astype(bool) & (cells_per_line > 1)
-    has_grid = grp["table_grid_id"].notna()
-    gridded = (is_data_line & has_grid).any()
-    ungridded = (is_data_line & ~has_grid).any()
-    return bool(gridded and ungridded)
+    Tag every cell with the two trust columns, both nullable boolean and both
+    NA wherever the ruling grid didn't place the cell (no grid_cell_id -- a
+    grid-less table, or a cell outside the ruled area):
 
+      ``grid_cell_trustworthy`` -- per grid_cell_id. A grid cell is NOT
+        trustworthy when it contains >= _UNTRUSTWORTHY_GRID_CELL_MIN_NUMERIC
+        cells with is_numeric_cell True. A trustworthy grid cell holds one
+        logical value: either text (possibly wrapped over several lines, e.g.
+        "Comirnaty / (COVID-19 / Vaccine, / mRNA)") or a single number. A box
+        holding a stack of numbers (481 / 427 / 0.13 / 0.06) is several data
+        rows the sparse ruling failed to separate.
 
-def _assign_grid_trustworthy(df_cells: pd.DataFrame) -> pd.DataFrame:
-    """
-    Tag every cell with ``grid_trustworthy`` (nullable boolean): whether the
-    detected ruling grid can be trusted as the table's row/column structure.
-    Only meaningful for tables that actually have a detected grid; cells in a
-    grid-less table (or outside any table) get NA.
+      ``grid_row_trustworthy`` -- per (table_grid_id, grid_row_start). True
+        when every grid cell in that band is trustworthy: one over-packed box
+        makes the whole band's row structure unusable.
 
-    Per table_id (a table can legitimately span more than one detected grid,
-    e.g. a header grid and a body grid, so grid_id count alone says nothing
-    about trust):
-      1. If the ruling grid only covers part of the table -- some genuine,
-         multi-cell, complete data lines have a table_grid_id and others don't
-         -- it's not trustworthy: a grid drawn over only a corner or column of
-         the table (e.g. a single shaded header cell) isn't a reliable row
-         structure for the rest, so the whole grid is rejected.
-      2. Otherwise, trustworthy only when there is at least one qualifying data
-         band and no band is over-packed: if any grid_row_start holds
-         >= _SPARSE_GRID_ROW_MIN_COMPLETE distinct complete lines (row_complete)
-         the grid is too sparse (many real rows in one band) -> not trustworthy;
-         and if NO qualifying band exists at all (the grid never demonstrably
-         places a complete data row below the top band) -> also not trustworthy.
-         Excluded from the count: single-cell lines (cell_count == 1, e.g. a
-         subheading), and the top band (grid_row_start == 0), whose header rows
-         clear only the looser min_top threshold and would trip a false sparse.
-
-    E.g. a fully-ruled table (one grid row per data row) is trustworthy; a table
-    with far more rows than ruling lines packs several complete rows into a grid
-    band and is not.
+    Trust is scored per grid cell rather than per table because it varies
+    within one table: a header line can be tightly ruled (trustworthy) while
+    the body below it has only sparse rules that merge many data rows into each
+    band (untrustworthy).
     """
     result = df_cells.copy()
-    result["grid_trustworthy"] = pd.array([pd.NA] * len(result), dtype="boolean")
+    result["grid_cell_trustworthy"] = pd.array([pd.NA] * len(result), dtype="boolean")
+    result["grid_row_trustworthy"] = pd.array([pd.NA] * len(result), dtype="boolean")
 
-    need = {"table_id", "table_grid_id", "grid_row_start", "row_complete", "line_id"}
-    if not need.issubset(result.columns) or not result["table_id"].notna().any():
+    need = {"grid_cell_id", "is_numeric_cell", "table_grid_id", "grid_row_start"}
+    if not need.issubset(result.columns):
         return result
 
-    in_table = result["table_id"].notna()
-    for _, grp in result.loc[in_table].groupby("table_id", sort=False):
-        if grp["table_grid_id"].isna().all():
-            continue  # no detected grid -> not applicable, leave NA
-        if _grid_partially_covers_table(grp):
-            trust = False
-        else:
-            # Count only complete, multi-cell lines below the top band: a
-            # single-cell line (cell_count == 1, e.g. a subheading) must not
-            # inflate a band, and grid_row_start 0 rows pass only the looser
-            # min_top threshold so they'd falsely read as over-packed.
-            cells_per_line = grp.groupby("line_id")["cell_id"].transform("count")
-            keep = (
-                grp["row_complete"].fillna(False).astype(bool)
-                & (cells_per_line > 1)
-                & grp["grid_row_start"].ne(0).fillna(False).astype(bool)
-            )
-            per_row = grp[keep].groupby("grid_row_start")["line_id"].nunique()
-            # Need at least one qualifying data band with an acceptable count:
-            # a grid that never demonstrably places a complete data row below the
-            # top band (per_row empty) isn't trusted either.
-            trust = bool(len(per_row) > 0
-                         and (per_row < _SPARSE_GRID_ROW_MIN_COMPLETE).all())
-        result.loc[grp.index, "grid_trustworthy"] = trust
+    placed = result["grid_cell_id"].notna()
+    if not placed.any():
+        return result
+
+    numeric = result["is_numeric_cell"].fillna(False).astype(bool)
+    sub = result.loc[placed]
+
+    numeric_per_grid_cell = numeric.loc[placed].groupby(sub["grid_cell_id"]).sum()
+    cell_trust = numeric_per_grid_cell < _UNTRUSTWORTHY_GRID_CELL_MIN_NUMERIC
+    cell_trust_cells = sub["grid_cell_id"].map(cell_trust)
+
+    # A band is only as good as its worst grid cell, so min() over the band.
+    row_trust = cell_trust_cells.groupby(
+        [sub["table_grid_id"], sub["grid_row_start"]], dropna=False
+    ).min()
+    row_trust_cells = pd.MultiIndex.from_arrays(
+        [sub["table_grid_id"], sub["grid_row_start"]]
+    ).map(row_trust)
+
+    result.loc[placed, "grid_cell_trustworthy"] = pd.array(
+        cell_trust_cells.to_numpy(), dtype="boolean")
+    result.loc[placed, "grid_row_trustworthy"] = pd.array(
+        np.asarray(row_trust_cells), dtype="boolean")
     return result
 
 
@@ -609,6 +676,14 @@ def _line_summary(grp: pd.DataFrame) -> pd.DataFrame:
     One row per line_id of a single table, sorted by line_id (reading order),
     with the per-line signals row assignment needs. groupby().first() skips NA,
     so struct_row is the line's first non-NA struct_table_row_id.
+
+    ``grid_id`` / ``band`` locate the line in the ruling grid, both by max
+    across the line's cells. Max, not first: a cell spanning several bands
+    carries the grid_row_start of the *top* band it covers, so a line sitting
+    lower in that span sees a too-small value from it. Every other cell on the
+    line starts at the line's own band, so the max is that band. A line that
+    falls entirely inside spanning cells reports their top band and so reads as
+    a continuation of it, which is what it is.
     """
     agg: dict[str, tuple[str, str]] = {}
     if "struct_table_row_id" in grp.columns:
@@ -619,42 +694,105 @@ def _line_summary(grp: pd.DataFrame) -> pd.DataFrame:
         agg["is_subheading"] = ("is_subheading", "any")
     if "is_last_tr_below" in grp.columns:
         agg["is_last_tr"] = ("is_last_tr_below", "max")
-    if "is_numeric_like" in grp.columns:
-        agg["is_numeric_like"] = ("is_numeric_like", "any")
+    if "is_numeric_line" in grp.columns:
+        agg["is_numeric_line"] = ("is_numeric_line", "any")
+    if "table_grid_id" in grp.columns:
+        agg["grid_id"] = ("table_grid_id", "max")
+    if "grid_row_start" in grp.columns:
+        agg["band"] = ("grid_row_start", "max")
 
     lines = grp.groupby("line_id").agg(**agg).sort_index()
     for col, default in (("struct_row", pd.NA), ("row_complete", False),
                          ("is_subheading", False), ("is_last_tr", False),
-                         ("is_numeric_like", False)):
+                         ("is_numeric_line", False), ("grid_id", pd.NA),
+                         ("band", pd.NA)):
         if col not in lines.columns:
             lines[col] = default
     return lines
 
 
+def _band_trust_map(grp: pd.DataFrame) -> dict[tuple[float, float], bool]:
+    """
+    (grid_id, band) -> grid_row_trustworthy for every band the ruling grid
+    placed in this table. grid_row_trustworthy is constant within a band by
+    construction, so this is just a lookup keyed the way the line walk asks
+    for it. Bands the grid never placed are absent -> treated as untrusted.
+    """
+    if not {"table_grid_id", "grid_row_start", "grid_row_trustworthy"}.issubset(grp.columns):
+        return {}
+    g = pd.to_numeric(grp["table_grid_id"], errors="coerce")
+    b = pd.to_numeric(grp["grid_row_start"], errors="coerce")
+    placed = g.notna() & b.notna()
+    if not placed.any():
+        return {}
+    trust = grp["grid_row_trustworthy"].fillna(False).astype(bool)
+    by_band = (
+        pd.DataFrame({"g": g[placed], "b": b[placed], "t": trust[placed]})
+        .groupby(["g", "b"])["t"].all()
+    )
+    return {(float(k[0]), float(k[1])): bool(v) for k, v in by_band.items()}
+
+
+def _grid_span(
+    grid_id: float,
+    band: float,
+    span: float,
+    trust_by_band: dict[tuple[float, float], bool],
+) -> float:
+    """
+    The rowspan a cell's ruling geometry is worth, or NaN when the grid can't
+    be believed for it. Every trusted band collapses to exactly one logical row
+    (that's what trusting it means), so a cell spanning trusted bands spans that
+    many rows and grid_rowspan carries over unchanged. If any band it covers is
+    untrusted, that band explodes into however many rows the scratch walk finds
+    inside it and the grid's span no longer counts rows at all -> NaN, and the
+    caller falls back to 1.
+    """
+    if pd.isna(grid_id) or pd.isna(band) or pd.isna(span) or span <= 1:
+        return np.nan
+    if all(trust_by_band.get((float(grid_id), float(b)), False)
+           for b in range(int(band), int(band) + int(span))):
+        return float(span)
+    return np.nan
+
+
 def _assign_row_layout(df_cells: pd.DataFrame) -> pd.DataFrame:
     """
     Assign ``row_start`` (0-based logical row within the table, shared by all
-    cells of a line) and ``rowspan`` per cell. Three strategies, chosen per
-    table_id:
+    cells of a line) and ``rowspan`` per cell.
 
-    1. STRUCT (tagged table) -- takes precedence even over a trustworthy grid.
-       Walk the table's lines in line_id order; row_start increments whenever
-       the line's struct_table_row_id differs from the previous line's (a line
-       with no struct_table_row_id counts as its own new row). rowspan is
-       struct_row_span where > 1; where struct claims 1 but a trustworthy grid
-       says grid_rowspan > 1, the grid wins; else 1.
+    STRUCT (tagged table) takes precedence: walk the table's lines in line_id
+    order; row_start increments whenever the line's struct_table_row_id differs
+    from the previous line's (a line with no struct_table_row_id counts as its
+    own new row).
 
-    2. GRID (grid_trustworthy is True, no struct tagging) -- copy the detected
-       ruling grid's grid_row_start / grid_rowspan per cell. Cells the grid
-       didn't capture (no grid_cell_id, e.g. a footnote line outside the ruled
-       area) keep NA row_start.
+    Otherwise walk the lines in line_id order and decide per line whether it
+    opens a new row, because trust is per band, not per table. A line opens a
+    new row when:
 
-    3. SCRATCH (no struct, no trusted grid) -- first line gets row_start 0;
-       each next line increments when the line itself is a complete row
-       (row_complete), a subheading (is_subheading), or a numeric-like data
-       row (is_numeric_like), or when the previous line sat directly above a
-       table rule (is_last_tr_below) -- otherwise it continues the previous
-       logical row (wrapped / multiline cells). rowspan is 1 everywhere.
+      - it enters a different grid band than the line above it (including
+        entering or leaving the ruled area altogether) -- a band boundary is a
+        row boundary whether or not the band is trusted; or
+      - its band is NOT trusted (or the grid never placed it) and the SCRATCH
+        rule fires: the line is a complete row (row_complete), a subheading
+        (is_subheading), or a numeric-like data row (is_numeric_line), or the
+        line above sat directly on a table rule (is_last_tr_below).
+
+    Inside a TRUSTED band the scratch rule is ignored, so every line of the
+    band folds into the one row the ruling says it is -- that's a header whose
+    columns wrap over four lines becoming one row. Inside an UNTRUSTED band the
+    ruling is just a box drawn around many real rows, so the scratch rule splits
+    it line by line. A table ruled tightly at the header and sparsely below --
+    the common financial-statement layout -- therefore gets both: one folded
+    header row, then a row per data line.
+
+    This is one walk, not a grid/scratch fork: a fully-trusted grid is the case
+    where every band folds (one row per band, exactly the ruling's structure),
+    and a grid-less table is the case where no band exists and the scratch rule
+    decides every line.
+
+    rowspan is struct_row_span where > 1, else the ruling grid's grid_rowspan
+    where every band the cell covers is trusted (see _grid_span), else 1.
 
     Cells outside a table layout get NA in both columns.
     """
@@ -680,59 +818,85 @@ def _assign_row_layout(df_cells: pd.DataFrame) -> pd.DataFrame:
         if "grid_rowspan" in result.columns
         else pd.Series(np.nan, index=result.index)
     )
-    grid_trust = (
-        result["grid_trustworthy"].fillna(False).astype(bool)
-        if "grid_trustworthy" in result.columns
-        else pd.Series(False, index=result.index)
+    grid_id_num = (
+        pd.to_numeric(result["table_grid_id"], errors="coerce")
+        if "table_grid_id" in result.columns
+        else pd.Series(np.nan, index=result.index)
     )
 
     in_table = result["table_id"].notna()
     for _, grp in result.loc[in_table].groupby("table_id", sort=False):
         lines = _line_summary(grp)
-        has_struct = lines["struct_row"].notna().any()
-        trusted_grid = bool(grid_trust.loc[grp.index].any())
+        trust_by_band = _band_trust_map(grp)
 
-        if has_struct:
+        # The ruling grid's own claim on each cell, kept only where every band
+        # the cell covers is trusted; NaN otherwise (see _grid_span).
+        span_from_grid = pd.Series(
+            [_grid_span(g, b, s, trust_by_band)
+             for g, b, s in zip(grid_id_num.loc[grp.index],
+                                grid_row_start.loc[grp.index],
+                                grid_rowspan.loc[grp.index])],
+            index=grp.index, dtype=float,
+        )
+
+        if lines["struct_row"].notna().any():
             # New logical row whenever struct_table_row_id changes between
             # consecutive lines. NA lines (untagged, e.g. an inserted
             # subheading) get a unique sentinel so each one is its own row.
             keys = lines["struct_row"].astype(object)
             keys = keys.where(keys.notna(), -pd.Series(lines.index, index=lines.index))
             row_start_by_line = (keys != keys.shift()).cumsum() - 1
-
-            span = struct_span.loc[grp.index].where(struct_span.loc[grp.index] > 1)
-            if trusted_grid:
-                # Struct says span 1 (or nothing) but the trusted ruling grid
-                # detected a taller cell -> take the grid's rowspan.
-                span = span.fillna(grid_rowspan.loc[grp.index].where(
-                    grid_rowspan.loc[grp.index] > 1))
-            rowspan_cells = span.fillna(1)
-
-        elif trusted_grid:
-            row_start_cells = grid_row_start.loc[grp.index]
-            # rowspan defaults to 1 only where the grid placed the cell at
-            # all; a cell outside the ruled area stays NA in both columns.
-            span_cells = grid_rowspan.loc[grp.index].fillna(1.0).where(
-                row_start_cells.notna())
-            result.loc[grp.index, "row_start"] = pd.array(
-                row_start_cells.to_numpy(), dtype="Int64")
-            result.loc[grp.index, "rowspan"] = pd.array(
-                span_cells.to_numpy(), dtype="Int64")
-            continue
-
+            row_cells = grp["line_id"].map(row_start_by_line)
         else:
-            increment = (
+            # Band key per line; the grid-less / unplaced lines share the -1
+            # sentinel so a run of them reads as one band and the scratch rule
+            # (not a spurious band change) decides where their rows break.
+            band_key = pd.Series(
+                list(zip(lines["grid_id"].astype(float).fillna(-1.0),
+                         lines["band"].astype(float).fillna(-1.0))),
+                index=lines.index,
+            )
+            band_changed = band_key.ne(band_key.shift())
+            band_trusted = band_key.map(lambda k: trust_by_band.get(k, False))
+
+            scratch = (
                 lines["row_complete"].fillna(False).astype(bool)
                 | lines["is_subheading"].fillna(False).astype(bool)
-                | lines["is_numeric_like"].fillna(False).astype(bool)
+                | lines["is_numeric_line"].fillna(False).astype(bool)
                 | lines["is_last_tr"].fillna(False).astype(bool).shift(fill_value=False)
             )
+            increment = band_changed | (~band_trusted & scratch)
             increment.iloc[0] = False           # first line is always row 0
             row_start_by_line = increment.cumsum()
-            rowspan_cells = pd.Series(1, index=grp.index)
+
+            # A trusted band folds to exactly one row, so first() is that row.
+            band_row = (
+                pd.DataFrame({"key": band_key, "row": row_start_by_line})
+                .loc[band_trusted.astype(bool)]
+                .groupby("key")["row"].first()
+                .to_dict()
+            )
+            # Where a trusted band placed the cell, its row comes from ITS OWN
+            # band rather than from the line its text landed on. The two differ
+            # for a cell whose text doesn't sit at the top of its box: a tall
+            # vertically-centred row label is grouped into a line belonging to a
+            # band further down, and keying it by that line would flush it late,
+            # to the row its text sits next to instead of the row it opens.
+            cell_key = pd.Series(
+                list(zip(grid_id_num.loc[grp.index].fillna(-1.0),
+                         grid_row_start.loc[grp.index].fillna(-1.0))),
+                index=grp.index,
+            )
+            # Cells the grid never placed, or placed in an untrusted band, are
+            # absent from band_row -> they keep their line's row.
+            row_cells = cell_key.map(band_row).fillna(
+                grp["line_id"].map(row_start_by_line))
+
+        span = struct_span.loc[grp.index].where(struct_span.loc[grp.index] > 1)
+        rowspan_cells = span.fillna(span_from_grid).fillna(1)
 
         result.loc[grp.index, "row_start"] = pd.array(
-            grp["line_id"].map(row_start_by_line).to_numpy(), dtype="Int64")
+            row_cells.to_numpy(), dtype="Int64")
         result.loc[grp.index, "rowspan"] = pd.array(
             rowspan_cells.to_numpy(), dtype="Int64")
 
@@ -845,8 +1009,9 @@ def build_tables(
     df_cells = _assign_row_completeness(df_cells)
     df_cells = _assign_last_tr_below(df_cells)
     df_cells = _assign_is_subheading(df_cells)
-    df_cells = _assign_is_numeric_like(df_cells)
-    df_cells = _assign_grid_trustworthy(df_cells)
+    df_cells = _assign_is_numeric_cell(df_cells)
+    df_cells = _assign_is_numeric_line(df_cells)
+    df_cells = _assign_grid_trust(df_cells)
     df_cells = _assign_row_layout(df_cells)
     df_cells = _assign_table_cell_ids(df_cells)
 

@@ -218,6 +218,14 @@ _NUMERIC_VALUE_RE = re.compile(
     rf'^(?=.*\d)[\s\d{re.escape(_NUMERIC_PUNCT)}]+$'
 )
 
+# Bare 20xx year token ("2024", "(2025)") -- excluded from is_numeric_value /
+# numeric_value_mask so a lone year cell isn't treated as a numeric data
+# value. Broader year phrasings (FY2025, 2027E) already fail _NUMERIC_VALUE_RE
+# since letters aren't in the numeric-punctuation class, so only the bare
+# digit form needs handling here; table_utils._YEAR_PAT covers the full set
+# of year phrasings for row/header-level "mentions a year" checks.
+_BARE_YEAR_RE = re.compile(r'^[\(\[]?\s*20[0-4]\d\s*[\)\]]?$')
+
 # NA-style "no value" placeholders, same role as the dashes ("Revenue  NA
 # 1,234  5%"). Matched case-insensitively (NA / n/a / N.A.).
 _NA_PLACEHOLDER_TOKENS: frozenset[str] = frozenset({"na", "n/a", "n.a."})
@@ -227,12 +235,32 @@ _NA_PLACEHOLDER_TOKENS: frozenset[str] = frozenset({"na", "n/a", "n.a."})
 # currency symbol.
 _UNIT_TOKENS: frozenset[str] = frozenset({"%"})
 
+# Footnote-style placeholder marker ("*" on its own, referring to a footnote
+# below) — same "no numeric value here" role as a dash/NA placeholder.
+_STAR_TOKEN: str = "*"
+
+# A dash/NA/star placeholder paired with a currency symbol or "%" on either
+# side ("— %", "$ –", "N/A%") — the placeholder marks "no value" and the
+# currency/unit is just the column's formatting bleeding into the cell, so
+# the pair as a whole still reads as numeric even though _NUMERIC_VALUE_RE's
+# digit requirement can't match it.
+_PLACEHOLDER_UNIT_CLASS = rf"(?:{_CURRENCY_SYM_CLASS}|%)"
+_PLACEHOLDER_CORE = "|".join(
+    re.escape(t)
+    for t in sorted({*_DASH_TOKENS, *_NA_PLACEHOLDER_TOKENS, _STAR_TOKEN}, key=len, reverse=True)
+)
+_PLACEHOLDER_RE = re.compile(
+    rf"^(?:{_PLACEHOLDER_UNIT_CLASS}\s*)?(?:{_PLACEHOLDER_CORE})\s*(?:{_PLACEHOLDER_UNIT_CLASS})?$",
+    re.IGNORECASE,
+)
+
 
 def is_numeric_value(text: object) -> bool:
     """
     True if *text* is a numeric/currency table value: a numeric value token
-    (see _NUMERIC_VALUE_RE), a standalone currency symbol or percent sign, or
-    a dash / NA placeholder.
+    (see _NUMERIC_VALUE_RE), a standalone currency symbol, percent sign, or
+    star, a dash / NA / star placeholder, or one of those placeholders paired
+    with a currency symbol or "%" (see _PLACEHOLDER_RE).
     """
     if text is None:
         return False
@@ -246,7 +274,9 @@ def is_numeric_value(text: object) -> bool:
         or t.lower() in _NA_PLACEHOLDER_TOKENS
         or t in _CURRENCY_SYMBOLS
         or t in _UNIT_TOKENS
-        or bool(_NUMERIC_VALUE_RE.match(t))
+        or t == _STAR_TOKEN
+        or (bool(_NUMERIC_VALUE_RE.match(t)) and not _BARE_YEAR_RE.match(t))
+        or bool(_PLACEHOLDER_RE.match(t))
     )
 
 
@@ -258,7 +288,9 @@ def numeric_value_mask(series: pd.Series) -> pd.Series:
         | s.str.lower().isin(_NA_PLACEHOLDER_TOKENS)
         | s.isin(_CURRENCY_SYMBOLS)
         | s.isin(_UNIT_TOKENS)
-        | s.str.match(_NUMERIC_VALUE_RE)
+        | s.eq(_STAR_TOKEN)
+        | (s.str.match(_NUMERIC_VALUE_RE) & ~s.str.match(_BARE_YEAR_RE))
+        | s.str.match(_PLACEHOLDER_RE)
     )
 
 

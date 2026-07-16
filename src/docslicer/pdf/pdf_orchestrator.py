@@ -302,6 +302,12 @@ def run_pipeline(
         with timed_step("table_building", logger=logger):
             df_cells, df_table_cells = build_tables(df_cells, df_grid_cells)
 
+            # Merge final table_id back onto df_lines (build_tables runs after build_lines,
+            # so df_lines otherwise never sees the final, dense table_id assign_layouts
+            # doesn't compute — block_type="table" is already set by assign_layouts).
+            line_table_id = df_cells.groupby("line_id")["table_id"].first()
+            df_lines["table_id"] = df_lines["line_id"].map(line_table_id)
+
         # Optional - Convert Y coordinates from page-relative to global
         #df_cells = convert_to_global_y_coordinates(df_cells)
 
