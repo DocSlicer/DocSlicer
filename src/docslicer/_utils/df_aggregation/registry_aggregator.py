@@ -68,8 +68,8 @@ class Agg(str, Enum):
     MAX = "max"
     SUM = "sum"
     ANY = "any"                        # boolean OR across the group (via max)
-    DOMINANT = "dominant"              # value from the row with the most alphabetic
-                                       # text (alpha_count, else char_count, else first)
+    DOMINANT = "dominant"              # value from the row with the most characters
+                                       # (char_count, else first)
     LIST = "list"                      # all values in row order (vectorised; much
                                        # faster than a per-group `list` override)
     SORTED_UNIQUE_LIST = "sorted_unique_list"  # unique non-null values, ascending
@@ -84,7 +84,7 @@ class Agg(str, Enum):
 Policy = Union[Agg, str, Callable[..., Any], list]
 
 # Weight columns for DOMINANT, in priority order.
-_DOMINANT_WEIGHT_COLS = ("alpha_count", "char_count")
+_DOMINANT_WEIGHT_COLS = ("char_count",)
 
 # Weight column for WEIGHTED_RATIO (falls back to plain mean when absent).
 _RATIO_WEIGHT_COL = "char_count"
@@ -774,7 +774,7 @@ def aggregate_to(
         grouped = work[[by]].drop_duplicates().reset_index(drop=True)
 
     # DOMINANT: one vectorised idxmax on the weight column picks, per group, the
-    # row with the most alphabetic text; its values are taken for all dominant
+    # row with the most characters; its values are taken for all dominant
     # columns at once. No per-group Python calls.
     if dominant_cols:
         weights = pd.to_numeric(work[dominant_weight], errors="coerce").fillna(0.0)

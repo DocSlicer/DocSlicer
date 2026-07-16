@@ -164,6 +164,16 @@ class RowGroupConfig:
     # V-stack scoring
     # --------------------
 
+    # HARD GATE (not a score): reject a run whose merged bbox would be alone in the
+    # y-band it spans — no other cell sits beside it (entirely left/right)
+    # overlapping that band. That is a centered multi-line title/heading block, not
+    # a table cell; a genuine column header shares its band with sibling columns.
+    # This is the ONLY thing that blanks vstack_score to NaN for a real (>= 2 cell)
+    # stack; it is recorded per cell in the vstack_alone_in_band column so the
+    # rejection is auditable. Set False to disable the gate (nothing excluded).
+    # See _runs_alone_in_y_band.
+    score_require_band_siblings: bool = True
+
     # --- vstack scoring (only runs with >= 2 cells are scored) ---
     # Visible-line score table (vstack_n_lines: summed line_ids entries across the
     # run's cells, mcid-aware — one cell can already be several visible lines). Each
@@ -224,21 +234,16 @@ class RowGroupConfig:
     # between two of the run's cells — a horizontal divider cutting through the
     # stack, so the cells below it are a separate row and should not have merged.
     score_shape_tr_internal_penalty: float = -10.0  # a rule line splits the run
-    # HARD GATE (not a score): reject a run whose merged bbox would be alone in the
-    # y-band it spans — no other cell sits beside it (entirely left/right)
-    # overlapping that band. That is a centered multi-line title/heading block, not
-    # a table cell; a genuine column header shares its band with sibling columns.
-    # This is the ONLY thing that blanks vstack_score to NaN for a real (>= 2 cell)
-    # stack; it is recorded per cell in the vstack_alone_in_band column so the
-    # rejection is auditable. Set False to disable the gate (nothing excluded).
-    # See _runs_alone_in_y_band.
-    score_require_band_siblings: bool = True
+
+    # --------------------
+    # Group winning V-stacks into rows
+    # --------------------
 
     # --- final grouped-row decision (grouped_row_id) ---
     # A vstack *seeds* a logical-row group when its vstack_score is >= this. An
     # unscored (NaN) run never seeds. Seeds are the confident multi-line table
     # cells that survived scoring; grouping grows outward from them.
-    grouped_min_score: float = 1.0
+    grouped_min_score: float = 0.0
     # Two vstacks are "line-adjacent" (a precondition to joining one row) when
     # their line_id ranges are within this many lines of touching: 0 = the ranges
     # must overlap, 1 = also back-to-back reading lines. Keeps a row local — it
@@ -1334,9 +1339,6 @@ def group_multiline_cells(
     # ── Final decision: merge scored vstacks into logical rows (grouped_row_id) ─
     df = assign_grouped_rows(df, config)
 
-
-    """
-
     # ── Fold groups into the id space: 1 vstack -> 1 cell_id, 1 group -> 1
     # line_id, both renumbered densely (originals in cell_id_orig/line_id_orig).
     df = reindex_grouped_ids(df)
@@ -1348,7 +1350,5 @@ def group_multiline_cells(
 
     # ── Physically collapse each merged cell_id back to a single row.
     df = rebuild_merged_cells(df)
-
-    """
 
     return df if df_words is None else (df, df_words)

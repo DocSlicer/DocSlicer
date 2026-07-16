@@ -58,7 +58,7 @@ from ._utils.coordinates import convert_to_global_y_coordinates
 
 # Global Utils
 from .._utils.layout.shape_processor import process_shapes
-from .._utils.layout.layouts import assign_layouts
+from .._utils.layout.layouts import assign_layouts, LayoutConfig
 from .._utils.layout.reading_order import assign_reading_order as assign_reading_order_fallback
 from .._utils.layout.line_number_detector import detect_line_numbers
 from .._utils.io.yaml_loader import load_yamls
@@ -279,7 +279,12 @@ def run_pipeline(
 
         # Step 14 - Layout Assignment (layout_id, layout_type - table vs text, layout_score)
         with timed_step("layout_assignment", logger=logger):
-            df_lines = assign_layouts(df_lines)
+            layout_config = (
+                LayoutConfig.for_ocr_second_pass()
+                if discovered_metadata.get("has_ocr")
+                else LayoutConfig.for_pdf()
+            )
+            df_lines = assign_layouts(df_lines, config=layout_config)
 
             # Merge layout_id onto df_cells
             line_layout = df_lines.set_index("line_id")[

@@ -393,12 +393,15 @@ def add_table_rule_relationships(
     side wins. A rule level with the word's box (its y-center inside the glyph box)
     is neither above nor below, so it is skipped.
 
-    A search can't cross a barrier line: the nearest line whose shape_role is in
+    A search can't cross a barrier line: the nearest horizontal line (shape_type ==
+    "line", shape_orientation == "horizontal") whose shape_role is in
     ``_TR_WALL_ROLES`` (a "separator", or an undetermined "other" line) and whose
-    x-span passes over the word acts as a wall on each side. A table rule beyond
-    that wall (farther from the word than the barrier) is excluded, so a word
-    directly under a full-width divider gets no shape_id_tr_below from rules living
-    below that divider.
+    x-span passes over the word acts as a wall on each side. Rects and vertical
+    lines are excluded even when their shape_role is still the unclassified
+    "other" default — only horizontal lines are eligible walls. A table rule
+    beyond that wall (farther from the word than the barrier) is excluded, so a
+    word directly under a full-width divider gets no shape_id_tr_below from rules
+    living below that divider.
 
     Columns added to df_words:
         shape_id_tr_above   obj — shape_id of the nearest qualifying rule above
@@ -417,7 +420,12 @@ def add_table_rule_relationships(
     if rules.empty:
         return df_words
     has_shape_id = "shape_id" in rules.columns
-    walls = df_shapes[df_shapes["shape_role"].isin(_TR_WALL_ROLES)]
+    wall_mask = df_shapes["shape_role"].isin(_TR_WALL_ROLES)
+    if "shape_type" in df_shapes.columns:
+        wall_mask &= df_shapes["shape_type"].astype("string") == "line"
+    if "shape_orientation" in df_shapes.columns:
+        wall_mask &= df_shapes["shape_orientation"].astype("string") == "horizontal"
+    walls = df_shapes[wall_mask]
 
     idx_arr = df_words.index.to_numpy()
     a_xl = df_words["x_left"].to_numpy(float)

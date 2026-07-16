@@ -27,7 +27,7 @@ from .._utils.layout.line_number_detector import (
     OCR_CONFIG as OCR_LINE_NUMBER_CONFIG,
 )
 from .._utils.layout.reading_order import assign_reading_order
-from .._utils.layout.layouts import LayoutConfig, assign_layouts
+from .._utils.layout.layouts import assign_layouts
 from .._utils.layout.shape_processor import process_shapes
 from .._utils.timing import timed_step
 
@@ -229,13 +229,11 @@ def run_ocr_pipeline(
 
     # 6) Estimate font size (per layout, too noisy on a line level)
     with timed_step("font_size_estimation", logger=logger):
-        df_words = assign_layouts(
-            df_words, line_level=False, config=LayoutConfig.for_ocr_prelim()
-        )
+        df_words = assign_layouts(df_words, line_level=False)
         df_words = estimate_ocr_font_sizes(df_words, method="word")
         
         # Drop the layout_id column (will later be assessed more accurately, this one was just to set the font sizes)
-        #df_words = df_words.drop(columns=["layout_id"], errors="ignore")
+        df_words = df_words.drop(columns=["layout_id"], errors="ignore")
 
     return df_words, df_shapes, df_grid_cells, df_gutters
 
