@@ -14,7 +14,8 @@ import pandas as pd
 from .._utils.df_aggregation.registry_aggregator import aggregate_to
 from .._utils.df_aggregation.text_merge import merge_text_within_line
 from .._utils.df_schemas import TABLE_CELLS_COLS, conform_table_cells
-from .._utils.table_utils import detect_cell_roles
+from .._utils.table.table_normalize import normalize_columns_by_table
+from .._utils.table.table_header import detect_cell_roles
 from .._utils.text_utils import numeric_value_mask
 
 # ============================================================
@@ -58,7 +59,7 @@ def _merge_grid_cell_layout(
     if (df_grid_cells is None or df_grid_cells.empty
             or "grid_cell_id" not in result.columns):
         for col in grid_cols:
-            result[col] = pd.array([pd.NA] * len(result), dtype="Int64")
+            result[col] = pd.Series(pd.NA, index=result.index, dtype="Int64")
         return result
 
     lookup = df_grid_cells[["grid_cell_id", *_GRID_CELL_LAYOUT_COLS]].rename(
@@ -83,7 +84,7 @@ def _assign_table_ids(
     order. Rows outside a table layout get NA.
     """
     result = df_cells.copy()
-    result["table_id"] = pd.array([pd.NA] * len(result), dtype="Int64")
+    result["table_id"] = pd.Series(pd.NA, index=result.index, dtype="Int64")
 
     if (result.empty or layout_col not in result.columns
             or type_col not in result.columns):
@@ -174,55 +175,70 @@ def _assign_column_layout(df_cells: pd.DataFrame) -> pd.DataFrame:
             col_rights[col_idx:col_idx + 1] = [e for _, e in segs]
 
     result = df_cells.copy()
-    for col in ("col_start", "col_end", "colspan", "band_total_cols"):
-        result[col] = pd.array([pd.NA] * len(result), dtype="Int64")
+    n = len(result)
 
-    if "table_id" not in result.columns:
-        return result
-    in_table = result["table_id"].notna()
-    if not in_table.any():
+    if "table_id" not in result.columns or not result["table_id"].notna().any():
+        for col in ("col_start", "col_end", "colspan", "band_total_cols"):
+            result[col] = pd.Series(pd.NA, index=result.index, dtype="Int64")
         return result
 
-    # Defaults are correct for single-cell tables; multi-cell tables override below.
-    table_idx = result.index[in_table]
-    result.loc[table_idx, "col_start"]       = 0
-    result.loc[table_idx, "col_end"]         = 0
-    result.loc[table_idx, "colspan"]         = 1
-    result.loc[table_idx, "band_total_cols"] = 1
+    in_table = result["table_id"].notna().to_numpy()
+    sub_pos  = np.flatnonzero(in_table)
 
-    # Only tables with >1 cell on some line need grid inference.
-    line_sizes = result.loc[table_idx].groupby("line_id", sort=False)["cell_id"].transform("count")
-    table_max  = line_sizes.groupby(result.loc[table_idx, "table_id"]).transform("max")
-    multi_cell_tables = set(result.loc[table_idx, "table_id"][table_max > 1].unique())
+    # Output accumulators (NaN -> NA outside tables); defaults are correct for
+    # single-cell tables, multi-cell tables override below.
+    cs_full  = np.full(n, np.nan)
+    ce_full  = np.full(n, np.nan)
+    btc_full = np.full(n, np.nan)
+    cs_full[sub_pos]  = 0
+    ce_full[sub_pos]  = 0
+    btc_full[sub_pos] = 1
 
-    for table_id, band_df in result.loc[table_idx].groupby("table_id", sort=False):
-        if table_id not in multi_cell_tables:
+    # One global sort by (table_id, line_id, x_left) replaces the per-line
+    # sort_values and the nested groupby iteration: everything below works on
+    # contiguous numpy slices of these sorted arrays.
+    sub = result.iloc[sub_pos]
+    tid_arr  = sub["table_id"].astype("int64").to_numpy()
+    line_arr = sub["line_id"].to_numpy()
+    xl_all   = sub["x_left"].to_numpy(dtype=float)
+    xr_all   = sub["x_right"].to_numpy(dtype=float)
+
+    order = np.lexsort((xl_all, line_arr, tid_arr))
+    st, sl   = tid_arr[order], line_arr[order]
+    sxl, sxr = xl_all[order], xr_all[order]
+    spos     = sub_pos[order]                    # positions in result, sorted
+
+    # Only tables with >1 cell on some line need grid inference. Line sizes
+    # are counted globally (per line_id over all in-table cells), matching the
+    # previous transform-based check.
+    _, line_inv, line_counts = np.unique(line_arr, return_inverse=True,
+                                         return_counts=True)
+    cell_line_size = line_counts[line_inv][order]
+
+    table_bounds = np.concatenate(
+        ([0], np.flatnonzero(np.diff(st)) + 1, [len(st)]))
+    for ti in range(len(table_bounds) - 1):
+        a, z = table_bounds[ti], table_bounds[ti + 1]
+        if cell_line_size[a:z].max() <= 1:
             continue  # already initialised with correct single-cell values
 
-        line_cell_counts = band_df.groupby("line_id").size()
-        seed_line_id     = line_cell_counts.idxmax()
+        # Line slices within [a, z): sl is sorted, x_left sorted within line.
+        line_starts = np.concatenate(
+            ([a], a + np.flatnonzero(np.diff(sl[a:z])) + 1, [z]))
+        n_lines = len(line_starts) - 1
+        line_sizes = np.diff(line_starts)
 
-        # Pre-group by line_id once; store sorted numpy arrays to avoid
-        # repeated DataFrame filtering and itertuples overhead.
-        line_groups: dict[int, tuple[np.ndarray, np.ndarray]] = {}
-        for lid, grp in band_df.groupby("line_id", sort=False):
-            grp_sorted = grp.sort_values("x_left")
-            line_groups[lid] = (
-                grp_sorted["x_left"].to_numpy(dtype=float),
-                grp_sorted["x_right"].to_numpy(dtype=float),
-            )
+        # Seed line: most cells; ties go to the lowest line_id (first max).
+        seed_idx = int(np.argmax(line_sizes))
+        s0, s1 = line_starts[seed_idx], line_starts[seed_idx + 1]
+        col_lefts:  list[float] = list(sxl[s0:s1])
+        col_rights: list[float] = list(sxr[s0:s1])
 
-        seed_xl, seed_xr = line_groups[seed_line_id]
-        col_lefts:  list[float] = list(seed_xl)
-        col_rights: list[float] = list(seed_xr)
-
-        all_line_ids = sorted(band_df["line_id"].unique())
-        seed_idx     = all_line_ids.index(seed_line_id)
-        lines_below  = all_line_ids[seed_idx + 1:]
-        lines_above  = list(reversed(all_line_ids[:seed_idx]))
-
-        for line_id in lines_below + lines_above:
-            xl_arr, xr_arr = line_groups[line_id]
+        # Walk lines below the seed (DOWN), then above (UP).
+        for li in (*range(seed_idx + 1, n_lines),
+                   *range(seed_idx - 1, -1, -1)):
+            l0, l1 = line_starts[li], line_starts[li + 1]
+            xl_arr, xr_arr = sxl[l0:l1], sxr[l0:l1]
             _maybe_split(xl_arr, xr_arr, col_lefts, col_rights)
             for xl, xr in zip(xl_arr, xr_arr):
                 _process_cell(xl, xr, col_lefts, col_rights)
@@ -230,10 +246,7 @@ def _assign_column_layout(df_cells: pd.DataFrame) -> pd.DataFrame:
         total_cols = len(col_lefts)
 
         # Vectorised final assignment: broadcast (n_cells, 1) vs (1, n_cols).
-        # This replaces the per-cell result.loc[mask] loop which was O(n²).
-        band_xl = band_df["x_left"].to_numpy(dtype=float)
-        band_xr = band_df["x_right"].to_numpy(dtype=float)
-
+        band_xl, band_xr = sxl[a:z], sxr[a:z]
         if total_cols > 0:
             cl_np = np.array(col_lefts)
             cr_np = np.array(col_rights)
@@ -245,15 +258,17 @@ def _assign_column_layout(df_cells: pd.DataFrame) -> pd.DataFrame:
                                total_cols - 1 - np.fliplr(overlap).argmax(axis=1),
                                total_cols)
         else:
-            cs_arr = np.full(len(band_df), total_cols, dtype=np.intp)
-            ce_arr = np.full(len(band_df), total_cols, dtype=np.intp)
+            cs_arr = np.full(z - a, total_cols, dtype=np.intp)
+            ce_arr = np.full(z - a, total_cols, dtype=np.intp)
 
-        # Assign to result in one shot using the original DataFrame index.
-        result.loc[band_df.index, "col_start"]       = cs_arr
-        result.loc[band_df.index, "col_end"]         = ce_arr
-        result.loc[band_df.index, "colspan"]         = ce_arr - cs_arr + 1
-        result.loc[band_df.index, "band_total_cols"] = total_cols
+        cs_full[spos[a:z]]  = cs_arr
+        ce_full[spos[a:z]]  = ce_arr
+        btc_full[spos[a:z]] = total_cols
 
+    result["col_start"]       = pd.array(cs_full, dtype="Int64")
+    result["col_end"]         = pd.array(ce_full, dtype="Int64")
+    result["colspan"]         = pd.array(ce_full - cs_full + 1, dtype="Int64")
+    result["band_total_cols"] = pd.array(btc_full, dtype="Int64")
     return result
 
 
@@ -609,7 +624,7 @@ def _assign_row_completeness(df_cells: pd.DataFrame) -> pd.DataFrame:
     result = df_cells.copy()
     needed = {"table_id", "band_total_cols", "colspan", "line_id"}
     if not needed.issubset(result.columns) or not result["table_id"].notna().any():
-        result["row_complete"] = pd.array([pd.NA] * len(result), dtype="boolean")
+        result["row_complete"] = pd.Series(pd.NA, index=result.index, dtype="boolean")
         return result
 
     in_table = result["table_id"].notna()
@@ -663,7 +678,7 @@ def _assign_last_tr_below(df_cells: pd.DataFrame) -> pd.DataFrame:
     else:
         has = pd.Series(False, index=result.index)
     if not has.any():
-        result["is_last_tr_below"] = pd.array([pd.NA] * len(result), dtype="boolean")
+        result["is_last_tr_below"] = pd.Series(pd.NA, index=result.index, dtype="boolean")
         return result
 
     sub = result.loc[has]
@@ -819,8 +834,8 @@ def _assign_grid_trust(df_cells: pd.DataFrame) -> pd.DataFrame:
     band (untrustworthy).
     """
     result = df_cells.copy()
-    result["grid_cell_trustworthy"] = pd.array([pd.NA] * len(result), dtype="boolean")
-    result["grid_row_trustworthy"] = pd.array([pd.NA] * len(result), dtype="boolean")
+    result["grid_cell_trustworthy"] = pd.Series(pd.NA, index=result.index, dtype="boolean")
+    result["grid_row_trustworthy"] = pd.Series(pd.NA, index=result.index, dtype="boolean")
 
     need = {"grid_cell_id", "is_numeric_cell", "table_grid_id", "grid_row_start"}
     if not need.issubset(result.columns):
@@ -859,9 +874,12 @@ def _assign_grid_trust(df_cells: pd.DataFrame) -> pd.DataFrame:
 
 def _line_summary(grp: pd.DataFrame) -> pd.DataFrame:
     """
-    One row per line_id of a single table, sorted by line_id (reading order),
-    with the per-line signals row assignment needs. groupby().first() skips NA,
-    so struct_row is the line's first non-NA struct_table_row_id.
+    One row per (table_id, line_id) across ALL tables at once, sorted by
+    (table_id, line_id) -- reading order within each table -- with the
+    per-line signals row assignment needs. One global groupby instead of one
+    per table: the per-call fixed cost of groupby().agg() dominates on
+    documents with hundreds of small tables. groupby().first() skips NA, so
+    struct_row is the line's first non-NA struct_table_row_id.
 
     ``grid_id`` / ``band`` locate the line in the ruling grid, both by max
     across the line's cells. Max, not first: a cell spanning several bands
@@ -887,7 +905,7 @@ def _line_summary(grp: pd.DataFrame) -> pd.DataFrame:
     if "grid_row_start" in grp.columns:
         agg["band"] = ("grid_row_start", "max")
 
-    lines = grp.groupby("line_id").agg(**agg).sort_index()
+    lines = grp.groupby(["table_id", "line_id"], sort=True).agg(**agg)
     for col, default in (("struct_row", pd.NA), ("row_complete", False),
                          ("is_subheading", False), ("is_last_tr", False),
                          ("is_numeric_line", False), ("grid_id", pd.NA),
@@ -897,14 +915,20 @@ def _line_summary(grp: pd.DataFrame) -> pd.DataFrame:
     return lines
 
 
-def _band_trust_map(grp: pd.DataFrame) -> dict[tuple[float, float], bool]:
+def _band_trust_maps(grp: pd.DataFrame) -> dict[object, dict[tuple[float, float], bool]]:
     """
-    (grid_id, band) -> grid_row_trustworthy for every band the ruling grid
-    placed in this table. grid_row_trustworthy is constant within a band by
-    construction, so this is just a lookup keyed the way the line walk asks
-    for it. Bands the grid never placed are absent -> treated as untrusted.
+    Per-table band trust, computed for ALL tables in one groupby:
+    table_id -> {(grid_id, band): grid_row_trustworthy} for every band the
+    ruling grid placed *within that table's cells*. grid_row_trustworthy is
+    constant within a band by construction (assigned per (table_grid_id,
+    grid_row_start) in _assign_grid_trust), so this is just a lookup keyed the
+    way the line walk asks for it. The maps must stay per table: one grid can
+    straddle two detected tables, and a band a table never touches must read
+    as untrusted for it even if the neighbouring table trusts it. Bands the
+    grid never placed are absent -> treated as untrusted.
     """
-    if not {"table_grid_id", "grid_row_start", "grid_row_trustworthy"}.issubset(grp.columns):
+    if not {"table_id", "table_grid_id", "grid_row_start",
+            "grid_row_trustworthy"}.issubset(grp.columns):
         return {}
     g = pd.to_numeric(grp["table_grid_id"], errors="coerce")
     b = pd.to_numeric(grp["grid_row_start"], errors="coerce")
@@ -913,10 +937,14 @@ def _band_trust_map(grp: pd.DataFrame) -> dict[tuple[float, float], bool]:
         return {}
     trust = grp["grid_row_trustworthy"].fillna(False).astype(bool)
     by_band = (
-        pd.DataFrame({"g": g[placed], "b": b[placed], "t": trust[placed]})
-        .groupby(["g", "b"])["t"].all()
+        pd.DataFrame({"tid": grp["table_id"][placed],
+                      "g": g[placed], "b": b[placed], "t": trust[placed]})
+        .groupby(["tid", "g", "b"])["t"].all()
     )
-    return {(float(k[0]), float(k[1])): bool(v) for k, v in by_band.items()}
+    maps: dict[object, dict[tuple[float, float], bool]] = {}
+    for (tid, gg, bb), v in by_band.items():
+        maps.setdefault(tid, {})[(float(gg), float(bb))] = bool(v)
+    return maps
 
 
 def _grid_span(
@@ -983,47 +1011,57 @@ def _assign_row_layout(df_cells: pd.DataFrame) -> pd.DataFrame:
     Cells outside a table layout get NA in both columns.
     """
     result = df_cells.copy()
-    result["row_start"] = pd.array([pd.NA] * len(result), dtype="Int64")
-    result["rowspan"]   = pd.array([pd.NA] * len(result), dtype="Int64")
+    n = len(result)
 
     if "table_id" not in result.columns or not result["table_id"].notna().any():
+        result["row_start"] = pd.Series(pd.NA, index=result.index, dtype="Int64")
+        result["rowspan"]   = pd.Series(pd.NA, index=result.index, dtype="Int64")
         return result
 
-    struct_span = (
-        pd.to_numeric(result["struct_row_span"], errors="coerce")
-        if "struct_row_span" in result.columns
-        else pd.Series(np.nan, index=result.index)
-    )
-    grid_row_start = (
-        pd.to_numeric(result["grid_row_start"], errors="coerce")
-        if "grid_row_start" in result.columns
-        else pd.Series(np.nan, index=result.index)
-    )
-    grid_rowspan = (
-        pd.to_numeric(result["grid_rowspan"], errors="coerce")
-        if "grid_rowspan" in result.columns
-        else pd.Series(np.nan, index=result.index)
-    )
-    grid_id_num = (
-        pd.to_numeric(result["table_grid_id"], errors="coerce")
-        if "table_grid_id" in result.columns
-        else pd.Series(np.nan, index=result.index)
-    )
+    def _col_as_float(name: str) -> np.ndarray:
+        if name in result.columns:
+            return pd.to_numeric(result[name], errors="coerce").to_numpy(float)
+        return np.full(n, np.nan)
 
-    in_table = result["table_id"].notna()
-    for _, grp in result.loc[in_table].groupby("table_id", sort=False):
-        lines = _line_summary(grp)
-        trust_by_band = _band_trust_map(grp)
+    struct_span    = _col_as_float("struct_row_span")
+    grid_row_start = _col_as_float("grid_row_start")
+    grid_rowspan   = _col_as_float("grid_rowspan")
+    grid_id_num    = _col_as_float("table_grid_id")
 
-        # The ruling grid's own claim on each cell, kept only where every band
-        # the cell covers is trusted; NaN otherwise (see _grid_span).
-        span_from_grid = pd.Series(
-            [_grid_span(g, b, s, trust_by_band)
-             for g, b, s in zip(grid_id_num.loc[grp.index],
-                                grid_row_start.loc[grp.index],
-                                grid_rowspan.loc[grp.index])],
-            index=grp.index, dtype=float,
-        )
+    in_table = result["table_id"].notna().to_numpy()
+    sub_pos  = np.flatnonzero(in_table)          # positions of in-table cells
+    sub      = result.iloc[sub_pos]
+
+    # One global line summary and one global (but per-table-keyed) band-trust
+    # pass (see the helpers' docstrings), then a cheap numpy walk per table
+    # instead of per-table pandas groupbys.
+    lines_all  = _line_summary(sub)
+    trust_maps = _band_trust_maps(sub)
+
+    g = grid_id_num[sub_pos]
+    b = grid_row_start[sub_pos]
+    s = grid_rowspan[sub_pos]
+    sub_tid = sub["table_id"].to_numpy()
+
+    # The ruling grid's own claim on each cell, kept only where every band
+    # the cell covers is trusted; NaN otherwise (see _grid_span). Only cells
+    # with span > 1 can produce a value, so only those are checked.
+    span_from_grid = np.full(len(sub_pos), np.nan)
+    for i in np.flatnonzero(~np.isnan(g) & ~np.isnan(b) & (s > 1)):
+        span_from_grid[i] = _grid_span(
+            g[i], b[i], s[i], trust_maps.get(sub_tid[i], {}))
+
+    sub_line  = sub["line_id"].to_numpy()
+    row_start_sub = np.full(len(sub_pos), np.nan)
+
+    lines_by_tid = {
+        tid: frame.droplevel(0)
+        for tid, frame in lines_all.groupby(level=0, sort=False)
+    }
+    for tid, cpos in sub.groupby("table_id", sort=False).indices.items():
+        lines = lines_by_tid[tid]
+        line_index = lines.index.to_numpy()      # sorted line_ids of this table
+        trust_by_band = trust_maps.get(tid, {})
 
         if lines["struct_row"].notna().any():
             # New logical row whenever struct_table_row_id changes between
@@ -1031,61 +1069,72 @@ def _assign_row_layout(df_cells: pd.DataFrame) -> pd.DataFrame:
             # subheading) get a unique sentinel so each one is its own row.
             keys = lines["struct_row"].astype(object)
             keys = keys.where(keys.notna(), -pd.Series(lines.index, index=lines.index))
-            row_start_by_line = (keys != keys.shift()).cumsum() - 1
-            row_cells = grp["line_id"].map(row_start_by_line)
+            row_line = ((keys != keys.shift()).cumsum() - 1).to_numpy(float)
+            row_start_sub[cpos] = row_line[
+                np.searchsorted(line_index, sub_line[cpos])]
         else:
             # Band key per line; the grid-less / unplaced lines share the -1
             # sentinel so a run of them reads as one band and the scratch rule
             # (not a spurious band change) decides where their rows break.
-            band_key = pd.Series(
-                list(zip(lines["grid_id"].astype(float).fillna(-1.0),
-                         lines["band"].astype(float).fillna(-1.0))),
-                index=lines.index,
-            )
-            band_changed = band_key.ne(band_key.shift())
-            band_trusted = band_key.map(lambda k: trust_by_band.get(k, False))
+            grid_vals = lines["grid_id"].astype(float).fillna(-1.0).to_numpy()
+            band_vals = lines["band"].astype(float).fillna(-1.0).to_numpy()
+            band_changed = np.ones(len(lines), dtype=bool)
+            band_changed[1:] = ((grid_vals[1:] != grid_vals[:-1])
+                                | (band_vals[1:] != band_vals[:-1]))
+            band_trusted = np.fromiter(
+                (trust_by_band.get((gv, bv), False)
+                 for gv, bv in zip(grid_vals, band_vals)),
+                dtype=bool, count=len(lines))
 
             scratch = (
-                lines["row_complete"].fillna(False).astype(bool)
-                | lines["is_subheading"].fillna(False).astype(bool)
-                | lines["is_numeric_line"].fillna(False).astype(bool)
-                | lines["is_last_tr"].fillna(False).astype(bool).shift(fill_value=False)
+                lines["row_complete"].fillna(False).to_numpy(bool)
+                | lines["is_subheading"].fillna(False).to_numpy(bool)
+                | lines["is_numeric_line"].fillna(False).to_numpy(bool)
             )
-            increment = band_changed | (~band_trusted & scratch)
-            increment.iloc[0] = False           # first line is always row 0
-            row_start_by_line = increment.cumsum()
+            is_last_prev = np.empty(len(lines), dtype=bool)
+            is_last_prev[0] = False
+            is_last_prev[1:] = lines["is_last_tr"].fillna(False).to_numpy(bool)[:-1]
+            scratch |= is_last_prev
 
-            # A trusted band folds to exactly one row, so first() is that row.
-            band_row = (
-                pd.DataFrame({"key": band_key, "row": row_start_by_line})
-                .loc[band_trusted.astype(bool)]
-                .groupby("key")["row"].first()
-                .to_dict()
-            )
+            increment = band_changed | (~band_trusted & scratch)
+            increment[0] = False                # first line is always row 0
+            row_line = np.cumsum(increment).astype(float)
+
+            # A trusted band folds to exactly one row, so the first line's row
+            # (in line order) is that row.
+            band_row: dict[tuple[float, float], float] = {}
+            for i in np.flatnonzero(band_trusted):
+                key = (grid_vals[i], band_vals[i])
+                if key not in band_row:
+                    band_row[key] = row_line[i]
+
             # Where a trusted band placed the cell, its row comes from ITS OWN
             # band rather than from the line its text landed on. The two differ
             # for a cell whose text doesn't sit at the top of its box: a tall
             # vertically-centred row label is grouped into a line belonging to a
             # band further down, and keying it by that line would flush it late,
             # to the row its text sits next to instead of the row it opens.
-            cell_key = pd.Series(
-                list(zip(grid_id_num.loc[grp.index].fillna(-1.0),
-                         grid_row_start.loc[grp.index].fillna(-1.0))),
-                index=grp.index,
-            )
             # Cells the grid never placed, or placed in an untrusted band, are
             # absent from band_row -> they keep their line's row.
-            row_cells = cell_key.map(band_row).fillna(
-                grp["line_id"].map(row_start_by_line))
+            line_row = row_line[np.searchsorted(line_index, sub_line[cpos])]
+            cg = np.where(np.isnan(g[cpos]), -1.0, g[cpos])
+            cb = np.where(np.isnan(b[cpos]), -1.0, b[cpos])
+            row_start_sub[cpos] = [
+                band_row.get((cg[j], cb[j]), line_row[j])
+                for j in range(len(cpos))
+            ]
 
-        span = struct_span.loc[grp.index].where(struct_span.loc[grp.index] > 1)
-        rowspan_cells = span.fillna(span_from_grid).fillna(1)
+    # rowspan: struct_row_span where > 1, else the trusted grid span, else 1.
+    ss = struct_span[sub_pos]
+    rowspan_sub = np.where(ss > 1, ss,
+                           np.where(np.isnan(span_from_grid), 1.0, span_from_grid))
 
-        result.loc[grp.index, "row_start"] = pd.array(
-            row_cells.to_numpy(), dtype="Int64")
-        result.loc[grp.index, "rowspan"] = pd.array(
-            rowspan_cells.to_numpy(), dtype="Int64")
-
+    row_start_full = np.full(n, np.nan)
+    rowspan_full   = np.full(n, np.nan)
+    row_start_full[sub_pos] = row_start_sub
+    rowspan_full[sub_pos]   = rowspan_sub
+    result["row_start"] = pd.array(row_start_full, dtype="Int64")
+    result["rowspan"]   = pd.array(rowspan_full, dtype="Int64")
     return result
 
 
@@ -1104,7 +1153,7 @@ def _assign_table_cell_ids(df_cells: pd.DataFrame) -> pd.DataFrame:
     row_start, get NA.
     """
     result = df_cells.copy()
-    result["table_cell_id"] = pd.array([pd.NA] * len(result), dtype="Int64")
+    result["table_cell_id"] = pd.Series(pd.NA, index=result.index, dtype="Int64")
 
     key_cols = ["table_id", "row_start", "col_start"]
     if not set(key_cols).issubset(result.columns):
@@ -1169,11 +1218,19 @@ def _build_table_cells_df(df_cells: pd.DataFrame, debug: bool = False) -> pd.Dat
                          on="table_cell_id", how="left")
 
     if not out.empty and "table_id" in out.columns:
+        # Drop blank/paren spacer columns and merge %, (b), $ cells into their
+        # value neighbor (shared with the HTML pipeline). Cells can be dropped
+        # here, so table_cell_id is re-densified in reading order afterwards.
+        out = normalize_columns_by_table(out)
+        out = out.sort_values(["table_id", "row_start", "col_start"],
+                              kind="stable").reset_index(drop=True)
+        out["table_cell_id"] = pd.array(range(1, len(out) + 1), dtype="Int64")
+
         # detect_cell_roles processes every table in one vectorized pass,
         # grouping internally on (table_id, row_start).
         out = detect_cell_roles(out)
     else:
-        out["table_cell_role"] = pd.array([pd.NA] * len(out), dtype="string")
+        out["table_cell_role"] = pd.Series(pd.NA, index=out.index, dtype="string")
 
     return out #conform_table_cells(out, debug=debug)
 

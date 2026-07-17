@@ -36,7 +36,7 @@ import pandas as pd
 from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 
 from .._utils.df_schemas import conform_table_cells
-from .._utils.table_utils import detect_cell_roles
+from .._utils.table.table_header import detect_cell_roles
 from .._utils.text_utils import _CURRENCY_SYMBOLS
 
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)

@@ -28,7 +28,7 @@ from .step_02_run_extractor import (
     _iter_part_roots,
 )
 from .._utils.df_schemas import TABLE_CELLS_COLS, conform_table_cells
-from .._utils.table_utils import detect_cell_roles
+from .._utils.table.table_header import detect_cell_roles
 
 
 # ---------------------------------------------------------------------------

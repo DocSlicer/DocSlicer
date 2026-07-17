@@ -9,7 +9,7 @@ import re
 import numpy as np
 import pandas as pd
 
-from .text_utils import _CURRENCY_SYM_CLASS, numeric_value_mask
+from ..text_utils import _CURRENCY_SYM_CLASS, numeric_value_mask
 
 # ============================================================
 # Config
