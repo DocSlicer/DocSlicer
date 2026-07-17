@@ -1295,7 +1295,7 @@ def assign_layouts(
     join_cols = ["line_gap", "median_gap", "page_gap_thresh", "style_change", "layout_id"]
     if config.classify_types:
         line_df = assign_layout_types(line_df, layout_col="layout_id", config=config)
-        join_cols += ["layout_type", "layout_score"]
+        join_cols += ["layout_type", "layout_score", "block_type"]
 
     # ── Join back onto the input rows by line_id ─────────────────────────────
     band_cols = line_df.set_index("line_id")[join_cols]

@@ -288,9 +288,9 @@ def _reconcile_colspan(df_cells: pd.DataFrame) -> pd.DataFrame:
     ``col_end`` is rewritten to follow the reconciled span so the three column
     fields stay consistent (col_end == col_start + colspan - 1).
 
-    NOTE (future): this only *widens* to the largest claimed span. It does not
-    yet look at unoccupied column positions to pad top-row header cells over the
-    gaps they should cover -- that padding pass would slot in here, after the max.
+    The padding of top-row header cells over unoccupied column positions is a
+    separate second pass (_pad_header_colspans) that runs after the numeric
+    line flags are available.
     """
     result = df_cells.copy()
     present = [c for c in _COLSPAN_SOURCES if c in result.columns]
@@ -369,6 +369,192 @@ def _clamp_colspan_to_line(df_cells: pd.DataFrame, merged: np.ndarray) -> np.nda
     pos   = sub["pos"].to_numpy()
     out[pos] = np.fmax(np.minimum(out[pos], room), floor[pos])
     return out
+
+
+# ============================================================
+# Pad header colspans (second reconciliation pass)
+# ============================================================
+
+# Only the first few lines of a table are header candidates for gap padding.
+_PAD_MAX_HEADER_LINES = 3
+
+
+def _pad_header_colspans(df_cells: pd.DataFrame) -> pd.DataFrame:
+    """
+    Second colspan pass: widen top-row header cells over the column positions
+    they visually govern but never claimed.
+
+    _assign_column_layout spans a cell over exactly the columns its x-range
+    grazes, so a short header ("2025") lands on one column even when it heads
+    a group of three, and most PDFs have no grid_colspan / struct_col_span to
+    widen it in _reconcile_colspan. The result is top rows with unoccupied
+    column positions.
+
+    Header candidates are the first _PAD_MAX_HEADER_LINES lines of each
+    table, cut greedily at the first line that is numeric (is_numeric_line)
+    or occupies only column 0 (a subheading): if line 2 is numeric, line 3 is
+    out too even if it looks fine.
+
+    Each run of unoccupied positions on a header line sits between a *left
+    anchor* (the header cell ending just before the run; unusable when its
+    col_start is 0 -- label cells are never widened) and a *right anchor*
+    (the header cell starting just after; absent at the band edge). Every
+    position in the run is resolved against a *reference cell*: the first
+    cell on a later line that occupies the position (skipping col_start == 0
+    cells, whose geometry belongs to the label column). The position goes to
+    whichever anchor is horizontally closer to the reference cell, ties
+    going left, using the anchors' original x geometry throughout so one
+    extension can't drag the next position along.
+
+    Because both anchors must stay contiguous, the run is split once: the
+    left anchor's col_end grows over the positions up to the last
+    left-preferring reference, the right anchor's col_start slides back to
+    the first right-preferring one. Positions with no reference anywhere
+    below stay unfilled unless a claimed position beyond them pulls the
+    anchor across. Column 0 is never filled.
+
+    Header lines are processed top-down, and every processed line deposits
+    its cell edges (col_start and col_end + 1, post-padding) as *group
+    boundaries* that later lines must respect: an anchor is never widened
+    across a boundary from a line above, even when raw distance prefers it.
+    This prevents staggered headers -- e.g. a row-2 "Change" cell under the
+    "US" group grabbing the "$m" column that row 1 already assigned to
+    "Emerging Markets"; the blocked position falls to the other anchor when
+    that side can take it without crossing a boundary of its own.
+    """
+    result = df_cells.copy()
+    needed = {"table_id", "line_id", "col_start", "col_end", "colspan",
+              "band_total_cols", "x_left", "x_right", "is_numeric_line"}
+    if not needed.issubset(result.columns) or not result["table_id"].notna().any():
+        return result
+
+    col_start = pd.to_numeric(result["col_start"], errors="coerce").to_numpy(float)
+    col_end   = pd.to_numeric(result["col_end"],   errors="coerce").to_numpy(float)
+    band      = pd.to_numeric(result["band_total_cols"], errors="coerce").to_numpy(float)
+    x_left    = pd.to_numeric(result["x_left"],  errors="coerce").to_numpy(float)
+    x_right   = pd.to_numeric(result["x_right"], errors="coerce").to_numpy(float)
+    line_ids  = result["line_id"].to_numpy()
+    numeric_line = result["is_numeric_line"].fillna(False).to_numpy(bool)
+
+    usable = (result["table_id"].notna().to_numpy()
+              & ~np.isnan(col_start) & ~np.isnan(col_end) & ~np.isnan(band))
+    if not usable.any():
+        return result
+
+    changed: list[int] = []
+    pos_all = np.flatnonzero(usable)
+    for _, grp in pd.Series(pos_all).groupby(result["table_id"].to_numpy()[pos_all]):
+        tpos = grp.to_numpy()
+        b = int(band[tpos[0]])
+        if b <= 1:
+            continue
+
+        tline = line_ids[tpos]
+        uniq_lines = np.unique(tline)
+
+        # Per line: cell positions sorted by col_start, label column excluded
+        # (reference cells starting at col 0 carry label-column geometry).
+        ref_cells: dict = {}
+        for lid in uniq_lines:
+            lpos = tpos[tline == lid]
+            lpos = lpos[col_start[lpos] >= 1]
+            ref_cells[lid] = lpos[np.argsort(col_start[lpos])]
+
+        def _find_ref(c, after_lid):
+            for lid in uniq_lines[uniq_lines > after_lid]:
+                for p in ref_cells[lid]:
+                    if col_start[p] <= c <= col_end[p]:
+                        if np.isnan(x_left[p]) or np.isnan(x_right[p]):
+                            return None
+                        return x_left[p], x_right[p]
+            return None
+
+        # Group boundaries deposited by header lines already processed:
+        # cell edges (col_start / col_end + 1) that lower lines must not
+        # be widened across.
+        edges: set[int] = set()
+
+        for lid in uniq_lines[:_PAD_MAX_HEADER_LINES]:
+            lpos = tpos[tline == lid]
+            if numeric_line[lpos[0]] or col_start[lpos].max() == 0:
+                break  # greedy cut: everything below this line is out too
+
+            lpos = lpos[np.argsort(col_start[lpos])]
+            cs_l, ce_l = col_start[lpos], col_end[lpos]
+            occupied = np.zeros(b, dtype=bool)
+            for s, e in zip(cs_l, ce_l):
+                occupied[int(s):int(e) + 1] = True
+            missing = np.flatnonzero(~occupied[1:]) + 1
+
+            # Contiguous runs of missing positions.
+            breaks = np.flatnonzero(np.diff(missing) > 1) + 1
+            for run in (np.split(missing, breaks) if missing.size else ()):
+                a, z = int(run[0]), int(run[-1])
+                li = np.flatnonzero(ce_l == a - 1)
+                ri = np.flatnonzero(cs_l == z + 1)
+                left_ok  = li.size > 0 and cs_l[li[0]] != 0
+                right_ok = ri.size > 0
+                if not left_ok and not right_ok:
+                    continue
+                lx_right = x_right[lpos[li[0]]] if left_ok else np.nan
+                rx_left  = x_left[lpos[ri[0]]]  if right_ok else np.nan
+
+                # How far each anchor may reach without crossing a boundary
+                # from a line above. The left anchor [cs, ..] may grow its
+                # col_end up to k_max; the right anchor [.., ce] may slide
+                # its col_start down to q_min.
+                if left_ok:
+                    left_cs = int(col_start[lpos[li[0]]])
+                    k_max = min((e for e in edges if e > left_cs), default=z + 1) - 1
+                else:
+                    k_max = a - 1
+                if right_ok:
+                    right_ce = int(col_end[lpos[ri[0]]])
+                    q_min = max((e for e in edges if e <= right_ce), default=a)
+                else:
+                    q_min = z + 1
+
+                k, q = a - 1, z + 1
+                left_open = left_ok
+                for c in run:
+                    c = int(c)
+                    ref = _find_ref(c, lid)
+                    if ref is None:
+                        continue
+                    can_left  = left_open and c <= k_max
+                    can_right = right_ok and c >= q_min
+                    if not can_left and not can_right:
+                        left_open = False  # contiguity: left can't reach past c
+                        continue
+                    d_left  = ref[0] - lx_right if can_left else np.inf
+                    d_right = rx_left - ref[1] if can_right else np.inf
+                    if d_left <= d_right:
+                        k = c
+                    else:
+                        q = c
+                        break
+                if left_ok and k >= a:
+                    p = int(lpos[li[0]])
+                    col_end[p] = k
+                    changed.append(p)
+                if right_ok and q <= z:
+                    p = int(lpos[ri[0]])
+                    col_start[p] = q
+                    changed.append(p)
+
+            # This line's (post-padding) cell edges bound the lines below.
+            edges.update(int(s) for s in col_start[lpos])
+            edges.update(int(e) + 1 for e in col_end[lpos])
+
+    if not changed:
+        return result
+
+    idx = np.array(sorted(set(changed)))
+    for col, arr in (("col_start", col_start), ("col_end", col_end),
+                     ("colspan", col_end - col_start + 1)):
+        loc = result.columns.get_loc(col)
+        result.iloc[idx, loc] = arr[idx].astype(np.int64)
+    return result
 
 
 # ============================================================
@@ -1006,11 +1192,12 @@ def build_tables(
     df_cells = _assign_table_ids(df_cells)
     df_cells = _assign_column_layout(df_cells)
     df_cells = _reconcile_colspan(df_cells)
+    df_cells = _assign_is_numeric_cell(df_cells)
+    df_cells = _assign_is_numeric_line(df_cells)
+    df_cells = _pad_header_colspans(df_cells)
     df_cells = _assign_row_completeness(df_cells)
     df_cells = _assign_last_tr_below(df_cells)
     df_cells = _assign_is_subheading(df_cells)
-    df_cells = _assign_is_numeric_cell(df_cells)
-    df_cells = _assign_is_numeric_line(df_cells)
     df_cells = _assign_grid_trust(df_cells)
     df_cells = _assign_row_layout(df_cells)
     df_cells = _assign_table_cell_ids(df_cells)

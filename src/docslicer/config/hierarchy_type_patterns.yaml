@@ -58,9 +58,9 @@ hierarchy_rules:
     patterns:
       - regex: '^\s*(?:Subtitle|SUBTITLE)\s+'
 
-  - hierarchy_type: part        # Example: "Part II — Other Information"
+  - hierarchy_type: part        # Example: "Part II — Other Information", "Parts I and II"
     patterns:
-      - regex: '^\s*(?:Part|PART)\s+'
+      - regex: '^\s*(?:Part|PART)s?\s+' # Includes plural "Parts"
 
   - hierarchy_type: subpart     # Example: "Subpart B — Procedures"
     patterns:
@@ -98,9 +98,9 @@ hierarchy_rules:
     patterns:
       - regex: '^\s*§+\s*'
 
-  - hierarchy_type: item        # Example: "Item 1A. Risk Factors"
+  - hierarchy_type: item        # Example: "Item 1A. Risk Factors", "Items 1 and 2"
     patterns:
-      - regex: '^\s*(?:Item|ITEM)\s+'
+      - regex: '^\s*(?:Item|ITEM)s?\s+' # Includes plural "Items"
 
   - hierarchy_type: note        # Example: "Note 3 — Revenue Recognition"
     patterns:
