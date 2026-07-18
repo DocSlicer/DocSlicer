@@ -46,7 +46,7 @@ import numpy as np
 
 _MAX_LINES_TOP = 5
 _MAX_LINES_BOTTOM = 5
-_MAX_CELLS_PER_LINE = 4
+_MAX_CELLS_PER_LINE = 5
 
 # Marked-content tag that tagged PDFs use for page furniture (running
 # headers/footers, pagination). When present, page numbers almost always
@@ -249,6 +249,17 @@ _SPLIT_PRIMARY_RE = re.compile(r"[|]+|(?:\s+-\s+)|(?:\s+—\s+)|(?:\s+–\s+)")
 # Reject classic heading patterns like: "4. Title", "2.3 Revenue"
 _HEADING_LIKE_RE = re.compile(r"^\s*\d+(?:\.\d+)*\.\s+\S+")
 
+# Reject alpha/roman list-item markers like: "c. Revenue", "ii. Summary", "I. Introduction"
+_LIST_ITEM_ALPHA_RE = re.compile(r"^\s*[a-zA-Z]{1,5}\.\s+\S+")
+
+# Reject "I" used as the sentence-starting pronoun, not roman numeral one.
+# Examples: "I have reviewed...", "I, James Dimon, certify that:"
+_PROSE_START_I_RE = re.compile(r"^\s*I\s*,|^\s*I\s+[a-z]")
+
+# Whole cells longer than this are never page labels; guards against long prose
+# cells that happen to end in a digit or short token.
+_MAX_CELL_LEN = 40
+
 # "Page 1 of 19", "2 of 20" — end-anchored, 1-4 digits only.
 # End-anchored to avoid "3 of 10 items"; validated post-match: 0 < N ≤ M.
 _N_OF_M_RE = re.compile(r"\b(\d{1,4})\s+of\s+(\d{1,4})\s*$", re.IGNORECASE)
@@ -320,6 +331,16 @@ def _extract_candidate_tokens(raw_text: str, max_len: int, has_link: bool) -> li
     if _HEADING_LIKE_RE.match(raw):
         return []
 
+    # Hard exclude: looks like an alpha/roman list-item marker
+    # Examples: "c. Revenue", "ii. Summary", "I. Introduction"
+    if _LIST_ITEM_ALPHA_RE.match(raw):
+        return []
+
+    # Hard exclude: "I" as the sentence-starting pronoun, not roman numeral one
+    # Example: "I have reviewed the attached document."
+    if _PROSE_START_I_RE.match(raw):
+        return []
+
     # Hard exclude: prose-like cells (must contain . or ,)
     if _SENTENCE_LOWER_DOT_UPPER_RE.search(raw):
         return []
@@ -327,6 +348,10 @@ def _extract_candidate_tokens(raw_text: str, max_len: int, has_link: bool) -> li
     # Hard exclude: cells that contain links
     # Page labels are never hyperlinks; links are almost always body content or TOC
     if bool(has_link):
+        return []
+
+    # Hard exclude: whole cell is too long to plausibly be a page label
+    if len(raw.strip()) > _MAX_CELL_LEN:
         return []
 
 
@@ -1045,16 +1070,19 @@ def pick_pdf_page_label_winners_and_validate(
         if curr.val >= prev.val:
             return False
 
-        # heuristic: looks like a restart (high -> small)
-        if not (curr.val <= restart_curr_max and prev.val >= restart_prev_min):
-            return False
-
         # Valid restart if either:
-        #  (A) fingerprint changes (format change, e.g. roman -> arabic, wrapper/share change), OR
-        #  (B) fingerprint stays the same but the restart is supported by a +1 continuation
+        #  (A) fingerprint changes (format change, e.g. roman -> arabic, wrapper/share
+        #      change) — strong evidence on its own, so no magnitude gate. A short
+        #      roman preamble (i–iii) must be able to restart into arabic 1.
+        #  (B) fingerprint stays the same, the drop looks like a restart
+        #      (high -> small), and it is supported by a +1 continuation
         fp_changed = (prev.fp is not None and curr.fp is not None and prev.fp != curr.fp)
         if fp_changed:
             return True
+
+        # heuristic: looks like a restart (high -> small)
+        if not (curr.val <= restart_curr_max and prev.val >= restart_prev_min):
+            return False
 
         return _restart_has_support(curr, curr_page)
 
@@ -1167,16 +1195,16 @@ def pick_pdf_page_label_winners_and_validate(
         st = candidates_by_page[p][j]
         chosen_states.append((p, st))
 
-    # series id increments on restart (curr.val < prev.val) among non-blank chosen
+    # series id increments on restart (curr.val < prev.val) among non-blank chosen.
+    # Blank pages do NOT reset the comparison value: a decrease across a blank
+    # bridge (e.g. ...62, blank, A-2) is still a new series. Resetting here would
+    # merge the post-blank run into the previous series and QC would then clear
+    # it as a monotonicity violation.
     series_id = 1
     prev_nonblank_val = None
-    prev_nonblank_fp = None
 
     for p, st in chosen_states:
         if st.row_idx is None:
-            # blank page: don't mark, and also reset prev_nonblank_val
-            prev_nonblank_val = None
-            prev_nonblank_fp = None
             continue
 
         # detect restart (value decrease relative to previous nonblank)
@@ -1188,7 +1216,6 @@ def pick_pdf_page_label_winners_and_validate(
             series_id += 1
 
         prev_nonblank_val = st.val
-        prev_nonblank_fp = st.fp
 
         # mark final label on the chosen row
         out.at[st.row_idx, out_final_col] = st.token
@@ -1212,13 +1239,19 @@ def qc_pdf_page_label_series(
     block_type_col: str = "block_type",
     series_id_col: str = "page_label_series_id",
     enforce_unit_step: bool = False,
+    step_anomaly_tolerance_pct: float = 0.02,
+    series_hole_tolerance_pct: float = 0.02,
 ) -> pd.DataFrame:
     """
     Post-DP quality control that exploits the fact PDF page numbers are always known.
 
     Scans winner labels in page order, grouped by series_id. Within each series two
-    rules are applied and the first violating page — plus every page after it in that
-    series — is cleared.
+    step rules are applied. The series is judged holistically: a series is allowed
+    up to max(1, step_anomaly_tolerance_pct * series length) violating steps (a
+    62-page series with one printed-label quirk, e.g. the document skips label 36,
+    stays intact). Only when a series exceeds that tolerance is it distrusted, and
+    then the first violating page — plus every page after it in that series — is
+    cleared.
 
     Rule 1 — strict monotonicity (always on):
         Consecutive labeled pages must have strictly increasing values.
@@ -1240,6 +1273,19 @@ def qc_pdf_page_label_series(
         At least 50% of the document's distinct page numbers must have a winner
         label.  If fewer pages are labeled the detection is too sparse to trust
         and all labels are cleared.
+
+    Rule 5 — per-series plausibility (always on):
+        Each series is judged on its own and cleared wholesale if implausible:
+        - a 1-label series is never trusted (rejects a stray "19" or "c");
+        - a 2-3 label series must be hole-free and read exactly N, N+1(, N+2)
+          with start N <= run length ("1,2", "2,3", "1,2,3", "3,4,5" pass;
+          "1,7" or "19,20" do not);
+        - a longer series must start at a value <= its run length, unless it
+          labels 100% of the document's pages (academic offprints: a 4-page
+          paper labeled 952..955 is fine), and may contain at most
+          series_hole_tolerance_pct unlabeled holes within its page span
+          (rejects accidental sparse runs like "Exhibit 1, blank, Exhibit 2,
+          blank, blank, Exhibit 3" where half the span has no label).
 
     Pages cleared by this function are also stripped of block_type, series_id,
     value, and type so that the subsequent spread step treats them as unlabeled.
@@ -1301,27 +1347,57 @@ def qc_pdf_page_label_series(
     for _, grp in winners.groupby("_sid"):
         pages = grp["_p"].astype(int).tolist()
         values = grp["_v"].tolist()
+        n = len(pages)
 
-        if len(pages) < 2:
+        # Rule 5: per-series plausibility.
+        if n == 1:
+            pages_to_clear.update(pages)
             continue
 
-        bad_from: Optional[int] = None
+        span = pages[-1] - pages[0] + 1
+        holes = span - n
+        v0 = values[0]
+
+        if n <= 3:
+            # Tiny series: hole-free, exactly consecutive, start no deeper than
+            # the run length (1,2 / 2,3 / 1,2,3 / ... / 3,4,5).
+            if holes > 0 or not (1 <= v0 <= n) or any(values[i] != v0 + i for i in range(n)):
+                pages_to_clear.update(pages)
+                continue
+        else:
+            allowed_holes = max(1, int(round(series_hole_tolerance_pct * span)))
+            if holes > allowed_holes:
+                pages_to_clear.update(pages)
+                continue
+            # Start value must be plausible for a fresh series, unless the
+            # series labels the entire document (academic offprint case).
+            covers_full_doc = n == num_pages
+            if not covers_full_doc and not (1 <= v0 <= n):
+                pages_to_clear.update(pages)
+                continue
+
+        violations: List[int] = []
         for i in range(1, len(pages)):
             p1, v1 = pages[i - 1], values[i - 1]
             p2, v2 = pages[i], values[i]
 
             # Rule 1: value must strictly increase
             if v2 <= v1:
-                bad_from = i
-                break
-
+                violations.append(i)
             # Rule 2 (optional): value increment must equal page increment
-            if enforce_unit_step and (v2 - v1) != (p2 - p1):
-                bad_from = i
-                break
+            elif enforce_unit_step and (v2 - v1) != (p2 - p1):
+                violations.append(i)
 
-        if bad_from is not None:
-            pages_to_clear.update(pages[bad_from:])
+        if not violations:
+            continue
+
+        # Holistic tolerance: a long, otherwise-consistent series may contain a
+        # few printed-label anomalies; only distrust it beyond the tolerance.
+        allowed = max(1, int(round(step_anomaly_tolerance_pct * len(pages))))
+        if len(violations) <= allowed:
+            continue
+
+        pages_to_clear.update(pages[violations[0]:])
 
     if not pages_to_clear:
         return out

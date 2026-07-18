@@ -9,9 +9,15 @@ Pass A — build_temp_sections()
     then assemble a compact section index.  The temp_section_id is joined
     back to the row-level DataFrame as a new column.
 
-Pass B–D  (TODO: coming next)
-    Split temp sections for coverpage / last_page, assign human-readable
-    section labels, and smear the final 'section' column back to rows.
+Pass B — assign_coverpage_and_last_page()
+    Detect and mark coverpage and last_page sections, splitting a temp
+    section when only part of it qualifies.
+
+Pass C — assign_section_labels()
+    Assign human-readable section labels (financials, schedules, annex,
+    body, front_matter, back_matter) to the remaining unlabeled sections.
+
+The final 'section' column is then smeared back to rows in classify_sections().
 """
 from __future__ import annotations
 
@@ -34,6 +40,9 @@ _ARABIC_FORMATS: frozenset[str] = frozenset({"arabic", "arabic_sub"})
 _ROMAN_FORMATS: frozenset[str] = frozenset({"roman", "roman_numeric"})
 
 _TOC_BLOCK_TYPES: frozenset[str] = frozenset({"toc", "toc_heading"})
+
+# Max blank pages pulled into a following section that starts at value > 1
+_MAX_BLANK_PREFIX_PULL = 3
 
 # Extracts the leading letter from alpha-prefixed labels like "A-1", "F-12", "S-3"
 _ALPHA_PREFIX_RE = re.compile(r"^\s*([A-Za-z])\s*[-–.]")
@@ -103,110 +112,138 @@ def _parse_label_value(label_text: str | None, label_type: str | None) -> int | 
 # Pass A — step 1: reduce line-level df to one row per page
 # ================================================================================
 
-def _first_nonblank(s: pd.Series) -> object:
-    """Return the first non-null, non-empty-string value in *s*, or None."""
-    for v in s:
-        if v is None:
-            continue
-        if isinstance(v, float) and pd.isna(v):
-            continue
-        if isinstance(v, str) and not v.strip():
-            continue
-        return v
-    return None
-
-
 def _reduce_to_page_index(df: pd.DataFrame) -> pd.DataFrame:
     """
     Collapse the line-level DataFrame to one row per page.
+
+    Fully vectorized: every per-page signal is a single groupby over the
+    page_number key instead of a boolean slice of *df* per page.
 
     Output columns:
         page_number, label_type, label_value, label_blank,
         docx_section_id (int or None), has_toc_block (bool)
     """
     pn = df["page_number"].astype(int)
-    pages = sorted(pn.unique())
+    pages = pd.Index(sorted(pn.unique()), name="page_number")
+    n_pages = len(pages)
 
-    records = []
-    for p in pages:
-        rows = df[pn.eq(p)]
+    # Docx: prefer body rows for label extraction; header/footer rows carry
+    # their own repeated labels that shouldn't drive section boundaries.
+    # label_mask: body rows on pages that have any, all rows elsewhere.
+    if "header_footer_type" in df.columns:
+        is_body = df["header_footer_type"].astype(str).str.lower().eq("body")
+        label_mask = is_body | ~is_body.groupby(pn).transform("any")
+    else:
+        label_mask = pd.Series(True, index=df.index)
 
-        # Docx: prefer body rows for label extraction; header/footer rows carry
-        # their own repeated labels that shouldn't drive section boundaries.
-        if "header_footer_type" in rows.columns:
-            body = rows[rows["header_footer_type"].astype(str).str.lower().eq("body")]
-            label_rows = body if not body.empty else rows
-        else:
-            label_rows = rows
+    def _first_per_page(values: pd.Series, mask: pd.Series) -> pd.Series:
+        """First value of *values* per page among rows where *mask* holds."""
+        sub = values[mask]
+        if sub.empty:
+            return pd.Series(index=pages, dtype="object")
+        return sub.groupby(pn[mask]).first().reindex(pages)
 
-        # Dominant label type — prefer any known format over unknown/None
-        label_type: str | None = None
-        if "page_label_type" in label_rows.columns:
-            s = label_rows["page_label_type"].astype("string")
-            known = s[s.isin(_KNOWN_LABEL_FORMATS)]
-            if not known.empty:
-                label_type = str(known.iloc[0])
-            else:
-                raw = _first_nonblank(label_rows["page_label_type"])
-                label_type = str(raw) if raw is not None else None
+    # Dominant label type — prefer any known format over unknown/None
+    if "page_label_type" in df.columns:
+        lt = df["page_label_type"].astype("string")
+        lt_nonblank = lt.notna() & lt.str.strip().ne("")
+        known_first = _first_per_page(lt, label_mask & lt.isin(_KNOWN_LABEL_FORMATS))
+        any_first = _first_per_page(lt, label_mask & lt_nonblank)
+        type_per_page = known_first.where(known_first.notna(), any_first)
+        label_type = [str(v) if pd.notna(v) else None for v in type_per_page]
+    else:
+        label_type = [None] * n_pages
 
-        # First integer label value on this page.
-        # Prefer the pre-parsed page_label_value column (PDF pipeline); fall
-        # back to parsing the raw page_label text (HTML pipeline omits the column).
-        label_value: int | None = None
-        if "page_label_value" in label_rows.columns:
-            vals = pd.to_numeric(label_rows["page_label_value"], errors="coerce").dropna()
-            if not vals.empty:
-                label_value = int(vals.iloc[0])
-        if label_value is None and "page_label" in label_rows.columns:
-            raw_lbl = _first_nonblank(label_rows["page_label"])
-            if raw_lbl is not None:
-                label_value = _parse_label_value(str(raw_lbl), label_type)
+    # First non-blank raw page label per page (drives the value fallback,
+    # blank detection, and the alpha prefix)
+    if "page_label" in df.columns:
+        pl = df["page_label"].astype("string")
+        pl_nonblank = pl.notna() & pl.str.strip().ne("")
+        first_label = _first_per_page(pl, label_mask & pl_nonblank)
+    else:
+        first_label = pd.Series(index=pages, dtype="object")
 
-        # Is the page label blank?
-        label_blank = True
-        if "page_label" in label_rows.columns:
-            non_blank = label_rows["page_label"].astype("string").str.strip()
-            non_blank = non_blank[non_blank.ne("") & non_blank.notna()]
-            label_blank = non_blank.empty
-        elif label_type is not None:
-            label_blank = False
+    # First integer label value on this page.
+    # Prefer the pre-parsed page_label_value column (PDF pipeline); fall
+    # back to parsing the raw page_label text (HTML pipeline omits the column).
+    if "page_label_value" in df.columns:
+        plv = pd.to_numeric(df["page_label_value"], errors="coerce")
+        value_first = _first_per_page(plv, label_mask & plv.notna())
+    else:
+        value_first = pd.Series(index=pages, dtype="float64")
+    label_value: list[int | None] = [
+        int(v) if pd.notna(v)
+        else (_parse_label_value(str(lbl), t) if pd.notna(lbl) else None)
+        for v, lbl, t in zip(value_first, first_label, label_type)
+    ]
 
-        # Docx section_id: most common value among all rows on this page
-        docx_section_id: int | None = None
-        if "section_id" in rows.columns:
-            sid_vals = pd.to_numeric(rows["section_id"], errors="coerce").dropna()
-            if not sid_vals.empty:
-                docx_section_id = int(sid_vals.mode().iloc[0])
+    # Is the page label blank?
+    if "page_label" in df.columns:
+        label_blank = first_label.isna().tolist()
+    else:
+        label_blank = [t is None for t in label_type]
 
-        # Any TOC block on this page?
-        has_toc = False
-        if "block_type" in rows.columns:
-            has_toc = bool(
-                rows["block_type"].astype("string").str.lower()
-                .isin(_TOC_BLOCK_TYPES).any()
-            )
+    # Page-label series id: first value on this page.  PDF pipeline
+    # writes page_label_series_id, HTML writes page_label_group_id;
+    # docx has neither.  Whichever is present is used.  Scans ALL rows
+    # (not label_mask rows): the id sits on one chosen row per page,
+    # which may be a header/footer row.
+    label_series_id = pd.Series(index=pages, dtype="float64")
+    for series_col in ("page_label_series_id", "page_label_group_id"):
+        if series_col in df.columns:
+            sv = pd.to_numeric(df[series_col], errors="coerce")
+            firsts = _first_per_page(sv, sv.notna()).astype("float64")
+            label_series_id = label_series_id.where(label_series_id.notna(), firsts)
 
-        # Leading letter of alpha-prefixed labels ("A-1" → "A", "F-3" → "F")
-        label_prefix: str | None = None
-        if label_type in _ALPHA_FORMATS and "page_label" in label_rows.columns:
-            raw_lbl = _first_nonblank(label_rows["page_label"])
-            if raw_lbl is not None:
-                m = _ALPHA_PREFIX_RE.match(str(raw_lbl).strip())
-                if m:
-                    label_prefix = m.group(1).upper()
+    # Docx section_id: most common value among all rows on this page
+    # (mode tie-break: smallest id, matching Series.mode().iloc[0])
+    docx_section_id = pd.Series(index=pages, dtype="float64")
+    if "section_id" in df.columns:
+        sid = pd.to_numeric(df["section_id"], errors="coerce")
+        sid_frame = pd.DataFrame({"p": pn[sid.notna()], "sid": sid.dropna()})
+        if not sid_frame.empty:
+            counts = sid_frame.groupby(["p", "sid"]).size().reset_index(name="n")
+            counts = counts.sort_values(["p", "n", "sid"], ascending=[True, False, True])
+            docx_section_id = counts.drop_duplicates("p").set_index("p")["sid"].reindex(pages)
 
-        records.append({
-            "page_number": p,
-            "label_type": label_type,
-            "label_value": label_value,
-            "label_blank": label_blank,
-            "label_prefix": label_prefix,
-            "docx_section_id": docx_section_id,
-            "has_toc_block": has_toc,
-        })
+    # Any TOC block on this page?
+    if "block_type" in df.columns:
+        is_toc = df["block_type"].astype("string").str.lower().isin(_TOC_BLOCK_TYPES)
+        has_toc = is_toc.groupby(pn).any().reindex(pages, fill_value=False).tolist()
+    else:
+        has_toc = [False] * n_pages
 
-    return pd.DataFrame(records)
+    # Leading letter of alpha-prefixed labels ("A-1" → "A", "F-3" → "F")
+    label_prefix: list[str | None] = []
+    for t, lbl in zip(label_type, first_label):
+        prefix = None
+        if t in _ALPHA_FORMATS and pd.notna(lbl):
+            m = _ALPHA_PREFIX_RE.match(str(lbl).strip())
+            if m:
+                prefix = m.group(1).upper()
+        label_prefix.append(prefix)
+
+    pi = pd.DataFrame({
+        "page_number": pages.to_numpy(),
+        "label_type": label_type,
+        "label_value": label_value,
+        "label_blank": label_blank,
+        "label_prefix": label_prefix,
+        "label_series_id": label_series_id.to_numpy(),
+        "docx_section_id": docx_section_id.to_numpy(),
+        "has_toc_block": has_toc,
+    })
+
+    # Infer series membership for gap pages: every page between the first
+    # and last occurrence of a series id belongs to that series, even when
+    # the page itself carries no id (e.g. blank chapter-title slides).
+    sid_series = pd.to_numeric(pi["label_series_id"], errors="coerce")
+    for sid in sid_series.dropna().unique():
+        pos = sid_series[sid_series == sid].index
+        gap = pi.index[(pi.index >= pos.min()) & (pi.index <= pos.max()) & sid_series.isna()]
+        pi.loc[gap, "label_series_id"] = int(sid)
+
+    return pi
 
 
 # ================================================================================
@@ -226,6 +263,11 @@ def _detect_boundaries(page_index: pd.DataFrame) -> list[int]:
        b. Current page is blank and the next page has value 2
           (the blank page is implicitly "1", next confirms the restart).
 
+    A boundary is suppressed when it would split a page-label series:
+    if the nearest labeled page before it and the nearest labeled page
+    at/after it share the same label_series_id, the transition (e.g. a
+    blank chapter-title slide inside a slide deck) stays in one section.
+
     The first page is always included as the start of section 1.
     """
     if page_index.empty:
@@ -239,6 +281,27 @@ def _detect_boundaries(page_index: pd.DataFrame) -> list[int]:
         "docx_section_id" in rows.columns
         and rows["docx_section_id"].notna().any()
     )
+
+    # For each position: last known series id at/before it, next at/after it
+    sids = (
+        pd.to_numeric(rows["label_series_id"], errors="coerce")
+        if "label_series_id" in rows.columns
+        else pd.Series([None] * n, dtype="object")
+    )
+    prev_sid: list[int | None] = [None] * n
+    last: int | None = None
+    for i in range(n):
+        v = sids.iloc[i]
+        if pd.notna(v):
+            last = int(v)
+        prev_sid[i] = last
+    next_sid: list[int | None] = [None] * n
+    upcoming: int | None = None
+    for i in range(n - 1, -1, -1):
+        v = sids.iloc[i]
+        if pd.notna(v):
+            upcoming = int(v)
+        next_sid[i] = upcoming
 
     for i in range(1, n):
         prev = rows.iloc[i - 1]
@@ -296,10 +359,71 @@ def _detect_boundaries(page_index: pd.DataFrame) -> list[int]:
             ):
                 trigger = "value_restart_blank"
 
+        # Never split a page-label series: suppress the boundary when the
+        # labeled pages on both sides belong to the same series.
+        if (
+            trigger is not None
+            and prev_sid[i - 1] is not None
+            and next_sid[i] == prev_sid[i - 1]
+        ):
+            trigger = None
+
         if trigger is not None:
             boundaries.append(page_num)
 
     return boundaries
+
+
+def _pull_blank_prefix_pages(
+    page_index: pd.DataFrame,
+    boundaries: list[int],
+) -> list[int]:
+    """
+    Shift boundaries backwards over implicitly-numbered blank pages.
+
+    When a section's first page carries label value v > 1, the v-1 pages
+    before it are implicitly labeled 1..v-1.  If those immediately
+    preceding pages are blank, they belong to this section, not the prior
+    one — so the boundary moves back by up to v-1 blank pages, capped at
+    _MAX_BLANK_PREFIX_PULL.  A prior boundary whose section is fully
+    consumed is dropped (sections merge).
+    """
+    if len(boundaries) < 2:
+        return boundaries
+
+    rows = page_index.reset_index(drop=True)
+    pos_of_page = {int(rows.at[i, "page_number"]): i for i in range(len(rows))}
+
+    adjusted = [boundaries[0]]
+    for b in boundaries[1:]:
+        i = pos_of_page[b]
+        row = rows.iloc[i]
+        v = row["label_value"]
+        if (
+            bool(row["label_blank"])
+            or row["label_type"] not in _KNOWN_LABEL_FORMATS
+            or pd.isna(v) or int(v) <= 1
+        ):
+            adjusted.append(b)
+            continue
+
+        prev_b = adjusted[-1]
+        k = i
+        pulled = 0
+        max_pull = min(int(v) - 1, _MAX_BLANK_PREFIX_PULL)
+        while pulled < max_pull and k - 1 >= 0:
+            cand = rows.iloc[k - 1]
+            if int(cand["page_number"]) < prev_b or not bool(cand["label_blank"]):
+                break
+            k -= 1
+            pulled += 1
+
+        new_b = int(rows.at[k, "page_number"])
+        if new_b == prev_b:
+            adjusted.pop()  # prior section fully consumed → merge
+        adjusted.append(new_b)
+
+    return adjusted
 
 
 # ================================================================================
@@ -408,6 +532,7 @@ def _build_temp_sections(
     """
     page_index = _reduce_to_page_index(df)
     boundaries = _detect_boundaries(page_index)
+    boundaries = _pull_blank_prefix_pages(page_index, boundaries)
     section_index, page_to_sid = _assemble_section_index(page_index, boundaries)
     return page_index, section_index, page_to_sid
 
@@ -865,8 +990,6 @@ def _assign_coverpage_and_last_page(
         si["section"] = pd.NA
 
     # --- Coverpage ---
-    cover_sids: set[int] = set()
-
     cover_sids = _coverpage_scenario_1(si)
     if not cover_sids:
         cover_sids = _coverpage_scenario_2(si)
@@ -966,6 +1089,16 @@ def _assign_section_labels(section_index: pd.DataFrame) -> pd.DataFrame:
         if row.get("label_format") not in _ARABIC_FORMATS:
             continue
         arabic_candidates.append((int(row["start_page"]), int(row["temp_section_id"]), int(row["n_pages"])))
+
+    # Fallback: no arabic section → longest unlabeled blank/unknown section
+    if not arabic_candidates:
+        for idx, row in si.iterrows():
+            if not _unlabeled(row):
+                continue
+            fmt = row.get("label_format")
+            if pd.notna(fmt) and fmt in _KNOWN_LABEL_FORMATS:
+                continue
+            arabic_candidates.append((int(row["start_page"]), int(row["temp_section_id"]), int(row["n_pages"])))
 
     body_sid: int | None = None
     if arabic_candidates:
@@ -1123,13 +1256,14 @@ def classify_sections(df: pd.DataFrame, *, debug: bool = False) -> pd.DataFrame:
         out["temp_section_id"] = pn.map(page_to_sid)
 
         # Build page → section mapping from the updated index
-        page_to_section: dict[int, str] = {}
-        for _, row in section_index.iterrows():
-            sec = row.get("section")
-            if pd.notna(sec):
-                for p, s in page_to_sid.items():
-                    if s == int(row["temp_section_id"]):
-                        page_to_section[p] = str(sec)
+        sid_to_section: dict[int, str] = {
+            int(row["temp_section_id"]): str(row["section"])
+            for _, row in section_index.iterrows()
+            if pd.notna(row.get("section"))
+        }
+        page_to_section = {
+            p: sid_to_section[s] for p, s in page_to_sid.items() if s in sid_to_section
+        }
         out["section"] = pn.map(page_to_section)
     else:
         out["temp_section_id"] = pd.NA

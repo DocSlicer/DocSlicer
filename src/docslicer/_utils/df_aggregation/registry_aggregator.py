@@ -123,10 +123,10 @@ COLUMN_REGISTRY: Dict[str, Agg] = {
     "page_label_cell_sharing": Agg.DROP,
     "page_label_wrapper": Agg.DROP,
     "page_label_score": Agg.DROP,
-    "page_label_series_id": Agg.DROP,
+    "page_label_series_id": Agg.FIRST, # Keep for the section classifier
     # HTML page-label detector debug outputs (box-level detail, debug mode only)
     "page_label_token": Agg.DROP,
-    "page_label_group_id": Agg.DROP,
+    "page_label_group_id": Agg.FIRST, # Keep for the section classifier
     "alternation_mode": Agg.DROP,
 
     # --- OCR internals: word-level detail, consumed upstream -------------------
