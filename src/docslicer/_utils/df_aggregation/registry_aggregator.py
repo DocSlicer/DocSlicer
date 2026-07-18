@@ -419,6 +419,17 @@ COLUMN_REGISTRY: Dict[str, Agg] = {
     "y_center": Agg.DROP,
     "y_movement": Agg.DROP,
     "gap_em_right": Agg.DROP,      # inter-word gap, consumed by cell splitting
+
+    # --- TOC detector KPI columns (shared step_02): consumed by the scorer, ----
+    # which stamps block_type; not meaningful past the line level ---------------
+    "toc_heading_candidate": Agg.DROP,
+    "toc_has_dot_leaders": Agg.DROP,
+    "toc_row_candidate": Agg.DROP,
+    "toc_row_page_token": Agg.DROP,
+    "toc_row_page_type": Agg.DROP,
+    "toc_segment_id": Agg.DROP,
+    "toc_segment_score": Agg.DROP,
+    "toc_segment_score_detail": Agg.DROP,
 }
 
 # Naming conventions for columns not in the registry. Checked in order.

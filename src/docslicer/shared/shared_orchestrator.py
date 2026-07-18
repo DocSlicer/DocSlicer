@@ -22,9 +22,9 @@ import logging
 logger = logging.getLogger(__name__)
 
 # Shared Preprocessing Steps
-from .step_01_toc_detector import detect_and_annotate_tocs
+from .step_01_navigation_detector import detect_navigation_blocks
+from .step_02_toc_detector import detect_tocs
 from .step_02_exhibit_detector import detect_and_mark_exhibits
-from .step_03_navigation_detector import detect_navigation_blocks
 from .step_05_heading_detector import detect_headings
 from .step_04_section_classifier import classify_sections
 from .step_06_hierarchy_builder import assign_doc_hierarchy
@@ -84,20 +84,20 @@ def run_pipeline(
     # ============================================================
     if on_stage:
         on_stage("detect_hierarchy")
-    
-    # Step 01 - TOC Detection
-    if page_label_config:
-        with timed_step("toc_detection", logger=logger):
-            df = detect_and_annotate_tocs(df, page_label_config)
-
-    # Step 02 - Exhibit Detection
-    if exhibit_pattern_config:
-        with timed_step("exhibit_detection", logger=logger):
-            df = detect_and_mark_exhibits(df, exhibit_pattern_config)
 
     # Step 03 - Navigation Detection
     with timed_step("navigation_detection", logger=logger):
         df = detect_navigation_blocks(df)
+    
+    # Step 02 - TOC Detection
+    if page_label_config:
+        with timed_step("toc_detection", logger=logger):
+            df = detect_tocs(df, page_label_config)
+
+    # Step 03 - Exhibit Detection
+    if exhibit_pattern_config:
+        with timed_step("exhibit_detection", logger=logger):
+            df = detect_and_mark_exhibits(df, exhibit_pattern_config)
 
     # Step 04 - Doc Region Assignment
     with timed_step("doc_region_assignment", logger=logger):

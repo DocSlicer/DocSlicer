@@ -10,9 +10,8 @@ def detect_navigation_blocks(lines_df: pd.DataFrame) -> pd.DataFrame:
     
     Logic:
     1. Filter lines_df on link_type = internal
-    2. Filter out block_type = toc
-    3. Check if there's a 'text' that repeats 3 or more times
-    4. Mark all those rows as block_type = navigation
+    2. Check if there's a 'text' that repeats 3 or more times
+    3. Mark all those rows as block_type = navigation
     
     Args:
         lines_df: DataFrame containing document lines
@@ -21,6 +20,9 @@ def detect_navigation_blocks(lines_df: pd.DataFrame) -> pd.DataFrame:
             - link_type: type of link (internal, external, etc.) - required for detection
             - block_type: current role of the block
             - text: text content of the line
+            - page_number: page the line is on; when present, a text is counted
+              at most once per page (multiple occurrences on the same page
+              count as 1)
             
     Returns:
         Modified DataFrame with navigation blocks marked (or unchanged if link_type column missing)
@@ -32,29 +34,28 @@ def detect_navigation_blocks(lines_df: pd.DataFrame) -> pd.DataFrame:
         return df
     
     # Step 1: Filter on link_type = internal
-    internal_links_mask = df['link_type'] == 'internal'
-    
-    # Step 2: Filter out block_type = toc (if block_type column exists)
-    if 'block_type' in df.columns:
-        not_toc_mask = df['block_type'] != 'toc'
-    else:
-        not_toc_mask = pd.Series([True] * len(df), index=df.index)
-    
-    # Combine filters
-    candidates_mask = internal_links_mask & not_toc_mask
-    
-    # Step 3: Check if there's a 'text' that repeats 3 or more times
+    candidates_mask = df['link_type'] == 'internal'
+
+    # Step 2: Check if there's a 'text' that repeats 3 or more times
     # Get the candidate rows
     candidates_df = df[candidates_mask]
     
     if not candidates_df.empty and 'text' in candidates_df.columns:
-        # Count occurrences of each text value among candidates
-        text_counts = candidates_df['text'].value_counts()
-        
+        if 'page_number' in candidates_df.columns:
+            # Count distinct pages each text appears on, so a text repeated
+            # multiple times on the same page only counts once.
+            text_counts = (
+                candidates_df.drop_duplicates(subset=['text', 'page_number'])['text']
+                .value_counts()
+            )
+        else:
+            # Count occurrences of each text value among candidates
+            text_counts = candidates_df['text'].value_counts()
+
         # Find texts that appear 3 or more times
         repeated_texts = text_counts[text_counts >= 3].index.tolist()
         
-        # Step 4: Mark all rows with those repeated texts as navigation
+        # Step 3: Mark all rows with those repeated texts as navigation
         if repeated_texts:
             # Ensure block_type column exists
             if 'block_type' not in df.columns:

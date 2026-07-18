@@ -79,6 +79,8 @@ MASTER_COLUMN_ORDER: List[str] = [
     "toc_page_label_type",
     "toc_has_dot_leaders",
     "toc_segment_id",
+    "toc_segment_score",
+    "toc_segment_score_detail",
     "toc_seg_type",
     "toc_seg_score",
     "toc_seg_passed",
