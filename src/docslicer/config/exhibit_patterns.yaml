@@ -92,8 +92,10 @@ exhibit_heading_patterns:
     regex: '^\s*exhibits\s*\.?\s*$'
     flags: 'i'
 
-  # "(d) Exhibits." – parenthesized letter/number/roman subpart heading
-  # e.g. "(d) Exhibits.", "(1) Exhibits", "(iv) Exhibits."
+  # "(d) Exhibits." – parenthesized letter/number/roman subpart heading,
+  # optionally with a continuation after "Exhibits"
+  # e.g. "(d) Exhibits.", "(1) Exhibits", "(iv) Exhibits.",
+  #      "(3) Exhibits required by Item 601 of Regulation S-K"
   - name: paren_letter_exhibits
-    regex: '^\s*\([a-z0-9]+\)\s+exhibits?\.?\s*$'
+    regex: '^\s*\([a-z0-9]+\)\s+exhibits?\b.*$'
     flags: 'i'

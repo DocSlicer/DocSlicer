@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 # Shared Preprocessing Steps
 from .step_01_navigation_detector import detect_navigation_blocks
 from .step_02_toc_detector import detect_tocs
-from .step_02_exhibit_detector import detect_and_mark_exhibits
+from .step_03_exhibit_detector import detect_exhibits
 from .step_05_heading_detector import detect_headings
 from .step_04_section_classifier import classify_sections
 from .step_06_hierarchy_builder import assign_doc_hierarchy
@@ -97,7 +97,7 @@ def run_pipeline(
     # Step 03 - Exhibit Detection
     if exhibit_pattern_config:
         with timed_step("exhibit_detection", logger=logger):
-            df = detect_and_mark_exhibits(df, exhibit_pattern_config)
+            df = detect_exhibits(df, exhibit_pattern_config)
 
     # Step 04 - Doc Region Assignment
     with timed_step("doc_region_assignment", logger=logger):

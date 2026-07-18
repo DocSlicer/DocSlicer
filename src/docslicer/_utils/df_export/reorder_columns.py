@@ -73,20 +73,6 @@ MASTER_COLUMN_ORDER: List[str] = [
     "section_id",           # docx
     "slide_index",          # pptx
 
-    "toc_heading_candidate",
-    "toc_row_candidate", # NOTE: temp
-    "toc_page_label_token",
-    "toc_page_label_type",
-    "toc_has_dot_leaders",
-    "toc_segment_id",
-    "toc_segment_score",
-    "toc_segment_score_detail",
-    "toc_seg_type",
-    "toc_seg_score",
-    "toc_seg_passed",
-    "toc_seg_accepted",
-    "toc_seg_max_consec",
-
     # ===== 2. Run / atom provenance =====
     # (docx + pptx: every row comes from a single XML run;
     #  these fields say *where* in the document structure it lives)
@@ -202,7 +188,13 @@ MASTER_COLUMN_ORDER: List[str] = [
     "grid_rowspan",	
     "grid_colspan",
 
-
+    "exhibit_heading_candidate",
+    "exhibit_row_candidate",
+    "exhibit_row_number",	
+    "exhibit_row_strength",
+    "exhibit_segment_id",
+    "exhibit_segment_score",
+    "exhibit_segment_score_detail",
     
 
 

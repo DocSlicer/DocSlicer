@@ -52,6 +52,10 @@ class TocConfig:
                                     # one accidental hit ("Total assets 118") is not enough
     min_table_candidate_ratio: float = 0.5  # AND at least this fraction of the table's rows must be
                                             # candidates — 2 hits in a 40-row data table don't count
+    min_run_candidate_ratio: float = 0.5    # of a run's dot-leader member lines, at least this
+                                            # fraction must be row candidates — a dotted financial
+                                            # table (1 accidental candidate in 14 dotted rows)
+                                            # seeds no segment
     # ---- step 7: scorer ----
     min_segment_rows: int = 4       # smaller segments are discarded without scoring
     min_score: float = 2.0          # acceptance threshold: a leader/link majority (+5) passes
@@ -254,26 +258,6 @@ def _is_numeric_like(tok: str, typ: str) -> bool:
     return typ != "unknown" or is_numeric_value(tok)
 
 
-def _leader_page_token(
-    toks: List[str],
-    cfg: PageLabelPatternConfig,
-    cache: Dict[str, str],
-) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Page label of a leader-fast-tracked row: the boundary token (leader
-    stand-ins excluded) that classifies as a page label, trailing side first.
-    Returns (page_token, page_type), (None, None) when neither boundary matches.
-    """
-    core = [t for t in toks if t != _LEADER_TOKEN]
-    if not core:
-        return (None, None)
-    for tok in (core[-1], core[0]):
-        typ = _classify_token(tok, cfg, cache)
-        if typ != "unknown":
-            return (tok.strip().strip(_TOKEN_STRIP), typ)
-    return (None, None)
-
-
 def _eval_toc_row(
     toks: List[str],
     cfg: PageLabelPatternConfig,
@@ -333,14 +317,13 @@ def add_toc_row_candidates(
       - ``toc_row_page_token`` (str | NA)   the page-label token that anchored the row
       - ``toc_row_page_type``  (str | NA)   its page-label type ('arabic', 'roman', ...)
 
-    Dot-leaders fast track: any non-hidden line containing a dot-leader run is a
-    candidate outright — the leaders ARE the TOC-row layout, no further gates
-    apply. Its page label is whichever boundary token classifies (trailing side
-    first); NA when neither does.
-
-    Every other line is a TOC row candidate when it starts OR ends with a clean
+    A line is a TOC row candidate when it starts OR ends with a clean
     page-label token and carries real title text. Pipes are treated as
-    whitespace, so piped table text tokenizes into its cells. Rejected:
+    whitespace, so piped table text tokenizes into its cells. Dot-leader runs
+    are collapsed to a stand-in token first, so a leader-bearing row's page
+    number is still a clean boundary token — but the leaders grant no shortcut:
+    financial tables also draw leader lines ("Cash ...... $ 1,175,840 ..."),
+    so every line faces the same gates. Rejected:
       - lines that neither start nor end with a page-label token ("US investment plans")
       - currency-bearing lines ("Total net revenue $ 182,447 ...")
       - lines with more than config.max_row_cells cells (table rows)
@@ -384,17 +367,6 @@ def add_toc_row_candidates(
     # Row length is measured without the leader stand-ins (dot-leaders excluded).
     row_chars = stripped.str.replace(_LEADER_TOKEN, "", regex=False).str.len()
 
-    # ---- dot-leaders fast track ----
-    # A dot-leader run IS the TOC-row layout: any non-hidden line carrying one
-    # is a candidate outright, no further gates. Requires something besides the
-    # leaders themselves (a pure "......" line is not a row). Reuses the step-4
-    # column when present; recomputed otherwise so this pass stays standalone.
-    if "toc_has_dot_leaders" in out.columns:
-        has_leaders = out["toc_has_dot_leaders"].fillna(False).astype(bool)
-    else:
-        has_leaders = text.str.contains(_DOT_LEADERS_RE, regex=True, na=False)
-    fast_track = has_leaders & ~_hidden_block_mask(out) & (row_chars > 0)
-
     # ---- cheap vectorized prefilter ----
     first_tok = toks_series.str[0]
     last_tok = toks_series.str[-1]
@@ -412,7 +384,6 @@ def add_toc_row_candidates(
         & (row_chars <= config.max_row_chars)
         & ~text.str.contains(_CURRENCY_RE, regex=True, na=False)
         & ~_hidden_block_mask(out)
-        & ~fast_track
     )
     if "cell_count" in out.columns:
         prefilter &= out["cell_count"].fillna(0) <= config.max_row_cells
@@ -433,12 +404,6 @@ def add_toc_row_candidates(
     cand_idx: List = []
     tokens_out: List = []
     types_out: List = []
-    for idx in out.index[fast_track]:
-        tok, typ = _leader_page_token(toks_list[pos_to_iloc[idx]], page_label_config, cache)
-        cand_idx.append(idx)
-        tokens_out.append(tok if tok is not None else pd.NA)
-        types_out.append(typ if typ is not None else pd.NA)
-
     for idx in positions:
         toks = toks_list[pos_to_iloc[idx]]
         ok, tok, typ = _eval_toc_row(toks, page_label_config, cache, bool(in_table.at[idx]))
@@ -468,7 +433,11 @@ def add_toc_run_segments(df: pd.DataFrame, config: TocConfig = TocConfig()) -> p
       - a dot-leader run (``toc_has_dot_leaders``), or
       - an internal hyperlink (``link_type == 'internal'``).
 
-    A segment is seeded by a member that is also a ``toc_row_candidate`` and
+    A segment is seeded by a member that is also a ``toc_row_candidate`` —
+    and, when the run has dot-leader members, at least
+    ``config.min_run_candidate_ratio`` of those dotted lines must be row
+    candidates (financial tables also draw leader lines; one accidental
+    candidate among 14 dotted table rows must not seed a segment). A segment
     only ever grows DOWNWARD: subsequent member lines join the same segment as
     long as at most ``config.max_bridge_lines`` non-member lines sit between
     consecutive members (bridging page labels, unlinked group titles like
@@ -504,15 +473,18 @@ def add_toc_run_segments(df: pd.DataFrame, config: TocConfig = TocConfig()) -> p
     if out.empty or "toc_row_candidate" not in out.columns:
         return out
 
-    member = pd.Series(False, index=out.index, dtype=bool)
+    hidden = _hidden_block_mask(out)
     if "toc_has_dot_leaders" in out.columns:
-        member |= out["toc_has_dot_leaders"].fillna(False).astype(bool)
+        leaders = out["toc_has_dot_leaders"].fillna(False).astype(bool) & ~hidden
+    else:
+        leaders = pd.Series(False, index=out.index, dtype=bool)
+    member = leaders.copy()
     if "link_type" in out.columns:
         link_type = out["link_type"].astype("string").str.strip().str.lower()
-        member |= link_type.eq("internal").fillna(False)
-    member &= ~_hidden_block_mask(out)
+        member |= link_type.eq("internal").fillna(False) & ~hidden
 
     cand = out["toc_row_candidate"].fillna(False).astype(bool).to_numpy()
+    leaders_arr = leaders.to_numpy()
     member_pos = member.to_numpy().nonzero()[0]
 
     # Split member positions into runs: a gap of more than max_bridge_lines
@@ -533,6 +505,13 @@ def add_toc_run_segments(df: pd.DataFrame, config: TocConfig = TocConfig()) -> p
         # (never looks upward past it) and ends at the run's last member.
         seed_hits = run[cand[run]]
         if seed_hits.size == 0:
+            continue
+        # Dotted-run gate: financial tables also draw leader lines, so a run's
+        # dot-leader members must be mostly row candidates — one accidental
+        # candidate among 14 dotted table rows seeds no segment. Link-only
+        # runs (no dotted members) skip the gate.
+        dotted = run[leaders_arr[run]]
+        if dotted.size and cand[dotted].sum() / dotted.size < config.min_run_candidate_ratio:
             continue
         start, end = seed_hits[0], run[-1]
         seg_ids[start : end + 1] = next_id
