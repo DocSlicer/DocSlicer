@@ -204,9 +204,16 @@ def _build_hierarchy(df_blocks: pd.DataFrame, df_chunks: pd.DataFrame) -> Hierar
         raw_ht = row.get("heading_type") if "heading_type" in row.index else None
         heading_type = str(raw_ht).strip() if raw_ht is not None and not (isinstance(raw_ht, float) and pd.isna(raw_ht)) else "free_form"
 
+        # For hybrid_heading_paragraph, use hybrid_heading_text (not the full paragraph text)
+        raw_text = row.get("text", "")
+        if str(row.get("block_type", "")).strip().lower() == "hybrid_heading_paragraph":
+            hybrid = row.get("hybrid_heading_text") if "hybrid_heading_text" in row.index else None
+            if hybrid is not None and pd.notna(hybrid) and str(hybrid).strip():
+                raw_text = hybrid
+
         nodes[hid] = HierarchyNode(
             heading_id=hid,
-            text=str(row.get("text", "")).strip(),
+            text=str(raw_text).strip() if pd.notna(raw_text) else "",
             level=level,
             heading_type=heading_type,
             page_number=page_number,

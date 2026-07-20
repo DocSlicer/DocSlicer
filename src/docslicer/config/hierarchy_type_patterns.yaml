@@ -27,6 +27,7 @@ hierarchy_rules:
   - hierarchy_type: appendix     # Appendix B: Methodology"
     patterns:
       - regex: '^\s*(?:Appendix|APPENDIX)\s+'
+      - regex: '^\s*(?:Appendix|APPENDIX)\s*$'
 
   - hierarchy_type: annex       # Example: "Annex A – Form of Agreement"
     patterns:

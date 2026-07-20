@@ -27,7 +27,7 @@ import re
 import numpy as np
 import pandas as pd
 
-from .._utils.text_utils import numeric_line_mask
+from .._utils.text_utils import _BULLET_PREFIX_CHARS, numeric_line_mask
 
 # ================================================================================
 # Pre-filter forbidden heading line formats (text that will never be a heading)
@@ -44,29 +44,136 @@ _FORBIDDEN_BLOCK_TYPES = {
     "table", "chart", "toc", "exhibits", 
     }
 
-_FORBIDDEN_SUBSTRINGS = {
-    # signature indicators
-    "/s/", "signed:",
-    # urls
-    "http:", "https", "www.", ".com",
-    # other
-    "page",
-    "@", "α", "π", "|",
+# ------------------------------------------------------------------------------
+# Forbidden content anywhere in the line
+#
+# Two different questions, deliberately answered two different ways:
+#
+#   * Signature / online markers are near-zero-false-positive *literals* — a line
+#     containing "/s/" or "http://" is never a heading. One hard-kill regex.
+#   * Symbol residue is a matter of *degree*. A single Greek letter is ordinary
+#     prose ("alpha-Diversity Analysis"); a line that is mostly operators is a
+#     formula. Scored over the whole line, not tripped by the first hit.
+#
+# NOTE: page furniture is deliberately absent. It is already handled upstream by
+# block_type (page_label / header / footer in _FORBIDDEN_BLOCK_TYPES) and by the
+# dedicated step_11 page-label detector. A bare "page" substring here also killed
+# legitimate headings ("Homepage Redesign", "Per-Page Pricing").
+# ------------------------------------------------------------------------------
 
-}
+_SIGNATURE_SUBSTRINGS = frozenset({
+    "/s/",                              # conformed signature mark
+    "signed:",
+    "signature of",
+})
 
-_FORBIDDEN_START_TEXT = {
-    # stars and quotes
-    "*", "'",'"', "“", "”", "‘", "’", "„", "«", "»",
-    # bullet tokens
-    "-", "–", "—", "•", "·", "…", "■", "▪", "",
-    "+", "☒", "☐", "○", "◦", "►", "▸", "‣", "⁃",
-    "✓", "✔", "✗", "✘", "✖", "✕", "¤",
-    # other punctuation
-    "©", "®", "™", "§", "¶", "†", "‡", "‹", "›", "|",
-    # signature indicators
+_ONLINE_SUBSTRINGS = frozenset({
+    "http",                             # covers http:// and https:// in one token
+    "www.",
+    "mailto:",
+})
+
+# Shaped patterns rather than bare fragments: a real email/domain needs a label
+# on both sides of the separator. Bare "@" killed "Sales@Scale Initiative", and
+# a bare ".com" ignored every other TLD.
+_EMAIL_PAT = r"[^\s@]+@[^\s@]+\.[a-z]{2,}"
+_DOMAIN_PAT = r"\b[a-z0-9-]+\.(?:com|org|net|edu|gov|io|ai|co\.uk)\b"
+
+# One pre-compiled alternation → a single vectorized pass over the column.
+# Pre-compiling (rather than passing a pattern string) also keeps this off
+# pandas' ASCII-only RE2 path and its silent fallback.
+_FORBIDDEN_CONTENT_RE = re.compile(
+    "|".join([
+        *(re.escape(t) for t in sorted(_SIGNATURE_SUBSTRINGS)),
+        *(re.escape(t) for t in sorted(_ONLINE_SUBSTRINGS)),
+        _EMAIL_PAT,
+        _DOMAIN_PAT,
+    ]),
+    re.IGNORECASE,
+)
+
+# Math / scientific symbol residue. Greek letters plus common operators —
+# principled coverage instead of the previous arbitrary two ("α", "π").
+# Note U+2212 MINUS SIGN, which is NOT the ASCII hyphen and is what most PDF
+# producers actually emit in formulas.
+_SYMBOL_RE = re.compile(
+    "["
+    "α-ωΑ-Ω"                            # Greek lower / upper
+    "∑∏∫√∞∂∇"                           # operators: sum, product, integral, root, …
+    "≈≠≤≥≡∝"                            # relations
+    "±×÷⋅·−"                            # arithmetic (incl. U+2212 minus)
+    "∈∉⊂⊃∪∩∅∀∃"                         # set / logic
+    "°µ‰Δ"                              # units & deltas
+    "⁰¹²³⁴⁵⁶⁷⁸⁹₀₁₂₃₄₅₆₇₈₉"              # super / subscripts
+    "]"
+)
+
+# An equals sign is a much stronger structural signal than density: real
+# equations dilute their own symbol ratio with ASCII variable names
+# ("G = αS + (1 − α)E" is only 12% symbols), so density alone misses them.
+# Excludes ==, <=, >=, != so comparison-style prose isn't caught.
+_EQUATION_RE = re.compile(r"(?<![<>!=])=(?!=)")
+
+# A line is formula residue when EITHER:
+#   * it clears both density bars — enough symbols that they aren't incidental,
+#     and a high enough share of the line that it isn't prose; or
+#   * it is equation-shaped — an equals sign plus at least one math symbol.
+_SYMBOL_MIN_COUNT = 2
+_SYMBOL_MAX_RATIO = 0.15
+_EQUATION_MIN_SYMBOLS = 1
+
+# Pipe residue from table/layout flattening. One pipe is a legitimate heading
+# separator ("Revenue | EMEA"); several mean a flattened table row.
+_PIPE_MAX_COUNT = 1
+
+# Start tokens specific to heading detection. The bullet glyphs come from
+# text_utils (_BULLET_PREFIX_CHARS = the non-alphanumeric subset of the canonical
+# bullet set, so the OCR bullet "o" can't strip "October"/"Overview").
+_FORBIDDEN_START_EXTRA = {
+    # Quotes — a line opening on a quote mark is pulled prose, not a heading.
+    "'", '"',                           # straight single / double
+    "“", "”",                           # curly double  (left / right)
+    "‘", "’",                           # curly single  (left / right)
+    "„",                                # low-9 double  (German open quote)
+    "«", "»",                           # guillemets    (left / right)
+
+    # Reference & legal marks — footnote refs, notices, section callouts.
+    "©", "®", "™",                      # copyright / registered / trademark
+    "§", "¶",                           # section sign / pilcrow (paragraph mark)
+    "†", "‡",                           # dagger / double dagger (footnote refs)
+    "‹", "›",                           # single guillemets (left / right)
+    "|",                                # pipe — table or layout residue
+    "¤",                                # currency sign (mojibake artifact)
+
+    # Signature-block indicators — always a signature line, never a heading.
     "By:", "Name:", "Title:", "Date:",
+
+    # Private-use bullet glyph (U+F09F) — kept as an escape because the literal
+    # renders as an invisible/tofu box in most editors. text_utils lists this
+    # slot as "" (the glyph was lost from the literal), so the canonical set
+    # can't supply it — keep here until that entry is repaired.
+    "\uf09f",
 }
+
+# Guard against empty/lost entries so a zero-length token can't slip into either
+# matcher bucket below.
+_FORBIDDEN_START_TEXT = {
+    t for t in (_BULLET_PREFIX_CHARS | _FORBIDDEN_START_EXTRA) if t
+}
+
+# Split once at import so the row-wise test stays vectorized: single-char tokens
+# go through a hash lookup on the first character, multi-char tokens through one
+# anchored regex. This keeps the non-ASCII glyphs off pandas' ASCII-only RE2
+# path (which silently falls back to Python re on Unicode).
+_FORBIDDEN_START_CHARS = frozenset(
+    t.lower() for t in _FORBIDDEN_START_TEXT if len(t) == 1
+)
+_FORBIDDEN_START_MULTI_RE = re.compile(
+    r"^(?:%s)" % "|".join(
+        re.escape(t)
+        for t in sorted({t.lower() for t in _FORBIDDEN_START_TEXT if len(t) > 1})
+    )
+)
 
 # Parenthesized line patterns:
 # fully enclosed in (), [], {} (after trimming whitespace)
@@ -80,7 +187,10 @@ def _pre_filter_lines(lines_df: pd.DataFrame) -> pd.DataFrame:
     (1) rows where block_type is in _FORBIDDEN_BLOCK_TYPES
     (2) rows where text starts with any token in _FORBIDDEN_START_TEXT (case-insensitive, after lstrip)
     (3) rows where text is fully parenthesized: (...), [...], {...}
-    (4) rows where text contains any substring in _FORBIDDEN_SUBSTRINGS (case-insensitive)
+    (4) rows carrying forbidden content anywhere in the line:
+        (a) signature marks / URLs / emails  — hard kill on literal match
+        (b) formula residue                  — scored on symbol count + density
+        (c) flattened table rows             — more than one pipe
     (5) rows where stripped text is fewer than 3 characters (e.g. decorative large first-letters)
     (6) rows that are numeric-only lines (stat callouts / chart axis rows:
         "1,633 1,584 1,258", "2023 2024 2025", "£185k")
@@ -103,25 +213,37 @@ def _pre_filter_lines(lines_df: pd.DataFrame) -> pd.DataFrame:
         br = df["block_type"].astype("string").str.strip().str.lower()
         keep &= ~br.isin(_FORBIDDEN_BLOCK_TYPES)
 
-    # (2) forbidden start tokens
-    # normalize tokens to lowercase for comparison
-    forbidden_tokens = sorted({t.lower() for t in _FORBIDDEN_START_TEXT if t is not None})
-    if forbidden_tokens:
-        # Build one regex that matches ANY forbidden token at start
-        # - uses re.escape for safety
-        # - matches after left-trim (we already lstrip, so anchor ^ is correct)
-        tok_re = re.compile(r"^(?:%s)" % "|".join(re.escape(t) for t in forbidden_tokens))
-        keep &= ~text_lower.str.match(tok_re)
+    # (2) forbidden start tokens (text is already lstripped, so ^ is correct)
+    # Single glyphs: hash lookup on the first character. Multi-char tokens
+    # ("by:", "name:"): one anchored, pre-compiled regex. Both C-level.
+    keep &= ~text_lower.str[0].isin(_FORBIDDEN_START_CHARS)
+    keep &= ~text_lower.str.match(_FORBIDDEN_START_MULTI_RE)
 
     # (3) fully parenthesized lines
     keep &= ~text_lstrip.str.match(_PAREN_FULL_RE)
 
-    # (4) forbidden substrings (anywhere in text)
-    forbidden_substrings = sorted({s.lower() for s in _FORBIDDEN_SUBSTRINGS if s is not None})
-    if forbidden_substrings:
-        # Check if any forbidden substring appears anywhere in the text
-        for substring in forbidden_substrings:
-            keep &= ~text_lower.str.contains(re.escape(substring), na=False)
+    # (4a) signature / online content — hard kill, one pass over the column
+    # (was one full str.contains pass per substring, with re.escape recomputed
+    # inside the loop on every call)
+    keep &= ~text_lower.str.contains(_FORBIDDEN_CONTENT_RE, na=False)
+
+    # (4b) formula residue — scored over the whole line rather than tripped by
+    # the first symbol, so "α-Diversity Analysis" survives and "α = β·σ² + Δπ"
+    # does not. Both counts are single vectorized passes.
+    # Denominator is raw length including spaces: stripping whitespace first cost
+    # ~25x more and only shifts the ratio slightly, well inside the threshold.
+    symbol_count = text_lstrip.str.count(_SYMBOL_RE).fillna(0)
+    line_len = text_lstrip.str.len().fillna(0)
+    symbol_ratio = symbol_count / line_len.where(line_len > 0, 1)
+    is_dense = (symbol_count >= _SYMBOL_MIN_COUNT) & (symbol_ratio > _SYMBOL_MAX_RATIO)
+    is_equation = (
+        text_lstrip.str.contains(_EQUATION_RE, na=False)
+        & (symbol_count >= _EQUATION_MIN_SYMBOLS)
+    )
+    keep &= ~(is_dense | is_equation)
+
+    # (4c) flattened table rows — several pipes, not one used as a separator
+    keep &= ~(text_lstrip.str.count(r"\|").fillna(0) > _PIPE_MAX_COUNT)
 
     # (5) minimum 3 characters — exempt named headings (non-blank hierarchy_marker)
     # so that short markers like "I." are not stripped before the subtitle merge runs
@@ -536,6 +658,7 @@ _BASIC_COLORS = frozenset({
     "#111111", "#222222", "#333333", "#444444", "#555555", "#666666",
     "#777777", "#888888", "#999999", "#aaaaaa", "#bbbbbb", "#cccccc",
     "#dddddd", "#eeeeee",
+    "#0000ff",  # standard hyperlink blue — not a heading signal
 })
 
 # Pattern used in coverpage suppression to identify FORM/SCHEDULE headings
@@ -595,6 +718,27 @@ def _safe_div(num: pd.Series, den: pd.Series, fill: float = 0.0) -> pd.Series:
 
 # ----- Core heading scoring function ----- #
 
+def _add_gap_context(lines_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add ``line_gap_below``: the gap under each line = the *next* line's
+    ``line_gap`` (which is the gap above it), within the same page.
+
+    Must run on the full line frame, before _pre_filter_lines: the scorer only
+    sees a filtered subset, where "the next line" is not the next line on the page.
+    """
+    out = lines_df.copy()
+    if "line_gap" not in out.columns:
+        out["line_gap_below"] = np.nan
+        return out
+
+    gap = pd.to_numeric(out["line_gap"], errors="coerce")
+    if "page_number" in out.columns:
+        out["line_gap_below"] = gap.groupby(out["page_number"], sort=False).shift(-1)
+    else:
+        out["line_gap_below"] = gap.shift(-1)
+    return out
+
+
 def _add_heading_score(lines_df: pd.DataFrame) -> pd.DataFrame:
     """
     Takes lines_df and returns it with one extra column: `heading_score`.
@@ -621,6 +765,13 @@ def _add_heading_score(lines_df: pd.DataFrame) -> pd.DataFrame:
     - layout_id consists out of only 1 line_id: +1
       (interpreted as: within the same layout_id, the number of rows/lines == 1)
     - layout_id has 4 or more lines: -2.0
+    - hierarchy_marker with 3+ levels (e.g. '2.1.5'): -0.5
+    - has_link = true: -5
+    - line_gap (top = gap above, bottom = gap below):
+      - top in [-2, 0.5]pt: -5
+      - top in (0.5, 2)pt: -2
+      - both positive and top < bottom: -0.5
+      - both positive, top > bottom and top in [6, 20]pt: +0.5
     """
     out = lines_df.copy()
 
@@ -632,6 +783,7 @@ def _add_heading_score(lines_df: pd.DataFrame) -> pd.DataFrame:
     c_fsr += np.where((fsr >= 1.01) & (fsr < 1.2), 1.0, 0.0)
     c_fsr += np.where((fsr >= 1.2) & (fsr < 1.4), 2.0, 0.0)
     c_fsr += np.where((fsr >= 1.4), 3.0, 0.0)
+    c_fsr += np.where((fsr < 0.95), -1.0, 0.0)
     c_fsr += np.where((fsr < 0.75), -5.0, 0.0)
     score += c_fsr
 
@@ -640,6 +792,8 @@ def _add_heading_score(lines_df: pd.DataFrame) -> pd.DataFrame:
     c_cc = pd.Series(0.0, index=out.index, dtype="float64")
     c_cc += np.where(cc < 50, 0.5, 0.0)
     c_cc += np.where(cc > 100, -1.0, 0.0)
+    c_cc += np.where(cc > 150, -1.5, 0.0)
+    c_cc += np.where(cc > 2000, -2.0, 0.0)
     c_cc += np.where(cc > 250, -3.0, 0.0)
     score += c_cc
 
@@ -713,6 +867,41 @@ def _add_heading_score(lines_df: pd.DataFrame) -> pd.DataFrame:
         c_hierarchy = (ht != "").astype("float64") * 0.5
     score += c_hierarchy
 
+    # --- deep numbered marker penalty (-0.5 if 3+ levels, e.g. '2.1.5')
+    c_marker_depth = pd.Series(0.0, index=out.index, dtype="float64")
+    if "hierarchy_marker" in out.columns:
+        marker = out["hierarchy_marker"].fillna("").astype(str).str.strip().str.rstrip(".")
+        # split on literal '.' rather than a regex count (RE2/ASCII pitfalls)
+        depth = marker.str.split(".").apply(lambda parts: len([p for p in parts if p]))
+        c_marker_depth = pd.Series(np.where(depth >= 3, -0.5, 0.0), index=out.index, dtype="float64")
+    score += c_marker_depth
+
+    # --- hyperlink penalty (-1)
+    c_link = pd.Series(0.0, index=out.index, dtype="float64")
+    if "has_link" in out.columns:
+        has_link = _to_bool_series(out["has_link"], default=False)
+        c_link = pd.Series(np.where(has_link, -5.0, 0.0), index=out.index, dtype="float64")
+    score += c_link
+
+    # --- vertical spacing (gap above vs gap below the line)
+    # A heading sits under whitespace and hugs the text it introduces, so the gap
+    # above should exceed the gap below. Bands are mutually exclusive; the lower
+    # bound of -2 keeps column jumps / page resets (large negatives) out of it.
+    c_gap = pd.Series(0.0, index=out.index, dtype="float64")
+    if "line_gap" in out.columns:
+        top = _to_float_series(out.get("line_gap"), default=np.nan)
+        bottom = _to_float_series(out.get("line_gap_below"), default=np.nan)
+
+        both_positive = (top > 0) & (bottom > 0)
+        # squeezed against the previous line -> almost certainly mid-paragraph
+        c_gap += np.where(top.between(-2.0, 0.5), -5.0, 0.0)
+        c_gap += np.where(top.gt(0.5) & top.lt(2.0), -2.0, 0.0)
+        # more air below than above -> reads as a caption, not a heading
+        c_gap += np.where(both_positive & (top < bottom), -0.5, 0.0)
+        # clear air above, tight below, at a plausible heading spacing
+        c_gap += np.where(both_positive & (top > bottom) & top.between(6.0, 20.0), 0.5, 0.0)
+    score += c_gap
+
     # --- layout_id density penalty (-0.5 if layout_id has 4+ lines)
     c_layout_density = pd.Series(0.0, index=out.index, dtype="float64")
     if "layout_id" in out.columns:
@@ -734,6 +923,9 @@ def _add_heading_score(lines_df: pd.DataFrame) -> pd.DataFrame:
         "text_align_center": c_center,
         "color_rarity": c_color,
         "hierarchy_type": c_hierarchy,
+        "marker_depth": c_marker_depth,
+        "has_link": c_link,
+        "line_gap": c_gap,
         "layout_density": c_layout_density,
     }, index=out.index)
 
@@ -1200,8 +1392,6 @@ _FINGERPRINT_COLS = [
     "is_underlined",
     "is_uppercase",
     "text_align",
-    "x_left_bucket",
-    "font_name",
     "font_family",
     "non_stroking_color",
 ]
@@ -1478,12 +1668,15 @@ def _suppress_headings(df: pd.DataFrame) -> pd.DataFrame:
                 suppress_mask.loc[scope_heading_idx.difference(keep_set)] = True
                 _suppress_rows(suppress_mask)
 
-    # (3) Magazine-page rule: on pages where most free_form headings sit in back-to-back
-    # runs (design-heavy pages where everything is bolded/large), keep only the topmost
-    # free_form heading as the page title and suppress the rest. Marker-based headings
-    # (numbered/alpha) are structural facts and are never suppressed, but they do count
-    # toward run adjacency. Requires real pagination: skipped when page_number is 1
-    # everywhere (formats without page geometry would collapse into a single "page").
+    # (3) Magazine-page rule: on pages where most free_form headings follow straight onto
+    # another free_form heading (design-heavy pages where everything is bolded/large), keep
+    # only the topmost free_form heading as the page title and suppress the rest.
+    # Adjacency is free_form-to-free_form only: a free_form under a marker heading (e.g.
+    # "Item 1. Business" / "Company Background") is ordinary document structure, not magazine
+    # layout. Only the follower of a pair counts, so a back-to-back pair scores 1, not 2.
+    # Marker-based headings (numbered/alpha) are structural facts and are never suppressed.
+    # Requires real pagination: skipped when page_number is 1 everywhere (formats without
+    # page geometry would collapse into a single "page").
     is_heading = _is_heading_mask(out["block_type"]) & ~docx_heading
     is_ff_heading = is_heading & is_free_form
     has_real_pages = (
@@ -1495,13 +1688,11 @@ def _suppress_headings(df: pd.DataFrame) -> pd.DataFrame:
         for page in ff_page_counts[ff_page_counts >= _MAGAZINE_MIN_FREE_FORM].index:
             page_order = (out.loc[out["page_number"].eq(page), "line_id"]
                           .pipe(pd.to_numeric, errors="coerce").sort_values().index)
-            head_seq = is_heading.loc[page_order].to_numpy()
             ff_seq = is_ff_heading.loc[page_order].to_numpy()
-            prev_head = np.roll(head_seq, 1); prev_head[0] = False
-            next_head = np.roll(head_seq, -1); next_head[-1] = False
-            in_run = head_seq & (prev_head | next_head)
+            prev_ff = np.roll(ff_seq, 1); prev_ff[0] = False
+            follows_ff = ff_seq & prev_ff          # free_form directly under another free_form
             n_ff = int(ff_seq.sum())
-            if n_ff and (in_run & ff_seq).sum() / n_ff >= _MAGAZINE_RUN_RATIO:
+            if n_ff and follows_ff.sum() / n_ff >= _MAGAZINE_RUN_RATIO:
                 ff_idx = page_order[ff_seq]
                 suppress_mask = pd.Series(False, index=out.index)
                 suppress_mask.loc[ff_idx[1:]] = True  # keep topmost as page title
@@ -1572,6 +1763,8 @@ def detect_headings(
     out = _detect_marker_candidates(out, compiled_patterns)
     out = _correct_paren_type_by_series(out)
     out = _validate_alpha_heading_series(out)
+
+    out = _add_gap_context(out)
 
     scored_input = _pre_filter_lines(out)
     if "heading_score" not in out.columns:

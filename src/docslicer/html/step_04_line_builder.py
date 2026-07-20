@@ -194,6 +194,31 @@ _HEADING_TAGS = frozenset({"h1", "h2", "h3", "h4", "h5", "h6"})
 _PRE_TAGS = frozenset({"pre"})
 
 
+def _add_line_gap(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add ``line_gap``: the vertical gap (pt) above each line, i.e.
+    ``y_top[i] - y_bottom[i-1]`` within a page, 0.0 for the first line of a page.
+
+    Mirrors the PDF definition (``_assign_gaps`` in _utils/layout/layouts.py) so
+    the shared heading scorer sees the same column on both pipelines.  Stays NaN
+    when coordinates are absent (static extraction).
+    """
+    out = df.copy()
+    if "y_top" not in out.columns or "y_bottom" not in out.columns:
+        out["line_gap"] = np.nan
+        return out
+
+    y_top = pd.to_numeric(out["y_top"], errors="coerce")
+    y_bottom = pd.to_numeric(out["y_bottom"], errors="coerce")
+    if "page_number" in out.columns:
+        prev_bottom = y_bottom.groupby(out["page_number"], sort=False).shift()
+    else:
+        prev_bottom = y_bottom.shift()
+
+    out["line_gap"] = (y_top - prev_bottom).fillna(0.0)   # first line of page -> 0
+    return out
+
+
 def _struct_layout_groups(df: pd.DataFrame) -> pd.Series:
     """
     Per line, a grouping key from the deepest list (ul/ol), heading (h1-h6), or
@@ -383,5 +408,8 @@ def merge_boxes_to_lines(
 
     # Step 5: Add layout_id column
     lines_df = _add_layout_id(lines_df)
-    
+
+    # Step 6: Add line_gap (vertical gap above each line, pt)
+    lines_df = _add_line_gap(lines_df)
+
     return lines_df
