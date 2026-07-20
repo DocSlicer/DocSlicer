@@ -194,6 +194,8 @@ COLUMN_REGISTRY: Dict[str, Agg] = {
     "heading_fingerprint": Agg.FIRST,
     "heading_hash": Agg.FIRST,
     "hybrid_heading_text": Agg.FIRST,
+    "hierarchy_marker": Agg.FIRST,   # leading list/heading marker of the first line
+    "hierarchy_type": Agg.FIRST,
     "active_heading_id": Agg.FIRST,
     "chunk_index": Agg.FIRST,
     "heading_source": Agg.DROP,

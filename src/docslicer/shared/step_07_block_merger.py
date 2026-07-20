@@ -4,9 +4,9 @@ step_07_block_merger.py
 Merge lines into logical blocks.
 
 Architecture:
-  1. _assign_block_ids()      - Decision logic: what constitutes a new block?
-  2. hierarchical_aggregator  - Shared aggregation boilerplate
-  3. _join_text()             - Text merging strategy (space vs newline)
+  1. _assign_block_ids()  - block_id = layout_id (layouts already carry the split)
+  2. aggregate_to()       - shared registry-driven aggregation (registry_aggregator)
+  3. _join_text()         - Text merging strategy (space vs newline)
 
 Table formatters:  _format_table_markdown / _format_table_jsonl / _format_table_melted
 Chart formatters:  _format_chart_markdown / _format_chart_melted / _format_chart_jsonl
@@ -18,219 +18,38 @@ import json
 
 import pandas as pd
 
-from .._utils.df_aggregation.hierarchical_aggregator import (
-    build_standard_agg_spec,
-    aggregate_hierarchical,
-)
+from .._utils.df_aggregation.registry_aggregator import aggregate_to
+from .._utils.df_aggregation.text_merge import join_lines
+from .._utils.text_utils import bullet_line_mask
 
 # =======================================================================================================================
-# STEP 1: ASSIGN BLOCK IDs (DECISION LOGIC)
+# STEP 1: ASSIGN BLOCK IDs
 # =======================================================================================================================
 
 # =================================
-# Config
-# =================================
-
-_LONG_LAYOUT_MIN_LINES = 10  # Min lines per (layout_id, col_start) to consider indent splitting
-_INDENT_INCREASE_PTS = 10.0  # Min x_left increase (points) to trigger indent split
-
-_BULLET_TOKENS = {
-    "•", "", "·", "∙", "◦", "▪", "–", "-", "—", "*", "●", "○", "◆", "■", "►", "➤", "➢", "‣", "⁃",
-}
-
-# =================================
-# Main Block Decision Engine
+# Block ID Assignment
 # =================================
 
 def _assign_block_ids(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Assign _block_id to each line based on block splitting rules.
-    
-    Block splitting strategy:
-      1. ALWAYS split when:
-         - block_type changes (unless both rows share the same non-null heading_id)
-         - layout_id changes
-         - page_number changes (safety)
-         - col_start changes (text_multicol only - each column becomes separate block)
-         - heading_id changes (for consecutive heading lines - different headings become separate blocks)
-         NOTE: rows sharing the same heading_id are never split by block_type or style changes.
-      
-      2. CONDITIONALLY split for paragraph blocks in text layouts:
-         a) Style property changes WITHIN same layout_id:
-            - Applies to: block_type == "paragraph" in text_singlecol/text_multicol layouts
-            - Properties tracked: font_size_ratio, non_stroking_color, is_bold, is_italic
-            - Trigger: Any style property changes
-         
-         b) Indentation increases:
-            - Applies to: block_type == "paragraph" in text_singlecol/text_multicol layouts
-            - Group by: layout_id + col_start (each column treated separately)
-            - Eligibility: group must have >10 lines
-            - Trigger: x_left increases by ≥10pt (ONLY increases, not decreases)
-            - Behavior: TRY to split (only if indent increases exist)
-    
-    Args:
-        df: Lines dataframe
-    
-    Returns:
-        Same df with "_block_id" column added
-    """
-    # -------------------------------------------------------------------------
-    # 1: SORT BY DOCUMENT ORDER
-    # -------------------------------------------------------------------------
-    df = df.sort_values(["layout_id", "line_id"], kind="mergesort").reset_index(drop=True)
-    
-    # -------------------------------------------------------------------------
-    # 2: IDENTIFY INDENT-SPLIT ELIGIBLE LINES
-    # -------------------------------------------------------------------------
-    # Only paragraph blocks in text_singlecol/text_multicol layouts can be split by indentation.
-    # Group by (layout_id, col_start) to treat each column separately.
-    # Only consider groups with >10 lines.
-    
-    # Initialize: no lines eligible for indent splitting
-    eligible_for_indent_split = pd.Series(False, index=df.index)
-    
-    # Check if required columns exist
-    if "layout_type" in df.columns and "col_start" in df.columns and "block_type" in df.columns:
-        # Filter to text layouts with paragraph role only
-        is_text_layout = df["layout_type"].isin(["text_singlecol", "text_multicol"])
-        is_paragraph = df["block_type"] == "paragraph"
-        
-        if is_text_layout.any() and is_paragraph.any():
-            # Create a grouping key: layout_id + col_start
-            # This ensures we count lines per column within each layout
-            df["_layout_col_group"] = (
-                df["layout_id"].astype(str) + "|" + 
-                df["col_start"].astype(str)
-            )
-            
-            # Count lines per (layout_id, col_start) group
-            group_line_counts = df.groupby("_layout_col_group", sort=False)["line_id"].transform("size")
-            is_long_group = group_line_counts > _LONG_LAYOUT_MIN_LINES
-            
-            # Lines are eligible if: text layout + paragraph role + long group
-            eligible_for_indent_split = is_text_layout & is_paragraph & is_long_group
-            
-            # Clean up temporary column
-            df = df.drop(columns=["_layout_col_group"])
-    
-    # -------------------------------------------------------------------------
-    # 3: DETECT INDENTATION INCREASES
-    # -------------------------------------------------------------------------
-    # For eligible lines, detect when x_left increases by ≥10pt from previous line
-    # (within same layout_id + col_start)
-    
-    indent_increase = pd.Series(False, index=df.index)
-    
-    if eligible_for_indent_split.any():
-        prev_layout = df["layout_id"].shift(1)
-        prev_col = df["col_start"].shift(1) if "col_start" in df.columns else pd.Series(0, index=df.index)
-        prev_x = df["x_left"].shift(1)
-        
-        # Check if current line is in same (layout_id, col_start) group as previous
-        same_group = (
-            prev_layout.eq(df["layout_id"]) & 
-            prev_col.eq(df["col_start"])
-        )
-        
-        # Calculate x_left delta
-        x_delta = df["x_left"] - prev_x
-        
-        # Indent increase = same group + eligible + x_left increases by ≥10pt
-        indent_increase = (
-            same_group & 
-            eligible_for_indent_split & 
-            x_delta.ge(_INDENT_INCREASE_PTS)
-        )
-    
-    # -------------------------------------------------------------------------
-    # 4: COMPUTE NEW BLOCK TRIGGERS
-    # -------------------------------------------------------------------------
-    # Combine all conditions that trigger a new block
-    
-    prev_block_type = df["block_type"].shift(1)
-    prev_page = df["page_number"].shift(1)
-    prev_layout = df["layout_id"].shift(1)
-    
-    # For text_multicol: also split when col_start changes (column switch)
-    col_start_change = pd.Series(False, index=df.index)
-    if "layout_type" in df.columns and "col_start" in df.columns:
-        is_multicol = df["layout_type"] == "text_multicol"
-        prev_col = df["col_start"].shift(1)
-        same_layout = prev_layout.eq(df["layout_id"])
-        
-        # Split when col_start changes within same layout
-        col_start_change = is_multicol & same_layout & df["col_start"].ne(prev_col)
-    
-    # Within same layout: split when style fingerprint changes (only for paragraph blocks in text layouts)
-    # Create a fingerprint from: font_size_ratio, non_stroking_color, is_bold, is_italic
-    # Only applies to paragraph blocks in text_singlecol/text_multicol layouts for safety
-    style_change = pd.Series(False, index=df.index)
-    same_layout = prev_layout.eq(df["layout_id"])
-    
-    # Only apply to paragraph blocks in text layouts
-    is_eligible = pd.Series(False, index=df.index)
-    if "block_type" in df.columns and "layout_type" in df.columns:
-        is_paragraph = df["block_type"] == "paragraph"
-        is_text_layout = df["layout_type"].isin(["text_singlecol", "text_multicol"])
-        is_eligible = is_paragraph & is_text_layout
-    
-    if same_layout.any() and is_eligible.any():
-        # Build style fingerprint tuple for each line
-        style_cols = ["font_size_ratio", "non_stroking_color", "is_bold", "is_italic"]
-        available_style_cols = [col for col in style_cols if col in df.columns]
-        
-        if available_style_cols:
-            # Create fingerprint as tuple of values
-            df["_style_fp"] = df[available_style_cols].apply(tuple, axis=1)
-            prev_style_fp = df["_style_fp"].shift(1)
-            
-            # Split when fingerprint changes within same layout (only for eligible lines)
-            style_change = same_layout & is_eligible & df["_style_fp"].ne(prev_style_fp)
-            
-            # Clean up temporary column
-            df = df.drop(columns=["_style_fp"])
-    
-    # Split when heading_id changes between consecutive heading lines
-    heading_id_change = pd.Series(False, index=df.index)
-    if "heading_id" in df.columns and "block_type" in df.columns:
-        is_heading = df["block_type"] == "heading"
-        prev_is_heading = prev_block_type == "heading"
-        prev_heading_id = df["heading_id"].shift(1)
-        
-        # Split when both current and previous are headings, but heading_id changes
-        heading_id_change = (
-            is_heading & 
-            prev_is_heading & 
-            df["heading_id"].ne(prev_heading_id)
-        )
-    
-    # Rows that share the same non-null heading_id must stay in the same block —
-    # suppress block_type and style splits for them (page/layout boundaries still apply)
-    same_heading_group = pd.Series(False, index=df.index)
-    if "heading_id" in df.columns:
-        prev_heading_id_gen = df["heading_id"].shift(1)
-        hid_notna = df["heading_id"].notna() & prev_heading_id_gen.notna()
-        same_heading_group = hid_notna & df["heading_id"].eq(prev_heading_id_gen)
+    Assign _block_id to each line: one block per layout_id.
 
-    is_new_block = (
-        (df["block_type"].ne(prev_block_type) |  # Role change
-        df["layout_id"].ne(prev_layout) |        # Layout change
-        df["page_number"].ne(prev_page) |        # Page change
-        col_start_change |                        # Column change (text_multicol only)
-        indent_increase |                         # Indentation increase (conditional)
-        style_change |                            # Style property change (within same layout)
-        heading_id_change)                        # Heading ID change (consecutive headings only)
-        & ~same_heading_group                     # Never split rows that share the same heading_id
-    )
-    
-    # First line always starts a new block
-    is_new_block.iloc[0] = True
-    
-    # -------------------------------------------------------------------------
-    # 5: ASSIGN SEQUENTIAL BLOCK IDs
-    # -------------------------------------------------------------------------
-    df["_block_id"] = is_new_block.cumsum().astype(int)
-    
+    Every upstream pipeline now assigns layout_id such that each layout already
+    corresponds to exactly one logical block (headings, paragraphs, columns,
+    tables, etc. each get their own layout). So the block is just the layout —
+    no separate splitting decision is needed here.
+
+    Lines are sorted into document order (layout_id, line_id) so the downstream
+    text join sees them in reading order.
+
+    Args:
+        df: Lines dataframe (must carry "layout_id" and "line_id")
+
+    Returns:
+        Same df with "_block_id" column added (== layout_id)
+    """
+    df = df.sort_values(["layout_id", "line_id"], kind="mergesort").reset_index(drop=True)
+    df["_block_id"] = df["layout_id"]
     return df
 
 
@@ -281,22 +100,33 @@ def _format_table_markdown(table_df: pd.DataFrame) -> str:
     # Build grid: (row, col) -> cell text
     grid = {}
     last_header_row = -1
-    
-    for _, cell in table_df.iterrows():
-        row = int(cell["row_start"])
-        col = int(cell["col_start"])
-        text = str(cell.get("text", "")).strip()
-        colspan = int(cell.get("colspan", 1))
-        rowspan = int(cell.get("rowspan", 1))
-        role = cell.get("table_cell_role", "")
-        
+
+    # Pull columns as arrays once — iterrows() rebuilds a Series per row, which
+    # dominated this function's runtime on wide tables (see _format_table_jsonl,
+    # which uses the same to_numpy + zip pattern).
+    rows_arr = table_df["row_start"].to_numpy(dtype=int)
+    cols_arr = table_df["col_start"].to_numpy(dtype=int)
+    texts_arr = table_df["text"].fillna("").astype(str).str.strip().to_numpy()
+    colspans_arr = table_df["colspan"].fillna(1).to_numpy(dtype=int)
+    rowspans_arr = table_df["rowspan"].fillna(1).to_numpy(dtype=int)
+    if "table_cell_role" in table_df.columns:
+        roles_arr = table_df["table_cell_role"].fillna("").to_numpy()
+    else:
+        roles_arr = [""] * len(table_df)
+
+    for row, col, text, colspan, rowspan, role in zip(
+        rows_arr, cols_arr, texts_arr, colspans_arr, rowspans_arr, roles_arr
+    ):
+        row = int(row)
+        col = int(col)
+
         # Track last header row
         if role == "header":
             last_header_row = max(last_header_row, row)
-        
+
         # Fill spans by duplicating value
-        for r in range(row, row + rowspan):
-            for c in range(col, col + colspan):
+        for r in range(row, row + int(rowspan)):
+            for c in range(col, col + int(colspan)):
                 grid[(r, c)] = text
     
     # Build markdown lines
@@ -473,7 +303,7 @@ def _format_table_melted(table_df: pd.DataFrame) -> str:
 def _generate_table_block(
     table_id: str,
     df_lines: pd.DataFrame,
-    table_cells_df: pd.DataFrame,
+    table_df: pd.DataFrame,
     representation: str = "markdown",
 ) -> str:
     """
@@ -485,21 +315,22 @@ def _generate_table_block(
       - "melted": One fact per row (fully melted)
 
     Args:
-        table_id: Unique identifier for the table
+        table_id: Unique identifier for the table (only used for the fallback)
         df_lines: Lines belonging to this table block
-        table_cells_df: Full table cells dataframe (filtered to this table)
+        table_df: Table cells ALREADY scoped to this table (the caller pre-slices
+            table_cells_df by table_id once — see _join_text). None/empty falls
+            back to a plain line join.
         representation: Format to use for table output
 
     Returns:
         Formatted table text
     """
-    if table_cells_df is None or table_cells_df.empty:
-        return _build_text_from_lines(df_lines)
+    if table_df is None or table_df.empty:
+        return join_lines(df_lines["text"])
 
-    table_df = table_cells_df[table_cells_df["table_id"] == table_id].copy() if table_id else table_cells_df.copy()
-
-    if table_df.empty:
-        return _build_text_from_lines(df_lines)
+    # The formatters add/mutate columns in place — copy once so the shared slice
+    # held in _join_text's group dict is never mutated.
+    table_df = table_df.copy()
 
     if representation == "jsonl":
         return _format_table_jsonl(table_df)
@@ -646,11 +477,11 @@ def _generate_chart_block(
         Formatted chart text
     """
     if chart_points_df is None or chart_points_df.empty:
-        return _build_text_from_lines(df_lines)
+        return join_lines(df_lines["text"])
 
     chart_df = chart_points_df[chart_points_df["chart_id"] == chart_id].copy()
     if chart_df.empty:
-        return _build_text_from_lines(df_lines)
+        return join_lines(df_lines["text"])
 
     parts = []
 
@@ -678,21 +509,6 @@ def _generate_chart_block(
 # =================================
 # Helper Functions
 # =================================
-
-def _starts_with_any_token(s: str, tokens: set[str]) -> bool:
-    """Check if string starts with any token from the set."""
-    if not s:
-        return False
-    s2 = s.lstrip()
-    if not s2:
-        return False
-    if s2[0] in tokens:
-        return True
-    for t in tokens:
-        if s2.startswith(t + " "):
-            return True
-    return False
-
 
 def _compute_line_separator(df_with_block_ids: pd.DataFrame) -> pd.DataFrame:
     """
@@ -726,8 +542,7 @@ def _compute_line_separator(df_with_block_ids: pd.DataFrame) -> pd.DataFrame:
         df_with_block_ids.loc[is_toc_or_exhibits & ~has_table_id, "_join_sep"] = "\n"
 
     # Rule 2: Lines starting with bullet tokens use newlines (if not part of a table)
-    text_s = df_with_block_ids["text"].fillna("").astype(str)
-    is_bullet_start = text_s.map(lambda x: _starts_with_any_token(x, _BULLET_TOKENS))
+    is_bullet_start = bullet_line_mask(df_with_block_ids["text"])
     df_with_block_ids.loc[is_bullet_start & ~has_table_id, "_join_sep"] = "\n"
 
     # Rule 3: Lines with hierarchy markers use newlines (if not part of a table)
@@ -736,32 +551,6 @@ def _compute_line_separator(df_with_block_ids: pd.DataFrame) -> pd.DataFrame:
         df_with_block_ids.loc[has_hm & ~has_table_id, "_join_sep"] = "\n"
     
     return df_with_block_ids
-
-
-def _build_text_from_lines(lines: pd.DataFrame) -> str:
-    """
-    Build block text by joining line texts with their respective separators.
-
-    Args:
-        lines: DataFrame rows for ONE block (in document order)
-
-    Returns:
-        Joined text string
-    """
-    texts = lines["text"].fillna("").astype(str).tolist()
-    seps = lines["_join_sep"].fillna(" ").astype(str).tolist()
-
-    out_parts: list[str] = []
-    for i, t in enumerate(texts):
-        t2 = t.strip()
-        if not t2:
-            continue
-        if not out_parts:
-            out_parts.append(t2)
-        else:
-            out_parts.append(seps[i] + t2)
-
-    return "".join(out_parts)
 
 
 # =================================
@@ -857,6 +646,17 @@ def _join_text(
     special_lines = df_with_block_ids[~is_text_line]
 
     if not special_lines.empty:
+        # Pre-slice the cells / points by their id ONCE. Without this each block
+        # re-scanned the full table_cells_df (O(n_blocks × all_cells)) — the
+        # bottleneck on table-heavy docs (hundreds of tables). A single groupby
+        # turns each per-block lookup into an O(1) dict fetch of its own slice.
+        table_groups: dict = {}
+        if table_cells_df is not None and not table_cells_df.empty and "table_id" in table_cells_df.columns:
+            table_groups = dict(tuple(table_cells_df.groupby("table_id", sort=False)))
+        chart_groups: dict = {}
+        if chart_points_df is not None and not chart_points_df.empty and "chart_id" in chart_points_df.columns:
+            chart_groups = dict(tuple(chart_points_df.groupby("chart_id", sort=False)))
+
         def _build_special_text(lines: pd.DataFrame) -> str:
             if lines.empty:
                 return ""
@@ -867,10 +667,13 @@ def _join_text(
             has_chart = chart_id is not None and str(chart_id).strip() not in ("", "nan", "None")
 
             if block_type == "table" or (block_type in ["toc", "exhibits"] and has_table):
-                return _generate_table_block(table_id, lines, table_cells_df, table_representation)
+                # Pass this table's pre-sliced cells; a "table" block with no
+                # table_id keeps the legacy whole-frame fallback.
+                table_df = table_groups.get(table_id) if has_table else table_cells_df
+                return _generate_table_block(table_id, lines, table_df, table_representation)
             if block_type == "chart" or has_chart:
-                return _generate_chart_block(chart_id, lines, chart_points_df, table_representation)
-            return _build_text_from_lines(lines)
+                return _generate_chart_block(chart_id, lines, chart_groups.get(chart_id), table_representation)
+            return join_lines(lines["text"])
 
         special_joined = (
             special_lines.groupby("_block_id", sort=False, observed=True)
@@ -933,23 +736,16 @@ def merge_blocks(
     # -------------------------
     # STEP 3: AGGREGATE
     # -------------------------
-    agg_spec = build_standard_agg_spec(
-        include_hierarchy=True,
-        include_geometry=True,
-        include_style=True,
-        include_counts=True,
-        include_metadata=True,
-        include_table=True,
-    )
-    
-    blocks_df = aggregate_hierarchical(
+    # Registry-driven: each column's roll-up rule lives in COLUMN_REGISTRY, so
+    # the block level picks up new line columns automatically. layout_id (== the
+    # group key) is preserved by the registry's "first" rule for the STEP 6 sort.
+    blocks_df = aggregate_to(
         df,
-        group_col="_block_id",
-        agg_spec=agg_spec,
-        rename_group_col="block_id",
-        compute_derived=True,
+        by="_block_id",
+        rename_by="block_id",
+        derived=True,
     )
-    
+
     # -------------------------
     # STEP 4: JOIN TEXT
     # -------------------------
