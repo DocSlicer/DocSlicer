@@ -27,6 +27,8 @@ import re
 import numpy as np
 import pandas as pd
 
+from .._utils.text_utils import numeric_line_mask
+
 # ================================================================================
 # Pre-filter forbidden heading line formats (text that will never be a heading)
 # ================================================================================
@@ -48,7 +50,9 @@ _FORBIDDEN_SUBSTRINGS = {
     # urls
     "http:", "https", "www.", ".com",
     # other
-    "page"
+    "page",
+    "@", "α", "π", "|",
+
 }
 
 _FORBIDDEN_START_TEXT = {
@@ -57,9 +61,9 @@ _FORBIDDEN_START_TEXT = {
     # bullet tokens
     "-", "–", "—", "•", "·", "…", "■", "▪", "",
     "+", "☒", "☐", "○", "◦", "►", "▸", "‣", "⁃",
-    "✓", "✔", "✗", "✘", "✖", "✕",
+    "✓", "✔", "✗", "✘", "✖", "✕", "¤",
     # other punctuation
-    "©", "®", "™", "§", "¶", "†", "‡", "‹", "›",
+    "©", "®", "™", "§", "¶", "†", "‡", "‹", "›", "|",
     # signature indicators
     "By:", "Name:", "Title:", "Date:",
 }
@@ -78,6 +82,8 @@ def _pre_filter_lines(lines_df: pd.DataFrame) -> pd.DataFrame:
     (3) rows where text is fully parenthesized: (...), [...], {...}
     (4) rows where text contains any substring in _FORBIDDEN_SUBSTRINGS (case-insensitive)
     (5) rows where stripped text is fewer than 3 characters (e.g. decorative large first-letters)
+    (6) rows that are numeric-only lines (stat callouts / chart axis rows:
+        "1,633 1,584 1,258", "2023 2024 2025", "£185k")
 
     Returns a filtered COPY (subset of rows).
     """
@@ -128,6 +134,10 @@ def _pre_filter_lines(lines_df: pd.DataFrame) -> pd.DataFrame:
         keep &= (_to_float_series(df["char_count"], default=0.0) >= 3) | has_named_marker
     else:
         keep &= (text.str.strip().str.len() >= 3) | has_named_marker
+
+    # (6) numeric-only lines (stat callouts, chart axis rows) — exempt rows with
+    # a hierarchy marker so a standalone "8.1" marker line isn't stripped
+    keep &= ~numeric_line_mask(text) | has_named_marker
 
     return df.loc[keep].copy()
 
@@ -608,10 +618,9 @@ def _add_heading_score(lines_df: pd.DataFrame) -> pd.DataFrame:
     - text_align = center: +1
     - is_uppercase = true: +1
 
-    [PDF specific]
     - layout_id consists out of only 1 line_id: +1
       (interpreted as: within the same layout_id, the number of rows/lines == 1)
-    - layout_id has 4 or more lines: -0.5
+    - layout_id has 4 or more lines: -2.0
     """
     out = lines_df.copy()
 
@@ -708,7 +717,7 @@ def _add_heading_score(lines_df: pd.DataFrame) -> pd.DataFrame:
     c_layout_density = pd.Series(0.0, index=out.index, dtype="float64")
     if "layout_id" in out.columns:
         layout_sizes = out.groupby("layout_id", sort=False)["layout_id"].transform("count")
-        c_layout_density = pd.Series(np.where(layout_sizes >= 4, -0.5, 0.0), index=out.index, dtype="float64")
+        c_layout_density = pd.Series(np.where(layout_sizes >= 4, -2.0, 0.0), index=out.index, dtype="float64")
     score += c_layout_density
 
     out["heading_score"] = score
@@ -927,13 +936,14 @@ def _parse_numbered_value(marker: str) -> tuple | None:
     return None
 
 
-def _is_valid_numbered_continuation(prev: tuple, curr: tuple, max_jump: int = 20) -> bool:
+def _is_valid_numbered_continuation(prev: tuple, curr: tuple, max_jump: int = 2) -> bool:
     """
     Returns True if curr is a logical next step after prev in a numbered hierarchy.
 
     Strategy: trim prev to the depth of curr (going shallower is always ok),
     find the first divergence index d, then:
       - at d: curr[d] must advance by 1..max_jump over prev[d]
+        (max_jump=2 tolerates exactly one undetected sibling, nothing more)
       - after d: all curr[d+1:] must be 1 (restarting each child level)
 
     Special case: no divergence (curr is a direct child of prev) — valid only
@@ -943,9 +953,10 @@ def _is_valid_numbered_continuation(prev: tuple, curr: tuple, max_jump: int = 20
       (1,3) → (2,1)    valid  — parent advances, child restarts at 1
       (8,)  → (8,1)    valid  — first child
       (8,2) → (9,)     valid  — go up and advance
+      (6,9) → (6,11)   valid  — one sibling (6.10) missed
       (1,3) → (2,2)    invalid — child didn't restart at 1
       (11,) → (1,)     invalid — negative advance (restart → new group)
-      (11,5)→ (501,)   invalid — jump too large
+      (10,) → (24,)    invalid — jump too large
     """
     if not prev or not curr:
         return False
@@ -976,8 +987,17 @@ def _assign_numbered_heading_groups(lines_df: pd.DataFrame) -> pd.DataFrame:
     Analyses rows with hierarchy_type in {numbered_heading, roman_numbered_heading}.
 
     1. Parses each hierarchy_marker into an int tuple (e.g. '8.1' → (8, 1)).
-    2. Groups sequential rows into logical series ordered by line_id.
-       A new group starts whenever the transition is not a valid continuation.
+    2. Groups sequential rows into logical series ordered by line_id, with
+       numbered_heading and roman_numbered_heading processed as strictly
+       separate pools (a roman marker never continues or interrupts an
+       arabic series, and vice versa).
+       A new group starts whenever the transition is not a valid continuation,
+       and a broken series is closed for good — it can never be resumed later.
+       Continuing at a depth the series has already visited additionally
+       requires the same font size (|Δ| ≤ 0.25) as the last row seen at that
+       depth — same-level items of one scheme share a font, so a size change
+       means a different scheme. Depth changes are exempt (child levels may
+       legitimately use different sizes); rows without font data skip the check.
        Singleton rows (no valid neighbour on either side) are left ungrouped.
     3. Within each (group, depth-level), if at least one row already has
        block_type = 'heading', every other non-special row at the same depth
@@ -1010,51 +1030,58 @@ def _assign_numbered_heading_groups(lines_df: pd.DataFrame) -> pd.DataFrame:
     # Parse markers
     values = cand["hierarchy_marker"].fillna("").astype(str).apply(_parse_numbered_value)
 
-    # State-machine grouping: keep a series "alive" across noise interruptions.
+    # Font size per row (NaN → no check). Prefer raw font_size (PDF),
+    # fall back to font_size_ratio (HTML).
+    font_col = next(
+        (c for c in ("font_size", "font_size_ratio") if c in cand.columns), None
+    )
+    if font_col is not None:
+        fonts = pd.to_numeric(cand[font_col], errors="coerce")
+    else:
+        fonts = pd.Series(np.nan, index=cand.index)
+
+    # Strict outline grouping, one pool per hierarchy_type so arabic and
+    # roman series can never mix.
     #
-    # active  — the series currently being extended {gid, last}
-    # paused  — series interrupted by noise, kept alive in case they resume
-    #           (most-recently-paused last, so we prefer resuming the freshest)
-    #
-    # When a value can't continue active:
-    #   1. Park active into paused.
-    #   2. Walk paused newest→oldest: first one that accepts value is resumed.
-    #   3. If none accept: start a new group.
+    # Only one series is ever alive per pool. Each parsed value either
+    # extends it (sibling +1, one skipped sibling, first child, or ancestor
+    # sibling — see _is_valid_numbered_continuation, plus a matching font
+    # size at already-visited depths) or breaks it; a broken series is
+    # closed permanently and a new group starts. There is no pause/resume:
+    # a series can never bridge across another series.
     # Unparseable rows (value=None) are skipped entirely — they don't interrupt state.
     # After assignment, groups of size 1 (no valid neighbour) are marked stray (null).
-    active = None       # {"gid": int, "last": tuple}
-    paused: list = []   # [{"gid": int, "last": tuple}, ...]
+    _FONT_TOL = 0.25
     group_counter = 0
     row_group_ids: dict = {}   # cand.index → raw gid
 
-    for idx, value in values.items():
-        if value is None:
-            continue  # noise that didn't parse — leave state untouched
+    htypes = cand["hierarchy_type"].fillna("").astype(str)
+    for _htype in htypes.unique():
+        active = None   # {"gid": int, "last": tuple, "fonts": {depth: size}}
+        for idx, value in values[htypes == _htype].items():
+            if value is None:
+                continue  # noise that didn't parse — leave state untouched
 
-        if active and _is_valid_numbered_continuation(active["last"], value):
-            active["last"] = value
+            fs = fonts.loc[idx]
+            depth = len(value)
+
+            extends = active is not None and _is_valid_numbered_continuation(
+                active["last"], value
+            )
+            if extends and not pd.isna(fs):
+                prev_fs = active["fonts"].get(depth)
+                if prev_fs is not None and abs(fs - prev_fs) > _FONT_TOL:
+                    extends = False
+
+            if extends:
+                active["last"] = value
+            else:
+                group_counter += 1
+                active = {"gid": group_counter, "last": value, "fonts": {}}
+
+            if not pd.isna(fs):
+                active["fonts"][depth] = float(fs)
             row_group_ids[idx] = active["gid"]
-            continue
-
-        # Active can't accept → pause it, try to resume a paused series
-        if active:
-            paused.append(active)
-            active = None
-
-        resumed = None
-        for i in range(len(paused) - 1, -1, -1):
-            if _is_valid_numbered_continuation(paused[i]["last"], value):
-                resumed = paused.pop(i)
-                break
-
-        if resumed:
-            resumed["last"] = value
-            active = resumed
-        else:
-            group_counter += 1
-            active = {"gid": group_counter, "last": value}
-
-        row_group_ids[idx] = active["gid"]
 
     # Build Series aligned to cand.index (rows with value=None get NA)
     raw_group = pd.Series(row_group_ids, dtype="Int64").reindex(cand.index)
@@ -1333,6 +1360,14 @@ _SUPPRESS_BLANK_COLS = (
     "heading_type", "heading_id", "heading_fp_id", "heading_fingerprint", "heading_hash",
 )
 
+# Magazine-page rule: a page is "magazine-style" (everything bolded/large, so most lines
+# score as free_form headings) when it has at least this many free_form headings AND at
+# least this fraction of them sit in back-to-back runs of consecutive heading lines.
+# Genuine heading-dense pages (e.g. a 10-K "Services" page with 9 headings, each followed
+# by a paragraph) stay below the run ratio because their headings are rarely adjacent.
+_MAGAZINE_MIN_FREE_FORM = 6
+_MAGAZINE_RUN_RATIO = 0.5
+
 
 def _suppress_headings(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -1340,7 +1375,10 @@ def _suppress_headings(df: pd.DataFrame) -> pd.DataFrame:
         Only applies to free_form headings — headings with an identified hierarchy_type marker are never suppressed.
     (2) Coverpage rule: when 3+ consecutive heading line_ids exist on coverpage/page-1,
         keep only the best one (FORM/SCHEDULE prefix > highest score > lowest line_id).
-    (3) Per-slide rule (pptx): when slide_index is present, keep only the first heading
+    (3) Magazine-page rule: on pages with >= _MAGAZINE_MIN_FREE_FORM free_form headings
+        where >= _MAGAZINE_RUN_RATIO of them are back-to-back with another heading,
+        keep only the topmost free_form heading and suppress the rest.
+    (4) Per-slide rule (pptx): when slide_index is present, keep only the first heading
         per slide (lowest line_id) and suppress all others on that slide.
     """
     out = df.copy()
@@ -1440,7 +1478,36 @@ def _suppress_headings(df: pd.DataFrame) -> pd.DataFrame:
                 suppress_mask.loc[scope_heading_idx.difference(keep_set)] = True
                 _suppress_rows(suppress_mask)
 
-    # (3) Per-slide rule: keep only the first heading per slide_index
+    # (3) Magazine-page rule: on pages where most free_form headings sit in back-to-back
+    # runs (design-heavy pages where everything is bolded/large), keep only the topmost
+    # free_form heading as the page title and suppress the rest. Marker-based headings
+    # (numbered/alpha) are structural facts and are never suppressed, but they do count
+    # toward run adjacency. Requires real pagination: skipped when page_number is 1
+    # everywhere (formats without page geometry would collapse into a single "page").
+    is_heading = _is_heading_mask(out["block_type"]) & ~docx_heading
+    is_ff_heading = is_heading & is_free_form
+    has_real_pages = (
+        "page_number" in out.columns
+        and not pd.to_numeric(out["page_number"], errors="coerce").fillna(1).eq(1).all()
+    )
+    if is_ff_heading.any() and has_real_pages and "line_id" in out.columns:
+        ff_page_counts = out.loc[is_ff_heading, "page_number"].value_counts()
+        for page in ff_page_counts[ff_page_counts >= _MAGAZINE_MIN_FREE_FORM].index:
+            page_order = (out.loc[out["page_number"].eq(page), "line_id"]
+                          .pipe(pd.to_numeric, errors="coerce").sort_values().index)
+            head_seq = is_heading.loc[page_order].to_numpy()
+            ff_seq = is_ff_heading.loc[page_order].to_numpy()
+            prev_head = np.roll(head_seq, 1); prev_head[0] = False
+            next_head = np.roll(head_seq, -1); next_head[-1] = False
+            in_run = head_seq & (prev_head | next_head)
+            n_ff = int(ff_seq.sum())
+            if n_ff and (in_run & ff_seq).sum() / n_ff >= _MAGAZINE_RUN_RATIO:
+                ff_idx = page_order[ff_seq]
+                suppress_mask = pd.Series(False, index=out.index)
+                suppress_mask.loc[ff_idx[1:]] = True  # keep topmost as page title
+                _suppress_rows(suppress_mask)
+
+    # (4) Per-slide rule: keep only the first heading per slide_index
     # Includes hybrid_heading_paragraph — suppressed ones become paragraph via _finalize_block_types
     is_heading = _is_heading_mask(out["block_type"])
     is_hybrid = out["block_type"].astype("string").str.strip().str.lower().eq("hybrid_heading_paragraph").fillna(False)
@@ -1492,7 +1559,7 @@ def detect_headings(
     5. Heading decision
     6. Numbered section groups + hybrid heading text
     7. Heading fingerprints and fp_ids
-    8. Suppress repeated / coverpage headings
+    8. Suppress repeated / coverpage / magazine-page headings
     9. Finalize block roles (fill blanks → 'paragraph')
 
     Returns lines_df with columns added:

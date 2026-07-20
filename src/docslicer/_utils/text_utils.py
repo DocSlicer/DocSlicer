@@ -294,6 +294,37 @@ def numeric_value_mask(series: pd.Series) -> pd.Series:
     )
 
 
+# Compact stat value with a trailing magnitude suffix ("185k", "1.2bn",
+# "(259)m", "£185k") — infographic/dashboard callout style rather than a table
+# cell, so _NUMERIC_VALUE_RE's letter-free class rejects it. The suffix
+# whitelist stays short on purpose: bare magnitude letters only, so unit words
+# like "mg" or "km" still read as non-numeric.
+_MAGNITUDE_SUFFIX_RE = re.compile(
+    rf'^(?=.*\d)[\s\d{re.escape(_NUMERIC_PUNCT)}]+(?:k|m|mm|b|bn|tn)$',
+    re.IGNORECASE,
+)
+
+
+def numeric_line_mask(series: pd.Series) -> pd.Series:
+    """
+    True where an entire line reads as numeric data: every whitespace-separated
+    token is a numeric value (:func:`numeric_value_mask`), a bare year
+    ("2023 2024 2025"), or a magnitude-suffixed value ("£185k"). Blank lines
+    are False. Meant for whole text lines (e.g. chart/stat callout rows), where
+    a bare year is data — unlike the single-cell semantics of
+    :func:`numeric_value_mask`, which excludes lone years.
+    """
+    s = series.fillna("").astype(str).str.strip()
+    tokens = s.str.split().explode().fillna("").astype(str)
+    token_ok = (
+        numeric_value_mask(tokens)
+        | tokens.str.match(_BARE_YEAR_RE)
+        | tokens.str.match(_MAGNITUDE_SUFFIX_RE)
+    )
+    all_ok = token_ok.groupby(level=0).all()
+    return all_ok.reindex(s.index, fill_value=False) & s.str.len().gt(0)
+
+
 # ==================================================
 # FONT FEATURE HELPERS
 # ==================================================

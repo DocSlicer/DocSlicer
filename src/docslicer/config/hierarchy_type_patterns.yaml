@@ -144,10 +144,11 @@ hierarchy_rules:
       - regex: '^\s*\(\d+\)(?!\s*[-]?\d{3}\b)' # exludes US phone numbers
         flags: 'i'
 
-  - hierarchy_type: bracketed_numeric   # [1] Introduction"
-    patterns:
-      - regex: '^\s*\[\d+\]'
-        flags: 'i'
+  #removed: matches IEEE references far more often than real headings
+  #- hierarchy_type: bracketed_numeric   # [1] Introduction" 
+  #  patterns:
+  #    - regex: '^\s*\[\d+\]'
+  #      flags: 'i'
 
   - hierarchy_type: single_parens_roman     # Example: "(iv) Termination"
     patterns:
@@ -203,10 +204,10 @@ hierarchy_rules:
   # Numbered headings
   # =========================
 
-  - hierarchy_type: numbered_heading        # Example: "10.2 Revenue", "1. Introduction", "1 - Introduction" -- excludes years like 1920, 2020, etc.
+  - hierarchy_type: numbered_heading        # Example: "10.2 Revenue", "1. Introduction", "1 - Introduction" -- excludes years like 1920, 2020, etc. -- requires at least one alpha token somewhere in the string, else "0 50%" and "3 4 5 6 7 10 12 13" would match
     patterns:
       #- regex: '^(?!\s*(19|20)\d{2}\b)\s*\d+(?:\.\d+)*\.?'
-      - regex: '^(?!\s*(19|20)\d{2}\b)\s*\d+(?:\.\d+)*(?:\.(?=\s+["\u201C\u2018\[<]?(?-i:[A-Z0-9]))|(?=\s+["\u201C\u2018\[<]?(?-i:[A-Z0-9]))|(?=\s+[-\u2013\u2014]\s+["\u201C\u2018\[<]?(?-i:[A-Z0-9])))' # stricter version with lookahead, either followed by a dot, dash separator, or capital letter, optionally preceded by an opening quote, bracket, or angle bracket
+      - regex: '^(?!\s*(19|20)\d{2}\b)(?=.*[A-Za-z])\s*\d+(?:\.\d+)*(?:\.(?=\s+["\u201C\u2018\[<]?(?-i:[A-Z0-9]))|(?=\s+["\u201C\u2018\[<]?(?-i:[A-Z0-9]))|(?=\s+[-\u2013\u2014]\s+["\u201C\u2018\[<]?(?-i:[A-Z0-9])))' # stricter version with lookahead, either followed by a dot, dash separator, or capital letter, optionally preceded by an opening quote, bracket, or angle bracket; also requires at least one alpha character somewhere in the string
         flags: 'i'
 
   - hierarchy_type: roman_numbered_heading         # Example: "II. Background", "II - Background"

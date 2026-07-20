@@ -32,17 +32,23 @@ STATIC_WEIGHTS = {
 
 # heading type rank (lower = stronger / higher in hierarchy)
 _HEADING_TYPE_RANK_TIERS = {
-    0: ["title", "centered_upper", "exhibit", "volume", "appendix", "annex", "schedule", "attachment"],
-    1: ["subtitle"],
-    2: ["chapter", "part"], # Chapter sometimes higher, sometimes lower than part
-    3: ["subchapter", "subpart", "item"],
-    4: ["note", "section", "proposal"],
-    5: ["subsection", "section_symbol", "section_abbreviated"],
-    6: ["article", "rule"],
-    7: ["free_form"],
-    8: ["table", "figure"], # These are usually captions
+    0: ["exhibit", "volume", "appendix", "annex", "schedule", "attachment",
+        "form", "book", "amendment", "endnote"], # doc-level: always resets the stack
+    1: ["title"],
+    2: ["subtitle"],
+    3: ["chapter", "part"], # Chapter sometimes higher, sometimes lower than part
+    4: ["subchapter", "subpart", "item", "division"],
+    5: ["subdivision"],
+    6: ["note", "section", "proposal"],
+    7: ["subsection", "section_symbol", "section_abbreviated"],
+    8: ["article", "rule"],
+    9: ["free_form"],
+    10: ["table", "figure"], # These are usually captions
 }
 HEADING_TYPE_RANK = {t: rank for rank, types in _HEADING_TYPE_RANK_TIERS.items() for t in types}
+
+# tier-0 heading types restart the hierarchy at level 1 regardless of what precedes them
+STACK_RESET_TYPES = frozenset(_HEADING_TYPE_RANK_TIERS[0])
 
 # block_type values treated as headings throughout this module
 _HEADING_ROLES = {"heading", "toc_heading", "exhibit_heading", "hybrid_heading_paragraph"}
@@ -196,12 +202,21 @@ def _assign_heading_id(df: pd.DataFrame) -> pd.DataFrame:
                         pfx_i_str = pfx_i.group(0).strip() if pfx_i else ""
                         if pfx_i_str != pfx_j.group(0).strip():
                             diff_numbered_prefix = True
-            # Named heading followed by a blank-marker subtitle on the next line
+            # Named heading followed by a blank-marker subtitle on the next line.
+            # The subtitle may itself span multiple lines sharing one heading_fp_id,
+            # so also absorb further consecutive blank-marker lines that continue the
+            # previous subtitle line's fp (where the prior marker is already blank).
+            marker_prev = str(hm_vals[j - 1]).strip() if hm_vals is not None else ""
+            marker_curr = str(hm_vals[j]).strip() if hm_vals is not None else ""
+            same_prev_fp = (
+                pd.notna(fp_vals[j - 1]) and pd.notna(fp_vals[j])
+                and fp_vals[j - 1] == fp_vals[j]
+            )
             named_heading_subtitle = (
                 hm_vals is not None
                 and consecutive
-                and str(hm_vals[j - 1]).strip() != ""
-                and str(hm_vals[j]).strip() == ""
+                and marker_curr == ""
+                and (marker_prev != "" or same_prev_fp)
             )
             if (same_fp and consecutive and not diff_numbered_prefix) or named_heading_subtitle:
                 out.at[idx_list[j], "heading_id"] = cur_id
@@ -297,11 +312,15 @@ def _infer_heading_hierarchy(df: pd.DataFrame) -> pd.DataFrame:
             curr_nd        = heading["numeric_depth"]
             indices        = heading["indices"]
 
-            if not path_stack:
+            if not path_stack or (
+                curr_type in STACK_RESET_TYPES
+                and heading["block_type"] != "toc_heading"
+            ):
                 for idx in indices:
                     out.at[idx, "parent_heading_id"] = pd.NA
                     out.at[idx, "parent_heading_text"] = pd.NA
                     out.at[idx, "heading_level"] = 1
+                path_stack.clear()
                 path_stack.append({"heading_id": curr_heading_id, "fp": curr_fp, "text": curr_text,
                                    "level": 1, "static_weight": curr_static, "heading_type": curr_type,
                                    "end_line_id": curr_line_id, "block_type": heading["block_type"],
@@ -325,6 +344,7 @@ def _infer_heading_hierarchy(df: pd.DataFrame) -> pd.DataFrame:
                 else:
                     decision = "sibling"
             elif (prior.get("block_type") == "heading"
+                  and curr_type not in NUMBERED_HEADING_TYPES
                   and curr_line_id is not None and prior["end_line_id"] is not None
                   and pd.notna(curr_line_id) and pd.notna(prior["end_line_id"])
                   and curr_line_id == prior["end_line_id"] + 1):
@@ -394,7 +414,7 @@ def _infer_heading_hierarchy(df: pd.DataFrame) -> pd.DataFrame:
                     path_stack.append(_node(sp["level"] + 1))
                 else:
                     path_stack.pop()
-                    is_high = HEADING_TYPE_RANK.get(curr_type, 999) <= 1
+                    is_high = HEADING_TYPE_RANK.get(curr_type, 999) <= 2
                     if is_high or not path_stack:
                         _set(indices, pd.NA, pd.NA, 1)
                         path_stack.append(_node(1))

@@ -187,20 +187,6 @@ MASTER_COLUMN_ORDER: List[str] = [
     "grid_col_start",	
     "grid_rowspan",	
     "grid_colspan",
-
-    "exhibit_heading_candidate",
-    "exhibit_row_candidate",
-    "exhibit_row_number",	
-    "exhibit_row_strength",
-    "exhibit_segment_id",
-    "exhibit_segment_score",
-    "exhibit_segment_score_detail",
-    
-
-
-
-
-
     
 
     # Shape core
@@ -226,10 +212,13 @@ MASTER_COLUMN_ORDER: List[str] = [
     "heading_level",
     "heading_level_raw",
     "heading_score",
-    "heading_score_debug",
+    
     "hierarchy_marker",
     "hierarchy_type",
     "heading_type",
+    "numbered_heading_group",
+
+
     "embed_char_count", #Temporarily
     "heading_fp_id",
     "heading_fingerprint",
@@ -239,6 +228,7 @@ MASTER_COLUMN_ORDER: List[str] = [
     "heading_hash",
     "heading_weight_static",
     "heading_weight_dynamic",
+    "heading_score_debug",
     "heading_sequence",
     
 

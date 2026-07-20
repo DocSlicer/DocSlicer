@@ -4,6 +4,11 @@ Step 01 – Raw word extraction
 Responsibilities:
     - Open a PDF with pypdfium2
     - Iterate characters via textpage, group into whitespace-delimited words
+    - Letter-spaced text (Tc tracking, e.g. spaced-out headings) is kept as
+      whole words: a gap above the strict break threshold only splits when it
+      also exceeds an absolute ceiling, is an outlier vs. the word's median
+      intra-char gap, or (no history) differs from the next char's gap;
+      pdfium-generated spaces are ignored in favour of this geometry
     - Attach font name, font size, fill/stroke color from the first char of each word
     - Derive text_orientation from first→last char centre direction within the word
     - Convert all color values to hex format (#rrggbb)
@@ -175,6 +180,17 @@ def _orientation_from_centers(
     return "TTB" if dy >= _THRESH else ("BTT" if dy <= -_THRESH else "UNKNOWN")
 
 _GAP_FACTOR = 0.10
+# Letter-spaced (tracked) text — e.g. a "0.1499 Tc" heading — puts a uniform
+# gap after every glyph that exceeds _GAP_FACTOR, exploding words into single
+# chars. A gap above the strict factor is therefore only treated as a word
+# break when it also fails the adaptive tests below:
+_GAP_CEILING = 0.40   # × font size — always break above this, no exceptions
+_GAP_RATIO   = 1.8    # break when gap > ratio × median intra-word gap
+_GAP_SIMILAR = 0.30   # no-history lookahead: gaps within 30% = uniform tracking
+# The no-history path (single-char word so far) has only gap uniformity to go
+# on, and uniform WORD gaps are common too (justified text, TOC lines at
+# ~0.33 em). Tracking is rarely wider than ~0.2 em, so accept far less there.
+_GAP_TRACKING_MAX = 0.25
 
 
 # ── Marked-content & struct-tree helpers ────────────────────────────────────
@@ -657,6 +673,7 @@ def _extract_words_for_page(
         word_first_box: Optional[Tuple[float, float, float, float]] = None
         word_last_box:  Optional[Tuple[float, float, float, float]] = None
         word_n_chars:   int  = 0
+        word_gaps:      List[float] = []   # intra-word gaps kept so far (≥0)
         # Script state
         word_script_type:      Optional[str] = None   # "superscript" | "subscript" | None
         word_ref_size:         float         = 0.0    # normal font-size before entering script
@@ -699,6 +716,7 @@ def _extract_words_for_page(
                 "text_object_id":     word_text_obj_id,
             })
             char_texts.clear()
+            word_gaps.clear()
             word_first_box = word_last_box = None
             word_n_chars   = 0
             word_x_left    = word_y_top    = _INF
@@ -746,6 +764,44 @@ def _extract_words_for_page(
             if sb[2] > word_x_right:  word_x_right  = sb[2]
             if sb[3] > word_y_bottom: word_y_bottom = sb[3]
 
+        def _next_gap(i: int, cur_right: float) -> Optional[float]:
+            """Gap between char *i*'s right edge and the next real char's left
+            edge, skipping pdfium-generated spaces. None at line/word ends."""
+            j = i + 1
+            while j < n:
+                cj = all_chars[j]
+                if cj == _HYPHEN_BREAK:
+                    return None
+                if cj in _WHITESPACE:
+                    if pdfium_c.FPDFText_IsGenerated(tp, j) == 1:
+                        j += 1
+                        continue
+                    return None
+                bj = to_screen(*tp.get_charbox(j, loose=True))
+                return bj[0] - cur_right
+            return None
+
+        def _is_word_break(gap: float, i: int, cur_right: float) -> bool:
+            """Called only when gap > _GAP_FACTOR × size. Distinguishes a real
+            word space from uniform letter-spacing (Tc tracking)."""
+            size = word_size or 8.0
+            if gap > _GAP_CEILING * size:
+                return True
+            if word_gaps:
+                # Tracking gaps are uniform: keep the word together while the
+                # gap stays close to the intra-word median. Normal words have
+                # median ≈ 0, so any qualifying gap still breaks.
+                mid = sorted(word_gaps)[len(word_gaps) // 2]
+                return not (mid > 1e-6 and gap < _GAP_RATIO * mid)
+            # No history yet (word is a single char): a near-identical next
+            # gap means tracking; a differing or absent one means word break.
+            nxt = _next_gap(i, cur_right)
+            if nxt is None:
+                return True
+            hi = max(gap, nxt)
+            return not (hi <= _GAP_TRACKING_MAX * size
+                        and hi - min(gap, nxt) <= _GAP_SIMILAR * hi)
+
         # ── Main character loop ───────────────────────────────────────────────
 
         for i in range(n):
@@ -761,6 +817,12 @@ def _extract_words_for_page(
                 continue
 
             if ch in _WHITESPACE:
+                # pdfium-inserted spaces (large-gap heuristic) are unreliable on
+                # letter-spaced text — skip them and let our own gap logic decide
+                # on the next real char. Generated CR/LF (line breaks) and real
+                # content-stream whitespace still flush unconditionally.
+                if ch == ' ' and pdfium_c.FPDFText_IsGenerated(tp, i) == 1:
+                    continue
                 _flush()
                 prev_x_right = -1.0
                 continue
@@ -777,11 +839,12 @@ def _extract_words_for_page(
                 # break detection tracks the reading direction as displayed, not
                 # the raw content-stream axis (which is swapped under rotation).
                 gap = screen_box[0] - prev_x_right
-                if gap > _GAP_FACTOR * (word_size or 8.0):
+                if gap > _GAP_FACTOR * (word_size or 8.0) and _is_word_break(gap, i, screen_box[2]):
                     _flush()
                     _start_word(i)
                     word_first_baseline = char_baseline
                 else:
+                    word_gaps.append(gap if gap > 0.0 else 0.0)
                     # ── Script detection (fast-path: y-shift first) ───────────
                     y_shift = abs(char_baseline - word_first_baseline)
                     if y_shift > SCRIPT_Y_FACTOR * (word_size or 8.0):

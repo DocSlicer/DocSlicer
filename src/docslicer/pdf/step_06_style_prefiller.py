@@ -34,6 +34,23 @@ with struct_ancestors / struct_ancestor_ids by the struct-tree parser, adds:
        heading       — heading tag (H/H1-H6) in ancestor chain
        vertical_text — text_orientation is BTT or TTB
 
+    4. QC gate on struct-tagged headings (per heading level).
+
+       Some tagged PDFs assign a heading tag (typically H2) to essentially the
+       whole document, so every word would be classified "heading". A whole
+       heading level is *suppressed* (its words reverted to unfilled block_type)
+       when it looks like body styling rather than real headings, judged on two
+       word-level signals — either one is enough:
+
+         body_length_heading    — the typical heading *element* at this level is
+                                   far too long to be a heading (median
+                                   words-per-element above a threshold).
+         level_dominates_document — this single level covers most of the
+                                   document's words.
+
+       The gate is per level, so a trustworthy level (e.g. short H1 titles)
+       survives even when another level (e.g. body-as-H2) is suppressed.
+
 These fields only depend on raw struct-ancestor columns, not on
 struct_group_id, so they can be computed independently of group-ID
 assignment.
@@ -55,6 +72,21 @@ import pandas as pd
 _TABLE_CELL = frozenset({"TD", "TH"})
 _HEADINGS   = frozenset({"H", "H1", "H2", "H3", "H4", "H5", "H6"})
 _TOC_TAGS   = frozenset({"TOC", "TOCI"})
+
+# QC thresholds for trusting struct-tagged headings (see module docstring, §4).
+# A heading level is suppressed when EITHER signal fires.
+#
+# body_length_heading: real headings are short. If the median heading *element*
+# at a level runs this many words or more, the level is body text mislabeled as
+# a heading. Length-normalised, so it is independent of document size.
+_BODY_HEADING_MEDIAN_WORDS = 25
+_BODY_HEADING_MIN_ELEMENTS = 3      # need a few elements before judging a level
+
+# level_dominates_document: one heading level covering this share of the whole
+# document's (non-empty) words is styling, not structure. Guarded by a minimum
+# document size so tiny inputs are never judged on coverage alone.
+_LEVEL_DOMINANCE_RATIO     = 0.50
+_LEVEL_DOMINANCE_MIN_WORDS = 40
 
 
 def _heading_level_from_tag(tag: object) -> Optional[int]:
@@ -201,9 +233,69 @@ def _assign_textbox_id(df: pd.DataFrame) -> None:
     df["textbox_id"] = textbox_id
 
 
+def _suppressed_heading_levels(
+    block_types: np.ndarray,
+    heading_levels: np.ndarray,
+    heading_elem_ids: np.ndarray,
+    content_word_count: int,
+) -> tuple[set, dict]:
+    """
+    Detect struct-tagged heading levels that are really body/list styling.
+
+    Judged per level, on word-level evidence over the ``block_type == "heading"``
+    words only (toc_heading is a separate semantic and is never suppressed here):
+
+      * body_length_heading — the median heading *element* at this level runs
+        ``_BODY_HEADING_MEDIAN_WORDS`` words or more (with a small minimum
+        element count so a single long heading cannot suppress a level).
+      * level_dominates_document — this level covers ``_LEVEL_DOMINANCE_RATIO``
+        or more of the document's non-empty words (guarded by a minimum
+        document size).
+
+    Returns ``(suppressed_levels, reasons_by_level)``. Levels are the raw
+    heading-level values (int, or ``None`` for a bare ``H`` tag), so both are
+    valid dict/set keys.
+    """
+    words_per_level: dict = defaultdict(int)
+    words_per_elem: dict = defaultdict(lambda: defaultdict(int))
+    for bt, lvl, eid in zip(block_types, heading_levels, heading_elem_ids):
+        if bt != "heading":
+            continue
+        words_per_level[lvl] += 1
+        if eid is not None:
+            words_per_elem[lvl][eid] += 1
+
+    denom = max(int(content_word_count), 1)
+    suppressed: set = set()
+    reasons: dict = {}
+
+    for lvl, total in words_per_level.items():
+        elem_counts = list(words_per_elem[lvl].values())
+        median_wpe = float(np.median(elem_counts)) if elem_counts else 0.0
+        coverage = total / denom
+
+        reason_parts: list[str] = []
+        if (
+            len(elem_counts) >= _BODY_HEADING_MIN_ELEMENTS
+            and median_wpe >= _BODY_HEADING_MEDIAN_WORDS
+        ):
+            reason_parts.append(f"body_length_heading(median_wpe={median_wpe:.0f})")
+        if denom >= _LEVEL_DOMINANCE_MIN_WORDS and coverage >= _LEVEL_DOMINANCE_RATIO:
+            reason_parts.append(f"level_dominates_document(coverage={coverage:.2f})")
+
+        if reason_parts:
+            suppressed.add(lvl)
+            reasons[lvl] = ";".join(reason_parts)
+
+    return suppressed, reasons
+
+
 def _assign_block_type(df: pd.DataFrame) -> None:
     """Add ``block_type`` column to *df* in-place using struct and layout data."""
     anc_arr     = df["struct_ancestors"].to_numpy(dtype=object)
+    aid_arr     = df["struct_ancestor_ids"].to_numpy(dtype=object) \
+        if "struct_ancestor_ids" in df.columns \
+        else np.full(len(df), None, dtype=object)
     raw_anc_arr = df["struct_raw_ancestors"].to_numpy(dtype=object) \
         if "struct_raw_ancestors" in df.columns \
         else np.full(len(df), None, dtype=object)
@@ -227,6 +319,8 @@ def _assign_block_type(df: pd.DataFrame) -> None:
     block_types[:] = None
     heading_levels = np.empty(n, dtype=object)
     heading_levels[:] = None
+    heading_elem_ids = np.empty(n, dtype=object)
+    heading_elem_ids[:] = None
 
     for i in range(n):
         ancs     = _as_list(anc_arr[i])
@@ -264,10 +358,12 @@ def _assign_block_type(df: pd.DataFrame) -> None:
             is_toc_context = bool(ancs_set & _TOC_TAGS)
             is_toc_text    = text_arr[i] in _TOC_HEADER_TEXTS
             block_types[i] = "toc_heading" if (is_toc_context or is_toc_text) else "heading"
-            # Raw level from the deepest heading tag (ancestors run root -> leaf).
-            for tag in ancs:
+            # Raw level + element id from the deepest heading tag (ancestors run
+            # root -> leaf, so the last heading tag wins).
+            for tag, eid in zip(ancs, _as_list(aid_arr[i])):
                 if tag in _HEADINGS:
                     heading_levels[i] = _heading_level_from_tag(tag)
+                    heading_elem_ids[i] = eid
             continue
 
         # 7. toc: TOC or TOCI in ancestor chain (but not the title heading itself)
@@ -278,6 +374,28 @@ def _assign_block_type(df: pd.DataFrame) -> None:
         # 8. vertical_text
         if orient_arr[i] in ("BTT", "TTB"):
             block_types[i] = "vertical_text"
+
+    # QC gate: suppress heading levels that are really body styling (see §4).
+    # Runs before the TOC post-process so suppressed words cannot be reclassified.
+    heading_candidate = np.array([bt == "heading" for bt in block_types], dtype=bool)
+    heading_suppressed = np.zeros(n, dtype=bool)
+    suppressed_reason = np.empty(n, dtype=object)
+    suppressed_reason[:] = None
+
+    content_word_count = int((text_arr != "").sum())
+    suppressed_levels, suppressed_reasons = _suppressed_heading_levels(
+        block_types, heading_levels, heading_elem_ids, content_word_count
+    )
+    if suppressed_levels:
+        for i in range(n):
+            if heading_candidate[i] and heading_levels[i] in suppressed_levels:
+                heading_suppressed[i] = True
+                suppressed_reason[i] = suppressed_reasons.get(heading_levels[i])
+                block_types[i] = None
+
+    df["pdf_heading_candidate"] = heading_candidate
+    df["pdf_heading_suppressed"] = heading_suppressed
+    df["pdf_heading_suppressed_reason"] = suppressed_reason
 
     # Post-process: heading immediately before TOC/TOCI content → toc_heading.
     # Handles the common pattern where the TOC title (e.g. "Contents") is tagged
@@ -326,6 +444,25 @@ def _assign_block_type(df: pd.DataFrame) -> None:
 
     df["block_type"] = block_types
     df["heading_level_raw"] = heading_levels
+
+    # Provenance for surviving struct-tagged headings (parity with the docx
+    # prefiller); suppressed words were reverted above and are left unset.
+    heading_source = np.empty(n, dtype=object)
+    heading_source[:] = None
+    for i in range(n):
+        if block_types[i] in ("heading", "toc_heading"):
+            heading_source[i] = "pdf"
+    if "heading_source" in df.columns:
+        existing = df["heading_source"].to_numpy(dtype=object)
+        for i in range(n):
+            if heading_source[i] is not None and (
+                existing[i] is None
+                or (isinstance(existing[i], float) and existing[i] != existing[i])
+            ):
+                existing[i] = heading_source[i]
+        df["heading_source"] = existing
+    else:
+        df["heading_source"] = heading_source
 
 
 def prefill_styles(df: pd.DataFrame) -> pd.DataFrame:

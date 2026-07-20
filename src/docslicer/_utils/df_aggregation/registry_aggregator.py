@@ -196,6 +196,11 @@ COLUMN_REGISTRY: Dict[str, Agg] = {
     "hybrid_heading_text": Agg.FIRST,
     "active_heading_id": Agg.FIRST,
     "chunk_index": Agg.FIRST,
+    "heading_source": Agg.DROP,
+    "pdf_heading_candidate": Agg.DROP,
+    "pdf_heading_suppressed": Agg.DROP,
+    "pdf_heading_suppressed_reason": Agg.DROP,
+    
 
     # --- geometry ---------------------------------------------------------------
     "x_left": Agg.MIN,
@@ -415,6 +420,7 @@ COLUMN_REGISTRY: Dict[str, Agg] = {
     "vstack_n_lines": Agg.DROP,
     "vstack_score": Agg.DROP,
     "vstack_width": Agg.DROP,
+    "vstack_alone_in_band": Agg.DROP,
     "x_movement": Agg.DROP,
     "y_center": Agg.DROP,
     "y_movement": Agg.DROP,
@@ -430,6 +436,15 @@ COLUMN_REGISTRY: Dict[str, Agg] = {
     "toc_segment_id": Agg.DROP,
     "toc_segment_score": Agg.DROP,
     "toc_segment_score_detail": Agg.DROP,
+
+    # --- Exhibit detector KPI columns
+    "exhibit_heading_candidate": Agg.DROP,
+    "exhibit_row_candidate": Agg.DROP,
+    "exhibit_row_number": Agg.DROP,
+    "exhibit_row_strength": Agg.DROP,
+    "exhibit_segment_id": Agg.DROP,
+    "exhibit_segment_score": Agg.DROP,
+    "exhibit_segment_score_detail": Agg.DROP,
 }
 
 # Naming conventions for columns not in the registry. Checked in order.

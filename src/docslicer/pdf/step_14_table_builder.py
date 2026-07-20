@@ -825,8 +825,10 @@ def _assign_grid_trust(df_cells: pd.DataFrame) -> pd.DataFrame:
         rows the sparse ruling failed to separate.
 
       ``grid_row_trustworthy`` -- per (table_grid_id, grid_row_start). True
-        when every grid cell in that band is trustworthy: one over-packed box
-        makes the whole band's row structure unusable.
+        when every grid cell in that band is trustworthy and no cell in the
+        band lies on a numeric line (is_numeric_line): one over-packed box
+        makes the whole band's row structure unusable, and a numeric data
+        line inside a band means the ruling may have merged data rows.
 
     Trust is scored per grid cell rather than per table because it varies
     within one table: a header line can be tightly ruled (trustworthy) while
@@ -856,6 +858,13 @@ def _assign_grid_trust(df_cells: pd.DataFrame) -> pd.DataFrame:
     row_trust = cell_trust_cells.groupby(
         [sub["table_grid_id"], sub["grid_row_start"]], dropna=False
     ).min()
+    if "is_numeric_line" in sub.columns:
+        band_has_numeric_line = (
+            sub["is_numeric_line"].fillna(False).astype(bool).groupby(
+                [sub["table_grid_id"], sub["grid_row_start"]], dropna=False
+            ).max()
+        )
+        row_trust &= ~band_has_numeric_line
     row_trust_cells = pd.MultiIndex.from_arrays(
         [sub["table_grid_id"], sub["grid_row_start"]]
     ).map(row_trust)
