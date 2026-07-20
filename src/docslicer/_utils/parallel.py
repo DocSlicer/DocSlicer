@@ -3,9 +3,17 @@ Shared helpers for fanning page-oriented pipeline stages out over a process pool
 
 Pairs with cpu.resolve_worker_count(): the caller decides the pool width from
 CPU topology, these helpers decide when a pool is worth it and how to split the
-work. Used by the PDF word extractor, the OCR word extractor and the cell
-builder; any new page-parallel stage should import from here rather than
-growing its own copy.
+work. Any new page-parallel stage should import from here rather than growing
+its own copy.
+
+Not every stage gates on a page threshold, and the ones that do don't share a
+single break-even point:
+  - PDF word extractor: goes parallel at PARALLEL_PAGE_THRESHOLD pages.
+  - cell builder: much cheaper per page, so its own higher
+    CELL_BUILDER_PARALLEL_PAGE_THRESHOLD.
+  - OCR word extractor: no page threshold — Tesseract per page is expensive
+    enough that it fans out whenever resolve_worker_count() yields >1 worker
+    (i.e. >=2 pages on a multi-core box). It only borrows warn_pool_fell_back.
 """
 
 from __future__ import annotations
@@ -39,6 +47,12 @@ def warn_pool_fell_back(stage: str) -> None:
 # (process spawn + interpreter/pandas import per worker, pickling work in and
 # results out) outweigh the parallel speedup on small documents.
 PARALLEL_PAGE_THRESHOLD = 50
+
+# The cell builder's per-page work is far cheaper than the word extractor's, so
+# the same fixed pool costs only pay off on much larger documents. Its own,
+# higher break-even lives here rather than in the step so all the parallelism
+# thresholds stay together.
+CELL_BUILDER_PARALLEL_PAGE_THRESHOLD = 1500
 
 
 def chunk_evenly(items: Sequence[T], n_chunks: int) -> List[List[T]]:

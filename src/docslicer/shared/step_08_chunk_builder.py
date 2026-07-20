@@ -9,11 +9,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import pandas as pd
-from .._utils.df_aggregation.hierarchical_aggregator import (
-    build_standard_agg_spec,
-    aggregate_hierarchical,
-    _collect_unique_list,
-)
+from .._utils.df_aggregation.registry_aggregator import Agg, aggregate_to, group_join
 
 # =======================================================================================================================
 # CONFIG
@@ -54,38 +50,43 @@ _HEADING_BLOCK_TYPES = {"heading", "toc_heading", "exhibit_heading", "hybrid_hea
 
 
 # =======================================================================================================================
-# PARAMETER VALIDATION
+# CHUNK SIZE CONFIG
 # =======================================================================================================================
 
-def _validate_chunking_params(
-    max_chunk_chars: int,
-    optimal_chunk_chars: int,
-    softmin_chunk_chars: int,
-    min_chunk_chars: int,
-) -> Tuple[int, int, int, int]:
+@dataclass(frozen=True)
+class ChunkSizeConfig:
     """
-    Validate and clamp chunking parameters to reasonable bounds.
-    
-    Also ensures logical ordering: min <= softmin <= optimal <= max
-    
-    Returns:
-        Tuple of (max_chunk_chars, optimal_chunk_chars, softmin_chunk_chars, min_chunk_chars)
+    Chunk size targets, clamped to bounds and ordered on construction.
+
+    The invariant min <= softmin <= optimal <= max is enforced in __post_init__,
+    so any constructed instance is guaranteed valid — internal functions don't
+    have to re-validate or trust that a separate validator was called first.
     """
-    # Clamp to absolute bounds
-    max_chunk_chars = max(_MAX_CHUNK_CHARS_MIN, min(max_chunk_chars, _MAX_CHUNK_CHARS_MAX))
-    optimal_chunk_chars = max(_OPTIMAL_CHUNK_CHARS_MIN, min(optimal_chunk_chars, _OPTIMAL_CHUNK_CHARS_MAX))
-    softmin_chunk_chars = max(_SOFTMIN_CHUNK_CHARS_MIN, min(softmin_chunk_chars, _SOFTMIN_CHUNK_CHARS_MAX))
-    min_chunk_chars = max(_MIN_CHUNK_CHARS_MIN, min(min_chunk_chars, _MIN_CHUNK_CHARS_MAX))
-    
-    # Ensure logical ordering
-    if min_chunk_chars > softmin_chunk_chars:
-        min_chunk_chars = softmin_chunk_chars
-    if softmin_chunk_chars > optimal_chunk_chars:
-        softmin_chunk_chars = optimal_chunk_chars
-    if optimal_chunk_chars > max_chunk_chars:
-        optimal_chunk_chars = max_chunk_chars
-    
-    return max_chunk_chars, optimal_chunk_chars, softmin_chunk_chars, min_chunk_chars
+    max_chunk_chars: int = _DEFAULT_MAX_CHUNK_CHARS
+    optimal_chunk_chars: int = _DEFAULT_OPTIMAL_CHUNK_CHARS
+    softmin_chunk_chars: int = _DEFAULT_SOFTMIN_CHUNK_CHARS
+    min_chunk_chars: int = _DEFAULT_MIN_CHUNK_CHARS
+
+    def __post_init__(self) -> None:
+        # frozen=True blocks normal attribute assignment, so use object.__setattr__
+        # Clamp to absolute bounds
+        max_c = max(_MAX_CHUNK_CHARS_MIN, min(int(self.max_chunk_chars), _MAX_CHUNK_CHARS_MAX))
+        optimal_c = max(_OPTIMAL_CHUNK_CHARS_MIN, min(int(self.optimal_chunk_chars), _OPTIMAL_CHUNK_CHARS_MAX))
+        softmin_c = max(_SOFTMIN_CHUNK_CHARS_MIN, min(int(self.softmin_chunk_chars), _SOFTMIN_CHUNK_CHARS_MAX))
+        min_c = max(_MIN_CHUNK_CHARS_MIN, min(int(self.min_chunk_chars), _MIN_CHUNK_CHARS_MAX))
+
+        # Ensure logical ordering: min <= softmin <= optimal <= max
+        if min_c > softmin_c:
+            min_c = softmin_c
+        if softmin_c > optimal_c:
+            softmin_c = optimal_c
+        if optimal_c > max_c:
+            optimal_c = max_c
+
+        object.__setattr__(self, "max_chunk_chars", max_c)
+        object.__setattr__(self, "optimal_chunk_chars", optimal_c)
+        object.__setattr__(self, "softmin_chunk_chars", softmin_c)
+        object.__setattr__(self, "min_chunk_chars", min_c)
 
 
 # =======================================================================================================================
@@ -350,9 +351,7 @@ def _split_text_into_parts(
 
 def _explode_oversize_blocks_within_group(
     group_df: pd.DataFrame,
-    max_chunk_chars: int,
-    optimal_chunk_chars: int,
-    softmin_chunk_chars: int,
+    cfg: ChunkSizeConfig,
 ) -> pd.DataFrame:
     """
     Replace any row with embed_char_count > max_chunk_chars by multiple "virtual" rows.
@@ -363,6 +362,10 @@ def _explode_oversize_blocks_within_group(
       - orig_row_id (stable id within this function)
     Keeps order by original sort + sub_block_index.
     """
+    max_chunk_chars = cfg.max_chunk_chars
+    optimal_chunk_chars = cfg.optimal_chunk_chars
+    softmin_chunk_chars = cfg.softmin_chunk_chars
+
     g = group_df.copy()
 
     if "embed_char_count" not in g.columns:
@@ -470,10 +473,7 @@ def _partition_blocks_greedy(
 def _partition_blocks_dp(
     block_lens: List[int],
     heading_chars: int,
-    max_chunk_chars: int,
-    optimal_chunk_chars: int,
-    softmin_chunk_chars: int,
-    min_chunk_chars: int,
+    cfg: ChunkSizeConfig,
 ) -> List[Tuple[int, int]]:
     """
     Partition ordered blocks into k contiguous groups using DP, where
@@ -484,6 +484,13 @@ def _partition_blocks_dp(
 
     Returns list of (start_idx, end_idx) inclusive indices into block_lens.
     """
+    # Pull config into locals: these are read inside the vectorized inner loop,
+    # so avoid repeated attribute lookups on the hot path.
+    max_chunk_chars = cfg.max_chunk_chars
+    optimal_chunk_chars = cfg.optimal_chunk_chars
+    softmin_chunk_chars = cfg.softmin_chunk_chars
+    min_chunk_chars = cfg.min_chunk_chars
+
     n = len(block_lens)
     if n == 0:
         return []
@@ -572,10 +579,7 @@ def _partition_blocks_dp(
 
 def _assign_chunk_indices(
     blocks_df: pd.DataFrame,
-    max_chunk_chars: int,
-    optimal_chunk_chars: int,
-    softmin_chunk_chars: int,
-    min_chunk_chars: int,
+    cfg: ChunkSizeConfig,
 ) -> pd.DataFrame:
     """
     Assign chunk_index to each block based on chunk partitioning strategy.
@@ -618,6 +622,8 @@ def _assign_chunk_indices(
         out["chunk_index"] = 0
         return out
 
+    max_chunk_chars = cfg.max_chunk_chars
+
     df0 = blocks_df.copy()
 
     # Ensure embed_char_count exists
@@ -643,12 +649,7 @@ def _assign_chunk_indices(
 
         # If any oversize in this heading group, explode them into virtual rows (DP-friendly atoms)
         if (g2["embed_char_count"].astype(int) > int(max_chunk_chars)).any():
-            g2 = _explode_oversize_blocks_within_group(
-                g2,
-                max_chunk_chars=max_chunk_chars,
-                optimal_chunk_chars=optimal_chunk_chars,
-                softmin_chunk_chars=softmin_chunk_chars,
-            )
+            g2 = _explode_oversize_blocks_within_group(g2, cfg)
         else:
             # ensure expected columns exist
             if "sub_block_index" not in g2.columns:
@@ -697,10 +698,7 @@ def _assign_chunk_indices(
         cuts = _partition_blocks_dp(
             block_lens,
             heading_chars=heading_chars,
-            max_chunk_chars=max_chunk_chars,
-            optimal_chunk_chars=optimal_chunk_chars,
-            softmin_chunk_chars=softmin_chunk_chars,
-            min_chunk_chars=min_chunk_chars,
+            cfg=cfg,
         )
         _dp_elapsed = __import__("time").perf_counter() - _t0_dp
         if _dp_elapsed > 0.5:
@@ -730,7 +728,7 @@ def _join_chunk_text(blocks_with_chunk_index: pd.DataFrame, chunks_df: pd.DataFr
     
     Args:
         blocks_with_chunk_index: Blocks df with chunk_index column
-        chunks_df: Aggregated chunks df (from hierarchical_aggregator)
+        chunks_df: Aggregated chunks df (from registry_aggregator)
         
     Returns:
         chunks_df with "text", "chunk_heading", and "contains_table" columns added
@@ -788,91 +786,108 @@ def _join_chunk_text(blocks_with_chunk_index: pd.DataFrame, chunks_df: pd.DataFr
     
     # Build chunk text per chunk_index, including heading with ## prefix
     # We need to pass active_heading_id to look up the heading for multi-chunk sections
-    def _build_chunk_text_with_heading(group: pd.DataFrame) -> pd.Series:
-        """Build text for one chunk, including heading with ## prefix at the start.
-        
-        For chunks that don't contain the heading block (e.g., continuation chunks from 
-        a split heading section), we look up the heading text from the active_heading_id.
-        """
-        chunk_idx = group.name  # chunk_index
-        
-        if group.empty:
-            return pd.Series({"text": "", "active_heading_id": ""})
-        
-        # Get the active_heading_id for this chunk
-        active_hid = group["active_heading_id"].iloc[0] if "active_heading_id" in group.columns else ""
-        
-        # Get heading text - first try from heading block in this chunk
-        block_types = group.get("block_type", pd.Series([""] * len(group))).astype("string").str.strip().str.lower()
-        heading_mask = block_types.isin(_HEADING_BLOCK_TYPES)
-        
-        heading_text = ""
-        hybrid_body = ""  # paragraph body from a hybrid_heading_paragraph (first chunk only)
-        if heading_mask.any():
-            # This chunk contains the heading block
-            heading_row = group.loc[heading_mask].iloc[0]
-            # For hybrid_heading_paragraph, use hybrid_heading_text (not the full paragraph text)
-            if str(heading_row.get("block_type", "")).strip().lower() == "hybrid_heading_paragraph":
-                raw = heading_row.get("hybrid_heading_text", "") or heading_row.get("text", "")
-                # Preserve the paragraph body (full text minus the heading prefix)
-                full_text = str(heading_row.get("text", "")) if pd.notna(heading_row.get("text")) else ""
-                heading_prefix = str(raw).strip() if pd.notna(raw) else ""
-                if heading_prefix and full_text.startswith(heading_prefix):
-                    hybrid_body = full_text[len(heading_prefix):].strip()
-                elif full_text and not heading_prefix:
-                    hybrid_body = full_text
-            else:
-                raw = heading_row.get("text", "")
-            heading_text = str(raw) if pd.notna(raw) else ""
-        elif active_hid and active_hid in heading_metadata:
-            # This chunk doesn't have the heading block, but it belongs to a heading section
-            # Look up the heading text from metadata
-            heading_text = heading_metadata[active_hid].get("chunk_heading", "")
+    # ------------------------------------------------------------------
+    # Build chunk text — vectorized, no per-chunk groupby.apply.
+    #
+    # Each chunk's text is:  "## {heading}\n\n{content}"  where
+    #   * content is the "\n\n"-join of the chunk's non-heading block texts
+    #     (via group_join, the shared text primitive), blanks skipped;
+    #   * heading is the chunk's heading block text, or — for continuation
+    #     chunks with no heading block — the heading looked up from
+    #     heading_metadata via active_heading_id;
+    #   * a hybrid_heading_paragraph contributes its paragraph body as the
+    #     first content part.
+    # Empty heading / content collapse exactly as the scalar form did.
+    # ------------------------------------------------------------------
+    blocks = blocks_with_chunk_index
+    all_chunks = pd.Index(blocks["chunk_index"].unique(), name="chunk_index")
 
-        # Get content blocks (exclude headings)
-        content_blocks = group.loc[~heading_mask]
-        block_texts = content_blocks["text"].astype("string").fillna("")
-        # For the first chunk of a hybrid_heading_paragraph, insert the paragraph body first
-        content_parts = ([hybrid_body] if hybrid_body else []) + [t for t in block_texts if t]
-        content_text = "\n\n".join(content_parts)
-        
-        # Combine heading (with ##) and content
-        if heading_text and content_text:
-            final_text = f"## {heading_text}\n\n{content_text}"
-        elif heading_text:
-            final_text = f"## {heading_text}"
-        else:
-            final_text = content_text
-        
-        return pd.Series({"text": final_text, "active_heading_id": active_hid})
-    
-    # Group by chunk_index and build text
-    text_df = (
-        blocks_with_chunk_index.groupby("chunk_index", sort=False, observed=True)
-        .apply(_build_chunk_text_with_heading, include_groups=False)
-        .reset_index()
+    block_types_all = (
+        blocks.get("block_type", pd.Series([""] * len(blocks), index=blocks.index))
+        .astype("string").str.strip().str.lower()
     )
-    
-    # Drop active_heading_id from text_df since chunks_df already has it
-    # (The text_df version is just for internal use in the function)
-    if "active_heading_id" in text_df.columns:
-        text_df = text_df.drop(columns=["active_heading_id"])
-    
-    # Check if each chunk contains at least one table block
-    def _check_contains_table(blocks: pd.DataFrame) -> bool:
-        """Check if any block in the chunk has block_type = 'table'."""
-        if blocks.empty or "block_type" not in blocks.columns:
-            return False
-        block_types = blocks["block_type"].astype("string").str.strip().str.lower()
-        return (block_types == "table").any()
-    
-    contains_table_df = (
-        blocks_with_chunk_index.groupby("chunk_index", sort=False, observed=True)
-        .apply(_check_contains_table, include_groups=False)
-        .reset_index()
-        .rename(columns={0: "contains_table"})
+    is_heading = block_types_all.isin(_HEADING_BLOCK_TYPES).to_numpy()
+
+    # --- content: join non-heading block texts per chunk, skipping blanks ---
+    content_txt = blocks["text"].astype("string").fillna("")
+    keep = (~is_heading) & content_txt.str.strip().ne("").fillna(False).to_numpy()
+    content_series = group_join(
+        content_txt[keep], blocks["chunk_index"][keep], sep="\n\n"
+    ).reindex(all_chunks, fill_value="")
+
+    # --- heading text + hybrid body from the first heading block per chunk ---
+    # (heading_rows is ~one row per heading section, far smaller than all blocks)
+    heading_text_by_chunk = pd.Series("", index=all_chunks, dtype=object)
+    hybrid_body_by_chunk = pd.Series("", index=all_chunks, dtype=object)
+    heading_rows = blocks.loc[is_heading].drop_duplicates(subset="chunk_index", keep="first")
+    has_heading_block = pd.Series(False, index=all_chunks)
+    if not heading_rows.empty:
+        has_heading_block.loc[heading_rows["chunk_index"].to_numpy()] = True
+        bt_arr = heading_rows["block_type"].astype("string").str.strip().str.lower().fillna("").to_numpy()
+        txt_arr = heading_rows["text"].astype("string").fillna("").to_numpy()
+        hyb_arr = (
+            heading_rows["hybrid_heading_text"].astype("string").fillna("").to_numpy()
+            if "hybrid_heading_text" in heading_rows.columns
+            else np.full(len(heading_rows), "", dtype=object)
+        )
+        h_text, h_body = [], []
+        for bt, txt, hyb in zip(bt_arr, txt_arr, hyb_arr):
+            if bt == "hybrid_heading_paragraph":
+                raw = hyb if hyb else txt          # hybrid_heading_text, else the paragraph text
+                prefix = raw.strip()
+                if prefix and txt.startswith(prefix):
+                    body = txt[len(prefix):].strip()
+                elif txt and not prefix:
+                    body = txt
+                else:
+                    body = ""
+            else:
+                raw, body = txt, ""
+            h_text.append(raw)
+            h_body.append(body)
+        ci = heading_rows["chunk_index"].to_numpy()
+        heading_text_by_chunk.loc[ci] = h_text
+        hybrid_body_by_chunk.loc[ci] = h_body
+
+    # --- continuation chunks (no heading block): heading from metadata ---
+    active_by_chunk = (
+        blocks.drop_duplicates("chunk_index").set_index("chunk_index")["active_heading_id"]
+        .reindex(all_chunks)
+        if "active_heading_id" in blocks.columns
+        else pd.Series("", index=all_chunks)
     )
-    
+    meta_heading = active_by_chunk.map(
+        lambda a: heading_metadata.get(a, {}).get("chunk_heading", "") if pd.notna(a) else ""
+    ).fillna("")
+    heading_final = heading_text_by_chunk.where(has_heading_block, meta_heading)
+
+    # --- assemble: prepend hybrid body to content, then the "## heading" ---
+    mid_sep = np.where(
+        (hybrid_body_by_chunk != "").to_numpy() & (content_series != "").to_numpy(), "\n\n", ""
+    )
+    content_with_body = hybrid_body_by_chunk + pd.Series(mid_sep, index=all_chunks) + content_series
+
+    has_h = (heading_final != "").to_numpy()
+    has_c = (content_with_body != "").to_numpy()
+    final_text = np.where(
+        has_h & has_c,
+        ("## " + heading_final + "\n\n" + content_with_body).to_numpy(),
+        np.where(has_h, ("## " + heading_final).to_numpy(), content_with_body.to_numpy()),
+    )
+    text_df = pd.DataFrame({"chunk_index": all_chunks.to_numpy(), "text": final_text})
+
+    # --- contains_table: any table block per chunk (vectorized) ---
+    if "block_type" in blocks.columns:
+        is_table = block_types_all.eq("table")
+        ct = is_table.groupby(blocks["chunk_index"], sort=False, observed=True).any()
+        contains_table_df = (
+            ct.reindex(all_chunks, fill_value=False).rename("contains_table").reset_index()
+        )
+    else:
+        contains_table_df = pd.DataFrame(
+            {"chunk_index": all_chunks.to_numpy(), "contains_table": False}
+        )
+
     # Merge text and contains_table into chunks_df
     chunks_df = chunks_df.merge(text_df, on="chunk_index", how="left")
     chunks_df = chunks_df.merge(contains_table_df, on="chunk_index", how="left")
@@ -1120,60 +1135,41 @@ def assign_merged_chunk_id(chunks_df: pd.DataFrame, cfg: MergePlanConfig) -> pd.
 # Rebuild Merged Chunks
 # ------------------------------
 
-def _aggregate_merged_chunks_fields(group: pd.DataFrame) -> pd.Series:
+def _aggregate_merged_fields_by_id(merged_chunks: pd.DataFrame) -> pd.DataFrame:
     """
-    Aggregate all fields across chunks being merged using standard hierarchical aggregation.
-    
-    This properly aggregates:
-    - Geometry (bbox coordinates, width, height)
-    - Counts (char_count, word_count, alpha_count, etc.)
-    - Style fields (font_size, colors, etc.)
-    - Flags (has_link, is_bold, etc.)
-    
-    Args:
-        group: DataFrame containing all chunks being merged together
-        
-    Returns:
-        Series with aggregated values for all fields
+    Aggregate the non-text fields of every merged group in ONE registry-driven
+    pass, keyed by merged_chunk_id — bbox, counts, styles, flags, etc.
+
+    Runs the aggregation machinery once for all merged groups instead of once per
+    group (the previous per-group call was a bottleneck). The caller rebuilds
+    text / chunk_heading per merge mode and overwrites those afterwards.
+
+    Local overrides (everything else resolves via COLUMN_REGISTRY, where
+    chunk_index/heading_id/parent_heading_id/heading_level/heading_type are already
+    "first"):
+      - table_id/chart_id collect the (already list-valued) child ids, flattened
+        and de-duplicated across the merged chunks;
+      - contains_table is True if ANY merged chunk holds a table (the registry has
+        no entry for this chunk-level column, so it would otherwise default to
+        first).
+
+    Returns a frame indexed by merged_chunk_id (one row per merged group).
     """
-    # Add a temporary group column for aggregation
-    group = group.copy()
-    group['_merge_group'] = 1
-    
-    # Build aggregation spec for chunks
-    # Include all standard fields that might be present in chunks
-    agg_spec = build_standard_agg_spec(
-        identity_cols=['page_number', 'section', 'page_label', 'page_label_type', 'page_label_value'],
-        include_hierarchy=True,
-        include_geometry=True,
-        include_style=True,
-        include_counts=True,
-        include_metadata=True,
-        include_table=False,
-        include_html_provenance=False,
-        extra_agg={"table_id": _collect_unique_list, "chart_id": _collect_unique_list},
-    )
-    
-    # Add chunk-specific fields
-    # These use "first" since they're structural identifiers from the parent/first chunk
-    agg_spec.update({
-        'chunk_index': 'first',
-        'heading_id': 'first',
-        'parent_heading_id': 'first',
-        'heading_level': 'first',
-        'heading_type': 'first',
-    })
-    
-    # Aggregate the group
-    aggregated = aggregate_hierarchical(
-        df=group,
-        group_col='_merge_group',
-        agg_spec=agg_spec,
-        compute_derived=True
-    )
-    
-    # Return the single aggregated row as a Series
-    return aggregated.iloc[0] if not aggregated.empty else pd.Series()
+    return aggregate_to(
+        merged_chunks,
+        by="merged_chunk_id",
+        overrides={
+            "table_id": Agg.UNIQUE_LIST,
+            "chart_id": Agg.UNIQUE_LIST,
+            "contains_table": Agg.ANY,
+        },
+        # merge bookkeeping (merge_mode / merge_group_parent_heading_id /
+        # merge_member_heading_ids) and chunk_heading are local to this stage, not
+        # part of the shared column registry; "first" is fine (chunk_heading is
+        # overwritten by the caller). Silenced so they don't nag to be registered.
+        on_unknown="silent",
+        derived=True,
+    ).set_index("merged_chunk_id")
 
 
 def _rebuild_merged_chunks(chunks_df: pd.DataFrame) -> pd.DataFrame:
@@ -1210,10 +1206,15 @@ def _rebuild_merged_chunks(chunks_df: pd.DataFrame) -> pd.DataFrame:
     
     if merged_chunks.empty:
         return df
-    
+
+    # Aggregate every merged group's fields in a single pass, keyed by
+    # merged_chunk_id (bbox/counts/styles/flags). The per-group loop below only
+    # rebuilds text + chunk_heading and pulls the pre-aggregated row by id.
+    agg_by_id = _aggregate_merged_fields_by_id(merged_chunks)
+
     # Group merged chunks by merged_chunk_id
     merged_groups = []
-    
+
     for merge_id, group in merged_chunks.groupby("merged_chunk_id", sort=False):
         # Get the merge mode (should be same for all in group)
         merge_mode = group["merge_mode"].iloc[0] if "merge_mode" in group.columns else ""
@@ -1264,7 +1265,7 @@ def _rebuild_merged_chunks(chunks_df: pd.DataFrame) -> pd.DataFrame:
                 new_text = "\n\n".join(text_parts)
                 
                 # Aggregate all fields across the merged chunks (bbox, counts, styles, etc.)
-                merged_row = _aggregate_merged_chunks_fields(group)
+                merged_row = agg_by_id.loc[merge_id].copy()
                 
                 # Override with merge-specific values
                 merged_row["chunk_heading"] = new_chunk_heading
@@ -1274,7 +1275,7 @@ def _rebuild_merged_chunks(chunks_df: pd.DataFrame) -> pd.DataFrame:
                 merged_groups.append(merged_row)
             else:
                 # Fallback: if no parent found, aggregate all chunks
-                merged_row = _aggregate_merged_chunks_fields(group)
+                merged_row = agg_by_id.loc[merge_id].copy()
                 merged_groups.append(merged_row)
         
         elif merge_mode == "children_tail":
@@ -1301,7 +1302,7 @@ def _rebuild_merged_chunks(chunks_df: pd.DataFrame) -> pd.DataFrame:
             new_text = "\n\n".join(text_parts)
             
             # Aggregate all fields across the merged chunks (bbox, counts, styles, etc.)
-            merged_row = _aggregate_merged_chunks_fields(group)
+            merged_row = agg_by_id.loc[merge_id].copy()
             
             # Override with merge-specific values
             merged_row["chunk_heading"] = new_chunk_heading
@@ -1312,7 +1313,7 @@ def _rebuild_merged_chunks(chunks_df: pd.DataFrame) -> pd.DataFrame:
         
         else:
             # Unknown merge mode, aggregate all chunks
-            merged_row = _aggregate_merged_chunks_fields(group)
+            merged_row = agg_by_id.loc[merge_id].copy()
             merged_groups.append(merged_row)
     
     # Combine merged groups back into dataframe
@@ -1615,7 +1616,7 @@ def build_chunks(
     Process:
       1. Prepare blocks (add active_heading_id, remove noise blocks)
       2. Assign chunk indices (decision logic using DP partitioning)
-      3. Aggregate to chunk level (using hierarchical_aggregator)
+      3. Aggregate to chunk level (using registry_aggregator)
       4. Join text and extract chunk headings
       5. Sort by document order
       6. Merge chunk candidates (if merge_small_chunks=True)
@@ -1639,10 +1640,17 @@ def build_chunks(
     # -------------------------
     # VALIDATE PARAMETERS
     # -------------------------
-    max_chunk_chars, optimal_chunk_chars, softmin_chunk_chars, min_chunk_chars = _validate_chunking_params(
-        max_chunk_chars, optimal_chunk_chars, softmin_chunk_chars, min_chunk_chars
+    # ChunkSizeConfig clamps to bounds and enforces min <= softmin <= optimal <= max
+    # on construction, so the clamped values are read back from the instance.
+    size_cfg = ChunkSizeConfig(
+        max_chunk_chars=max_chunk_chars,
+        optimal_chunk_chars=optimal_chunk_chars,
+        softmin_chunk_chars=softmin_chunk_chars,
+        min_chunk_chars=min_chunk_chars,
     )
-    
+    max_chunk_chars = size_cfg.max_chunk_chars
+    softmin_chunk_chars = size_cfg.softmin_chunk_chars
+
     # -------------------------
     # STEP 1: PREPARE
     # -------------------------
@@ -1661,37 +1669,24 @@ def build_chunks(
     # -------------------------
     # STEP 2: ASSIGN CHUNK INDICES
     # -------------------------
-    df = _assign_chunk_indices(
-        df,
-        max_chunk_chars=max_chunk_chars,
-        optimal_chunk_chars=optimal_chunk_chars,
-        softmin_chunk_chars=softmin_chunk_chars,
-        min_chunk_chars=min_chunk_chars,
-    )
+    df = _assign_chunk_indices(df, size_cfg)
     
     # -------------------------
     # STEP 3: AGGREGATE
     # -------------------------
-    agg_spec = build_standard_agg_spec(
-        identity_cols=["page_number", "active_heading_id", "page_label", "page_label_type", "page_label_value", "section"],
-        include_hierarchy=True,
-        include_geometry=True,
-        include_style=True,
-        include_counts=True,
-        include_metadata=True,
-        include_table=True,
-        count_col="block_id",
-        extra_first=["layout_id", "layout_type"],
-        extra_agg={"table_id": _collect_unique_list, "chart_id": _collect_unique_list},
-    )
-    
-    chunks_df = aggregate_hierarchical(
+    # Registry-driven: every column's roll-up rule lives in COLUMN_REGISTRY, so
+    # the chunk level picks up new block columns automatically. Only the local
+    # exceptions are supplied here — table_id/chart_id collect the child ids into
+    # a list (a chunk spans many blocks/tables). The decision-layer helper columns
+    # from _assign_chunk_indices are dropped; they are internal to chunking and not
+    # part of the chunk contract. block_count == group size (every row has a block).
+    chunks_df = aggregate_to(
         df,
-        group_col="chunk_index",
-        agg_spec=agg_spec,
-        rename_group_col=None,  # Keep chunk_index as is (will be preserved from reset_index)
-        rename_count_col={"block_id": "block_count"},
-        compute_derived=True,
+        by="chunk_index",  # kept as-is (registry "first"); preserved as the group key
+        overrides={"table_id": Agg.UNIQUE_LIST, "chart_id": Agg.UNIQUE_LIST},
+        drop=["needs_block_split", "sub_block_index", "is_virtual_sub_block"],
+        size_as="block_count",
+        derived=True,
     )
     
     # -------------------------

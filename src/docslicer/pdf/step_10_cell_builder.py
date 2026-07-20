@@ -56,7 +56,11 @@ import numpy as np
 import pandas as pd
 
 from .._utils.cpu import resolve_worker_count
-from .._utils.parallel import PARALLEL_PAGE_THRESHOLD, chunk_evenly, warn_pool_fell_back
+from .._utils.parallel import (
+    CELL_BUILDER_PARALLEL_PAGE_THRESHOLD,
+    chunk_evenly,
+    warn_pool_fell_back,
+)
 from .._utils.text_utils import _BULLET_TOKENS, _CURRENCY_SYMBOLS, is_list_marker, numeric_value_mask
 from .._utils.df_aggregation.registry_aggregator import Agg, aggregate_to
 from .._utils.df_aggregation.text_merge import apply_inline_markup, merge_text_within_line
@@ -988,7 +992,7 @@ def build_cells(
     # renumber below makes the final ids identical to a serial run.
     pages = sorted(df["page_number"].unique())
     n_workers = 1
-    if len(pages) >= PARALLEL_PAGE_THRESHOLD:
+    if len(pages) >= CELL_BUILDER_PARALLEL_PAGE_THRESHOLD:
         n_workers = resolve_worker_count(max_workers, n_items=len(pages))
 
     if n_workers > 1:
