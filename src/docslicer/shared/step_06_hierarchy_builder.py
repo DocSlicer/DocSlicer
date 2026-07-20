@@ -3,11 +3,13 @@ step_06_hierarchy_builder.py
 
 Builds the document heading hierarchy from annotated lines_df.
 
-Receives lines_df from step_05 (which already has block_type, heading_fp_id, etc.)
-and produces the heading tree:
+Receives lines_df from step_05 (which already has block_type, heading_fp_id and
+heading_id) and produces the heading tree:
   - heading_weight_static / heading_weight_dynamic
-  - heading_id
   - parent_heading_id / parent_heading_text / heading_level
+
+heading_id itself is assigned in step_05, before heading suppression, so that
+suppression can act on whole multi-line heading units. This module only reads it.
 
 Public API: assign_doc_hierarchy(lines_df)
 """
@@ -16,6 +18,12 @@ from __future__ import annotations
 import re
 import numpy as np
 import pandas as pd
+
+from .step_05_heading_detector import (
+    _HEADING_ROLES,
+    NUMBERED_HEADING_TYPES,
+    _RE_NUMERIC_PREFIX,
+)
 
 
 # ================================================================================
@@ -50,19 +58,7 @@ HEADING_TYPE_RANK = {t: rank for rank, types in _HEADING_TYPE_RANK_TIERS.items()
 # tier-0 heading types restart the hierarchy at level 1 regardless of what precedes them
 STACK_RESET_TYPES = frozenset(_HEADING_TYPE_RANK_TIERS[0])
 
-# block_type values treated as headings throughout this module
-_HEADING_ROLES = {"heading", "toc_heading", "exhibit_heading", "hybrid_heading_paragraph"}
-
-# heading types whose hierarchy is determined by their own numeric depth
-NUMBERED_HEADING_TYPES = {
-    "numbered_heading",
-    "roman_numbered_heading",
-    "alpha_dotted_numbered_heading",
-    "alpha_numbered_heading",
-    # TODO add alpha heading
-}
-
-_RE_NUMERIC_PREFIX = re.compile(r'^\s*(\d+(?:\.\d+)*)')
+# _HEADING_ROLES, NUMBERED_HEADING_TYPES and _RE_NUMERIC_PREFIX are imported from step_05.
 _RE_ALPHA_DOTTED_PREFIX = re.compile(r'^\s*[A-Za-z]\.?\d+(?:\.\d+)*')
 
 
@@ -131,101 +127,6 @@ def _add_heading_weights(df: pd.DataFrame) -> pd.DataFrame:
         dynamic.loc[rank > rank_prev] -= 1
 
     out.loc[idx, "heading_weight_dynamic"] = dynamic
-    return out
-
-
-# ================================================================================
-# Assign heading id
-# ================================================================================
-
-def _assign_heading_id(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Groups consecutive heading rows that share the same heading_fp_id into a
-    single heading_id (multi-line headings). Non-heading rows get NA.
-
-    Numbered headings with different numeric prefixes are never merged,
-    even when consecutive and sharing an fp_id.
-    """
-    out = df.copy()
-    out["heading_id"] = pd.Series([pd.NA] * len(out), index=out.index, dtype="Int64")
-
-    if "block_type" not in out.columns:
-        return out
-
-    is_heading = (
-        out["block_type"].astype("string").str.strip().str.lower()
-        .isin(_HEADING_ROLES).fillna(False)
-    )
-    if not is_heading.any():
-        return out
-
-    if "heading_fp_id" not in out.columns:
-        next_id = 1
-        for idx in out.index[is_heading]:
-            out.at[idx, "heading_id"] = next_id
-            next_id += 1
-        return out
-
-    heading_idx = out.index[is_heading]
-    fp_vals = out.loc[heading_idx, "heading_fp_id"].values
-    line_vals = (pd.to_numeric(out.loc[heading_idx, "line_id"], errors="coerce").values
-                 if "line_id" in out.columns else None)
-    text_vals = (out.loc[heading_idx, "text"].astype("string").fillna("").values
-                 if "text" in out.columns else None)
-    ht_vals = (out.loc[heading_idx, "heading_type"].astype("string").fillna("").values
-               if "heading_type" in out.columns else None)
-    hm_vals = (out.loc[heading_idx, "hierarchy_marker"].astype("string").fillna("").values
-               if "hierarchy_marker" in out.columns else None)
-
-    idx_list = list(heading_idx)
-    next_id = 1
-    i = 0
-    while i < len(idx_list):
-        cur_fp = fp_vals[i]
-        cur_id = next_id
-        out.at[idx_list[i], "heading_id"] = cur_id
-        j = i + 1
-        while j < len(idx_list):
-            same_fp = pd.notna(cur_fp) and pd.notna(fp_vals[j]) and fp_vals[j] == cur_fp
-            consecutive = (line_vals is None or (
-                np.isfinite(line_vals[j - 1]) and np.isfinite(line_vals[j])
-                and line_vals[j] == line_vals[j - 1] + 1
-            ))
-            # Never merge two numbered heading rows that have different numeric prefixes
-            diff_numbered_prefix = False
-            if same_fp and consecutive and ht_vals is not None and text_vals is not None:
-                ht_j = str(ht_vals[j]).strip().lower()
-                if ht_j in NUMBERED_HEADING_TYPES:
-                    pfx_i = _RE_NUMERIC_PREFIX.match(str(text_vals[i]))
-                    pfx_j = _RE_NUMERIC_PREFIX.match(str(text_vals[j]))
-                    if pfx_j is not None:
-                        pfx_i_str = pfx_i.group(0).strip() if pfx_i else ""
-                        if pfx_i_str != pfx_j.group(0).strip():
-                            diff_numbered_prefix = True
-            # Named heading followed by a blank-marker subtitle on the next line.
-            # The subtitle may itself span multiple lines sharing one heading_fp_id,
-            # so also absorb further consecutive blank-marker lines that continue the
-            # previous subtitle line's fp (where the prior marker is already blank).
-            marker_prev = str(hm_vals[j - 1]).strip() if hm_vals is not None else ""
-            marker_curr = str(hm_vals[j]).strip() if hm_vals is not None else ""
-            same_prev_fp = (
-                pd.notna(fp_vals[j - 1]) and pd.notna(fp_vals[j])
-                and fp_vals[j - 1] == fp_vals[j]
-            )
-            named_heading_subtitle = (
-                hm_vals is not None
-                and consecutive
-                and marker_curr == ""
-                and (marker_prev != "" or same_prev_fp)
-            )
-            if (same_fp and consecutive and not diff_numbered_prefix) or named_heading_subtitle:
-                out.at[idx_list[j], "heading_id"] = cur_id
-                j += 1
-            else:
-                break
-        i = j
-        next_id += 1
-
     return out
 
 
@@ -496,11 +397,11 @@ def assign_doc_hierarchy(
     lines_df: pd.DataFrame,
 ) -> pd.DataFrame:
     """
-    Full document hierarchy pipeline: weights → heading_id → hierarchy tree.
+    Full document hierarchy pipeline: weights → hierarchy tree.
+    heading_id is expected to already exist (assigned in step_05).
 
     Returns lines_df with all heading columns added.
     """
     out = _add_heading_weights(lines_df)
-    out = _assign_heading_id(out)
     out = _infer_heading_hierarchy(out)
     return out
