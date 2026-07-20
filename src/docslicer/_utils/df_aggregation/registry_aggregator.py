@@ -151,7 +151,6 @@ COLUMN_REGISTRY: Dict[str, Agg] = {
     "gutter_id_left": Agg.FIRST,
     "gutter_id_right": Agg.FIRST,
     "stream_group_id": Agg.FIRST,
-    "sentence_score": Agg.FIRST,
     "center_bucket": Agg.FIRST,
     "top_bucket": Agg.DROP,        # line_merger y-band internal; consumed by line_id
     "line_number_flag": Agg.DROP,   # pdf line-number margin flag; word-level detail
@@ -202,7 +201,19 @@ COLUMN_REGISTRY: Dict[str, Agg] = {
     "pdf_heading_candidate": Agg.DROP,
     "pdf_heading_suppressed": Agg.DROP,
     "pdf_heading_suppressed_reason": Agg.DROP,
-    
+    "docx_heading_candidate": Agg.DROP,
+    "docx_heading_suppressed": Agg.DROP,
+    "docx_heading_suppressed_reason": Agg.DROP,
+    "heading_score": Agg.DROP,
+    "heading_score_debug": Agg.DROP,
+    "heading_weight_dynamic": Agg.DROP,
+    "heading_weight_static": Agg.DROP,
+    "line_gap_below": Agg.DROP,
+    "numbered_heading_group": Agg.DROP,
+    "parent_heading_text": Agg.DROP,
+    "style_change": Agg.DROP,
+    "temp_section_id": Agg.DROP,
+
 
     # --- geometry ---------------------------------------------------------------
     "x_left": Agg.MIN,
@@ -211,7 +222,6 @@ COLUMN_REGISTRY: Dict[str, Agg] = {
     "y_bottom": Agg.MAX,
     "width": Agg.DROP,             # recomputed from the aggregated bbox
     "height": Agg.DROP,            # recomputed from the aggregated bbox
-    "layout_align": Agg.DOMINANT,
     "text_align": Agg.DOMINANT,
 
     # --- style -------------------------------------------------------------------
@@ -292,7 +302,6 @@ COLUMN_REGISTRY: Dict[str, Agg] = {
     "shape_id_strikethrough": Agg.DROP,
     "shape_id_tr_above": Agg.FIRST,
     "shape_id_tr_below": Agg.FIRST,
-    "shape_id_vertical_grid_line": Agg.UNIQUE_LIST, #TODO check if still relevant
 
     # --- PDF structure tree / content-stream provenance ----------------------------------------
     "struct_group_id": Agg.FIRST,

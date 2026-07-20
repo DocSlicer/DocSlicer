@@ -27,7 +27,7 @@ from .step_02_run_extractor import (
     _content_part_specs,
     _iter_part_roots,
 )
-from .._utils.df_schemas import TABLE_CELLS_COLS, conform_table_cells
+from .._utils.table.table_schema import TABLE_CELLS_COLS
 from .._utils.table.table_header import detect_cell_roles
 
 
@@ -428,4 +428,4 @@ def build_table_cells(
     # internally on (table_id, row_start).
     result = detect_cell_roles(result, with_row_label=False)
 
-    return result #conform_table_cells(result, debug=debug)
+    return result

@@ -8,7 +8,7 @@ from typing import BinaryIO, Callable, NamedTuple, Optional
 
 import pandas as pd
 
-from .._utils.io.config import load_compiled_page_label_config
+from .._utils.io.yaml_loader import load_page_label_config
 from .._utils.timing import timed_step
 from .step_01_package_reader import DocxPackage, read_docx_package
 from .step_02_run_extractor import expand_header_footer_runs, extract_runs
@@ -70,7 +70,7 @@ def run_pipeline(
 
     with timed_step("package_reading", logger=logger):
         package = read_docx_package(source)
-    page_label_config = load_compiled_page_label_config()
+    page_label_config = load_page_label_config()
 
     # Always extract header/footer runs so df_runs contains them for inspection.
     with timed_step("run_extraction", logger=logger):

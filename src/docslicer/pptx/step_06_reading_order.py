@@ -44,11 +44,11 @@ columns (`reading_group_key`, `reading_group_order`, `reading_group_path`,
 become their own top-level group.
 
 Finally, `assign_group_order` orders the top-level groups *between* each
-other: each reading_group_key's union bbox is fed to the shared per-page
-reading-order walk (`_utils.layout.group_order`, generalized from the PDF
-pipeline) yielding `reading_group_rank`, and `order_index` combines that rank
-with the within-group order into one global paragraph sequence -- again as a
-column only, without reshuffling the DataFrame.
+other: each reading_group_key's union bbox is fed to a per-page recursive
+XY-cut walk (`_xy_cut_order`, inlined below) yielding `reading_group_rank`,
+and `order_index` combines that rank with the within-group order into one
+global paragraph sequence -- again as a column only, without reshuffling the
+DataFrame.
 
 `assign_reading_order` is the single entry point running all three stages.
 """
@@ -56,8 +56,6 @@ column only, without reshuffling the DataFrame.
 from __future__ import annotations
 
 import pandas as pd
-
-from .._utils.layout.group_order import order_group_boxes
 
 # Minimum fraction of a shape's own bbox area that must overlap a candidate
 # container's bbox for that container to count as enclosing it.
@@ -416,6 +414,102 @@ def assign_reading_groups(paragraph_df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+# XY-cut: two projected intervals merge into the same slice/column only when
+# they overlap by more than this, so a grazing touch across a gutter does not
+# fuse two columns.
+_XY_MERGE_TOL = 2.0
+
+
+def _interval_segments(starts, ends, positions: list[int], tol: float) -> list[list[int]]:
+    """Partition `positions` into maximal runs of transitively overlapping
+    intervals along one axis, ordered by start coordinate. More than one run
+    means a clean gap (a cut) exists between them."""
+    order = sorted(positions, key=lambda p: starts[p])
+    segments: list[list[int]] = [[order[0]]]
+    seg_end = ends[order[0]]
+    for p in order[1:]:
+        if starts[p] < seg_end - tol:
+            segments[-1].append(p)
+            seg_end = max(seg_end, ends[p])
+        else:
+            segments.append([p])
+            seg_end = ends[p]
+    return segments
+
+
+def _xy_cut_order(xl, yt, xr, yb) -> list[int]:
+    """Order group boxes by recursive XY-cut, column-first.
+
+    Split on horizontal gaps into top-to-bottom slices, which peels off
+    full-width bands (title, footer). Then, before emitting the slices one by
+    one, greedily merge maximal runs of consecutive slices whose *union* still
+    admits a vertical gutter: such a run is a multi-column region and is read
+    column-first -- each column in full, left to right -- instead of slice by
+    slice, which would interleave the columns. Everything recurses; a cluster
+    that can be cut on neither axis (irreducible overlap) falls back to a plain
+    top-to-bottom / left-to-right sort. Returns box positions 0..n-1 in order.
+    """
+
+    def x_segments(positions: list[int]) -> list[list[int]]:
+        return _interval_segments(xl, xr, positions, _XY_MERGE_TOL)
+
+    def cut_slice(positions: list[int]) -> list[int]:
+        """One y-slice: a vertical gutter splits it, else fall back to a sort."""
+        if len(positions) <= 1:
+            return list(positions)
+        segments = x_segments(positions)
+        if len(segments) > 1:
+            return [p for seg in segments for p in recurse(seg)]
+        return sorted(positions, key=lambda p: (yt[p], xl[p]))
+
+    def recurse(positions: list[int]) -> list[int]:
+        if len(positions) <= 1:
+            return list(positions)
+        y_segments = _interval_segments(yt, yb, positions, _XY_MERGE_TOL)
+        if len(y_segments) == 1:
+            return cut_slice(positions)
+
+        out: list[int] = []
+        i = 0
+        while i < len(y_segments):
+            j = i
+            union = list(y_segments[i])
+            while j + 1 < len(y_segments) and len(x_segments(union + y_segments[j + 1])) > 1:
+                j += 1
+                union += y_segments[j]
+            if j > i:
+                # Multi-column run: read each column in full, left to right.
+                for col in x_segments(union):
+                    out.extend(recurse(col))
+            else:
+                out.extend(cut_slice(y_segments[i]))
+            i = j + 1
+        return out
+
+    return recurse(list(range(len(xl))))
+
+
+def _order_group_boxes_xy(boxes: pd.DataFrame, page_col: str) -> pd.DataFrame:
+    """Assign a globally sequential `reading_order` rank per group box, running
+    the recursive XY-cut per page (pages ascending, groups within a page in
+    reading order)."""
+    out = boxes.copy()
+    out["reading_order"] = -1
+    rank = 0
+    for _page, page_boxes in out.groupby(page_col, sort=True, dropna=False):
+        idx = page_boxes.index.to_numpy()
+        ordered = _xy_cut_order(
+            page_boxes["x_left"].to_numpy(float),
+            page_boxes["y_top"].to_numpy(float),
+            page_boxes["x_right"].to_numpy(float),
+            page_boxes["y_bottom"].to_numpy(float),
+        )
+        for local in ordered:
+            out.at[idx[local], "reading_order"] = rank
+            rank += 1
+    return out
+
+
 def assign_group_order(paragraph_df: pd.DataFrame) -> pd.DataFrame:
     """
     Order the top-level reading groups between each other.
@@ -457,10 +551,10 @@ def assign_group_order(paragraph_df: pd.DataFrame) -> pd.DataFrame:
     if not page_col:
         boxes["page"] = 0
 
-    # "xy" (recursive XY-cut) reads side-by-side panels column-first, which is
-    # how slides are meant to be read; the default "walk" would sweep shared
-    # y-bands left-to-right and interleave the columns.
-    boxes = order_group_boxes(boxes, page_col="page", method="xy")
+    # Recursive XY-cut reads side-by-side panels column-first, which is how
+    # slides are meant to be read; a left-to-right band walk would sweep shared
+    # y-bands and interleave the columns.
+    boxes = _order_group_boxes_xy(boxes, page_col="page")
     rank_map = dict(zip(boxes["reading_group_key"], boxes["reading_order"]))
     out["reading_group_rank"] = out["reading_group_key"].map(rank_map).astype("Int64")
 

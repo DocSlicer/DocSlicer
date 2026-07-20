@@ -35,7 +35,6 @@ import numpy as np
 import pandas as pd
 from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 
-from .._utils.df_schemas import conform_table_cells
 from .._utils.table.table_header import detect_cell_roles
 from .._utils.text_utils import _CURRENCY_SYMBOLS
 
@@ -697,4 +696,4 @@ def extract_table_cells(
         return None
 
     result = pd.concat(all_cells, ignore_index=True)
-    return result #conform_table_cells(result, debug=debug)
+    return result

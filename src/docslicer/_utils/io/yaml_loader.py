@@ -9,11 +9,19 @@ from importlib.resources import files
 from typing import Dict, Tuple, Any
 import yaml
 
-from .yaml_compilers.page_label_patterns import load_and_compile_patterns
+from .yaml_compilers.page_label_patterns import load_and_compile_patterns, PageLabelPatternConfig
 from .yaml_compilers.hierarchy_type_patterns import load_and_compile_hierarchy_type_patterns
 from .yaml_compilers.exhibit_patterns import load_and_compile_exhibit_patterns
 
 _CONFIG = files("docslicer") / "config"
+
+
+def load_page_label_config() -> PageLabelPatternConfig:
+    """Load and compile just the page label patterns (used by the docx pipeline,
+    which doesn't need the hierarchy_type/exhibit patterns loaded by load_yamls)."""
+    with (_CONFIG / "page_label_patterns.yaml").open("r", encoding="utf-8") as f:
+        page_label_dict = yaml.safe_load(f)
+    return load_and_compile_patterns(page_label_dict)
 
 
 def load_yamls() -> Tuple[Dict[str, Any], Any, Any, Any]:

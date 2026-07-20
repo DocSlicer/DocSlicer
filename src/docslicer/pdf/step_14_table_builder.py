@@ -13,7 +13,7 @@ import pandas as pd
 
 from .._utils.df_aggregation.registry_aggregator import aggregate_to
 from .._utils.df_aggregation.text_merge import merge_text_within_line
-from .._utils.df_schemas import TABLE_CELLS_COLS, conform_table_cells
+from .._utils.table.table_schema import TABLE_CELLS_COLS
 from .._utils.table.table_normalize import normalize_columns_by_table
 from .._utils.table.table_header import detect_cell_roles
 from .._utils.text_utils import numeric_value_mask
@@ -1241,7 +1241,7 @@ def _build_table_cells_df(df_cells: pd.DataFrame, debug: bool = False) -> pd.Dat
     else:
         out["table_cell_role"] = pd.Series(pd.NA, index=out.index, dtype="string")
 
-    return out #conform_table_cells(out, debug=debug)
+    return out
 
 
 # ============================================================

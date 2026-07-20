@@ -41,13 +41,3 @@ class ParseConfig:
 
 
 DEFAULT_CONFIG = ParseConfig()
-
-
-@dataclass(frozen=True)
-class LayoutConfig:
-    """Immutable configuration for layout detection."""
-    min_column_gap: float = 30.0
-    table_score_threshold: float = 0.7
-    heading_score_threshold: float = 1.5
-    max_chunk_chars: int = 3200
-    min_chunk_chars: int = 400

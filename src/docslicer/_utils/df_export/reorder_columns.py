@@ -9,6 +9,21 @@ produced anywhere in the pipeline.  Columns not listed here end up appended
 at the end of any reordered DataFrame — a useful signal that the list is
 out of date.
 
+The list is split into two parts:
+
+    PART A — STABLE OUTPUT COLUMNS
+        Columns that survive to (or near) the final output, ordered so that a
+        human inspecting an exported frame reads identity → hierarchy →
+        content → geometry → style → features → provenance left-to-right.
+
+    PART B — INTERMEDIATE / DIAGNOSTIC COLUMNS
+        Scratch, debug and per-atom columns consumed at some stage and
+        dropped before the final output. Grouped by the pipeline stage that
+        produces them and pushed to the back so they never clutter the front
+        of an inspected frame. Ordering here mirrors the sections in
+        ``df_aggregation/registry_aggregator.py`` (the aggregation source of
+        truth); the two files should be kept in sync.
+
 Usage:
     from docslicer._utils.reorder_columns import reorder_columns
 
@@ -40,57 +55,38 @@ DataFrameType = Literal[
 # =====================
 # Master Column Order
 # =====================
-# Every column produced anywhere in the pipeline belongs here.
-# Groups:
-#   1.  Document / page identifiers          (all formats)
-#   2.  Run / atom provenance                (docx, pptx)
-#   3.  IDs and hierarchy                    (all formats)
-#   4.  Content                              (all formats)
-#   5.  Geometry                             (all formats)
-#   6.  Style                                (all formats)
-#   7.  Calculated features                  (all formats)
-#   8.  Page context                         (all formats)
-#   9.  List / outline                       (docx, pptx, html)
-#   10. Relationships                        (all formats)
-#   11. HTML DOM provenance                  (html)
-#   12. Style inheritance                    (docx, pptx)
-#   13. Table-specific fields                (all formats)
-#   14. Image metadata                       (pdf)
-#   15. Shape internals                      (pdf)
-#   16. Line / band statistics               (pdf, html)
-#   17. Table-builder analysis               (pdf)
-#   18. Scores                               (all formats)
-#   19. Cross-document references            (docx)
 
 MASTER_COLUMN_ORDER: List[str] = [
 
-    # ===== 1. Document / page identifiers =====
+    # =========================================================================
+    # PART A — STABLE OUTPUT COLUMNS
+    # =========================================================================
+
+    # ===== 1. Document / page identity =====
     "page_number",
-    "vstack_score",     # NOTE: temp
-    "grouped_row_id",   # NOTE: temp
+    "page_format",
     "page_label",
+    "page_label_type",
+    "page_label_value",
     "section",
     "section_id",           # docx
     "slide_index",          # pptx
 
-    # ===== 2. Run / atom provenance =====
-    # (docx + pptx: every row comes from a single XML run;
-    #  these fields say *where* in the document structure it lives)
-    "run_type",             # docx, pptx  — text / tab / image_ref / chart_ref / …
-    "run_index",            # docx, pptx  — position within parent paragraph
-    "order_index",          # docx, pptx  — global sequential position in document
-    
-    "header_footer_type",   # docx        — body / header / footer
-    "nested_table_depth",   # docx        — 0 for top-level, >0 for tables inside table cells
-    "page_break_before",    # docx        — paragraph-level page break flag
-    "section_break_after",  # docx        — section break appended after paragraph
-    "section_break_type",   # docx        — nextPage / continuous / evenPage / oddPage
+    # ===== 2. Run / atom provenance (docx, pptx) =====
+    # (every row comes from a single XML run; these say *where* it lives)
+    "run_type",             # text / tab / image_ref / chart_ref / …
+    "run_index",            # position within parent paragraph
+    "order_index",          # global sequential position in document
+    "header_footer_type",   # body / header / footer
+    "nested_table_depth",   # 0 for top-level, >0 inside table cells
+    "page_break_before",    # paragraph-level page break flag
+    "section_break_after",  # section break appended after paragraph
+    "section_break_type",   # nextPage / continuous / evenPage / oddPage
 
     # ===== 3. IDs and hierarchy =====
-
     # Atomic-level IDs (raw extraction)
     "word_id",              # pdf, ocr, html
-    "text_object_id",       # native pdf's
+    "text_object_id",       # native pdf
     "box_id",               # html
     "run_id",               # docx, pptx
     "image_id",             # pdf, docx, pptx
@@ -98,22 +94,17 @@ MASTER_COLUMN_ORDER: List[str] = [
     "shape_id",             # pdf, pptx
     "link_id",              # pdf, html
     "chart_id",             # pptx
-    
 
     # Mid-pipeline IDs (pdf + html)
     "cell_id",
     "line_id",
     "layout_id",
     "cell_count",
-    "temp_line_id",
     "paragraph_id",
     "gutter_id",
-    "gutter_candidate_id",
     "reading_order",
     "struct_group_id",
     "stream_group_id",
-    "stream_group_trigger",
-
 
     # Shared-pipeline IDs
     "block_id",
@@ -123,44 +114,34 @@ MASTER_COLUMN_ORDER: List[str] = [
     # Aggregated hierarchical ID lists
     "word_ids",
     "line_ids",
-    "run_ids",              # docx, pptx  — list of run_id values aggregated here
-    "paragraph_ids",        # docx, pptx  — list of paragraph_id values aggregated here
+    "cell_ids",
     "raw_shape_ids",
-    "group_ids", # PPTX element grouping
-    "container_shape_ids", # PPTX element grouping
-    "container_group_ids", # PPTX element grouping
-
-
-
-    # NOTE: HTML struct_tag / struct_tag_id are ordered in the shared struct-tree
-    # provenance block below (they now share names with the PDF pipeline).
+    "group_ids",            # PPTX element grouping
+    "group_names",          # PPTX element grouping
+    "group_depth",          # PPTX element grouping
+    "container_shape_ids",  # PPTX element grouping
 
     # Aggregated hierarchical counts
-    "run_count",            # docx, pptx  — runs collapsed into this paragraph
-    "paragraph_count",      # docx, pptx  — paragraphs collapsed into this line
+    "run_count",            # runs collapsed into this paragraph
+    "paragraph_count",      # paragraphs collapsed into this line
     "block_count",
 
-    # Layout IDs
+    # Layout classification
     "layout_type",
     "layout_score",
     "block_type",
+    "shape_role",           # page_background / table_grid / underline / …
 
-    # Shape classification
-    "shape_role",               # page_background / table_grid / underline / separator / background_band / other
-
-    # Table IDs # TODO WIP
+    # ===== 4. Table IDs and structure =====
     "table_id",
-
     "row_start",
     "col_start",
     "col_end",
-    "rowspan", 
+    "rowspan",
     "colspan",
     "band_total_cols",
     "table_cell_role",      # header / data / row_label
-
-    
-
+    "role",                 # html generic cell role
     "row_complete",
     "is_last_tr_below",
     "is_subheading",
@@ -170,74 +151,72 @@ MASTER_COLUMN_ORDER: List[str] = [
     "grid_row_trustworthy",
 
     "table_cell_id",
+    "table_cell_index",
     "table_header_flag",
+    "table_row_id",
+    "table_row_cell_count",
 
     "struct_table_id",
-    "table_row_id", # Not a column in table_cell_df
     "struct_table_row_id",
     "struct_table_cell_id",
     "struct_col_span",
     "struct_row_span",
 
-    "table_grid_id", # Detected grids in df_shapes, not the same as table_id (there are more tables than grids ~ tables with only horizontal lines)
-    "grid_cell_id",  # Detected grid cells in df_shapes, not the same as table_cell_id 
-                     # (1 grid cell can have multiple table cells, for example in tables without inside borders)
-
-    "grid_row_start",	
-    "grid_col_start",	
-    "grid_rowspan",	
+    "table_grid_id",        # detected grids in df_shapes (≠ table_id)
+    "grid_cell_id",         # detected grid cells in df_shapes (≠ table_cell_id)
+    "grid_row_start",
+    "grid_rowspan",
     "grid_colspan",
-    
 
-    # Shape core
+    # ===== 5. Shape core =====
     "raw_shape_type",
     "shape_type",
-    "shape_orientation",    # pdf  — horizontal / vertical / unknown
+    "shape_orientation",    # horizontal / vertical / unknown
 
-    # Gutter / reading column (pdf — on words df)
-    "gutter_id_left",       # ID of the gutter immediately to the left of this word
-    "gutter_id_right",      # ID of the gutter immediately to the right
-    "reading_column",       # 1-based column index assigned by gutter split
+    # ===== 6. Gutter / reading column (pdf — on words df) =====
+    "gutter_id_left",
+    "gutter_id_right",
+    "reading_column",
 
-    # ===== 4. Content =====
+    # ===== 7. Content =====
     "chunk_heading",
     "chunk_path",
-    "shape_id_tr_above", # TODO: Reorder after stable debug
-    "shape_id_tr_below", # TODO: Reorder after stable debug
     "text",
-    "text_raw", # Pre-processed OCR text
+    "text_raw",             # pre-processed OCR text
     "cells",
 
     # Heading hierarchy
     "heading_level",
     "heading_level_raw",
     "heading_score",
-    
     "hierarchy_marker",
     "hierarchy_type",
     "heading_type",
-    "numbered_heading_group",
-
-
-    "embed_char_count", #Temporarily
+    "hybrid_heading_text",
+    "embed_char_count",
     "heading_fp_id",
     "heading_fingerprint",
     "active_heading_id",
     "heading_id",
     "parent_heading_id",
     "heading_hash",
-    "heading_weight_static",
-    "heading_weight_dynamic",
-    "heading_score_debug",
-    "heading_sequence",
-    
 
-    # ===== 5. Geometry =====
+    # PDF form fields
+    "form_widget",
+    "form_field_name",
+    "form_value",
+    "form_tooltip",
+    "form_is_empty",
+
+    # Image content
+    "img_alt",
+    "img_src",
+
+    # ===== 8. Geometry =====
     "x_left",
     "x_right",
     "y_top",
     "y_bottom",
-    "x_center",
     "y_center",
     "top_bucket",
     "center_bucket",
@@ -246,18 +225,18 @@ MASTER_COLUMN_ORDER: List[str] = [
     "height",
     "area",
 
-    # ===== 6. Style =====
+    # ===== 9. Style =====
     "font_name",
     "font_family",
     "font_size",
     "font_size_ratio",
     "font_weight",
     "text_align",
-    "layout_align",
     "text_orientation",
     "non_stroking_color",
     "stroking_color",
     "linewidth",
+    "has_vertical_line",
 
     # Gutter geometry (pdf — on gutters df)
     "gutter_x_left",
@@ -265,25 +244,15 @@ MASTER_COLUMN_ORDER: List[str] = [
     "gutter_y_top",
     "gutter_y_bottom",
     "gutter_width",
-    "intersecting_horizontal_line_ids",
-
-    # Gutter candidate scratch columns (pdf — intermediate)
-    "sliding_window_id",
-    "sliding_window",
-    "x_page_min",
-    "x_page_max",
-    "gutter_candidate_x_left",
-    "gutter_candidate_x_right",
 
     # Shape paint state (pdf)
     "fill",
     "stroke",
     "paint_op",
 
-    # ===== 7. Calculated features =====
+    # ===== 10. Calculated features =====
     # Counts
-    "token_count", # From Tiktoken
-    #"embed_char_count",
+    "token_count",          # from tiktoken
     "char_count",
     "alpha_count",
     "digit_count",
@@ -291,17 +260,13 @@ MASTER_COLUMN_ORDER: List[str] = [
     "word_count",
     "alpha_word_count",
     "capitalized_word_count",
-    
 
     # Ratios
     "bold_ratio",
     "italic_ratio",
-    "digit_ratio",
-    "uppercase_ratio",
     "capitalized_token_ratio",
     "underlined_ratio",
     "strikethrough_ratio",
-    "inside_rect_fraction",
 
     # Boolean style flags (derived from ratios / direct XML attributes)
     "is_bold",
@@ -309,30 +274,18 @@ MASTER_COLUMN_ORDER: List[str] = [
     "is_uppercase",
     "is_underlined",
     "is_strikethrough",
-    "script_type", # "superscript", "subscript", or None (blank)
+    "script_type",          # "superscript", "subscript", or None
 
-    # Average metrics
-    "avg_word_len",
-    "avg_cell_count",
+    # Row / line classification
+    "line_number_flag",     # pdf — row looks like a line-number margin label
+    "line_class",
+    "line_score",
 
-    # PDF-specific detection flags
-    "line_number_flag",     # pdf  — row looks like a line-number margin label
-
-    # ===== 8. Page context =====
+    # ===== 11. Page context =====
     "page_width",
     "page_height",
 
-    # Temporary page-label scratch IDs
-    "page_label_series_id",
-    "page_label_raw",
-    "page_label_candidate",
-    "page_label_type",
-    "page_label_value",
-    "page_label_cell_sharing",
-    "page_label_wrapper",
-    "page_label_score",
-
-    # ===== 9. List / outline =====
+    # ===== 12. List / outline =====
     "list_num_id",          # docx, pptx
     "list_level",           # docx, pptx
     "list_label",           # docx, pptx  — rendered label ("1.", "a)", "•")
@@ -341,7 +294,7 @@ MASTER_COLUMN_ORDER: List[str] = [
     "list_start_at",        # pptx        — override start value
     "outline_level",        # docx, pptx  — 0-based heading depth from style
 
-    # ===== 10. Relationships =====
+    # ===== 13. Relationships =====
     # Links and bookmarks
     "has_link",
     "link_url",
@@ -350,11 +303,12 @@ MASTER_COLUMN_ORDER: List[str] = [
     "ixbrl_id",
     "ix",
     "html_data_attrs",
+    "hyperlink_url",        # docx
     "bookmark_id",          # docx  — single bookmark on this run
     "bookmark_ids",         # docx  — all bookmark IDs on paragraph
     "bookmark_names",       # docx  — all bookmark names on paragraph
 
-    # Header-detection features from detect_cell_roles (row-level, broadcast to cells)
+    # Header-detection features from detect_cell_roles (row-level → cells)
     "table_row_style",
     "hdr_n_populated",
     "hdr_frac_numeric",
@@ -368,55 +322,46 @@ MASTER_COLUMN_ORDER: List[str] = [
     "hdr_in_row0_span",
 
     # Shape overlaps / decorations (pdf)
-    "has_horizontal_grid_line",
-    "has_vertical_grid_line",
-    "shape_id_underline",       # pdf — shape that provides the underline flag
+    "shape_id_container",         # shape acting as a bounding rectangle
+    "shape_id_underline",         # shape that provides the underline flag
     "shape_id_strikethrough",
-    "shape_id_horizontal_grid_line",
-    "shape_id_vertical_grid_line",   # pdf — shape that provides the vertical line flag
+    "shape_id_tr_above",
+    "shape_id_tr_below",
     "inside_rect_shape",
     "background_non_stroking_color",
     "background_stroking_color",
-    "shape_id_container",       # pdf — shape acting as a bounding rectangle
 
-    # ===== 11. PDF Struct Tree provenance =====
-    # Main cols
-    "struct_ancestors",	
-    "struct_raw_ancestors",	
+    # ===== 14. PDF struct-tree provenance =====
+    "word_source",
+    "struct_ancestors",
+    "struct_raw_ancestors",
     "struct_ancestor_ids",
     "textbox_id",
-    # Other
     "struct_tag_id",
     "struct_tag",
     "struct_raw_tag",
-    
     "struct_scope",
     "struct_headers",
     "mcid",
     "bdc_tag",
-    "dfs_position",	 # mostly inaccurate, even in well-tagged pdf's
+    "dfs_position",         # mostly inaccurate, even in well-tagged pdfs
 
-    
-
-    # ===== 11. HTML DOM provenance =====
+    # ===== 15. HTML DOM provenance =====
     "dom_id",
     "dom_class",
     "wrapping_tag",
     "split_reason",
-    # struct_ancestors / struct_ancestor_ids are ordered in the struct-tree block above
     "ancestor_ids",
     "ancestor_classes",
     "ancestor_aria_roles",
 
-    # ===== 12. Style inheritance =====
-    # (docx: resolved through the style-inheritance chain)
-
-    "source_part",          # docx, pptx  — XML part: body / footnotes / endnotes / header / footer / …
-    "source_part_id",       # docx, pptx  — ID of the item within that part
-
-    "placeholder_type",     # pptx        — title / body / subtitle / …
-    "shape_name", # PPTX
-
+    # ===== 16. Style inheritance (docx, pptx) =====
+    "source_part",          # XML part: body / footnotes / header / footer / …
+    "source_part_id",       # ID of the item within that part
+    "placeholder_type",     # pptx — title / body / subtitle / …
+    "shape_name",           # pptx
+    "style_id",
+    "style_name",
     "paragraph_style_id",
     "paragraph_style_name",
     "effective_paragraph_style_id",
@@ -426,21 +371,9 @@ MASTER_COLUMN_ORDER: List[str] = [
     "effective_character_style_id",
     "effective_character_style_name",
 
-    # ===== 13. Table-specific fields =====
-    """"
-    "row_start",
-    "col_start",
-    "col_end",
-    "rowspan",
-    "colspan",
-    "role",                 # header / data / row_label
-    "band_total_cols",
-    """
-
-    # ===== 14. Image metadata (pdf) =====
+    # ===== 17. Image metadata (pdf) =====
     "image_width",
     "image_height",
-    "xref",                 # pdf internal object reference
     "bpc",                  # bits per component
     "colorspace",
     "colorspace_name",
@@ -451,90 +384,157 @@ MASTER_COLUMN_ORDER: List[str] = [
     "dpi_x",
     "dpi_y",
 
-    # ===== 15. Shape internals (pdf) =====
-    # Merger intermediate
-    "candidate_group_id",       # grouping scratch ID during merge
-    
-    #"table_grid_id",            # shared ID across the lines of one detected table grid
+    # ===== 18. Shape internals (pdf) =====
+    "candidate_group_id",   # grouping scratch ID during merge
     "has_intersection",
     "intersection_count",
     "intersecting_line_ids",
     "color_hex",
     "color_label",
-
-    "hl_class", # TODO: Temp table hr debug
-
-    # Cell-builder shape diagnostics
-    "is_sentence_like",
-    "sentence_score",
+    "hl_class",
     "is_line_start",
 
-    # ===== 16. Line / band statistics (pdf, html) =====
-    "line_gap",
-    "line_gap_to_prev",
-    "page_median_gap",
-    "page_gap_thresh",
-
-    # Column / gutter gap metrics (pdf)
-    "median_x0x1_gap",
-    "max_x0x1_gap",
-    "gap_ratio",
-    "width_ratio",
-
-    # ===== 17. Table-builder analysis (pdf intermediate) =====
-    # These columns live on the lines/bands df during table classification
-    # and are typically dropped before the final output.
-    "band_table_score",
-    "row_pattern",
-    "row_pattern_max",
-    "row_pattern_reuse",
-    "column_reuse",
-    "reused_cols",
-    "atomic_cells",
-    "atomic_cell_ratio",
-    "total_cols",
-    "total_lines",
-    "max_cell_count",
-    "max_colspan",
-    "is_multi_cell",
-    "is_strong_multi_cell",
-    "is_prose_candidate",
-    "is_justified_prose_like",
-    "is_full_span_line",
-    "multi_cell_line_ratio",
-    "multi_cell_lines",
-    "strong_multi_cell_line_ratio",
-    "strong_multi_cell_lines",
-    "prose_candidate_lines",
-    "justified_prose_lines",
-    "justified_prose_ratio",
-    "full_span_lines",
-    "full_span_line_ratio",
-    "large_gap_lines",
-    "large_gap_ratio",
-    "gap_count",
-    "gap_std",
-    "gap_cv",
-    "median_cell_words",
-
-    # ===== 18. Scores =====
-    "table_row_score",
-    "table_header_score",
-    "table_title_score",
-    "avg_table_row_score",
-    "average_table_score",
-
-    # ===== 18. OCR Color Estimation =====
-    "non_stroking_color_hex_raw",
-    "background_non_stroking_color_hex_raw",
-    "ink_coverage",
-
-    # ===== 19. Cross-document references (docx) =====
-    # IDs pointing to objects elsewhere in the document (comments, footnotes, endnotes).
-    # Sit at the end because they're rarely needed during inspection.
+    # Cross-document references (docx) — rarely needed during inspection
     "comment_id",
     "footnote_id",
     "endnote_id",
+
+    # =========================================================================
+    # PART B — INTERMEDIATE / DIAGNOSTIC COLUMNS
+    # Consumed at some stage and dropped before final output. Grouped by the
+    # pipeline stage that produces them; ordering mirrors registry_aggregator.
+    # =========================================================================
+
+    # ----- OCR word-level internals (color / font-size estimation) -----
+    "non_stroking_color_hex_raw",
+    "background_non_stroking_color_hex_raw",
+    "ink_coverage",
+    "font_pointsize",
+    "ocr_confidence",
+    "has_capital",
+    "has_ascender",
+    "has_descender",
+
+    # ----- Native PDF stream-group pair features (step_07) -----
+    "large_gap",
+    "new_textbox",
+    "objects_between",
+    "same_line",
+    "same_struct",
+    "same_table",
+    "shifted_left",
+    "y_decreases",
+    "encapsulation_split",
+
+    # ----- Cell-builder line-splitting diagnostics (word/line level) -----
+    "line_em_threshold",
+    "line_is_bimodal",
+    "line_has_punct",
+    "line_max_em",
+    "line_median_em",
+    "line_n_gaps",
+    "line_n_words",
+    "line_split_em",
+    "line_jump_ratio",
+    "line_alpha_ratio",
+    "line_numeric_ratio",
+    "line_stopword_hits",
+    "line_cap_ratio",
+
+    # ----- Cell grouper (vstack / grouped-row) diagnostics -----
+    "cell_id_orig",
+    "line_id_orig",
+    "grouped_row_id",
+    "grouped_row_n_vstacks",
+    "grouped_row_x_left",
+    "grouped_row_x_right",
+    "grouped_row_y_top",
+    "grouped_row_y_bottom",
+    "vstack_id",
+    "vstack_gap_em",
+    "vstack_n_cells",
+    "vstack_n_lines",
+    "vstack_score",
+    "vstack_width",
+    "vstack_alone_in_band",
+    "x_movement",
+    "y_movement",
+    "gap_em_right",
+
+    # ----- PDF layout grouping (line → block) -----
+    "line_gap",
+    "page_gap_thresh",
+    "median_gap",
+    "width_ratio",
+
+    # ----- Heading detector debug -----
+    "pdf_heading_candidate",
+    "pdf_heading_suppressed",
+    "pdf_heading_suppressed_reason",
+    "docx_heading_candidate",
+    "docx_heading_suppressed",
+    "docx_heading_suppressed_reason",
+    "heading_source",
+    "heading_score_debug",
+    "heading_weight_static",
+    "heading_weight_dynamic",
+    "line_gap_below",
+    "numbered_heading_group",
+    "parent_heading_text",
+    "style_change",
+    "temp_section_id",
+
+    # ----- TOC detector KPI columns (step_02) -----
+    "toc_heading_candidate",
+    "toc_has_dot_leaders",
+    "toc_row_candidate",
+    "toc_row_page_token",
+    "toc_row_page_type",
+    "toc_segment_id",
+    "toc_segment_score",
+    "toc_segment_score_detail",
+
+    # ----- Exhibit detector KPI columns -----
+    "exhibit_heading_candidate",
+    "exhibit_row_candidate",
+    "exhibit_row_number",
+    "exhibit_row_strength",
+    "exhibit_segment_id",
+    "exhibit_segment_score",
+    "exhibit_segment_score_detail",
+
+    # ----- Table-builder analysis leftovers (pdf) -----
+    "total_cols",
+    "total_lines",
+
+    # ----- PPTX reading-order intermediates (step_06) -----
+    "container_group_ids",
+    "reading_group_key",
+    "reading_group_order",
+    "reading_group_path",
+    "reading_group_bboxes",
+    "reading_group_rank",
+
+    # ----- DOCX run-level detail -----
+    "hyperlink_id",
+    "field_id",
+    "field_type",
+    "field_phase",
+    "event_tag",
+    "chart_rel_id",
+    "is_deleted_revision",
+    "is_inserted_revision",
+
+    # ----- Page-label detector scratch / debug -----
+    "page_label_series_id",     # kept for the section classifier
+    "page_label_group_id",      # kept for the section classifier
+    "page_label_raw",
+    "page_label_candidate",
+    "page_label_cell_sharing",
+    "page_label_wrapper",
+    "page_label_score",
+    "page_label_token",
+    "alternation_mode",
 ]
 
 _seen: set[str] = set()
@@ -554,7 +554,6 @@ del _seen, _dupes
 
 def reorder_columns(
     df: pd.DataFrame,
-    dataframe_type: DataFrameType | None = None,
 ) -> pd.DataFrame:
     """
     Reorder columns in a DataFrame to match MASTER_COLUMN_ORDER.

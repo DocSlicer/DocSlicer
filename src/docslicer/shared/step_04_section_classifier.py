@@ -32,10 +32,12 @@ import pandas as pd
 
 _KNOWN_LABEL_FORMATS: frozenset[str] = frozenset({
     "arabic", "arabic_sub", "roman", "roman_numeric",
-    "alpha_numeric", "alpha_roman",
+    "alpha_numeric", "alpha_numeric_sub", "alpha_roman",
 })
 
-_ALPHA_FORMATS: frozenset[str] = frozenset({"alpha_numeric", "alpha_roman"})
+_ALPHA_FORMATS: frozenset[str] = frozenset({
+    "alpha_numeric", "alpha_numeric_sub", "alpha_roman",
+})
 _ARABIC_FORMATS: frozenset[str] = frozenset({"arabic", "arabic_sub"})
 _ROMAN_FORMATS: frozenset[str] = frozenset({"roman", "roman_numeric"})
 
@@ -80,6 +82,7 @@ def _parse_label_value(label_text: str | None, label_type: str | None) -> int | 
     - arabic / arabic_sub: strip to digits and parse
     - roman / roman_numeric: roman numeral conversion
     - alpha_numeric / alpha_roman: extract the trailing integer portion
+    - alpha_numeric_sub: composite major*1000 + minor (e.g. "A-1-86" → 1086)
     """
     if not label_text or not label_type:
         return None
@@ -98,6 +101,15 @@ def _parse_label_value(label_text: str | None, label_type: str | None) -> int | 
         m = re.match(r"^([ivxlcdmIVXLCDM]+)", txt)
         if m:
             return _roman_to_int(m.group(1))
+        return None
+
+    if ltype == "alpha_numeric_sub":
+        # e.g. "A-1-86" → composite major*1000 + minor (matches arabic_sub
+        # ordering); keeps a series monotonic so the minor resetting to 1 on
+        # each major bump doesn't fire a spurious value-restart boundary.
+        m = re.search(r"(\d+)\s*[-–.]\s*(\d+)\s*$", txt)
+        if m:
+            return int(m.group(1)) * 1000 + int(m.group(2))
         return None
 
     if ltype in ("alpha_numeric", "alpha_roman"):
@@ -1045,21 +1057,31 @@ def _assign_section_labels(section_index: pd.DataFrame) -> pd.DataFrame:
         return pd.isna(v) or str(v).strip() == ""
 
     # 1. Alpha-prefixed sections
-    # Consecutive alpha_numeric sections form a run. Within each run the
-    # collective set of distinct prefixes decides the label: sole "F" →
-    # financials, sole "S" → schedules, mixed / unknown → annex.
-    # alpha_roman sections are always annex and do NOT break a run.
+    # Consecutive sections of the same alpha_numeric format form a run. Within
+    # each run the collective set of distinct prefixes decides the label: sole
+    # "F" → financials, sole "S" → schedules, mixed / unknown → annex.
+    # alpha_numeric and alpha_numeric_sub form SEPARATE runs (a format change
+    # between them ends the current run); alpha_roman sections are always annex
+    # and do NOT extend or break a run.
+    _RUN_FORMATS = ("alpha_numeric", "alpha_numeric_sub")
     sorted_idx = si.sort_values("start_page").index.tolist()
     runs: list[list[int]] = []
     current_run: list[int] = []
+    current_fmt: str | None = None
     for idx in sorted_idx:
         row = si.loc[idx]
-        if _unlabeled(row) and row.get("label_format") == "alpha_numeric":
+        fmt = row.get("label_format")
+        if _unlabeled(row) and fmt in _RUN_FORMATS:
+            if current_run and fmt != current_fmt:
+                runs.append(current_run)
+                current_run = []
             current_run.append(idx)
+            current_fmt = fmt
         else:
             if current_run:
                 runs.append(current_run)
                 current_run = []
+            current_fmt = None
     if current_run:
         runs.append(current_run)
 

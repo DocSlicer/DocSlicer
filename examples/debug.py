@@ -22,7 +22,7 @@ from time import perf_counter
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 import docslicer
-from docslicer._utils.df_export.df_exports import export_debug
+from docslicer._utils.df_export.export_debug import export_debug
 
 # ── Args ───────────────────────────────────────────────────────────────────────
 
