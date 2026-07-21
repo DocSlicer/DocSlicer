@@ -35,8 +35,9 @@ from .._utils.io.yaml_loader import load_yamls
 from .._utils.timing import timed_step
 from .._utils.safe_call import safe_enrich
 
-# Metadata utilities
-from ..metadata import add_page_and_ocr_info, add_document_information
+# Metadata utilities — native channel (HTML <head>) + shared text/consolidate/page steps
+from .native_metadata import extract_native_metadata
+from ..metadata import add_page_info, add_text_fallbacks, consolidate
 
 # Scraping
 from ..scraping.dispatcher import fetch_url, _is_sec_url
@@ -227,10 +228,11 @@ def run_pipeline(
     discovered_metadata: Dict[str, Any] = {}
     discovered_metadata["rendered_html"] = rendered_html
 
-    with timed_step("page_count_ocr_detection", logger=logger):
+    with timed_step("page_info", logger=logger):
+        # HTML has no scanned/OCR concept — page geometry + char totals only.
         safe_enrich(
-            add_page_and_ocr_info, discovered_metadata, df_boxes, df_images=pd.DataFrame(),
-            fallback={"page_count": 1, "is_password_protected": False, "has_ocr": False},
+            add_page_info, discovered_metadata, df_boxes,
+            fallback={"page_count": 1, "chars": 0},
             logger=logger,
         )
 
@@ -269,21 +271,25 @@ def run_pipeline(
         df_lines = prefill_styles(df_lines)
 
     with timed_step("document_metadata", logger=logger):
+        # Native channel — the page's own <head> metadata (title/author/lang/dates).
+        discovered_metadata.update(extract_native_metadata(rendered_html))
+        # Text channel — heuristics over the parsed body, a fallback for the three
+        # fields that native <head> metadata routinely omits (SEC filings, etc.).
         safe_enrich(
-            add_document_information, discovered_metadata, html_content=rendered_html, df_lines=df_lines,
-            fallback={
-                "author_meta": None, "author_text": None,
-                "title_meta": None, "title_text": None,
-                "language": "unknown", "profile": "unknown",
-            },
+            add_text_fallbacks, discovered_metadata, df_lines,
+            fallback={"author_text": None, "title_text": None, "language_text": None},
             logger=logger,
         )
+        # Fold both channels into the final title / author / language.
+        consolidate(discovered_metadata)
 
     # ============================================================
     # Finalize metadata
     # ============================================================
     discovered_metadata["is_password_protected"] = False
     discovered_metadata["has_ocr"] = False
+    discovered_metadata["needs_ocr"] = False
+    discovered_metadata["is_scanned"] = False
 
     if df_table_cells is not None and not isinstance(df_table_cells, pd.DataFrame):
         df_table_cells = None

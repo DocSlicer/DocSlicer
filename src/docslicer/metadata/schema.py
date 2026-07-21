@@ -62,8 +62,12 @@ class DocumentMetadata:
     title: Optional[str] = None
     author: Optional[list[str]] = None
     language: Optional[str] = None
-    language_confidence: Optional[str] = None   # high | medium | low
-    language_source: Optional[str] = None       # meta | text
+
+    # Native-only fields (no text-channel fallback — passed straight through)
+    created: Optional[str] = None              # ISO-8601 creation timestamp
+    modified: Optional[str] = None             # ISO-8601 last-modified timestamp
+    last_modified_by: Optional[str] = None     # OOXML only; None for PDF/HTML
+    generator: Optional[str] = None            # normalized vendor label (microsoft | adobe | apple | …)
 
     profile: Optional[str] = None              # finance | legal | government | …
     document_type: Optional[str] = None        # sec_10k | earnings_deck | …
@@ -120,8 +124,10 @@ class DocumentMetadata:
             title=d.get("title"),
             author=d.get("author"),
             language=d.get("language"),
-            language_confidence=d.get("language_confidence"),
-            language_source=d.get("language_source"),
+            created=d.get("created"),
+            modified=d.get("modified"),
+            last_modified_by=d.get("last_modified_by"),
+            generator=d.get("generator"),
             profile=d.get("profile"),
             document_type=d.get("document_type"),
             parsing_quality_score=d.get("parsing_quality_score"),
@@ -166,10 +172,14 @@ class DocumentMetadata:
             out["author"] = self.author
         if self.language is not None:
             out["language"] = self.language
-        if self.language_confidence is not None:
-            out["language_confidence"] = self.language_confidence
-        if self.language_source is not None:
-            out["language_source"] = self.language_source
+        if self.created is not None:
+            out["created"] = self.created
+        if self.modified is not None:
+            out["modified"] = self.modified
+        if self.last_modified_by is not None:
+            out["last_modified_by"] = self.last_modified_by
+        if self.generator is not None:
+            out["generator"] = self.generator
         if self.profile is not None:
             out["profile"] = self.profile
         if self.document_type is not None:

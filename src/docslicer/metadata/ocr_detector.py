@@ -1,13 +1,12 @@
 """OCR / scanned-document detection — image coverage and add_page_and_ocr_info."""
 from __future__ import annotations
 
-import math
 from typing import Optional, Dict, Any
 
 import pandas as pd
 import numpy as np
 
-from .page_analysis import _detect_page_format, _check_mixed_page_sizes
+from .page_analysis import add_page_info
 
 
 def _calculate_page_image_coverage(
@@ -97,8 +96,8 @@ def add_page_and_ocr_info(
     """
     Add page info, OCR needs, and scanned detection after page label detection.
 
-    Calculates (vectorized for speed):
-    - page_count, page_width, page_height, page_format
+    Page geometry + char total are delegated to ``add_page_info``; this function
+    adds the OCR-specific detection on top (vectorized for speed):
     - needs_ocr: True if >60% of pages have <80 chars AND >60% image coverage
     - is_scanned: True if entire doc has 0 chars and only full-page images
 
@@ -113,60 +112,21 @@ def add_page_and_ocr_info(
     Modifies:
         doc_meta dictionary in-place
     """
-    if df_cells.empty:
-        doc_meta["page_count"] = 0
+    # Page geometry + char total: page_count, dims, format, mixed sizes, chars.
+    add_page_info(doc_meta, df_cells)
+
+    if (
+        df_cells.empty
+        or "char_count" not in df_cells.columns
+        or "page_number" not in df_cells.columns
+    ):
         doc_meta["needs_ocr"] = False
         doc_meta["is_scanned"] = False
         return
 
-    # =============================
-    # Basic Page Info
-    # =============================
-
-    if "page_number" in df_cells.columns:
-        doc_meta["page_count"] = int(df_cells["page_number"].max())
-    else:
-        doc_meta["page_count"] = 0
-
-    if "page_width" in df_cells.columns and "page_height" in df_cells.columns:
-        page_width = df_cells["page_width"].iloc[0]
-        page_height = df_cells["page_height"].iloc[0]
-
-        # Check for NaN values (common in HTML pages without defined dimensions)
-        if pd.isna(page_width) or pd.isna(page_height) or math.isnan(page_width) or math.isnan(page_height):
-            # For HTML/web pages without defined dimensions
-            content_type = doc_meta.get("content_type", "").upper()
-            if content_type == "HTML":
-                doc_meta["page_width"] = None
-                doc_meta["page_height"] = None
-                doc_meta["page_format"] = "WEB"
-            else:
-                doc_meta["page_width"] = None
-                doc_meta["page_height"] = None
-                doc_meta["page_format"] = "UNKNOWN"
-        else:
-            doc_meta["page_width"] = float(page_width)
-            doc_meta["page_height"] = float(page_height)
-            doc_meta["page_format"] = _detect_page_format(
-                doc_meta["page_width"],
-                doc_meta["page_height"]
-            )
-        doc_meta["has_mixed_page_sizes"] = bool(_check_mixed_page_sizes(df_cells))
-
-    # =============================
-    # Character Count per Page (vectorized)
-    # =============================
-
-    if "char_count" not in df_cells.columns or "page_number" not in df_cells.columns:
-        doc_meta["needs_ocr"] = False
-        doc_meta["is_scanned"] = False
-        return
-
-    # Group by page and sum char_count (vectorized)
+    # Per-page char counts drive OCR detection; the total is set by add_page_info.
     page_char_counts = df_cells.groupby("page_number", sort=False)["char_count"].sum()
-
-    total_chars = page_char_counts.sum()
-    doc_meta["chars"] = int(total_chars)
+    total_chars = doc_meta["chars"]
 
     # =============================
     # is_scanned: Zero chars + only full-page images

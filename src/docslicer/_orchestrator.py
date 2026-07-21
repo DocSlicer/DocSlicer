@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import datetime
-import json
 import logging
 import time
 import uuid
@@ -9,7 +8,6 @@ from typing import Callable, Literal, Optional
 
 import pandas as pd
 
-from ._utils.safe_call import safe_enrich
 from .metadata.schema import DocumentMetadata
 from .pdf.pdf_orchestrator import run_pipeline as _run_pdf_pipeline
 from .shared.shared_orchestrator import run_pipeline as _run_shared_pipeline
@@ -35,18 +33,11 @@ def _resolve_metadata(
     token_count: int | None = None,
     token_count_exact: bool = False,
 ) -> DocumentMetadata:
-    # Resolve title: prefer whichever of title_meta / title_text is longer
-    title_meta = str(discovered.get("title_meta") or "")
-    title_text = str(discovered.get("title_text") or "")
-    title = title_text if len(title_text) > len(title_meta) else title_meta
-    title = title or None
-
-    # Resolve author: prefer whichever of author_meta / author_text is longer
-    author_meta: list[str] = discovered.get("author_meta") or []
-    author_text: list[str] = discovered.get("author_text") or []
-    author_meta_str = json.dumps(author_meta) if isinstance(author_meta, list) else str(author_meta or "")
-    author_text_str = json.dumps(author_text) if isinstance(author_text, list) else str(author_text or "")
-    author_list = author_text if len(author_text_str) > len(author_meta_str) else author_meta
+    # Every pipeline runs metadata/consolidate.py, which resolves title / author /
+    # language on `discovered` (native-wins with a fake-author gate). This function
+    # just consumes those already-processed fields.
+    title = discovered.get("title") or None
+    author_list = discovered.get("author") or []
     author = list(author_list) if author_list else None
 
     # Compute chars from the final blocks (consistent across all formats)
@@ -83,15 +74,17 @@ def _resolve_metadata(
         title=title,
         author=author,
         language=discovered.get("language"),
-        language_confidence=discovered.get("language_confidence"),
-        language_source=discovered.get("language_source"),
-        profile=discovered.get("profile"),
+        # Native-only pass-through fields (set by each format's native_metadata.py)
+        created=discovered.get("created"),
+        modified=discovered.get("modified"),
+        last_modified_by=discovered.get("last_modified_by"),
+        generator=discovered.get("generator"),
         document_type=discovered.get("document_type"),
         parsing_quality_score=discovered.get("parsing_quality_score"),
         processing_time=processing_time,
         # Pipeline intermediates (not serialised)
-        author_meta=author_meta or None,
-        author_text=author_text or None,
+        author_meta=discovered.get("author_meta") or None,
+        author_text=discovered.get("author_text") or None,
         title_meta=discovered.get("title_meta"),
         title_text=discovered.get("title_text"),
         language_meta=discovered.get("language_meta"),
@@ -510,100 +503,48 @@ def _run_pipeline(
     elif content_type == "docx":
         if not isinstance(content, bytes):
             raise TypeError("DOCX content must be bytes")
-        import zipfile
         from .docx.docx_orchestrator import run_pipeline as _run_docx_pipeline
-        from .docx.step_00_metadata import extract_core_properties
-        from .metadata import add_document_information
-        from ._utils.password import decrypt_office, is_encrypted_office
-        _was_encrypted = False
-        try:
-            package, df_runs, df_chart_points, df_table_cells, df_paragraphs, df_lines = _run_docx_pipeline(
-                content,
-                include_headers_footers=config.include_headers_footers,
-                include_footnotes=config.include_footnotes,
-                include_comments=config.include_comments,
-                on_stage=on_stage,
-            )
-        except zipfile.BadZipFile:
-            if not is_encrypted_office(content):
-                raise
-            content = decrypt_office(content, config.password, source_filename)
-            package, df_runs, df_chart_points, df_table_cells, df_paragraphs, df_lines = _run_docx_pipeline(
-                content,
-                include_headers_footers=config.include_headers_footers,
-                include_footnotes=config.include_footnotes,
-                include_comments=config.include_comments,
-                on_stage=on_stage,
-            )
-            _was_encrypted = True
-        discovered_metadata = extract_core_properties(package)
-        if _was_encrypted:
-            discovered_metadata["is_password_protected"] = True
-        discovered_metadata["has_ocr"] = False
-        discovered_metadata["content_type"] = "docx"
-        if not discovered_metadata["page_count"]:
-            discovered_metadata["page_count"] = (
-                int(df_runs["page_number"].max())
-                if not df_runs.empty and "page_number" in df_runs.columns
-                else 0
-            )
-        safe_enrich(
-            add_document_information, discovered_metadata, df_lines=df_lines,
-            fallback={
-                "author_meta": None, "author_text": None,
-                "title_meta": None, "title_text": None,
-                "language": "unknown",
-            },
-            logger=_log,
+        docx_res = _run_docx_pipeline(
+            content,
+            include_headers_footers=config.include_headers_footers,
+            include_footnotes=config.include_footnotes,
+            include_comments=config.include_comments,
+            password=config.password,
+            source_filename=source_filename,
+            on_stage=on_stage,
         )
+        discovered_metadata = docx_res.discovered_metadata
+        discovered_metadata["content_type"] = "docx"
+        df_chart_points = docx_res.df_chart_points
+        df_table_cells = docx_res.df_table_cells
+        df_lines = docx_res.df_lines
         if config.debug:
-            early_steps["runs"] = df_runs
+            early_steps["runs"] = docx_res.df_runs
             early_steps["chart_points"] = df_chart_points
-            early_steps["paragraphs"] = df_paragraphs
+            early_steps["paragraphs"] = docx_res.df_paragraphs
             early_steps["lines"] = df_lines
             if df_table_cells is not None:
                 early_steps["table_cells"] = df_table_cells
     elif content_type == "pptx":
         if not isinstance(content, bytes):
             raise TypeError("PPTX content must be bytes")
-        import zipfile
-        from .metadata import add_document_information
         from .pptx.pptx_orchestrator import run_pipeline as _run_pptx_pipeline
-        from .pptx.step_00_metadata import extract_core_properties
-        from ._utils.password import decrypt_office, is_encrypted_office
-        _was_encrypted = False
-        try:
-            package, df_runs, df_chart_points, df_table_cells, df_paragraphs, df_lines = _run_pptx_pipeline(content, include_speaker_notes=config.include_speaker_notes, on_stage=on_stage)
-        except zipfile.BadZipFile:
-            if not is_encrypted_office(content):
-                raise
-            content = decrypt_office(content, config.password, source_filename)
-            package, df_runs, df_chart_points, df_table_cells, df_paragraphs, df_lines = _run_pptx_pipeline(content, include_speaker_notes=config.include_speaker_notes, on_stage=on_stage)
-            _was_encrypted = True
-        discovered_metadata = extract_core_properties(package)
-        if _was_encrypted:
-            discovered_metadata["is_password_protected"] = True
-        discovered_metadata["has_ocr"] = False
-        discovered_metadata["content_type"] = "pptx"
-        if not discovered_metadata["page_count"]:
-            discovered_metadata["page_count"] = (
-                int(df_runs["page_number"].max())
-                if not df_runs.empty and "page_number" in df_runs.columns
-                else 0
-            )
-        safe_enrich(
-            add_document_information, discovered_metadata, df_lines=df_lines,
-            fallback={
-                "author_meta": None, "author_text": None,
-                "title_meta": None, "title_text": None,
-                "language": "unknown",
-            },
-            logger=_log,
+        pptx_res = _run_pptx_pipeline(
+            content,
+            include_speaker_notes=config.include_speaker_notes,
+            password=config.password,
+            source_filename=source_filename,
+            on_stage=on_stage,
         )
+        discovered_metadata = pptx_res.discovered_metadata
+        discovered_metadata["content_type"] = "pptx"
+        df_chart_points = pptx_res.df_chart_points
+        df_table_cells = pptx_res.df_table_cells
+        df_lines = pptx_res.df_lines
         if config.debug:
-            early_steps["runs"] = df_runs
+            early_steps["runs"] = pptx_res.df_runs
             early_steps["chart_points"] = df_chart_points
-            early_steps["paragraphs"] = df_paragraphs
+            early_steps["paragraphs"] = pptx_res.df_paragraphs
             early_steps["lines"] = df_lines
             if df_table_cells is not None:
                 early_steps["table_cells"] = df_table_cells

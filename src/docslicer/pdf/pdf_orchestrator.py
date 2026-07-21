@@ -64,7 +64,8 @@ from .._utils.layout.line_number_detector import detect_line_numbers
 from .._utils.io.yaml_loader import load_yamls
 from .._utils.timing import timed_step
 from .._utils.safe_call import safe_enrich
-from ..metadata import add_page_and_ocr_info, add_document_information
+from .native_metadata import extract_native_metadata
+from ..metadata import add_page_and_ocr_info, add_text_fallbacks, consolidate
 
 
 class PdfPipelineResult(NamedTuple):
@@ -313,15 +314,30 @@ def run_pipeline(
 
         # ── Document Information ─────────────────────────────────────────────
         with timed_step("document_metadata", logger=logger):
+            # Native channel — the PDF's own XMP / /Info / catalog metadata. Reopen
+            # pikepdf on the (already-decrypted) path; struct_context closed its handle.
+            try:
+                with pikepdf.open(str(pdf_path)) as _pk:
+                    native = extract_native_metadata(_pk)
+                # len(pdf.pages) is the true page count (counts trailing blank pages
+                # that carry no words); prefer it, but never clobber the count that
+                # add_page_and_ocr_info derived with 0 on an unreadable page tree.
+                native_pages = native.pop("page_count", 0) or 0
+                discovered_metadata.update(native)
+                if native_pages:
+                    discovered_metadata["page_count"] = native_pages
+            except Exception as e:
+                logger.error(f"Error in extract_native_metadata: {e}", exc_info=True)
+                for key in ("title_meta", "author_meta", "language_meta"):
+                    discovered_metadata.setdefault(key, None)
+            # Text channel — heuristics over the parsed body as a fallback.
             safe_enrich(
-                add_document_information, discovered_metadata, pdf_path=pdf_path, df_lines=df_lines,
-                fallback={
-                    "author_meta": None, "author_text": None,
-                    "title_meta": None, "title_text": None,
-                    "language": "unknown",
-                },
+                add_text_fallbacks, discovered_metadata, df_lines,
+                fallback={"author_text": None, "title_text": None, "language_text": None},
                 logger=logger,
             )
+            # Fold both channels into the final title / author / language.
+            consolidate(discovered_metadata)
 
         discovered_metadata["is_password_protected"] = _is_password_protected
 
