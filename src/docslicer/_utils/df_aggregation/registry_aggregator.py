@@ -280,6 +280,8 @@ COLUMN_REGISTRY: Dict[str, Agg] = {
     "row_start": Agg.FIRST,
     "col_start": Agg.FIRST,
     "nested_table_depth": Agg.DROP,
+    "original_table_id": Agg.DROP,
+    "original_table_row_id": Agg.DROP,
 
     # --- HTML provenance -----------------------------------------------------------------
     # NOTE: HTML struct_tag / struct_tag_id / struct_ancestors share names with the

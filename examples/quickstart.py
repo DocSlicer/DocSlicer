@@ -3,6 +3,11 @@ quickstart.py — Parse a document and explore the result.
 
 Runs out of the box against the included sample PDF.
 
+The work runs under `if __name__ == "__main__":` — docslicer parses CPU-bound
+steps (PDF word extraction, OCR, ...) across a process pool, and on spawn-based
+platforms (macOS, Windows) each worker re-imports this file. The guard keeps that
+re-import from re-running the parse in every worker.
+
 Usage:
     python examples/quickstart.py
     python examples/quickstart.py path/to/your/document.pdf
@@ -16,64 +21,70 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 import docslicer
 
-# ── Input ──────────────────────────────────────────────────────────────────────
 
-source = sys.argv[1] if len(sys.argv) > 1 else Path(__file__).parent / "sample_docs" / "financial_report.pdf"
+def main() -> None:
+    # ── Input ────────────────────────────────────────────────────────────────
 
-print(f"Parsing: {source}")
-result = docslicer.parse_document(source)
+    source = sys.argv[1] if len(sys.argv) > 1 else Path(__file__).parent / "sample_docs" / "financial_report.pdf"
 
-# ── Metadata ───────────────────────────────────────────────────────────────────
+    print(f"Parsing: {source}")
+    result = docslicer.parse_document(source)
 
-meta = result.metadata
-print(f"\n── Metadata ────────────────────────────────────")
-print(f"  Title    : {meta.title}")
-print(f"  Author   : {meta.author}")
-print(f"  Language : {meta.language}")
-print(f"  Pages    : {meta.page_count}")
-print(f"  OCR used : {meta.has_ocr}")
-print(f"  Tokens   : {meta.estimated_tokens}")
+    # ── Metadata ─────────────────────────────────────────────────────────────
 
-# ── Hierarchy ──────────────────────────────────────────────────────────────────
+    meta = result.metadata
+    print(f"\n── Metadata ────────────────────────────────────")
+    print(f"  Title    : {meta.title}")
+    print(f"  Author   : {meta.author}")
+    print(f"  Language : {meta.language}")
+    print(f"  Pages    : {meta.page_count}")
+    print(f"  OCR used : {meta.has_ocr}")
+    print(f"  Tokens   : {meta.token_count}{' (exact)' if meta.token_count_exact else ' (estimated)'}")
 
-print(f"\n── Document outline ────────────────────────────")
-print(result.hierarchy.to_outline() or "  (no headings detected)")
+    # ── Hierarchy ────────────────────────────────────────────────────────────
 
-# ── Chunks ─────────────────────────────────────────────────────────────────────
+    print(f"\n── Document outline ────────────────────────────")
+    print(result.hierarchy.to_outline() or "  (no headings detected)")
 
-print(f"\n── Chunks ({len(result.chunks)} total) ─────────────────────")
-for chunk in result.chunks[:3]:
-    path = " > ".join(chunk.path) if chunk.path else "(no heading)"
-    print(f"\n  [{chunk.chunk_index}] p.{chunk.page_number}  {chunk.section}  {chunk.char_count} chars")
-    print(f"  Path : {path}")
-    print(f"  Text : {chunk.text[:120].replace(chr(10), ' ')} …")
+    # ── Chunks ───────────────────────────────────────────────────────────────
 
-if len(result.chunks) > 3:
-    print(f"\n  … and {len(result.chunks) - 3} more chunks")
+    print(f"\n── Chunks ({len(result.chunks)} total) ─────────────────────")
+    for chunk in result.chunks[:3]:
+        path = " > ".join(chunk.path) if chunk.path else "(no heading)"
+        print(f"\n  [{chunk.chunk_index}] p.{chunk.page_number}  {chunk.section}  {chunk.char_count} chars")
+        print(f"  Path : {path}")
+        print(f"  Text : {chunk.text[:120].replace(chr(10), ' ')} …")
 
-# ── Heading navigation ─────────────────────────────────────────────────────────
+    if len(result.chunks) > 3:
+        print(f"\n  … and {len(result.chunks) - 3} more chunks")
 
-# Find the first top-level heading and pull everything under it
-top_level = result.hierarchy.level(1)
-if top_level:
-    node = top_level[0]
-    under = result.chunks_under(node)
-    print(f"\n── chunks_under('{node.text}') → {len(under)} chunks ──")
-    for chunk in under[:2]:
-        print(f"  p.{chunk.page_number}  {chunk.char_count} chars  {chunk.text[:80].replace(chr(10), ' ')} …")
+    # ── Heading navigation ───────────────────────────────────────────────────
 
-# ── Tables ─────────────────────────────────────────────────────────────────────
+    # Find the first top-level heading and pull everything under it
+    top_level = result.hierarchy.level(1)
+    if top_level:
+        node = top_level[0]
+        under = result.chunks_under(node)
+        print(f"\n── chunks_under('{node.text}') → {len(under)} chunks ──")
+        for chunk in under[:2]:
+            print(f"  p.{chunk.page_number}  {chunk.char_count} chars  {chunk.text[:80].replace(chr(10), ' ')} …")
 
-print(f"\n── Tables ({len(result.tables)} total) ─────────────────────")
-for table in result.tables[:2]:
-    label = table.page_label or str(table.page_number)
-    print(f"\n  [{table.id}] p.{label}  {len(table.cells)} cells  caption={table.caption!r}")
-    for line in table.markdown.splitlines()[:4]:
-        print(f"  {line}")
-    if len(table.markdown.splitlines()) > 4:
-        print(f"  … ({len(table.markdown.splitlines()) - 4} more rows)")
+    # ── Tables ───────────────────────────────────────────────────────────────
 
-if not result.tables:
-    print("  (no tables detected)")
+    print(f"\n── Tables ({len(result.tables)} total) ─────────────────────")
+    for table in result.tables[:2]:
+        label = table.page_label or str(table.page_number)
+        print(f"\n  [{table.id}] p.{label}  {len(table.cells)} cells  caption={table.caption!r}")
+        for line in table.markdown.splitlines()[:4]:
+            print(f"  {line}")
+        if len(table.markdown.splitlines()) > 4:
+            print(f"  … ({len(table.markdown.splitlines()) - 4} more rows)")
 
-print()
+    if not result.tables:
+        print("  (no tables detected)")
+
+    print()
+
+
+if __name__ == "__main__":
+    main()

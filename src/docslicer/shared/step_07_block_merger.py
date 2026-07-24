@@ -4,7 +4,7 @@ step_07_block_merger.py
 Merge lines into logical blocks.
 
 Architecture:
-  1. _assign_block_ids()  - block_id = layout_id (layouts already carry the split)
+  1. _assign_block_ids()  - block_id = layout_id, split/merged on heading_id boundaries
   2. aggregate_to()       - shared registry-driven aggregation (registry_aggregator)
   3. _join_text()         - Text merging strategy (space vs newline)
 
@@ -32,12 +32,15 @@ from .._utils.text_utils import bullet_line_mask
 
 def _assign_block_ids(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Assign _block_id to each line: one block per layout_id.
+    Assign _block_id to each line: one block per layout_id, with heading-aware
+    corrections.
 
-    Every upstream pipeline now assigns layout_id such that each layout already
+    Every upstream pipeline assigns layout_id such that each layout usually
     corresponds to exactly one logical block (headings, paragraphs, columns,
-    tables, etc. each get their own layout). So the block is just the layout —
-    no separate splitting decision is needed here.
+    tables, etc. each get their own layout), so the block defaults to the layout.
+    Two heading-driven corrections override that default:
+      * distinct headings sharing one layout are split apart (heading_id change), and
+      * one multi-row heading spanning several layouts is merged (heading_id equal).
 
     Lines are sorted into document order (layout_id, line_id) so the downstream
     text join sees them in reading order.
@@ -49,7 +52,35 @@ def _assign_block_ids(df: pd.DataFrame) -> pd.DataFrame:
         Same df with "_block_id" column added (== layout_id)
     """
     df = df.sort_values(["layout_id", "line_id"], kind="mergesort").reset_index(drop=True)
-    df["_block_id"] = df["layout_id"]
+
+    # A layout is normally one block, so a layout boundary starts a new block.
+    prev_layout = df["layout_id"].shift(1)
+    new_block = df["layout_id"].ne(prev_layout)
+
+    # Two exceptions, both driven by heading_id:
+    #
+    #   * SPLIT WITHIN a layout: distinct numbered headings can share a single
+    #     layout (e.g. "1.1 Purpose …" and "1.2 Applicable References:" flowed
+    #     into one layout). They must NOT collapse into one block/HierarchyNode,
+    #     so force a new block whenever the (non-null) heading_id changes between
+    #     consecutive lines.
+    #   * MERGE ACROSS layouts: one multi-row heading can span several layouts
+    #     while sharing one heading_id (e.g. "TITLE I" + "SUBJECT MATTER AND
+    #     SCOPE" on consecutive lines). Those rows must land in the SAME block,
+    #     so suppress the layout-boundary split when the heading_id is unchanged.
+    if "heading_id" in df.columns and len(df) > 1:
+        hid = df["heading_id"]
+        prev_hid = hid.shift(1)
+        both_known = hid.notna() & prev_hid.notna()
+        same_heading = both_known & hid.eq(prev_hid)
+        diff_heading = both_known & hid.ne(prev_hid)
+        new_block = (new_block & ~same_heading) | diff_heading
+
+    if len(df):
+        new_block.iloc[0] = True
+
+    df["_block_id"] = new_block.cumsum().astype(int)
+
     return df
 
 

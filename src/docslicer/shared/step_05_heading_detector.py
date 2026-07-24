@@ -896,16 +896,23 @@ def _add_heading_score(lines_df: pd.DataFrame) -> pd.DataFrame:
 
     # --- vertical spacing (gap above vs gap below the line)
     # A heading sits under whitespace and hugs the text it introduces, so the gap
-    # above should exceed the gap below. Bands are mutually exclusive; the lower
-    # bound of -2 keeps column jumps / page resets (large negatives) out of it.
+    # above should exceed the gap below.
+    #
+    # The squeeze penalties only apply when there is a real predecessor line above
+    # on the same page. The first line of a page has NO line above it, and upstream
+    # encodes that as line_gap == 0.0 (a page reset, NOT a large negative). A page
+    # top is one of the strongest heading positions there is, so it must be excluded
+    # from the "squeezed against the previous line" band: penalise a genuine squeeze
+    # (a small *positive* gap) only, i.e. top strictly > 0.
     c_gap = pd.Series(0.0, index=out.index, dtype="float64")
     if "line_gap" in out.columns:
         top = _to_float_series(out.get("line_gap"), default=np.nan)
         bottom = _to_float_series(out.get("line_gap_below"), default=np.nan)
 
         both_positive = (top > 0) & (bottom > 0)
-        # squeezed against the previous line -> almost certainly mid-paragraph
-        c_gap += np.where(top.between(-2.0, 0.5), -5.0, 0.0)
+        # squeezed against the previous line -> almost certainly mid-paragraph.
+        # top <= 0 (page top / column reset) is not a squeeze and is left alone.
+        c_gap += np.where(top.gt(0.0) & top.le(0.5), -5.0, 0.0)
         c_gap += np.where(top.gt(0.5) & top.lt(2.0), -2.0, 0.0)
         # more air below than above -> reads as a caption, not a heading
         c_gap += np.where(both_positive & (top < bottom), -0.5, 0.0)

@@ -7,6 +7,11 @@ and remote URLs. This file demonstrates each format.
 The three local examples run by default. Uncomment any URL or file path
 section to try that input type.
 
+The work runs under `if __name__ == "__main__":` — docslicer parses CPU-bound
+steps (PDF word extraction, OCR, ...) across a process pool, and on spawn-based
+platforms (macOS, Windows) each worker re-imports this file. The guard keeps that
+re-import from re-running the parses in every worker.
+
 Usage:
     python examples/inputs.py
 """
@@ -37,46 +42,51 @@ def show(label: str, source) -> None:
         print(f"  Outline: {outline.splitlines()[0]} …")
 
 
-# ── 1. Digital PDF ─────────────────────────────────────────────────────────────
+def main() -> None:
+    # ── 1. Digital PDF ─────────────────────────────────────────────────────────
 
-show("Digital PDF", SAMPLE / "financial_report.pdf")
+    show("Digital PDF", SAMPLE / "financial_report.pdf")
 
-# ── 2. Scanned PDF — OCR is applied automatically ─────────────────────────────
+    # ── 2. Scanned PDF — OCR is applied automatically ──────────────────────────
 
-show("Scanned PDF (OCR)", SAMPLE / "letter_scanned.pdf")
+    show("Scanned PDF (OCR)", SAMPLE / "letter_scanned.pdf")
 
-# ── 3. HTML — local file ───────────────────────────────────────────────────────
+    # ── 3. HTML — local file ───────────────────────────────────────────────────
 
-show("HTML (local file)", SAMPLE / "sec_10q.html")
+    show("HTML (local file)", SAMPLE / "sec_10q.html")
 
-# ── 4. DOCX ────────────────────────────────────────────────────────────────────
+    # ── 4. DOCX ────────────────────────────────────────────────────────────────
 
-show("DOCX", SAMPLE / "infosec_policy.docx")
+    show("DOCX", SAMPLE / "infosec_policy.docx")
 
-# ── 5. PPTX ────────────────────────────────────────────────────────────────────
+    # ── 5. PPTX ────────────────────────────────────────────────────────────────
 
-show("PPTX", SAMPLE / "financial_review.pptx")
+    show("PPTX", SAMPLE / "financial_review.pptx")
 
-# ── 6. Non-SEC HTML URL ────────────────────────────────────────────────────────
+    # ── 6. Non-SEC HTML URL ────────────────────────────────────────────────────
 
-show(
-    "Non-SEC URL",
-    "https://eur-lex.europa.eu/legal-content/EN/TXT/HTML/?uri=CELEX:32006L0112",
-)
+    show(
+        "Non-SEC URL",
+        "https://eur-lex.europa.eu/legal-content/EN/TXT/HTML/?uri=CELEX:32006L0112",
+    )
 
-# ── 7. SEC EDGAR filing URL ────────────────────────────────────────────────────
+    # ── 7. SEC EDGAR filing URL ────────────────────────────────────────────────
 
-show(
-    "SEC EDGAR filing",
-    "https://www.sec.gov/Archives/edgar/data/1561861/000119312525270444/d11281d424b1.htm",
-)
+    show(
+        "SEC EDGAR filing",
+        "https://www.sec.gov/Archives/edgar/data/1561861/000119312525270444/d11281d424b1.htm",
+    )
 
-# ── 8. URL that resolves to a PDF ─────────────────────────────────────────────
-# docslicer follows the link and parses the underlying PDF directly.
+    # ── 8. URL that resolves to a PDF ──────────────────────────────────────────
+    # docslicer follows the link and parses the underlying PDF directly.
 
-show(
-    "URL → PDF",
-    "https://www.gsk.com/media/hpgfxwxv/q1-2026-results-announcement.pdf",
-)
+    show(
+        "URL → PDF",
+        "https://www.gsk.com/media/hpgfxwxv/q1-2026-results-announcement.pdf",
+    )
 
-print("\nDone.")
+    print("\nDone.")
+
+
+if __name__ == "__main__":
+    main()

@@ -3,6 +3,7 @@ test_jelle/
 PLAN.md
 .claude
 examples/output/
+.pytest_cache/
 
 # Python
 __pycache__/

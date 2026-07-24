@@ -558,11 +558,23 @@ def parse_document(
             raise ValueError(f"Unsupported legacy Office format: {suffix}. Use .pptx/.docx.")
         return parse_html(path, source_url=source_url, **kwargs)
 
+    # A nonexistent path that was clearly meant as a file — a Path object, or a
+    # string with a document extension — is a mistake, not HTML content. Raise
+    # instead of silently parsing the filename itself as HTML (a typo'd path
+    # would otherwise return an empty-looking ParseResult). Extensionless or
+    # markup-ish strings still fall back to HTML below.
+    if isinstance(source, Path) or path.suffix.lower() in _DOCUMENT_SUFFIXES:
+        raise FileNotFoundError(f"No such file: {source!r}")
+
     # Raw string that doesn't point to a file → treat as HTML
     return parse_html(str(source), source_url=source_url, **kwargs)
 
 
 _SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".pptx", ".html", ".htm", ".xhtml"}
+
+# File extensions that unambiguously denote a document on disk. A nonexistent
+# path with one of these is treated as a missing file, not as HTML text.
+_DOCUMENT_SUFFIXES = _SUPPORTED_EXTENSIONS | {".ppt", ".doc"}
 
 
 def parse_all(

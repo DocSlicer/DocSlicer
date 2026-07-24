@@ -71,6 +71,8 @@ from __future__ import annotations
 import ctypes
 import io
 import math
+import re
+import struct
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
@@ -109,27 +111,193 @@ _HYPHEN_BREAK = '\x02'
 
 _BYREF = ctypes.byref
 
+# Reusable ctypes scratch for the hot per-char path. Extraction is
+# single-threaded per process (PDFium isn't thread-safe; parallelism is by
+# process), so sharing these avoids allocating a fresh struct/double on every
+# one of the tens of thousands of glyphs.
+_TM = pdfium_c.FS_MATRIX()
+_ORIGIN_X = ctypes.c_double()
+_ORIGIN_Y = ctypes.c_double()
+
 
 # ── Low-level per-character helpers ──────────────────────────────────────────
 
-def _font_info(tp, i: int) -> Tuple[Optional[str], float]:
-    buf = ctypes.create_string_buffer(256)
-    flags = ctypes.c_int(0)
-    pdfium_c.FPDFText_GetFontInfo(tp, i, buf, 256, _BYREF(flags))
-    name = buf.value.decode("utf-8", errors="replace") or None
+def _char_eff_size(tp, i: int) -> float:
     # FPDFText_GetMatrix returns the text matrix (Tm) WITHOUT the Tf font size factor.
     # FPDFText_GetFontSize returns only the Tf value.
     # Effective size = Tf × |Tm scale| covers both encoding styles:
     #   Type A: Tf=12, Tm≈identity (scale=1)  → 12 × 1 = 12
     #   Type B: Tf=1,  Tm=[fs,0,0,fs,...] → 1 × fs = fs
     tf = float(pdfium_c.FPDFText_GetFontSize(tp, i))
-    m = pdfium_c.FS_MATRIX()
-    if pdfium_c.FPDFText_GetMatrix(tp, i, _BYREF(m)):
-        scale = max(math.hypot(m.a, m.b), math.hypot(m.c, m.d))
+    if pdfium_c.FPDFText_GetMatrix(tp, i, _BYREF(_TM)):
+        scale = max(math.hypot(_TM.a, _TM.b), math.hypot(_TM.c, _TM.d))
     else:
         scale = 1.0
-    size = tf * scale if scale > 1e-6 else tf
-    return name, size
+    return tf * scale if scale > 1e-6 else tf
+
+
+def _font_info(tp, i: int) -> Tuple[Optional[str], float]:
+    buf = ctypes.create_string_buffer(256)
+    flags = ctypes.c_int(0)
+    pdfium_c.FPDFText_GetFontInfo(tp, i, buf, 256, _BYREF(flags))
+    name = buf.value.decode("utf-8", errors="replace") or None
+    return name, _char_eff_size(tp, i)
+
+
+# ── Loose-box vertical reconstruction (pdfium-version independence) ───────────
+# pdfium synthesizes the *loose* char box's vertical extent from font metrics,
+# and that computation changed between builds: build 147 (pypdfium2 5.6) used
+# the font's FontBBox (~1.3× em); build 152 (5.12) switched to the descriptor
+# Ascent/Descent (~0.9× em), silently squeezing every glyph box ~30 % and
+# shifting its y-origin ~4 pt. Downstream geometry (line merging, heading
+# detection) is tuned to the FontBBox-based box, so we reconstruct that box
+# ourselves from the glyph baseline (FPDFText_GetCharOrigin — stable across
+# builds) plus the font's FontBBox, making the vertical extent independent of
+# the pdfium version. Horizontal extent and the tight box were unaffected and
+# are still read straight from pdfium.
+
+_FONTBBOX_RE = re.compile(
+    rb"/FontBBox\s*[\[{]\s*(-?\d+)\s+(-?\d+)\s+(-?\d+)\s+(-?\d+)"
+)
+
+# Sentinel: font pointer parsed but no FontBBox recoverable (distinct from
+# "not yet cached"), so we don't re-parse a font every time it recurs.
+_VBBOX_MISS: Any = object()
+
+
+def _get_font_data(font) -> Optional[bytes]:
+    """Raw embedded font program bytes for *font*, or None."""
+    size = ctypes.c_size_t(0)
+    pdfium_c.FPDFFont_GetFontData(font, None, 0, _BYREF(size))
+    n = size.value
+    if not n:
+        return None
+    buf = (ctypes.c_uint8 * n)()
+    got = ctypes.c_size_t(0)
+    if not pdfium_c.FPDFFont_GetFontData(font, buf, n, _BYREF(got)):
+        return None
+    return bytes(buf[: got.value])
+
+
+def _parse_font_vbbox(data: Optional[bytes]) -> Optional[Tuple[float, float]]:
+    """(ymin, ymax) in 1000-em units parsed from a font program, or None.
+
+    Handles the two formats that cover essentially all embedded fonts:
+      • sfnt (TrueType / OpenType, incl. OTTO / ttcf) — the 'head' table's
+        yMin/yMax, rescaled from unitsPerEm to 1000-em.
+      • Type1 / CFF cleartext — the ``/FontBBox`` array, already in 1000-em
+        glyph units (the PDF convention), read via regex.
+    """
+    if not data or len(data) < 12:
+        return None
+    magic = data[:4]
+    if magic in (b"\x00\x01\x00\x00", b"true", b"OTTO", b"ttcf"):
+        try:
+            num = struct.unpack(">H", data[4:6])[0]
+            off = 12
+            for _ in range(num):
+                rec = data[off:off + 16]
+                off += 16
+                if rec[:4] == b"head":
+                    toff = struct.unpack(">I", rec[8:12])[0]
+                    head = data[toff:toff + 54]
+                    upm = struct.unpack(">H", head[18:20])[0] or 1000
+                    _, ymin, _, ymax = struct.unpack(">hhhh", head[36:44])
+                    s = 1000.0 / upm
+                    return (ymin * s, ymax * s)
+        except (struct.error, IndexError):
+            return None
+        return None
+    m = _FONTBBOX_RE.search(data[:8192]) or _FONTBBOX_RE.search(data)
+    if m:
+        return (float(m.group(2)), float(m.group(4)))
+    return None
+
+
+def _std14_vbbox(name: str) -> Optional[Tuple[float, float]]:
+    """Approximate (ymin, ymax) 1000-em for the standard-14 / substituted fonts
+    that carry no embedded program or FontBBox. Adobe AFM values, family+style
+    matched. A best-effort fallback: these fonts are non-embedded so no source
+    reproduces pdfium's exact substitute, but this is close and rare in body
+    text."""
+    n = name.lower()
+    bold = "bold" in n
+    ital = "italic" in n or "oblique" in n
+    if "courier" in n or "mono" in n:
+        return (-250.0, 805.0)
+    if "helvetica" in n or "arial" in n or "sans" in n:
+        return (-228.0, 962.0) if bold else (-225.0, 931.0)
+    if "symbol" in n:
+        return (-293.0, 1010.0)
+    if "zapf" in n or "dingbat" in n:
+        return (-143.0, 820.0)
+    if "times" in n or "roman" in n or "serif" in n or "georgia" in n or "minion" in n:
+        if bold and ital:
+            return (-218.0, 921.0)
+        if bold:
+            return (-218.0, 935.0)
+        if ital:
+            return (-217.0, 883.0)
+        return (-218.0, 898.0)
+    return None
+
+
+def _base_font_name(font) -> str:
+    buf = ctypes.create_string_buffer(256)
+    pdfium_c.FPDFFont_GetBaseFontName(font, buf, 256)
+    return buf.value.decode("latin-1", errors="replace")
+
+
+def _font_vbbox(font, cache: Dict[int, Any]) -> Optional[Tuple[float, float]]:
+    """Cached (ymin, ymax) 1000-em for *font*: embedded program first, then the
+    standard-14 fallback. Keyed by font-handle pointer so each distinct font is
+    parsed once per page."""
+    ptr = ctypes.cast(font, ctypes.c_void_p).value
+    if ptr is None:
+        return None
+    hit = cache.get(ptr, _VBBOX_MISS)
+    if hit is not _VBBOX_MISS:
+        return hit
+    vb = _parse_font_vbbox(_get_font_data(font))
+    if vb is None:
+        vb = _std14_vbbox(_base_font_name(font))
+    cache[ptr] = vb
+    return vb
+
+
+def _loose_charbox_y(
+    tp, i: int, orig_b: float, orig_t: float, cache: Dict[int, Any],
+    obj_memo: List[Any],
+) -> Tuple[float, float]:
+    """Reconstruct char *i*'s loose-box (bottom, top) in raw PDF space from the
+    glyph baseline + FontBBox, so the vertical extent matches the pre-5.7 pdfium
+    convention regardless of build. Falls back to pdfium's own (orig_b, orig_t)
+    whenever the font handle, metrics, or baseline can't be resolved.
+
+    *obj_memo* is a mutable [last_obj_ptr, vbbox, size] scratch, reset per page.
+    Font (hence FontBBox) and effective size are constant within a pdfium text
+    object, so both are computed once per object and reused for its remaining
+    glyphs — the per-glyph path then costs just GetTextObject + GetCharOrigin.
+    """
+    obj = pdfium_c.FPDFText_GetTextObject(tp, i)
+    if not obj:
+        return orig_b, orig_t
+    op = ctypes.cast(obj, ctypes.c_void_p).value
+    if op == obj_memo[0]:
+        vb = obj_memo[1]
+        size = obj_memo[2]
+    else:
+        font = pdfium_c.FPDFTextObj_GetFont(obj)
+        vb = _font_vbbox(font, cache) if font else None
+        size = _char_eff_size(tp, i) if vb is not None else 0.0
+        obj_memo[0], obj_memo[1], obj_memo[2] = op, vb, size
+    if vb is None:
+        return orig_b, orig_t
+    if not pdfium_c.FPDFText_GetCharOrigin(tp, i, _BYREF(_ORIGIN_X), _BYREF(_ORIGIN_Y)):
+        return orig_b, orig_t
+    oy = _ORIGIN_Y.value
+    ymin, ymax = vb
+    return oy + ymin / 1000.0 * size, oy + ymax / 1000.0 * size
 
 
 def _fill_color(tp, i: int) -> Optional[str]:
@@ -635,7 +803,14 @@ def _extract_words_for_page(
     struct_index: Dict[Tuple[Optional[int], int], StructInfo],
     form_fields: List[FormField],
     form_label_index: Dict[Tuple[Optional[int], int], FormField],
+    font_vbbox_cache: Optional[Dict[int, Any]] = None,
 ) -> Tuple[pd.DataFrame, int]:
+    # FontBBox (ymin, ymax) per font handle, for loose-box y reconstruction.
+    # Font handles are stable for the document's lifetime, so the caller threads
+    # one cache across all pages — each embedded font program is fetched/parsed
+    # once per document, not once per page.
+    if font_vbbox_cache is None:
+        font_vbbox_cache = {}
     page_width  = float(page.get_width())
     page_height = float(page.get_height())
 
@@ -683,6 +858,8 @@ def _extract_words_for_page(
         _ptr_to_obj_id: Dict[int, int] = {}
         _next_obj_id   = [0]              # list so closures can mutate without nonlocal
         word_text_obj_id: Optional[int] = None
+        # [last_obj_ptr, vbbox, size] — per-object memo for loose-box y rebuild.
+        loose_obj_memo: List[Any] = [None, None, 0.0]
 
         _INF = float("inf")
 
@@ -807,10 +984,15 @@ def _extract_words_for_page(
         for i in range(n):
             ch = all_chars[i]
             l, b, r, t = tp.get_charbox(i, loose=True)
+            # y reconstruction (see _loose_charbox_y) is deferred until we know
+            # the char is kept — whitespace flushes without ever using the box,
+            # so reconstructing for it would be wasted per-char ctypes work.
 
             if ch == _HYPHEN_BREAK:
                 tl, _, tr, _ = tp.get_charbox(i, loose=False)
                 if tr - tl > 0.5 and char_texts:
+                    # Keep pdfium's x extent; rebuild y from baseline+FontBBox.
+                    b, t = _loose_charbox_y(tp, i, b, t, font_vbbox_cache, loose_obj_memo)
                     _add_char('-', to_screen(l, b, r, t))
                 _flush()
                 prev_x_right = -1.0
@@ -827,6 +1009,9 @@ def _extract_words_for_page(
                 prev_x_right = -1.0
                 continue
 
+            # Keep pdfium's x extent; rebuild the y extent from baseline+FontBBox
+            # so the loose box is stable across pdfium builds.
+            b, t = _loose_charbox_y(tp, i, b, t, font_vbbox_cache, loose_obj_memo)
             screen_box      = to_screen(l, b, r, t)
             char_baseline   = screen_box[3]   # screen-coord baseline (bottom of glyph)
 
@@ -930,6 +1115,7 @@ def _extract_words_chunk(
     reassigns them globally after merging all chunks.
     """
     dfs: List[pd.DataFrame] = []
+    font_vbbox_cache: Dict[int, Any] = {}
     with pdfium.PdfDocument(io.BytesIO(pdf_bytes)) as doc:
         total_pages = len(doc)
         for page_number in page_numbers:
@@ -947,6 +1133,7 @@ def _extract_words_chunk(
                     struct_index=struct_index,
                     form_fields=form_index.get(page_number - 1, []),
                     form_label_index=form_label_index,
+                    font_vbbox_cache=font_vbbox_cache,
                 )
             finally:
                 page.close()
@@ -968,6 +1155,7 @@ def _extract_words_serial(
     fallback when a process pool can't start (see ``warn_pool_fell_back``)."""
     all_dfs: List[pd.DataFrame] = []
     next_word_id = 0
+    font_vbbox_cache: Dict[int, Any] = {}
     with pdfium.PdfDocument(pdf_path) as doc:
         total_pages = len(doc)
         for page_number in page_numbers_list:
@@ -985,6 +1173,7 @@ def _extract_words_serial(
                     struct_index=struct_index,
                     form_fields=form_index.get(page_number - 1, []),
                     form_label_index=form_label_index,
+                    font_vbbox_cache=font_vbbox_cache,
                 )
             finally:
                 page.close()

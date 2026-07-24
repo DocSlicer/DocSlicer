@@ -39,5 +39,36 @@ class ParseConfig:
     # DOCX only: reviewer comments are annotations, not content — excluded by default.
     include_comments: bool = False
 
+    def __post_init__(self) -> None:
+        valid_representations = {"markdown", "jsonl", "melted"}
+        if self.table_representation not in valid_representations:
+            raise ValueError(
+                f"table_representation must be one of "
+                f"{sorted(valid_representations)}, got {self.table_representation!r}."
+            )
+
+        for name in ("max_chunk_size", "optimal_chunk_size", "min_chunk_size"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer, got {value!r}.")
+        if not (self.min_chunk_size <= self.optimal_chunk_size <= self.max_chunk_size):
+            raise ValueError(
+                "chunk sizes must satisfy min_chunk_size <= optimal_chunk_size <= "
+                f"max_chunk_size, got min={self.min_chunk_size}, "
+                f"optimal={self.optimal_chunk_size}, max={self.max_chunk_size}."
+            )
+
+        if self.max_workers is not None and (
+            not isinstance(self.max_workers, int) or self.max_workers < 1
+        ):
+            raise ValueError(
+                f"max_workers must be None or a positive integer, got {self.max_workers!r}."
+            )
+
+        if not isinstance(self.extra_fields, list) or not all(
+            isinstance(f, str) for f in self.extra_fields
+        ):
+            raise ValueError("extra_fields must be a list of column-name strings.")
+
 
 DEFAULT_CONFIG = ParseConfig()

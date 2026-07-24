@@ -20,6 +20,11 @@ just the rendered message.
 Either way, a StepDurationCollector taps every record's `duration_sec` field
 to print a per-step timing table and a total at the end.
 
+The work runs under `if __name__ == "__main__":` — docslicer parses CPU-bound
+steps (PDF word extraction, OCR, ...) across a process pool, and on spawn-based
+platforms (macOS, Windows) each worker re-imports this file. The guard keeps that
+re-import from re-running the parse in every worker.
+
 Usage:
     python examples/logging_and_stages.py
     python examples/logging_and_stages.py path/to/your/document.pdf
@@ -35,18 +40,6 @@ from time import perf_counter
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 import docslicer
-
-args = [a for a in sys.argv[1:] if not a.startswith("--")]
-AS_JSON = "--json" in sys.argv[1:]
-SOURCE = args[0] if args else Path(__file__).parent / "sample_docs" / "financial_report.pdf"
-
-# ── Logging setup ────────────────────────────────────────────────────────────
-# Root at WARNING so third-party libs (pikepdf, httpx, ...) stay quiet; only the
-# docslicer logger is bumped to INFO so per-step timing lines show up.
-
-logging.basicConfig(level=logging.WARNING, format="%(name)s: %(message)s")
-docslicer_logger = logging.getLogger("docslicer")
-docslicer_logger.setLevel(logging.INFO)
 
 # ── Reading the structured log_data ─────────────────────────────────────────
 # timed_step() attaches event/step_name/duration_sec (and any extra_meta) via
@@ -81,46 +74,61 @@ class StepDurationCollector(logging.Handler):
             self.steps.append((step_name, duration))
 
 
-if AS_JSON:
-    json_handler = logging.StreamHandler()
-    json_handler.setFormatter(StructuredJsonFormatter())
-    docslicer_logger.addHandler(json_handler)
-    docslicer_logger.propagate = False  # avoid double-printing via root's plain handler
+def main() -> None:
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    AS_JSON = "--json" in sys.argv[1:]
+    SOURCE = args[0] if args else Path(__file__).parent / "sample_docs" / "financial_report.pdf"
 
-collector = StepDurationCollector()
-docslicer_logger.addHandler(collector)
+    # ── Logging setup ────────────────────────────────────────────────────────
+    # Root at WARNING so third-party libs (pikepdf, httpx, ...) stay quiet; only
+    # the docslicer logger is bumped to INFO so per-step timing lines show up.
 
-# ── on_stage callback ────────────────────────────────────────────────────────
-# Fired once per coarse stage; use it to drive a progress bar or print phase
-# transitions with their own timing, independent of the step-level logs above.
+    logging.basicConfig(level=logging.WARNING, format="%(name)s: %(message)s")
+    docslicer_logger = logging.getLogger("docslicer")
+    docslicer_logger.setLevel(logging.INFO)
 
-_stage_t0 = perf_counter()
+    if AS_JSON:
+        json_handler = logging.StreamHandler()
+        json_handler.setFormatter(StructuredJsonFormatter())
+        docslicer_logger.addHandler(json_handler)
+        docslicer_logger.propagate = False  # avoid double-printing via root's plain handler
+
+    collector = StepDurationCollector()
+    docslicer_logger.addHandler(collector)
+
+    # ── on_stage callback ─────────────────────────────────────────────────────
+    # Fired once per coarse stage; use it to drive a progress bar or print phase
+    # transitions with their own timing, independent of the step-level logs above.
+
+    _stage_t0 = perf_counter()
+
+    def on_stage(stage: str) -> None:
+        nonlocal _stage_t0
+        now = perf_counter()
+        print(f"[stage] {stage:<20} (+{now - _stage_t0:.3f}s)")
+        _stage_t0 = now
+
+    # ── Parse ──────────────────────────────────────────────────────────────────
+
+    print(f"Parsing: {SOURCE}\n")
+    t0 = perf_counter()
+    result = docslicer.parse_document(SOURCE, on_stage=on_stage)
+    elapsed = perf_counter() - t0
+
+    print(f"\nDone in {elapsed:.2f}s — {len(result.chunks)} chunks  {len(result.blocks)} blocks  {len(result.tables)} tables")
+
+    # ── Totals, read back from the collected records ──────────────────────────
+
+    step_total = sum(duration for _, duration in collector.steps)
+    print(f"\n{'Step':<30} Duration")
+    print("-" * 42)
+    for step_name, duration in collector.steps:
+        print(f"{step_name:<30} {duration:>7.3f}s")
+    print("-" * 42)
+    print(f"{'sum of steps':<30} {step_total:>7.3f}s")
+    print(f"{'wall clock':<30} {elapsed:>7.3f}s")
+    print(f"{'unaccounted (I/O, browser launch, glue code)':<30} {elapsed - step_total:>7.3f}s")
 
 
-def on_stage(stage: str) -> None:
-    global _stage_t0
-    now = perf_counter()
-    print(f"[stage] {stage:<20} (+{now - _stage_t0:.3f}s)")
-    _stage_t0 = now
-
-
-# ── Parse ─────────────────────────────────────────────────────────────────────
-
-print(f"Parsing: {SOURCE}\n")
-t0 = perf_counter()
-result = docslicer.parse_document(SOURCE, on_stage=on_stage)
-elapsed = perf_counter() - t0
-
-print(f"\nDone in {elapsed:.2f}s — {len(result.chunks)} chunks  {len(result.blocks)} blocks  {len(result.tables)} tables")
-
-# ── Totals, read back from the collected records ────────────────────────────
-
-step_total = sum(duration for _, duration in collector.steps)
-print(f"\n{'Step':<30} Duration")
-print("-" * 42)
-for step_name, duration in collector.steps:
-    print(f"{step_name:<30} {duration:>7.3f}s")
-print("-" * 42)
-print(f"{'sum of steps':<30} {step_total:>7.3f}s")
-print(f"{'wall clock':<30} {elapsed:>7.3f}s")
-print(f"{'unaccounted (I/O, browser launch, glue code)':<30} {elapsed - step_total:>7.3f}s")
+if __name__ == "__main__":
+    main()
