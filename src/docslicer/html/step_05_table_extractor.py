@@ -616,15 +616,24 @@ def extract_table_cells(
 
     # Build a lookup: JS table_id → <table> element, using the
     # data-docslicer-table-id attribute stamped by extract_boxes.js.
-    soup = BeautifulSoup(rendered_html, "lxml")
+    with warnings.catch_warnings():
+        # rendered_html is intentionally HTML; silence bs4's XML-vs-HTML guess.
+        warnings.simplefilter("ignore", XMLParsedAsHTMLWarning)
+        soup = BeautifulSoup(rendered_html, "lxml")
     table_by_js_id: dict[int, any] = {}
-    for tbl in soup.find_all("table"):
+    for doc_order, tbl in enumerate(soup.find_all("table"), 1):
         attr = tbl.get("data-docslicer-table-id")
         if attr is not None:
             try:
                 table_by_js_id[int(attr)] = tbl
+                continue
             except (ValueError, TypeError):
                 pass
+        # Static path: extract_boxes.js never ran, so no data-docslicer-table-id
+        # attribute exists. The static box extractor keys tables by their 1-based
+        # document-order position (soup.find_all("table") order), so mirror that
+        # here to recover the same original_table_id mapping.
+        table_by_js_id.setdefault(doc_order, tbl)
 
     all_cells: list[pd.DataFrame] = []
     global_cell_id = 1

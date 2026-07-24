@@ -27,7 +27,9 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Optional
 
-from bs4 import BeautifulSoup, Comment, NavigableString, Tag
+import warnings
+
+from bs4 import BeautifulSoup, Comment, NavigableString, Tag, XMLParsedAsHTMLWarning
 
 # ---------------------------------------------------------------------------
 # Tag sets (mirrors JS STRUCTURE_TAGS)
@@ -521,7 +523,10 @@ def extract_boxes_static(html: str) -> List[Dict[str, Any]]:
     boundaries (strong, b, em, i, u, a …), each with its own style resolution.
     <hr> and <img> elements are emitted as separate boxes in DOM order.
     """
-    soup = BeautifulSoup(html, "lxml")
+    with warnings.catch_warnings():
+        # Input is intentionally HTML; silence bs4's XML-vs-HTML guess.
+        warnings.simplefilter("ignore", XMLParsedAsHTMLWarning)
+        soup = BeautifulSoup(html, "lxml")
 
     for unwanted in soup(["script", "style", "noscript"]):
         unwanted.decompose()

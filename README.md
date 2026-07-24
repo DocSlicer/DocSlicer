@@ -73,7 +73,10 @@ pip install 'docslicer[html]'    # HTML / URL parsing via Playwright
 playwright install chromium       # one-time browser install (Chromium only)
 
 pip install 'docslicer[ocr]'     # scanned PDF support via Tesseract + OpenCV
-# also requires: apt install tesseract-ocr  (or brew install tesseract)
+# The tesserocr wheel bundles libtesseract but NOT the language models,
+# so install the Tesseract engine to provide them (docslicer auto-detects the path):
+# Linux:  apt install tesseract-ocr
+# macOS:  brew install tesseract
 
 pip install 'docslicer[llm]'     # exact token counts via tiktoken (exact_tokens=True)
 pip install 'docslicer[crypto]'  # password-protected Office files (msoffcrypto-tool)
@@ -425,8 +428,9 @@ tells you whether OCR was used.
 
 ```bash
 pip install 'docslicer[ocr]'
-# Linux:  apt install tesseract-ocr
-# macOS:  brew install tesseract
+# tesserocr binds libtesseract directly, so install the Tesseract dev libraries first:
+# Linux:  apt install tesseract-ocr libtesseract-dev libleptonica-dev pkg-config
+# macOS:  brew install tesseract leptonica
 ```
 
 ---

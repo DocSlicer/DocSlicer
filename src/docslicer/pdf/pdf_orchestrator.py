@@ -179,7 +179,7 @@ def run_pipeline(
             warnings.warn(
                 "Scanned PDF detected — running OCR pipeline. "
                 "This may take significantly longer than normal parsing. "
-                "Install pytesseract and opencv-python if not already: "
+                "Install the OCR extra if not already: "
                 "pip install 'docslicer[ocr]'"
             )
             from ..ocr.ocr_orchestrator import run_ocr_pipeline, OCRPipelineConfig

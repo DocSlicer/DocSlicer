@@ -555,20 +555,25 @@ def _run_pipeline(
     elif content_type == "html":
         if content is not None and not isinstance(content, str):
             raise TypeError("HTML content must be a string")
-        if config.use_browser:
+        use_browser = config.use_browser
+        if use_browser:
             try:
                 from playwright.sync_api import sync_playwright as _pw  # noqa: F401
             except ImportError:
-                raise ImportError(
-                    "HTML parsing requires playwright. Install it with: "
-                    "pip install 'docslicer[html]' && playwright install\n"
-                    "Or pass use_browser=False to use the faster, lower-fidelity "
-                    "static (non-Playwright) box extractor instead."
+                import warnings
+                warnings.warn(
+                    "HTML parsing requested browser mode (use_browser=True) but "
+                    "playwright is not installed; falling back to the faster, "
+                    "lower-fidelity static (non-Playwright) box extractor. Install "
+                    "'docslicer[html]' && playwright install for full-fidelity "
+                    "rendering, or pass use_browser=False to silence this warning.",
+                    stacklevel=2,
                 )
+                use_browser = False
         from .html.html_orchestrator import run_pipeline as _run_html_pipeline
         discovered_metadata, df_lines, df_table_cells, html_steps = _run_html_pipeline(
             html=content, source_url=source_url, debug=config.debug, session=session,
-            use_browser=config.use_browser, on_stage=on_stage,
+            use_browser=use_browser, on_stage=on_stage,
         )
         discovered_metadata["content_type"] = "html"
         if config.debug:

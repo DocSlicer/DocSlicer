@@ -75,7 +75,7 @@ def _parse_flags(flags_s: str) -> int:
 # =========================
 
 def load_and_compile_hierarchy_type_patterns(yaml_obj: Dict[str, Any]) -> HierarchyTypePatternConfig:
-    """
+    r"""
     yaml_obj is parsed YAML (dict) passed in by the orchestrator.
 
     Expected shape (simplified):

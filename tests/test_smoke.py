@@ -48,3 +48,15 @@ def test_pdf_has_tables(pdf_result):
         assert table.id
         assert table.markdown
         assert len(table.cells) > 0
+
+
+def test_html_has_tables(html_result):
+    # Regression: the static (no-Playwright) extractor must still recover tables.
+    # sec_10q.html is table-heavy; a base install falls back to the static path,
+    # which previously emitted 0 tables because step_05 only matched tables via
+    # the data-docslicer-table-id attribute that browser-only JS stamps.
+    assert len(html_result.tables) > 0, "sec_10q.html should have tables"
+    for table in html_result.tables:
+        assert table.id
+        assert table.markdown
+        assert len(table.cells) > 0

@@ -4,24 +4,35 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "docslicer"
-version = "0.1.0"
+version = "0.2.0"
 description = "Deterministic hierarchical document parser and chunker"
 readme = "README.md"
 license = "AGPL-3.0-only"
 license-files = ["LICENSE"]
 authors = [{ name = "Market Framer Inc.", email = "jelle@docslicer.ai" }]
 requires-python = ">=3.10"
-keywords = ["pdf", "html", "parsing", "chunking", "rag", "document"]
+keywords = [
+    "pdf", "docx", "pptx", "html", "document", "document-parsing",
+    "text-extraction", "chunking", "rag", "ocr", "tables", "llm",
+]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Financial and Insurance Industry",
+    "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Text Processing",
+    "Topic :: Text Processing :: Markup",
+    "Topic :: Text Processing :: Markup :: HTML",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 
 dependencies = [
@@ -44,8 +55,9 @@ html = [
     "playwright>=1.49",
 ]
 ocr = [
-    "pytesseract>=0.3",
+    "tesserocr>=2.6",
     "opencv-python>=4.8",
+    "Pillow>=10.0",
 ]
 crypto = [
     "msoffcrypto-tool>=5.0",
@@ -75,3 +87,9 @@ docslicer = [
     "html/*.js",
     "scraping/*.js",
 ]
+
+[project.urls]
+Homepage = "https://docslicer.ai"
+Repository = "https://github.com/DocSlicer/DocSlicer/"
+Issues = "https://github.com/DocSlicer/DocSlicer/issues"
+Documentation = "https://docslicer.ai/docs"
