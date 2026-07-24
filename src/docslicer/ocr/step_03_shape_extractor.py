@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Market Framer Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
+"""Extract ruled lines and shapes from a rendered page image."""
+
 # ocr/step_03_shape_extractor.py
 #
 # Rule-line extractor for rendered (OCR) pages.

@@ -1,6 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Market Framer Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
 """
-step_06_line_number_detector.py
-
 Detects margin line numbers in structured documents (legal, technical, etc.).
 
 For each page:

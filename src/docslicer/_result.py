@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Market Framer Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
+"""Public result types (ParseResult, Chunk, Block, Table, Chart, HierarchyTree) and their serialization."""
+
 from __future__ import annotations
 
 import json
@@ -41,6 +45,13 @@ if TYPE_CHECKING:
 
 @dataclass
 class BBox:
+    """Axis-aligned bounding box (origin top-left), in the source's coordinate units.
+
+    Present only when the pipeline produced layout coordinates for the element;
+    ``None`` otherwise. See the per-field notes on Chunk/Block/Table/Chart for
+    which formats populate it.
+    """
+
     x_left: float
     y_top: float
     x_right: float
@@ -55,6 +66,12 @@ class BBox:
 
 @dataclass
 class Chunk:
+    """A retrieval-sized span of text with its heading path, page, and references.
+
+    Chunks are the primary unit for RAG: size-bounded, hierarchy-aware, and
+    carrying the table/chart IDs and links found within their text.
+    """
+
     id: str
     parent_chunk_id: str | None                      # id of parent chunk in hierarchy
     chunk_index: int
@@ -66,7 +83,7 @@ class Chunk:
     text: str
     char_count: int
     token_count: int
-    bbox: BBox | None                                 # PDF only
+    bbox: BBox | None                                 # all formats except DOCX
     link_url: list[str]                              # unique URLs found in chunk
     table_ids: list[str]                             # table IDs referenced in chunk
     chart_ids: list[str] = field(default_factory=list)  # chart IDs referenced in chunk (docx/pptx)
@@ -99,6 +116,12 @@ class Chunk:
 
 @dataclass
 class Block:
+    """A single logical element (paragraph, heading, table, …) before chunking.
+
+    Blocks are the pre-chunk layout units; each one links back to the chunk it
+    was placed in via ``chunk_id``.
+    """
+
     id: str
     type: str                                        # paragraph | heading | table | toc | exhibits | navigation | …
     page_number: int
@@ -107,7 +130,7 @@ class Block:
     text: str
     chunk_id: str | None                             # which chunk this block belongs to
     char_count: int
-    bbox: BBox | None                                 # PDF only
+    bbox: BBox | None                                 # all formats except DOCX
     link_url: list[str]                              # unique URLs found in block
     table_ids: list[str]                             # table IDs referenced in block
     chart_ids: list[str] = field(default_factory=list)  # chart IDs referenced in block (docx/pptx)
@@ -137,13 +160,15 @@ class Block:
 
 @dataclass
 class TableCell:
+    """One cell of a Table, with grid position, span, and semantic role."""
+
     row: int                                          # 0-indexed row position
     col: int                                          # 0-indexed column position
     rowspan: int                                      # rows spanned (>=1)
     colspan: int                                      # columns spanned (>=1)
     role: str                                         # header | row_label | value_numeric | value_text | footnote
     text: str
-    bbox: BBox | None                                 # PDF only
+    bbox: BBox | None                                 # all formats except DOCX
 
     @classmethod
     def from_dict(cls, d: dict) -> "TableCell":
@@ -163,12 +188,18 @@ class TableCell:
 
 @dataclass
 class Table:
+    """A parsed table: its cells plus a ready-to-use markdown rendering.
+
+    Use ``cells`` for structured access or ``to_dataframe()`` / ``markdown``
+    for tabular output.
+    """
+
     id: str
     caption: str | None
     page_number: int
     page_label: str | None
     chunk_id: str
-    bbox: BBox | None                                 # PDF only; union of all cell bboxes
+    bbox: BBox | None                                 # all formats except DOCX; union of all cell bboxes
     markdown: str                                     # convenience — full table as markdown
     cells: list[TableCell]
 
@@ -195,6 +226,8 @@ class Table:
 
 @dataclass
 class ChartPoint:
+    """A single plotted data point within a Chart series."""
+
     series_index: int                                 # 0-indexed series position
     series_name: str | None                           # e.g. "Revenue 2024"
     point_index: int                                  # 0-indexed point position within the series
@@ -227,6 +260,12 @@ class ChartPoint:
 
 @dataclass
 class Chart:
+    """A parsed chart: its series/points plus a markdown rendering of the data.
+
+    Extracted from DOCX/PPTX embedded charts. Use ``points`` for structured
+    access or ``to_dataframe()`` / ``markdown`` for tabular output.
+    """
+
     id: str
     chart_type: str                                   # barChart | lineChart | pieChart | scatterChart | …
     title: str | None
@@ -276,6 +315,8 @@ class Chart:
 
 @dataclass
 class HierarchyNode:
+    """One heading in the document tree, with its children and the chunks under it."""
+
     heading_id: int
     text: str
     level: int
@@ -327,6 +368,8 @@ class HierarchyNode:
 
 @dataclass
 class HierarchyTree:
+    """The document's heading tree. Iterable over its root nodes; supports search and traversal."""
+
     roots: list[HierarchyNode]
 
     @classmethod
@@ -555,6 +598,15 @@ def _to_parquet(df: "pd.DataFrame", path: Path) -> None:
 
 @dataclass
 class ParseResult:
+    """The result of parsing one document.
+
+    Bundles the retrieval-ready ``chunks``, the pre-chunk ``blocks``, extracted
+    ``tables`` and ``charts``, the heading ``hierarchy``, and document
+    ``metadata``. When parsed with ``debug=True``, ``pipeline_steps`` holds the
+    intermediate per-step DataFrames. Round-trips via ``to_dict()`` /
+    ``from_dict()`` and the export helpers.
+    """
+
     chunks: list[Chunk]
     blocks: list[Block]
     tables: list[Table]

@@ -1,42 +1,34 @@
+# SPDX-FileCopyrightText: 2026 Market Framer Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
 """
-step_07_reading_order.py
+Assign an approximate reading order from the PDF content stream.
 
-# ==============================================================================
-# NATIVE PDF STREAMING-ORDER ASSIGNMENT
-# ==============================================================================
-#
-# Goal
-# ----
-# 1. Derive an approximate reading order for native PDFs from the PDF content
-#    stream (`text_object_id`) instead of relying primarily on geometric
-#    heuristics such as XY-cut.
-#
-# 2. Partition consecutive text objects into `stream_group_id`s representing
-#    logical reading segments (typically lines or contiguous reading runs).
-#
-# 3. Leverage tagged-PDF metadata (`struct_group_id`, `table_id`, `textbox_id`)
-#    when available to improve grouping accuracy.
-#
-# 4. Assign `line_id`s to all words based on the resulting streaming groups.
-#
-# Background
-# ----------
-# This module is only used for native PDFs.
-#
-# PDFium exposes text objects in the order they appear in a page's content
-# stream (`text_object_id`, numbered 1..N per page). This native PDF streaming
-# order generally follows the intended reading order much more closely than
-# geometric layout heuristics, although occasional outliers exist (e.g. page
-# labels, headers/footers, or other content emitted earlier or later in the
-# content stream).
-#
-# Scanned PDFs are handled by the OCR pipeline, which derives reading order from
-# the page image using layout analysis (e.g. gutter detection), and therefore do
-# not use this algorithm.
-#
-# A later pipeline stage may reposition isolated streaming groups to produce the
-# final human reading order.
-# ==============================================================================
+df_words → df_words + stream_group_id, line_id.
+
+Goal:
+  1. Derive an approximate reading order for native PDFs from the PDF content
+     stream (`text_object_id`) instead of relying primarily on geometric
+     heuristics such as XY-cut.
+  2. Partition consecutive text objects into `stream_group_id`s representing
+     logical reading segments (typically lines or contiguous reading runs).
+  3. Leverage tagged-PDF metadata (`struct_group_id`, `table_id`, `textbox_id`)
+     when available to improve grouping accuracy.
+  4. Assign `line_id`s to all words based on the resulting streaming groups.
+
+Background:
+  This module is only used for native PDFs. PDFium exposes text objects in the
+  order they appear in a page's content stream (`text_object_id`, numbered
+  1..N per page). This native streaming order generally follows the intended
+  reading order much more closely than geometric layout heuristics, although
+  occasional outliers exist (e.g. page labels, headers/footers, or other
+  content emitted earlier or later in the content stream).
+
+  Scanned PDFs are handled by the OCR pipeline, which derives reading order
+  from the page image using layout analysis (e.g. gutter detection), and
+  therefore do not use this algorithm.
+
+  A later pipeline stage may reposition isolated streaming groups to produce
+  the final human reading order.
 
 """
 

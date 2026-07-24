@@ -1,5 +1,9 @@
+# SPDX-FileCopyrightText: 2026 Market Framer Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
 """
-Step 01 – Raw word extraction
+Raw word extraction.
+
+PDF → df_words (one row per whitespace-delimited word).
 
 Responsibilities:
     - Open a PDF with pypdfium2

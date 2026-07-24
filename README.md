@@ -1,37 +1,43 @@
 # DocSlicer
 
-Deterministic hierarchical document parser and chunker for business documents. No LLM calls.
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE) [![Commercial license available](https://img.shields.io/badge/License-Commercial-green.svg)](LICENSE-COMMERCIAL.md)
 
-DocSlicer turns PDFs, Word documents, HTML pages, and PowerPoint files into clean chunks, structured blocks, tables, and a navigable heading hierarchy — preserving the document's own structure instead of guessing at it.
+Lightning-fast, deterministic hierarchical document parser and chunker for business documents. No LLM calls or heavy ML models.
+
+DocSlicer turns PDFs, Word documents, HTML pages, and PowerPoint files into clean chunks, structured blocks, tables, charts, and a navigable heading hierarchy — preserving the document's own structure instead of guessing at it.
 
 ```python
 import docslicer
 
-result = docslicer.parse_document("annual_report.pdf")
+def main():
+    result = docslicer.parse_document("annual_report.pdf")
 
-# Inspect the outline first
-result.hierarchy.to_outline()
-# - PART I — FINANCIAL INFORMATION
-#   - Item 1. Financial Statements
-#     - Notes to Condensed Consolidated Financial Statements
-#       - Note 4 – Financial Instruments
-#         - Derivative Instruments and Hedging
-#           - Foreign Exchange Rate Risk
-#           - Interest Rate Risk
-#         - Accounts Receivable
-#           - Trade Receivables
-#   - Item 2. Management's Discussion and Analysis
-#     - Liquidity and Capital Resources
-# - PART II — OTHER INFORMATION
-#   ...
+    # Inspect the outline first
+    result.hierarchy.to_outline()
+    # - PART I — FINANCIAL INFORMATION
+    #   - Item 1. Financial Statements
+    #     - Notes to Condensed Consolidated Financial Statements
+    #       - Note 4 – Financial Instruments
+    #         - Derivative Instruments and Hedging
+    #           - Foreign Exchange Rate Risk
+    #           - Interest Rate Risk
+    #         - Accounts Receivable
+    #           - Trade Receivables
+    #   - Item 2. Management's Discussion and Analysis
+    #     - Liquidity and Capital Resources
+    # - PART II — OTHER INFORMATION
+    #   ...
 
-# Pull only the chunks you need
-risk_section = result.find_heading("Risk Factors")[0]
-chunks = result.chunks_under(risk_section)
+    # Pull only the chunks you need
+    risk_section = result.find_heading("Risk Factors")[0]
+    chunks = result.chunks_under(risk_section)
 
-# Tables come back structured, not as flat text
-for table in result.tables_under(risk_section):
-    print(table.markdown)
+    # Tables come back structured, not as flat text
+    for table in result.tables_under(risk_section):
+        print(table.markdown)
+
+if __name__ == "__main__":
+    main()
 ```
 
 ---
@@ -39,12 +45,12 @@ for table in result.tables_under(risk_section):
 ## Features
 
 - **No LLM, VLM, or ML models** — fully deterministic; no model weights to download, no GPU required, no cold-start delay
-- **Lightweight** — ~1.5 MB wheel with no heavy ML dependencies
+- **Lightweight** — ~630 KB wheel with no heavy ML dependencies
+- **Agentic-friendly** — reduces token spend on long documents: have the agent inspect the outline first, then pull only the relevant chunks into context instead of feeding a 500-page document verbatim; well-suited for legal texts, technical SOPs, financial filings, and compliance documents
 - **Deep hierarchy extraction** — works for both numbered (`1.`, `1.2.`, `1.2.3`) and free-form headings; uses font size, bold weight, and document structure — not inference; handles re-entry after exhibit breaks and repeated navigation headings across pages
 - **Structure-aware chunking** — splits at heading and paragraph boundaries, preserving semantic coherence
 - **Zero character overlap** — chunks are non-overlapping by default; no duplicated tokens in your context window
-- **Agentic-friendly** — reduces token spend on long documents: have the agent inspect the outline first, then pull only the relevant chunks into context instead of feeding a 500-page document verbatim; well-suited for legal texts, technical SOPs, financial filings, and compliance documents
-- **Unified result object** — `chunks`, `blocks`, `tables`, `metadata`, and `hierarchy` in one place
+- **Unified result object** — `chunks`, `blocks`, `tables`, `charts`, `metadata`, and `hierarchy` in one place
 - **Structured tables** — tables come back as cells, not flat text; export as Markdown, JSONL, or melted format
 - **Multiple export formats** — CSV, Markdown, JSONL, Parquet, JSON, plain text, and DataFrames
 - **Reading order preserved** — including multi-column PDF layouts
@@ -60,17 +66,21 @@ for table in result.tables_under(risk_section):
 pip install docslicer
 ```
 
-HTML parsing and OCR are optional extras:
+The core install is dependency-light. Optional features are available as extras:
 
 ```bash
 pip install 'docslicer[html]'    # HTML / URL parsing via Playwright
-playwright install                # one-time browser install
+playwright install chromium       # one-time browser install (Chromium only)
 
-pip install 'docslicer[ocr]'     # scanned PDF support via Tesseract
+pip install 'docslicer[ocr]'     # scanned PDF support via Tesseract + OpenCV
 # also requires: apt install tesseract-ocr  (or brew install tesseract)
 
+pip install 'docslicer[llm]'     # exact token counts via tiktoken (exact_tokens=True)
+pip install 'docslicer[crypto]'  # password-protected Office files (msoffcrypto-tool)
 pip install 'docslicer[parquet]' # Parquet export support
 ```
+
+Extras can be combined: `pip install 'docslicer[html,ocr,llm]'`.
 
 **Requires Python 3.10+**
 
@@ -84,6 +94,7 @@ pip install 'docslicer[parquet]' # Parquet export support
 result.chunks      # list[Chunk]   — heading-aware text chunks, ready for embedding
 result.blocks      # list[Block]   — paragraph/heading/table blocks before chunking
 result.tables      # list[Table]   — structured tables with cells, spans, and markdown
+result.charts      # list[Chart]   — charts as extracted data points (docx/pptx)
 result.metadata    # DocumentMetadata — title, author, language, page count, OCR flag
 result.hierarchy   # HierarchyTree — navigable tree of all headings
 ```
@@ -98,6 +109,7 @@ chunk.section       # str   — body | toc | exhibit | header | footer | coverpa
 chunk.page_number   # int   — 1-based physical page
 chunk.page_label    # str   — "A-6", "iv", "F-3" — as printed on the page
 chunk.table_ids     # list  — IDs of tables referenced in this chunk
+chunk.chart_ids     # list  — IDs of charts referenced in this chunk (docx/pptx)
 chunk.link_url      # list  — URLs found in this chunk
 chunk.bbox          # BBox  — bounding box (PDF only)
 ```
@@ -143,6 +155,25 @@ result = docslicer.parse_document("https://www.sec.gov/Archives/edgar/data/.../1
 result = docslicer.parse_document(file_bytes)
 ```
 
+### Parsing & content options
+
+`parse_document` (and the format-specific functions) accept options that control what
+gets parsed and how, before it's chunked. Format-specific toggles are accepted everywhere
+for a uniform API but only take effect for the relevant format.
+
+```python
+result = docslicer.parse_document(
+    "contract.docx",
+    password="admin123",           # decrypt password-protected files; .docx and .pptx needs [crypto] extra
+    max_workers=4,                 # process-pool width for PDF extraction/OCR (default: auto by CPU cores)
+    include_headers_footers=True,  # docx: include header/footer content (default False)
+    include_footnotes=True,        # docx: include footnotes (default True)
+    include_comments=True,         # docx: include review comments (default False)
+    include_speaker_notes=True,    # pptx: include slide speaker notes (default True)
+    use_browser=True,              # html/URL: render in a real browser (default True)
+)
+```
+
 ### Chunking options
 
 ```python
@@ -154,6 +185,7 @@ result = docslicer.parse_document(
     chunking=False,               # skip chunking, return blocks only (faster)
     merge_small_chunks=True,      # merge chunks below min_chunk_size (default True)
     table_representation="jsonl", # "markdown" (default) | "jsonl" | "melted"
+    exact_tokens=True,            # exact tiktoken (cl100k_base) counts; needs [llm] extra, else char/4 estimate
     extra_fields=["is_bold", "font_size", "font_name"],  # surface internal pipeline columns on each chunk/block via .extra
 )
 ```
@@ -217,8 +249,12 @@ when chunks are fed into structured extraction or tool-use pipelines:
 
 ### Batch processing
 
+Point `parse_all` at a folder (or pass a list of paths/URLs). It yields `(source, result)`
+pairs, and a file that fails to parse yields the `Exception` instead of aborting the batch.
+Any `parse_document` keyword — chunk sizes, `include_*`, etc. — is forwarded per document.
+
 ```python
-for path, result in docslicer.parse_all("documents/", recursive=True):
+for path, result in docslicer.parse_all("documents/", recursive=True, max_chunk_size=2000):
     if isinstance(result, Exception):
         print(f"Failed {path}: {result}")
     else:
@@ -227,14 +263,55 @@ for path, result in docslicer.parse_all("documents/", recursive=True):
 
 ### Reuse config across documents
 
+`DocumentParser` holds a fixed `ParseConfig` across many documents and keeps a single
+browser open across HTML/URL inputs (launched lazily on the first HTML parse), so a batch
+of URLs starts Chromium once instead of once per document. Use it as a context manager so
+that browser is always released:
+
 ```python
 from docslicer import DocumentParser, ParseConfig
 
-parser = DocumentParser(ParseConfig(max_chunk_size=1500, optimal_chunk_size=600))
+config = ParseConfig(max_chunk_size=1500, optimal_chunk_size=600)
 
-for path in paths:
-    result = parser.parse(path)
+with DocumentParser(config) as parser:
+    for path, result in parser.parse_all(paths):   # or parser.parse(path) for one
+        ...
 ```
+
+### Two levels of parallelism
+
+There are two independent knobs, and they compose:
+
+- **`ParseConfig(max_workers=N)`** — *within* a single document: parallelizes PDF word
+  extraction, cell building, and OCR across processes (default: auto, sized to CPU cores).
+  Best when documents are large.
+- **`DocumentParser(config, workers=N)`** — *across* documents: fans whole documents out
+  over `N` worker processes, each with its own config and browser. Best when you have many
+  documents. Results arrive in submission order (this path isn't lazy per-document).
+
+Setting `workers` alone defaults each worker's `max_workers` to `1`, so nested pools don't
+oversubscribe the machine; set both explicitly to run both levels at once. The `workers`
+path can't forward a browser session or `on_stage` callback across processes — leave
+`workers` unset when you need those.
+
+> **Guard your entry point.** DocSlicer uses a `ProcessPoolExecutor` whenever there's
+> real CPU work to fan out — **any PDF over ~50 pages, any scanned/OCR PDF of any length**,
+> and both parallelism knobs above. This is not opt-in: a plain
+> `docslicer.parse_document("big.pdf")` triggers it too. On macOS and Windows, Python
+> spawns workers by re-importing your script top to bottom, so a parse that runs at module
+> level makes each worker re-run it and spawn again — raising `RuntimeError: An attempt has
+> been made to start a new process before the current process ... bootstrapping phase`.
+> Put your parsing code inside a function behind an `if __name__ == "__main__":` guard:
+>
+> ```python
+> def main():
+>     with DocumentParser(config, workers=4) as parser:
+>         for path, result in parser.parse_all(paths):
+>             ...
+>
+> if __name__ == "__main__":
+>     main()
+> ```
 
 ---
 
@@ -286,6 +363,7 @@ node = result.find_heading("Financial Instruments")[0]
 chunks = result.chunks_under(node)              # text chunks, ready for embedding or prompting
 chunks = result.chunks_under(node, recursive=False)  # direct heading only, no subsections
 tables = result.tables_under(node)              # structured tables in this section
+charts = result.charts_under(node)              # charts (with extracted data points) in this section
 blocks = result.blocks_under(node)              # raw paragraph/heading blocks
 ```
 
@@ -296,6 +374,7 @@ result.chunks_by_page(14)        # by page number
 result.chunks_by_page("F-3")     # by printed page label
 result.blocks_by_page(14)
 result.tables_by_page(14)
+result.charts_by_page(14)
 ```
 
 ---
@@ -306,9 +385,11 @@ result.tables_by_page(14)
 # Save everything
 result.save("output/")
 # → output/chunks.parquet, blocks.parquet, tables.parquet, metadata.json
+#   (+ charts.parquet when the document has charts)
 
 # Specific formats
 result.save("chunks.csv")
+result.save("charts.jsonl")       # stems: chunks | blocks | tables | charts | metadata
 result.save("result.json")        # full parse result as JSON
 result.export_chunks_jsonl("chunks.jsonl")
 
@@ -330,8 +411,8 @@ for name, df in result.pipeline_steps.items():
     print(name, df.shape)
     df.to_csv(f"debug/{name}.csv", index=False)
 
-# PDF steps:  words → shapes → cells → lines → table_cells → blocks → chunks
-# DOCX steps: runs → paragraphs → lines → table_cells → blocks → chunks
+# PDF steps:        words → shapes → cells → lines → table_cells → blocks → chunks
+# DOCX/PPTX steps:  runs → chart_points → paragraphs → lines → table_cells → blocks → chunks
 ```
 
 ---
@@ -366,4 +447,9 @@ docslicer.parse_html("filing.html")
 
 ## License
 
-Apache 2.0
+DocSlicer is **dual-licensed**:
+
+- **[AGPL-3.0](LICENSE)** — free to use, modify, and distribute, provided you comply with the AGPL's terms, including making the complete source of any application that uses DocSlicer available to its users (including over a network).
+- **[Commercial license](LICENSE-COMMERCIAL.md)** — for embedding DocSlicer in a closed-source or proprietary product, or offering it as part of a hosted/SaaS service without releasing your source.
+
+See [LICENSE-COMMERCIAL.md](LICENSE-COMMERCIAL.md) for details, or reach out about a commercial license.

@@ -1,12 +1,13 @@
+# SPDX-FileCopyrightText: 2026 Market Framer Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
 """
-step_10_cell_builder.py
+Build cells from words, decided strictly per line (no cross-row lookahead).
 
-Words -> Cells, decided strictly per line (no cross-row lookahead).
+df_words → df_cells.
 
-Per-line decision pipeline
---------------------------
-For each line, in order (the analysis primitives are shared with step 09 and
-the gutter detector; see _utils/line_classification.py):
+Per-line decision pipeline:
+For each line, in order (the analysis primitives are shared with the word
+relationship step and the gutter detector; see _utils/line_classification.py):
 
   1. Gap distribution         -> line_gap_stats()
        The line's inter-word gaps, em-normalized (gap / font_size).
@@ -28,15 +29,13 @@ the gutter detector; see _utils/line_classification.py):
        symbols merge into an adjacent numeric value, at their own (looser)
        gap limits.
 
-Known per-line limitation
--------------------------
+Known per-line limitation:
 A line of single-word columns with uniform wide gaps is indistinguishable
 from justified prose without margins or neighbour rows. We classify it by
 the content prior and accept the occasional miss. This is deliberate, not a
 bug (resolving it requires lookahead, which this step forgoes by design).
 
-Why em, not pt
---------------
+Why em, not pt:
 A pt is absolute, but "what counts as a word-space" scales with font size.
 gap_em = gap_pt / font_size makes one threshold mean the same thing on a
 14pt body line (9.6pt gap = 0.69 em) and a 9.6pt table header (4.5pt gap =

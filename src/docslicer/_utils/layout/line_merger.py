@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Market Framer Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
+"""Group boxes and words into lines by vertical alignment (assign_line_id, same_line)."""
+
 # backend/app/services/parsing/_utils/line_merger.py
 
 from __future__ import annotations

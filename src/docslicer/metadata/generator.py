@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Market Framer Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
 """Normalize authoring/generator strings into a shared vendor label.
 
 Used by every native-metadata extractor so PDF and OOXML emit the *same*

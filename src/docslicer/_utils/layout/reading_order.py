@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Market Framer Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
 """
 Gutter-based reading order: fallback for sources without native stream order.
 

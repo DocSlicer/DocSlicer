@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Market Framer Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
 """DOCX package reader — thin alias over the shared Open XML package reader."""
 
 from .._utils.oxm_package import OxmlPackage as DocxPackage

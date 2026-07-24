@@ -1,5 +1,9 @@
+# SPDX-FileCopyrightText: 2026 Market Framer Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
 """
-Step 02 – Image extraction
+Image extraction.
+
+PDF → df_images (one row per raster image object).
 
 Output columns:
     page_number, image_id, obj_index,

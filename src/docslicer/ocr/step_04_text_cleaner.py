@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Market Framer Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
+"""Clean OCR word text: strip control chars, normalize Unicode, and remove table-rule noise."""
+
 # ocr/step_04_text_cleaner.py
 from __future__ import annotations
 

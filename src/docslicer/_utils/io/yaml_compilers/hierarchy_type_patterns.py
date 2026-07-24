@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Market Framer Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
+"""Compile hierarchy-marker regex patterns from YAML into profile-keyed configs."""
+
 from __future__ import annotations
 
 import hashlib

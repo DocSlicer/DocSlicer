@@ -1,6 +1,12 @@
-"""
-step_14_table_builder.py
+# SPDX-FileCopyrightText: 2026 Market Framer Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
+"""Build tables from cells: assign structure, reconcile colspans, emit table cells.
 
+df_cells + df_grid_cells → df_cells (table structure) + df_table_cells.
+
+Assigns table_id per cell, resolves column layout and colspans (padding header
+colspans and clamping to the line), then emits one row per table cell with its
+detected role (header / row label / value) in df_table_cells.
 """
 
 from __future__ import annotations

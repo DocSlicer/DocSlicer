@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Market Framer Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
+"""Detect performance-core counts and resolve worker-pool sizes across macOS, Linux, and Windows."""
+
 from __future__ import annotations
 
 import os

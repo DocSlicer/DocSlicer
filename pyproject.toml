@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=72", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,13 +7,14 @@ name = "docslicer"
 version = "0.1.0"
 description = "Deterministic hierarchical document parser and chunker"
 readme = "README.md"
-license = { file = "LICENSE" }
+license = "AGPL-3.0-only"
+license-files = ["LICENSE"]
+authors = [{ name = "Market Framer Inc.", email = "jelle@docslicer.ai" }]
 requires-python = ">=3.10"
 keywords = ["pdf", "html", "parsing", "chunking", "rag", "document"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: GNU Affero General Public License v3",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",

@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Market Framer Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
 """
 Shared helpers for fanning page-oriented pipeline stages out over a process pool.
 

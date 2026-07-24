@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Market Framer Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
+"""timed_step — context manager that logs each pipeline step's name and duration."""
+
 # _utils/timing.py
 from __future__ import annotations
 

@@ -1,6 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Market Framer Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
 """
-step_01_toc_detector_new.py
-
 Answers the question: which lines form a Table of Contents (or Index), and
 which line is its heading?
 

@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Market Framer Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
+"""Command-line entry point: parse a file path or URL to structured JSON on stdout."""
+
 import argparse
 import json
 import sys

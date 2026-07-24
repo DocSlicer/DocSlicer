@@ -1,66 +1,63 @@
+# SPDX-FileCopyrightText: 2026 Market Framer Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
 """
-step_07b_stream_group_order.py
+Re-sequence stream groups into human reading order.
 
-# ==============================================================================
-# STREAM-GROUP READING-ORDER SHUFFLE
-# ==============================================================================
-#
-# Goal
-# ----
-# step_07 assigns every word a ``stream_group_id`` — a contiguous run of the PDF
-# content stream that behaves like one logical reading segment. Content-stream
-# order approximates reading order but *between* groups it can be wrong (a tall
-# right-hand callout emitted early, a title emitted after its own column, etc.).
-#
-# This stage takes those groups as opaque bounding boxes and re-sequences them
-# into human reading order, writing a per-word ``reading_order`` rank. It does
-# NOT look at text — only at each group's union bbox.
-#
-# It then sorts the words into that reading order and assigns ``line_id`` (via
-# the shared line merger), with one rule on top: all words sharing a
-# ``table_row_id`` land on a single line, even when the row wraps onto several
-# visual lines.
-#
-# The algorithm (per page)
-# ------------------------
-# Repeatedly pick the current "top-left" group, then emit it once everything
-# that must be read before it has been emitted:
-#
-#   pick_top_left(S):
-#       1. L = the group in S with the smallest x_left (the leftmost).
-#       2. Among the groups in S whose x-range overlaps L's x-range, return the
-#          one with the smallest y_top.
-#      Anchoring on the leftmost group's x-column (step 2) is what stops us from
-#      grabbing a box that merely has the globally lowest y_top but lives in a
-#      different column (e.g. a right-hand table on the McKinsey contents page).
-#
-#   process(G):
-#       a. LEFT-BLOCKERS. While some still-unresolved group sits inside G's
-#          y-range AND starts to the left of G, G cannot be read yet. Mask G
-#          (put it aside) and recursively process the top-left of those blockers
-#          first. This is what defers a very tall right-hand box until the
-#          left/middle columns nested inside its y-range are done.
-#       b. EMIT G.
-#       c. FOLLOWERS. G has now "reserved" its y-band: resolve every group that
-#          falls inside it, picking the top-left each time and recursing (each
-#          follower runs the same process). A follower whose own y-range reaches
-#          further down pulls in whatever sits inside it, so a tall first column
-#          sweeps its sibling columns before the page moves on.
-#
-# It is the same recursive step everywhere — top level, left-blockers, and
-# followers all just "pick the top-left and process it".
-#
-# Masking (a group on the recursion stack is invisible to the scans below it) is
-# what keeps a deferred box out of the way while its nested content — including
-# content the box does not strictly block — is resolved around it.
-#
-# Out of scope
-# ------------
-# Vertical (TTB / BTT) groups are masked out up front and re-attached at the end
-# of their page; placing them precisely is a separate concern.
-#
-# See ``assign_stream_group_order`` for the public entry point.
-# ==============================================================================
+df_words → df_words + reading_order, line_id.
+
+Goal:
+  The stream-group step assigns every word a ``stream_group_id`` — a contiguous
+  run of the PDF content stream that behaves like one logical reading segment.
+  Content-stream order approximates reading order but *between* groups it can be
+  wrong (a tall right-hand callout emitted early, a title emitted after its own
+  column, etc.).
+
+  This stage takes those groups as opaque bounding boxes and re-sequences them
+  into human reading order, writing a per-word ``reading_order`` rank. It does
+  NOT look at text — only at each group's union bbox.
+
+  It then sorts the words into that reading order and assigns ``line_id`` (via
+  the shared line merger), with one rule on top: all words sharing a
+  ``table_row_id`` land on a single line, even when the row wraps onto several
+  visual lines.
+
+Algorithm (per page):
+  Repeatedly pick the current "top-left" group, then emit it once everything
+  that must be read before it has been emitted:
+
+    pick_top_left(S):
+        1. L = the group in S with the smallest x_left (the leftmost).
+        2. Among the groups in S whose x-range overlaps L's x-range, return the
+           one with the smallest y_top.
+       Anchoring on the leftmost group's x-column (step 2) is what stops us from
+       grabbing a box that merely has the globally lowest y_top but lives in a
+       different column (e.g. a right-hand table on the McKinsey contents page).
+
+    process(G):
+        a. LEFT-BLOCKERS. While some still-unresolved group sits inside G's
+           y-range AND starts to the left of G, G cannot be read yet. Mask G
+           (put it aside) and recursively process the top-left of those blockers
+           first. This is what defers a very tall right-hand box until the
+           left/middle columns nested inside its y-range are done.
+        b. EMIT G.
+        c. FOLLOWERS. G has now "reserved" its y-band: resolve every group that
+           falls inside it, picking the top-left each time and recursing (each
+           follower runs the same process). A follower whose own y-range reaches
+           further down pulls in whatever sits inside it, so a tall first column
+           sweeps its sibling columns before the page moves on.
+
+  It is the same recursive step everywhere — top level, left-blockers, and
+  followers all just "pick the top-left and process it".
+
+  Masking (a group on the recursion stack is invisible to the scans below it)
+  is what keeps a deferred box out of the way while its nested content —
+  including content the box does not strictly block — is resolved around it.
+
+Out of scope:
+  Vertical (TTB / BTT) groups are masked out up front and re-attached at the
+  end of their page; placing them precisely is a separate concern.
+
+See ``assign_stream_group_order`` for the public entry point.
 """
 
 # NOTE: This algo is left to right biased. For slides that have a columnar layout, a new algo should be added

@@ -1,9 +1,10 @@
+# SPDX-FileCopyrightText: 2026 Market Framer Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
 # step_03a_pdf_page_label_candidates.py
 """
-Step 03A — Mark page label candidates (cells-based)
+Mark page-label candidates from top/bottom cells (no series scoring yet).
 
-Goal (Phase 1 only):
-(1) Mark candidates (no series scoring yet)
+df_cells → df_cells + page-label candidate columns.
 
 Rules:
 - For each page_number:

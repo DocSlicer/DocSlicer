@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Market Framer Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
+"""Merge and classify shapes into background, band, and table-grid roles."""
+
 # step_05_shape_processor.py
 
 from __future__ import annotations

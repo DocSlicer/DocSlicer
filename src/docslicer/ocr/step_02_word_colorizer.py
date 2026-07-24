@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Market Framer Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
+"""Sample ink and background colors for each OCR word from the page image."""
+
 # ocr/step_02_word_colorizer.py
 from __future__ import annotations
 

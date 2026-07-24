@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Market Framer Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
+"""Scraping configuration and content-type helpers."""
+
 from __future__ import annotations
 
 from pathlib import Path

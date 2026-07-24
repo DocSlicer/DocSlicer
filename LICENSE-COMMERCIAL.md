@@ -26,4 +26,4 @@ include priority support, warranty, and IP indemnification.
 Unless you hold a separate signed commercial agreement, your use of
 Docslicer is governed by the AGPL.
 
-Contact **[email / company]** for commercial terms.
+Contact **jelle@docslicer.ai** for commercial terms.

@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Market Framer Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
+"""Estimate per-word font sizes for OCR output by snapping heights to modal bands."""
+
 # ocr/step_05_font_size_estimator.py
 from __future__ import annotations
 

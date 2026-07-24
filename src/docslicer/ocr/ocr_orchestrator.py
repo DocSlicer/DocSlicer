@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Market Framer Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
+"""Run the OCR pipeline: render PDF pages to images, then extract, colorize, and clean words."""
+
 # ocr/ocr_orchestrator.py
 from __future__ import annotations
 

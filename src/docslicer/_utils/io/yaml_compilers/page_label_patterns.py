@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Market Framer Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
+"""Compile page-label regex patterns from YAML into a cached config."""
+
 # utils/page_label_patterns.py
 from __future__ import annotations
 

@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Market Framer Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
+"""Drop boilerplate, merge structural boxes, and flag table headers in extracted HTML boxes."""
+
 # step_02_box_cleaner.py
 # Cleans raw extracted boxes by (1) dropping boilerplate elements based on HTML ancestor
 # context (nav/header/footer, cookie banners, social widgets, ads, etc.), (2) normalising

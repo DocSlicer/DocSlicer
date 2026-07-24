@@ -1,7 +1,11 @@
+# SPDX-FileCopyrightText: 2026 Market Framer Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
 """
 Struct-tree field enrichment for per-word DataFrames.
 
-Given the per-word DataFrame produced by step_01 (word extractor), enriched
+df_words → df_words + table fields, textbox_id, block_type.
+
+Given the per-word DataFrame produced by the word extractor, enriched
 with struct_ancestors / struct_ancestor_ids by the struct-tree parser, adds:
 
     1. Extract table structure fields per word:

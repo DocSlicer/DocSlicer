@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Market Framer Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
 """OCR / scanned-document detection — image coverage and add_page_and_ocr_info."""
 from __future__ import annotations
 

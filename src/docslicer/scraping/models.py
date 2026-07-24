@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Market Framer Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
+"""Scraping data models: SourceType and ScrapedPage."""
+
 # backend/app/services/scraping/models.py
 
 from __future__ import annotations

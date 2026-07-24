@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Market Framer Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
+"""Color conversion and perceptual comparison (hex/RGB/Lab, CIEDE2000 delta-E)."""
+
 from __future__ import annotations
 
 import math

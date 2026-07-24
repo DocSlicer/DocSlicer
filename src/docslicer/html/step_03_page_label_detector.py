@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Market Framer Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
 # step_03_page_labels.py
 """
 Page Label Detection and Sequence Identification

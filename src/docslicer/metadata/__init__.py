@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Market Framer Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
 """Document metadata: the format-agnostic half of the two-channel pipeline.
 
 Each format pipeline runs its own ``native_metadata.extract_native_metadata``

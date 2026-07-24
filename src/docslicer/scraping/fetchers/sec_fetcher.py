@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Market Framer Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
+"""SecHttpFetcher — fetch SEC EDGAR documents with the required headers and throttling."""
+
 from __future__ import annotations
 
 import logging

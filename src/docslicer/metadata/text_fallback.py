@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Market Framer Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
 """Text-based metadata fallbacks — derive author / title / language from the
 document body when native metadata is missing.
 

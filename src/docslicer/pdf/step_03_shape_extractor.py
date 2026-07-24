@@ -1,5 +1,9 @@
+# SPDX-FileCopyrightText: 2026 Market Framer Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
 """
-Step 03 – Raw shape extraction
+Raw shape extraction.
+
+PDF → df_shapes (one row per vector path, rule, or rectangle).
 
 Output columns:
     page_number, raw_shape_id, raw_shape_type,

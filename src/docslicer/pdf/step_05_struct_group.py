@@ -1,5 +1,9 @@
+# SPDX-FileCopyrightText: 2026 Market Framer Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
 """
-Step 02 – Struct group ID assignment
+Assign struct_group_id — the logical block each word belongs to.
+
+df_words → df_words + struct_group_id.
 
 Responsibility:
     Given the per-word DataFrame produced by step_01 (word extractor),

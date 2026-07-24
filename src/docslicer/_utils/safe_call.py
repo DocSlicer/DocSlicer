@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Market Framer Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
+"""safe_enrich — run an optional enrichment step, logging and swallowing its failures."""
+
 # _utils/safe_call.py
 from __future__ import annotations
 

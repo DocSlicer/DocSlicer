@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Market Framer Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
 # step_01_static_box_extractor.py
 """
 Fallback HTML box extractor using BeautifulSoup — no Playwright required.

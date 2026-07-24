@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Market Framer Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
+"""Merge HTML boxes into lines and assign layout groups."""
+
 # step_04_line_merger.py
 
 import re

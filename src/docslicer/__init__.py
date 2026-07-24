@@ -1,3 +1,11 @@
+# SPDX-FileCopyrightText: 2026 Market Framer Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
+"""docslicer — deterministic hierarchical document parser and chunker.
+
+Parse PDF, DOCX, PPTX, and HTML (local files or URLs) into a structured
+ParseResult of chunks, blocks, tables, charts, and a heading hierarchy.
+"""
+
 from __future__ import annotations
 
 import atexit

@@ -1,8 +1,10 @@
+# SPDX-FileCopyrightText: 2026 Market Framer Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
 """
-step_07_word_relationships.py
-
 Word-to-shape relationship detection: hyperlinks, background rects, table
 grid-cell containment, underlines / strikethroughs, and nearest table rules.
+
+df_words + df_shapes → df_words + relationship fields.
 """
 
 from __future__ import annotations

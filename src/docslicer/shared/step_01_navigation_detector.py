@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Market Framer Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
+"""Flag navigation and boilerplate line blocks (menus, repeated runs)."""
+
 # d03_navigation_detector.py
 from __future__ import annotations
 

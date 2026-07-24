@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Market Framer Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
 """Consolidate the native and text metadata channels into the final fields.
 
 By the time this runs, a channel's ``discovered_metadata`` already carries both:

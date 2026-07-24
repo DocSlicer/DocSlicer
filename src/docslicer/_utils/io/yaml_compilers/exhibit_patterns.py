@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Market Framer Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
+"""Compile exhibit and footnote regex patterns from YAML."""
+
 # utils/exhibit_patterns.py
 from __future__ import annotations
 

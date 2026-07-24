@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Market Framer Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
 """Page geometry + char totals — format-agnostic page info for all pipelines."""
 from __future__ import annotations
 

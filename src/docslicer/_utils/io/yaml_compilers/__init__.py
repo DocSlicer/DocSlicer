@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Market Framer Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
+"""Compilers that turn pattern YAML into cached, compiled regex configs."""
+
 # YAML compiler utilities for pattern matching
 from .page_label_patterns import load_and_compile_patterns, PageLabelPatternConfig
 from .exhibit_patterns import load_and_compile_exhibit_patterns, ExhibitPatternConfig

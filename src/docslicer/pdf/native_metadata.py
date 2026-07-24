@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Market Framer Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
 """Extract document metadata from a PDF's XMP packet, /Info dict and catalog.
 
 Mirrors the docx/pptx native extractors: same output keys, read off an already

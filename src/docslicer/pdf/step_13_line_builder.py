@@ -1,13 +1,14 @@
+# SPDX-FileCopyrightText: 2026 Market Framer Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
 """
-step_12_line_builder.py
+Aggregate per-cell rows into one row per logical line.
 
-Cells -> Lines.
+df_cells → df_lines.
 
-Aggregate the per-cell rows from step 09 (the cell builder) into one row per
-logical line. A cell already carries a scalar ``line_id`` (the first line it
-touches) and a fully merged ``text`` field, so building lines is a single
-groupby: join the cell texts left-to-right into a line string and roll the
-per-cell geometry up through the shared column registry.
+A cell already carries a scalar ``line_id`` (the first line it touches) and a
+fully merged ``text`` field, so building lines is a single groupby: join the
+cell texts left-to-right into a line string and roll the per-cell geometry up
+through the shared column registry.
 
 This is deliberately a thin first step. Later stages (paragraph / block
 grouping, reading order) consume ``df_lines``; the cross-line decisions live

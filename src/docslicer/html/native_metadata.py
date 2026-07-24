@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Market Framer Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
 """Extract document metadata from an HTML document's <head>.
 
 Mirrors the pdf/docx/pptx native extractors: same output keys, parsed once off

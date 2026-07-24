@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Market Framer Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
+"""Extract words with bounding boxes from page images via tesserocr."""
+
 # ocr/step_01_word_extractor_tesserocr.py  (tesserocr version, PURE extractor)
 #
 # Drop-in alternative to step_01_word_extractor.py that talks to libtesseract

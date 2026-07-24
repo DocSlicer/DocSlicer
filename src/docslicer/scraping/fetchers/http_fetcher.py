@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Market Framer Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
+"""GenericHttpFetcher — fetch arbitrary URLs over HTTP."""
+
 from __future__ import annotations
 
 from typing import Mapping

@@ -1,16 +1,17 @@
+# SPDX-FileCopyrightText: 2026 Market Framer Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
 """
-step_11_cell_grouper.py  (option 2 — movement annotation)
+Group cells across visual lines that form one logical table cell (annotation stage).
 
-# NOTE: this is not used for OCR because it does not have a streaming order
+df_cells → df_cells + movement / vstack annotations.
 
-Purpose: Group cells together that are on different visual lines, but form 1 logical table cell
-    - Multi-line header
-    - Table cells that flex onto another line
+Not used for OCR, which has no streaming order.
 
-Cells -> Cells.  Annotation-only first stage of a new multiline-cell grouper.
+Purpose: group cells on different visual lines that form one logical table
+cell — multi-line headers, and table cells that flex onto another line.
+Annotation-only first stage of a multiline-cell grouper (nothing destroyed).
 
-Background
-----------
+Background:
 step_08 serialises cells in reading order (cell_id). In a multiline table region
 a single logical row is spread over several cells, and the reading order walks
 one *column* down before jumping to the next column — so the y of consecutive
@@ -22,8 +23,7 @@ consecutive cells (in cell_id order), leaving the actual grouping decision for a
 later pass that will be designed after inspecting these signals on real
 documents.
 
-What this step adds (nothing destroyed)
----------------------------------------
+What this step adds:
   y_center     : the cell's vertical center, (y_top + y_bottom) / 2.
   y_movement   : how y_center changes from this cell (t) to the next (t+1),
                  in cell_id (reading) order:
@@ -45,8 +45,7 @@ Both movement columns describe the transition t -> t+1 and are stored on cell t
 (the source cell). Transitions never cross a page boundary: page-local y resets
 each page, so the last cell of every page has empty movement.
 
-Vertical-stack runs
--------------------
+Vertical-stack runs:
 A transition that is (y_movement DOWN, x_movement NONE) means "straight down,
 same column" — the signature of one line of a multi-line table cell continuing
 into the next. Maximal consecutive sequences of cells chained by such

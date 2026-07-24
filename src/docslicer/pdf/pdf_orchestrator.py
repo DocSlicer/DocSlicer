@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Market Framer Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
 # pdf_orchestrator.py - PDF-specific document processing pipeline
 """
 PDF-specific pipeline steps.

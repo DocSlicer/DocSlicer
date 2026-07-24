@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Market Framer Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
 """DocumentMetadata dataclass — single source of truth for document-level metadata."""
 
 from __future__ import annotations

@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Market Framer Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
+"""Assemble the pipeline's DataFrames into the public ParseResult (chunks, blocks, tables, charts, hierarchy)."""
+
 from __future__ import annotations
 
 import datetime

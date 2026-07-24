@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Market Framer Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
 """PPTX pipeline entry point — runs extraction steps and returns structured data."""
 
 from __future__ import annotations

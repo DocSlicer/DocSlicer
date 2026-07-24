@@ -1,5 +1,9 @@
+# SPDX-FileCopyrightText: 2026 Market Framer Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
 """
-Step 04 – Raw link extraction
+Raw link extraction.
+
+PDF → df_links (one row per link annotation).
 
 Output columns:
     page_number, link_id,

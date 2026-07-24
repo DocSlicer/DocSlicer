@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Market Framer Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
+"""ParseConfig — user-facing knobs for parsing, chunking, OCR, and concurrency."""
+
 from __future__ import annotations
 
 import uuid as _uuid
@@ -6,6 +10,22 @@ from dataclasses import dataclass, field
 
 @dataclass
 class ParseConfig:
+    """User-facing configuration for a parse.
+
+    Chunking: ``max_chunk_size`` / ``optimal_chunk_size`` / ``min_chunk_size``
+    bound chunk length (in characters, or tokens when ``exact_tokens=True``);
+    ``chunking`` toggles chunking entirely and ``merge_small_chunks`` folds
+    undersized chunks into neighbours. ``table_representation`` selects how
+    tables are serialized ("markdown", "jsonl", or "melted"). ``extra_fields``
+    surfaces extra pipeline columns on the result, and ``debug`` retains the
+    intermediate ``pipeline_steps`` DataFrames.
+
+    Concurrency: ``max_workers`` sets the intra-document process-pool width
+    (None auto-sizes to performance cores; 1 disables it). Format-specific knobs
+    (``password``, ``use_browser``, ``include_*``) are documented inline below.
+    Invalid combinations raise ``ValueError`` at construction.
+    """
+
     max_chunk_size: int = 3200
     optimal_chunk_size: int = 1500
     min_chunk_size: int = 700

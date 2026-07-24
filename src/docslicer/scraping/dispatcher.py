@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Market Framer Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
+"""Route a URL to the right fetcher (SEC vs. generic HTTP) and return a ScrapedPage."""
+
 from __future__ import annotations
 
 from urllib.parse import urlparse

@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Market Framer Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
+"""Extract text boxes from rendered HTML using a Playwright browser session."""
+
 # d01_box_extractor.py
 from __future__ import annotations
 

@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Market Framer Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
 # shared_orchestrator.py - Shared document processing steps
 """
 Shared pipeline steps that run for both HTML and PDF documents.

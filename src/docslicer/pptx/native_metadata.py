@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Market Framer Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
 """Extract document metadata from PPTX core/app properties XML parts."""
 
 from __future__ import annotations
