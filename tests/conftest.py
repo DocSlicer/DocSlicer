@@ -20,6 +20,11 @@ def scanned_result():
 
 
 @pytest.fixture(scope="session")
+def academic_result():
+    return docslicer.parse_document(SAMPLES / "academic_paper.pdf")
+
+
+@pytest.fixture(scope="session")
 def html_result():
     return docslicer.parse_document(SAMPLES / "sec_10q.html")
 

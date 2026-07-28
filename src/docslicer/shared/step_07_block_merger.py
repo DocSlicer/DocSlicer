@@ -91,6 +91,37 @@ def _assign_block_ids(df: pd.DataFrame) -> pd.DataFrame:
 # =======================================================================================================================
 
 # =================================
+# Cell Text Flattening
+# =================================
+
+# A cell whose content wrapped over several physical lines is stored with its
+# fragments joined by "\n" (see pdf/step_14_table_builder._build_table_cells_df).
+# That newline is fine in the data model but structural in the row-per-line
+# formats below: it splits one "| a | b |" row into two, corrupting the table.
+# Every formatter that emits one line per row must flatten cell text first.
+_CELL_NEWLINE_RE = r"\s*\n\s*"
+
+
+def _flatten_cell_text(texts: pd.Series, sep: str = "<br>") -> pd.Series:
+    """
+    Strip a cell text column and collapse embedded newlines to `sep`.
+
+    Args:
+        texts: Raw cell text column
+        sep: Replacement for each run of newline + surrounding whitespace
+            ("<br>" keeps the line break visible in markdown; " " suits
+            plain-text formats)
+
+    Returns:
+        Stripped, single-line text column
+    """
+    return (
+        texts.fillna("").astype(str).str.strip()
+        .str.replace(_CELL_NEWLINE_RE, sep, regex=True)
+    )
+
+
+# =================================
 # Markdown Format
 # =================================
 
@@ -139,7 +170,7 @@ def _format_table_markdown(table_df: pd.DataFrame) -> str:
     # which uses the same to_numpy + zip pattern).
     rows_arr = table_df["row_start"].to_numpy(dtype=int)
     cols_arr = table_df["col_start"].to_numpy(dtype=int)
-    texts_arr = table_df["text"].fillna("").astype(str).str.strip().to_numpy()
+    texts_arr = _flatten_cell_text(table_df["text"]).to_numpy()
     colspans_arr = table_df["colspan"].fillna(1).to_numpy(dtype=int)
     rowspans_arr = table_df["rowspan"].fillna(1).to_numpy(dtype=int)
     if "table_cell_role" in table_df.columns:
@@ -214,7 +245,7 @@ def _format_table_jsonl(table_df: pd.DataFrame) -> str:
     col_starts = headers_df["col_start"].to_numpy(dtype=int)
     colspans = headers_df["colspan"].to_numpy(dtype=int)
     rows_arr = headers_df["row_start"].to_numpy(dtype=int)
-    texts_arr = headers_df["text"].fillna("").astype(str).str.strip().to_numpy()
+    texts_arr = _flatten_cell_text(headers_df["text"], sep=" ").to_numpy()
 
     header_map: dict[int, dict[int, str]] = {}
     for col_start, colspan, row, text in zip(col_starts, colspans, rows_arr, texts_arr):
@@ -230,7 +261,7 @@ def _format_table_jsonl(table_df: pd.DataFrame) -> str:
         header_keys[col] = "_".join(parts) if parts else f"col_{col}"
 
     # Pre-compute stripped text once
-    data_df["_text"] = data_df["text"].fillna("").astype(str).str.strip()
+    data_df["_text"] = _flatten_cell_text(data_df["text"], sep=" ")
 
     json_lines = []
 
@@ -288,7 +319,7 @@ def _format_table_melted(table_df: pd.DataFrame) -> str:
     col_starts = headers_df["col_start"].to_numpy(dtype=int)
     colspans = headers_df["colspan"].to_numpy(dtype=int)
     rows_arr = headers_df["row_start"].to_numpy(dtype=int)
-    texts_arr = headers_df["text"].fillna("").astype(str).str.strip().to_numpy()
+    texts_arr = _flatten_cell_text(headers_df["text"], sep=" ").to_numpy()
 
     header_map: dict[int, dict[int, str]] = {}
     for col_start, colspan, row, text in zip(col_starts, colspans, rows_arr, texts_arr):
@@ -304,7 +335,7 @@ def _format_table_melted(table_df: pd.DataFrame) -> str:
         header_paths[col] = " > ".join(parts) if parts else f"col_{col}"
 
     # Pre-compute stripped text once to avoid repeated per-cell string ops
-    data_df["_text"] = data_df["text"].fillna("").astype(str).str.strip()
+    data_df["_text"] = _flatten_cell_text(data_df["text"], sep=" ")
 
     melted_lines = []
 

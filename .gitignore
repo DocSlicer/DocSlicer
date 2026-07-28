@@ -16,7 +16,12 @@ build/
 # Env
 .venv/
 venv/
+.buildvenv/
 .env
+
+# Eval artifacts
+.eval_cache/
+results.json
 
 # OS
 .DS_Store

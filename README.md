@@ -1,10 +1,16 @@
 # DocSlicer
 
-[![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE) [![Commercial license available](https://img.shields.io/badge/License-Commercial-green.svg)](LICENSE-COMMERCIAL.md)
+[![PyPI](https://img.shields.io/pypi/v/docslicer.svg)](https://pypi.org/project/docslicer/) [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE) [![Commercial license available](https://img.shields.io/badge/License-Commercial-green.svg)](LICENSE-COMMERCIAL.md)
 
-Lightning-fast, deterministic hierarchical document parser and chunker for business documents. No LLM calls or heavy ML models.
+Lightning-fast (31 pages/sec), deterministic document parser and chunker for business documents. No LLM calls or heavy ML models.
 
-DocSlicer turns PDFs, Word documents, HTML pages, and PowerPoint files into clean chunks, structured blocks, tables, charts, and a navigable heading hierarchy — preserving the document's own structure instead of guessing at it.
+DocSlicer turns PDFs, Word documents, HTML pages, and PowerPoint files into clean chunks, structured blocks, tables, charts, markdown and a navigable heading hierarchy.
+
+Top score on [BizDocBench](https://github.com/DocSlicer/BizDocBench) (0.88 overall vs 0.70 for the next-best tool). 0.80 table accuracy, 0.98 content faithfulness, 0.85 heading recognition and hierarchy preservation, and 0.76 RAG retrieval performance.
+
+**Add DocSlicer to your AI pipeline:**
+- Classic RAG: the layout-aware chunker gives you clean non-overlapping chunks, each carrying its full heading breadcrumb, ready to embed.
+- Vectorless RAG: for when you want an answer out of a document right now. The agent pulls the outline, picks the section it needs, and navigates to the correct section of text without embedding the whole document
 
 ```python
 import docslicer
@@ -57,6 +63,23 @@ if __name__ == "__main__":
 - **Supports `pdf`, `docx`, `pptx`, and `html`** — including JS-rendered pages via Playwright
 - **Robust URL fetching** — always renders pages in a real browser, handling cookie banners and bot protection out of the box; also preserves styling signals like boldness that raw HTML omits, producing sharper heading detection and chunk quality
 - **OCR fallback** — auto-detects scanned pages and falls back to Tesseract when the extra is installed
+
+---
+
+## Benchmarks
+
+Measured with [BizDocBench](https://github.com/DocSlicer/BizDocBench) — an open benchmark for multi-format business document parsing. All scores are 0–1 (higher is better); `pages_per_sec_aggregate` is throughput across the full corpus.
+
+| Tool | Score | Coverage | Speed | Hierarchy | Faithfulness | Tables | Retrieval | Pages/sec |
+|---|---|---|---|---|---|---|---|---|
+| **docslicer** | **0.8796** | 1.0000 | 0.8836 | 0.8466 | 0.9824 | 0.8047 | 0.7601 | 31.27 |
+| docling | 0.7036 | 1.0000 | 0.3805 | 0.4905 | 0.8927 | 0.7467 | 0.7111 | 3.46 |
+| markitdown | 0.5838 | 1.0000 | 0.8513 | 0.0604 | 0.7972 | 0.2584 | 0.5357 | 27.42 |
+| unstructured | 0.5798 | 0.9091 | 0.1073 | 0.4327 | 0.9057 | 0.4812 | 0.6430 | 0.52 |
+| opendataloader | 0.5359 | 0.5844 | 1.0000 | 0.3853 | 0.6484 | 0.2655 | 0.3317 | 117.26 |
+| pymupdf4llm | 0.4519 | 0.5974 | 0.6492 | 0.1089 | 0.6456 | 0.3551 | 0.3552 | 11.84 |
+| mineru | 0.4107 | 0.5974 | 0.1353 | 0.4220 | 0.6176 | 0.3012 | 0.3910 | 0.70 |
+| marker | 0.3735 | 0.5974 | 0.1598 | 0.1926 | 0.6121 | 0.3012 | 0.3778 | 0.87 |
 
 ---
 
@@ -380,21 +403,50 @@ result.tables_by_page(14)
 result.charts_by_page(14)
 ```
 
+### Parse once, navigate many times
+
+A parsed result is plain data, so you can persist it and reload it later. When an
+agent asks many questions about the same document, there's no need to parse it
+again on every question:
+
+```python
+from pathlib import Path
+import docslicer
+
+cache = Path("annual_report.json")
+
+if cache.exists():
+    result = docslicer.ParseResult.load(cache)
+else:
+    result = docslicer.parse_document("annual_report.pdf")
+    result.save(cache)
+```
+
+A reloaded result supports the full API — `hierarchy`, `find_heading`,
+`chunks_under`, `tables` — so a long-running agent session or document server can
+keep documents open across requests without re-parsing.
+
 ---
 
 ## Export
 
+`save()` decides what to write from the path you give it.
+
 ```python
-# Save everything
+# Save the whole result and reload it later — keeps the heading hierarchy
+result.save("result.json")                     # same output as result.to_json()
+result = docslicer.ParseResult.load("result.json")
+
+# A single collection, in the format you name
+result.save("chunks.csv")
+result.save("charts.jsonl")       # stems: chunks | blocks | tables | charts | metadata
+result.export_chunks_jsonl("chunks.jsonl")
+
+# One file per collection
 result.save("output/")
 # → output/chunks.parquet, blocks.parquet, tables.parquet, metadata.json
 #   (+ charts.parquet when the document has charts)
-
-# Specific formats
-result.save("chunks.csv")
-result.save("charts.jsonl")       # stems: chunks | blocks | tables | charts | metadata
-result.save("result.json")        # full parse result as JSON
-result.export_chunks_jsonl("chunks.jsonl")
+#   Falls back to .csv unless the [parquet] extra is installed.
 
 # Render as Markdown or plain text
 md = result.export_to_markdown(include_tables=True)
@@ -403,6 +455,9 @@ txt = result.export_to_text()
 # DataFrames
 df = result.chunks_df()
 ```
+
+Only `result.json` round-trips — the collection and directory forms write flat rows
+without the heading hierarchy, so `ParseResult.load()` can't read them back.
 
 ### Debug mode
 
