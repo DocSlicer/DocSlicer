@@ -101,6 +101,7 @@ pip install 'docslicer[ocr]'     # scanned PDF support via Tesseract + OpenCV
 # Linux:  apt install tesseract-ocr
 # macOS:  brew install tesseract
 
+pip install 'docslicer[mcp]'     # MCP server for LLM clients (Claude, Cursor, …)
 pip install 'docslicer[llm]'     # exact token counts via tiktoken (exact_tokens=True)
 pip install 'docslicer[crypto]'  # password-protected Office files (msoffcrypto-tool)
 pip install 'docslicer[parquet]' # Parquet export support
@@ -487,6 +488,71 @@ pip install 'docslicer[ocr]'
 # Linux:  apt install tesseract-ocr libtesseract-dev libleptonica-dev pkg-config
 # macOS:  brew install tesseract leptonica
 ```
+
+---
+
+## MCP server
+
+DocSlicer ships an [MCP](https://modelcontextprotocol.io) server, so LLM clients
+(Claude Desktop, Claude Code, Cursor, …) can parse and read documents directly.
+
+```bash
+pip install 'docslicer[mcp]'
+docslicer-mcp                    # stdio — what desktop clients launch
+docslicer-mcp --transport http --port 8000
+```
+
+Register it with a client by adding to its MCP config:
+
+```jsonc
+{
+  "mcpServers": {
+    "docslicer": {
+      "command": "docslicer-mcp",
+      "env": { "DOCSLICER_MCP_ROOT": "/Users/you/Documents" }
+    }
+  }
+}
+```
+
+### How it works
+
+A parsed document is far larger than a model's context window, so the server
+never returns one in a single call. `parse` registers the document and hands
+back a `doc_id` handle plus metadata, counts, and a heading outline. Every other
+tool takes that handle and returns a bounded slice — the model pulls in only
+what it needs.
+
+| Tool | Returns |
+| --- | --- |
+| `parse` | `doc_id` handle, metadata, element counts, heading outline |
+| `get_outline` | Heading tree with `heading_id`s, plus the document's printed TOC |
+| `get_section` | Text under one heading, by name or `heading_id` |
+| `get_chunks` | A paginated window of chunks in reading order |
+| `get_page` | Everything on one page |
+| `search` | Literal phrase matches with surrounding context |
+| `get_table` | Table index, or one table as markdown or structured cells |
+| `get_chart` | Chart index, or one chart's underlying data points |
+| `export` | Writes the full document to disk (markdown, text, json, csv) |
+| `list_documents` / `forget_document` | Manage the parse cache |
+
+Parsed results are cached on disk, so re-parsing the same file with the same
+options is free. Documents are also exposed as MCP resources
+(`docslicer://{doc_id}/outline`, `/metadata`). There is no full-document
+resource by design — attaching one would burn the client's whole context
+budget; use `export` to write the full document to disk instead.
+
+### Configuration
+
+| Variable | Effect |
+| --- | --- |
+| `DOCSLICER_MCP_ROOT` | Restrict file sources and exports to this directory tree |
+| `DOCSLICER_MCP_ALLOW_URLS` | Set to `0` to reject `http(s)` sources |
+| `DOCSLICER_MCP_CACHE` | Where parsed results are persisted (default `~/.cache/docslicer-mcp`) |
+| `DOCSLICER_MCP_MAX_CHARS` | Default per-response text budget (default `20000`) |
+
+Set `DOCSLICER_MCP_ROOT` when exposing the server to anything but yourself —
+without it, any readable path on the machine is parseable.
 
 ---
 
