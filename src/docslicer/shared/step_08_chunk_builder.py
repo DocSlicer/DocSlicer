@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 import hashlib
+import logging
+import time
 import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -14,6 +16,8 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import numpy as np
 import pandas as pd
 from .._utils.df_aggregation.registry_aggregator import Agg, aggregate_to, group_join
+
+_log = logging.getLogger(__name__)
 
 # =======================================================================================================================
 # CONFIG
@@ -752,15 +756,20 @@ def _assign_chunk_indices(
             global_chunk_idx += 1
             continue
 
-        _t0_dp = __import__("time").perf_counter()
+        _t0_dp = time.perf_counter()
         cuts = _partition_blocks_dp(
             block_lens,
             heading_chars=heading_chars,
             cfg=cfg,
         )
-        _dp_elapsed = __import__("time").perf_counter() - _t0_dp
+        # Logged, not printed: stdout belongs to the caller. Under the MCP
+        # stdio transport it is the JSON-RPC channel itself.
+        _dp_elapsed = time.perf_counter() - _t0_dp
         if _dp_elapsed > 0.5:
-            print(f"[chunk_builder] SLOW DP: active_heading_id={active_hid!r}  n={len(block_lens)}  total_chars={total_len}  cuts={len(cuts)}  time={_dp_elapsed:.2f}s")
+            _log.warning(
+                "slow chunk partition: active_heading_id=%r n=%d total_chars=%d cuts=%d time=%.2fs",
+                active_hid, len(block_lens), total_len, len(cuts), _dp_elapsed,
+            )
 
         for local_idx, (a, b) in enumerate(cuts, start=1):
             segment_indices = content_indices[a : b + 1]

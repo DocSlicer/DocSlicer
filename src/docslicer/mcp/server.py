@@ -1,11 +1,12 @@
 # SPDX-FileCopyrightText: 2026 Market Framer Inc.
 # SPDX-License-Identifier: AGPL-3.0-only
-"""docslicer MCP server — four tools.
+"""docslicer MCP server — five tools.
 
     parse(source)                  -> doc_id + hierarchy.to_outline()
     get_outline(doc_id)            -> outline (refresh if lost in context)
     read(doc_id, headings=[...])   -> chunks_under() for each, as text
-    to_markdown(source)            -> full document as markdown
+    search(doc_id, query)          -> headings to read, ranked, with snippets
+    to_markdown(source | doc_id)   -> full document as markdown, written to disk
 
 Run with::
 
@@ -13,20 +14,19 @@ Run with::
     docslicer-mcp --transport http --port 8000
 
 Environment:
-    DOCSLICER_MCP_CACHE       Where parsed results are persisted.
-    DOCSLICER_MCP_ROOT        Restrict file sources to this directory tree.
-    DOCSLICER_MCP_ALLOW_URLS  Set to 0 to reject http(s) sources.
+    DOCSLICER_MCP_CACHE         Where parsed results are persisted.
+    DOCSLICER_MCP_CACHE_MAX_MB  Cache size ceiling (default 2048; 0 disables pruning).
+    DOCSLICER_MCP_ROOT          Restrict file sources and outputs to this directory tree.
+    DOCSLICER_MCP_ALLOW_URLS    Set to 0 to reject http(s) sources.
 """
 
 from __future__ import annotations
 
 import argparse
-import contextlib
 import functools
 import math
 import os
 import re
-import sys
 from collections import Counter
 from pathlib import Path
 
@@ -34,62 +34,39 @@ import anyio
 
 from .. import __version__, parse_document
 from .._result import Chunk, HierarchyNode
-from ._store import DocumentStore, make_doc_id, resolve_source
+from ._store import (
+    DocumentStore,
+    allowed_root,
+    make_doc_id,
+    resolve_output,
+    resolve_source,
+)
 
-# The SDK renamed FastMCP to MCPServer in mcp 2.0; support both generations.
 try:
-    from mcp.server import MCPServer as _Server  # mcp >= 2.0
-
-    _MCP_V2 = True
-except ImportError:  # pragma: no cover - depends on installed SDK
-    try:
-        from mcp.server.fastmcp import FastMCP as _Server  # mcp 1.x
-
-        _MCP_V2 = False
-    except ImportError as exc:
-        raise ImportError(
-            "The MCP server requires the 'mcp' package. Install it with:\n"
-            "    pip install 'docslicer[mcp]'"
-        ) from exc
+    from mcp.server import MCPServer as _Server
+except ImportError as exc:  # pragma: no cover - depends on installed SDK
+    raise ImportError(
+        "The MCP server requires the 'mcp' package (2.0 or newer). Install it with:\n"
+        "    pip install 'docslicer[mcp]'"
+    ) from exc
 
 
 INSTRUCTIONS = """\
-Read documents in steps.
+To answer questions from a document:
 
-1. `parse` the document. You get its full heading outline and a doc_id.
+1. `parse` it — you get a doc_id and the heading outline, each line marked with
+   what reading it costs.
+2. `read` the headings that look relevant, all in one call. Stop if the answer
+   is there; otherwise read more — the outline is still valid.
+3. `search` when no heading in the outline looks relevant to the question — 
+   whether because all headings are non-descriptive ("Acticle 14"), the hierarchy is 
+   malformed, or target facts aren't named in headings. It returns headings 
+   to `read`, not answers.
+4. `get_outline` if the outline scrolls out of your context. Cheap.
 
-2. `read` the headings you need. Normally pass each heading's text exactly as
-   it appears in the outline. Pass all of them in one call.
-
-   Indentation in the outline shows which headings sit under which. If a
-   heading appears in more than one place, prefix a parent from above it,
-   separated by ">", to say which one you mean:
-
-       "Consolidated Statement of Operations"                    ambiguous — appears twice
-       "Financial Statements > Consolidated Statement of Operations"     the one under Financial Statements
-
-   Any ancestor will do; the full chain is not needed.
-
-Each outline line ends with what reading it costs, in tokens: "~48k" is a
-section to descend into by naming a subsection under it, "~900" is one to
-just read. The figure covers a heading's subsections, so a parent is never
-cheaper than the children listed beneath it.
-
-If what you read answers the question, stop. If it does not, read more
-headings — the outline is still valid.
-
-3. `get_outline` to refresh the outline if you've lost it from your context
-   during a long conversation. It is fast and takes only the doc_id.
-
-4. `search` when the outline does not tell you where to look — headings that
-   name nothing useful ("Note 14"), a figure in a table no heading mentions,
-   or a section too large to read whole.
-
-   Search finds the place; it does not replace reading it. Each hit carries a
-   snippet cut around the match, usually out of something longer — marked
-   "snippet_is_partial" when so. Normally `read` the heading it names. Stop at
-   the snippet only when it answers the question by itself: a figure whose
-   table header you cannot see is not an answer, it is a guess.
+If the user instead wants the document itself as a file, `to_markdown` writes
+it to disk and returns a path — nothing enters your context, so size does not
+matter.
 """
 
 
@@ -120,17 +97,6 @@ async def _to_thread(func, *args, **kwargs):
     return await anyio.to_thread.run_sync(functools.partial(func, *args, **kwargs))
 
 
-@contextlib.contextmanager
-def _stdout_guard():
-    """Route stray library prints to stderr.
-
-    Under the stdio transport, stdout *is* the JSON-RPC channel — a single
-    stray print from deep in the pipeline would desynchronise the client.
-    """
-    with contextlib.redirect_stdout(sys.stderr):
-        yield
-
-
 # ===========================================================================
 # Tools
 # ===========================================================================
@@ -144,15 +110,17 @@ async def parse(
 ) -> dict:
     """Parse a document and return its heading outline. Call this first.
 
-    Local path or http(s) URL; format detected automatically. Returns the
-    outline, not the document text. Every outline line carries an estimate of
-    the tokens `read` would return for it, subsections included — use it to
-    choose how deep to go before you spend the context.
+    Local path or http(s) URL, format detected automatically. Returns the
+    outline, not the text. Each line carries the tokens `read` would return for
+    that heading — "~48k" is a section to descend into, "~900" one to just
+    read. The figure includes subsections, so a parent never costs less than
+    the children under it. Use it to choose how deep to go before spending the
+    context.
 
     Args:
         source: File path or URL to parse.
-        password: Password for an encrypted document.
-        refresh: Re-parse even if an identical parse is already cached.
+        password: For an encrypted document.
+        refresh: Re-parse even if an identical parse is cached.
     """
     resolved = resolve_source(source)
     options = _server_options()
@@ -162,13 +130,12 @@ async def parse(
     if cached:
         result = _store.get(cached)
     else:
-        with _stdout_guard():
-            result = await _to_thread(
-                parse_document,
-                resolved,
-                password=password,
-                **options,
-            )
+        result = await _to_thread(
+            parse_document,
+            resolved,
+            password=password,
+            **options,
+        )
         _store.put(doc_id, result, resolved, options)
 
     meta = result.metadata
@@ -184,11 +151,9 @@ async def parse(
 
 @mcp.tool()
 async def get_outline(doc_id: str) -> dict:
-    """Retrieve the outline of a previously parsed document.
+    """Re-fetch a parsed document's outline, with per-heading read costs.
 
-    Call this to refresh the outline in your context if you've lost it during
-    a long conversation. The outline shows the document structure and estimated
-    tokens for each section — use it to navigate and budget your reads.
+    Use when the outline has scrolled out of your context. Cheap.
 
     Args:
         doc_id: Handle from parse.
@@ -207,27 +172,23 @@ async def get_outline(doc_id: str) -> dict:
 async def read(doc_id: str, headings: list[str]) -> dict:
     """Return the text under one or more headings, chosen from the outline.
 
-    Normally pass a heading's text exactly as it appears in the outline. Each
-    heading includes its subsections — so it returns roughly the token count
-    the outline printed against it. Prefer a subsection when the parent is
-    large.
+    Pass a heading's text exactly as the outline shows it. A heading includes
+    its subsections, so it returns roughly the tokens the outline printed
+    against it — prefer a subsection when the parent is large.
 
-    Indentation in the outline shows which headings sit under which. If a
-    heading appears in more than one place, prefix a parent from above it,
-    separated by ">", to say which one you mean — "Financial Statements > Consolidated Statement of Operations".
-    Any ancestor will do; the full chain is not needed. An unqualified heading
-    that matches several places returns all of them.
+    Outline indentation shows nesting. If a heading appears in more than one
+    place, prefix any ancestor with ">" to pick one — "Notes > Revenue". The
+    full chain is not needed. Unqualified, it returns every match.
 
-    A "[Page X]" line means everything below it is on page X, until the next
-    such line. X is the page as the document itself numbers it ("S-23", "iv"),
-    which is what a reader can look up. To cite something, use the nearest
-    "[Page X]" above it — a section usually runs over several pages, so the
-    page it opens on is the right citation only for its first part.
+    A "[Page X]" line means the text below it is on page X until the next such
+    line, numbered as the document numbers it ("S-23", "iv"). Cite the nearest
+    one above what you quote — sections run over several pages, so the page a
+    section opens on is right only for its first part.
 
     Args:
         doc_id: Handle from parse.
-        headings: Heading texts from the outline, exact, or qualified as
-            "Parent > Heading". Pass every one you want in a single call.
+        headings: Exact outline headings, or "Parent > Heading". Pass every one
+            you want in a single call.
     """
     result = _store.get(doc_id)
 
@@ -256,97 +217,30 @@ async def read(doc_id: str, headings: list[str]) -> dict:
 
 
 @mcp.tool()
-async def to_markdown(
-    source: str,
-    password: str | None = None,
-    output_path: str | None = None,
-) -> dict:
-    """Convert a document to markdown and save to disk.
-
-    Uses the same powerful parser as parse/read/search but saves the entire
-    document as markdown to a file. Does not load the markdown into context —
-    only returns the file path. Use when you want the full document as a markdown
-    file, especially for large documents with big tables/figures.
-
-    Preserves tables, charts, page markers, and document structure.
-
-    Args:
-        source: File path or URL to convert.
-        password: Password for an encrypted document.
-        output_path: Where to save the markdown. If not provided, saves to
-            current directory with an auto-generated name like "document.md".
-    """
-    resolved = resolve_source(source)
-    options = _server_options()
-
-    with _stdout_guard():
-        result = await _to_thread(
-            parse_document,
-            resolved,
-            password=password,
-            **options,
-        )
-
-    markdown = result.export_to_markdown()
-
-    # Generate output path if not provided
-    if output_path is None:
-        title = result.metadata.title or "document"
-        # Sanitize title for filename
-        safe_title = "".join(c if c.isalnum() or c in "-_ " else "" for c in title)
-        safe_title = safe_title.strip().replace(" ", "_")[:50] or "document"
-        output_path = f"{safe_title}.md"
-
-    # Ensure parent directory exists
-    path_obj = Path(output_path)
-    path_obj.parent.mkdir(parents=True, exist_ok=True)
-
-    # Write markdown to disk
-    await _to_thread(path_obj.write_text, markdown, encoding="utf-8")
-
-    meta = result.metadata
-    return {
-        "title": meta.title,
-        "pages": meta.page_count,
-        "output_path": str(path_obj.absolute()),
-        "markdown_size_bytes": len(markdown),
-        "tokens": meta.token_count,
-    }
-
-
-@mcp.tool()
 async def search(doc_id: str, query: str, limit: int = 8) -> dict:
-    """Find where in the document something is discussed. Use when the outline is not enough.
+    """Find where something is discussed. Use when the outline is not enough.
 
-    The outline is the faster route and should be tried first. Search is for
-    when it does not settle the question: headings that name nothing useful
-    ("Note 14", "Item 7A"), a figure buried in a table no heading mentions, or
-    a section too large to read whole.
+    Try the outline first; it is faster. Search is for when it does not settle
+    the question: headings that name nothing useful ("Note 14", "Item 7A"), a
+    figure buried in a table no heading mentions, or a section too big to read
+    whole.
 
-    Returns places, not prose: each hit is a heading you can pass straight to
-    `read`, the tokens reading it would cost, and a snippet showing the match.
+    Returns places, not answers: each hit is a heading to pass to `read`, what
+    reading it costs, and a snippet — a window cut around the match, flagged
+    "snippet_is_partial" when cut from something longer.
 
-    A snippet is a window cut around the match, not the whole section. Having
-    found the right place, decide between two things:
+    Usually `read` the heading. Stop at the snippet only when it answers the
+    question alone and depends on nothing you cannot see. A partial snippet is
+    missing what sat around it — often a table's header row, so figures appear
+    without the column naming them. Never infer a truncated table's columns.
 
-    - `read` that heading. This is the usual case. A snippet marked
-      "snippet_is_partial" was cut out of something longer and is missing
-      whatever sat around it — most importantly, a table's header row, so
-      figures appear without the column that says what they are. Anything you
-      would have to assume in order to use the snippet is a reason to read.
-    - Stop, when the snippet answers the question on its own and nothing in it
-      depends on context you cannot see.
-
-    Never infer what a truncated table's columns are. Read the section.
-
-    Matches exact wording and related wording both, so a quoted term
-    ("NCT0123456", a trial ID, a number) and a description of a topic ("revenue
-    by product") each work.
+    Exact and related wording both match, so a quoted term ("NCT0123456") and a
+    topic ("revenue by product") each work.
 
     Args:
         doc_id: Handle from parse.
-        query: What to look for — a term, a phrase, or a description.
-        limit: Most sections to return. Each is a distinct place in the document.
+        query: A term, a phrase, or a description.
+        limit: Most sections to return, each a distinct place in the document.
     """
     result = _store.get(doc_id)
     found = await _to_thread(_search, result, query, limit)
@@ -355,20 +249,95 @@ async def search(doc_id: str, query: str, limit: int = 8) -> dict:
         "doc_id": doc_id,
         "query": query,
         "hits": found["hits"],
+        # Repeated here rather than left to the tool description: the choice to
+        # trust a snippet is made now, not when the description was read.
         "note": (
-            "Pass a hit's 'heading' to read; 'read_tokens' is what that costs."
-            " Snippets marked 'snippet_is_partial' are windows into a longer"
-            " section — read it rather than assuming what was cut."
+            "Pass a hit's 'heading' to read; 'read_tokens' is the cost."
+            " A 'snippet_is_partial' hit was cut from a longer section — read it"
+            " rather than assuming what was cut."
         ),
     }
     if found["unmatched_terms"]:
         response["unmatched_terms"] = found["unmatched_terms"]
         response["note"] += (
-            " These query words appear nowhere in the document, so the hits rest"
-            " on the rest of the query — judge them by their snippets, and"
-            " re-query if they are beside the point."
+            " The listed words appear nowhere in the document, so these hits rest"
+            " on the rest of the query — judge them by their snippets and re-query"
+            " if they are beside the point."
         )
     return response
+
+
+@mcp.tool()
+async def to_markdown(
+    source: str | None = None,
+    doc_id: str | None = None,
+    password: str | None = None,
+    output_path: str | None = None,
+) -> dict:
+    """Write the whole document to disk as markdown. Returns a path, not the text.
+
+    For when the user wants the document as a file rather than an answer drawn
+    from it. Nothing enters your context, so size does not matter. Tables,
+    charts, page markers and structure are preserved.
+
+    Args:
+        source: File path or URL. Omit if passing doc_id.
+        doc_id: Handle from a previous parse — reuses it instead of parsing again.
+        password: For an encrypted document. Ignored with doc_id.
+        output_path: Where to write it. Defaults to a name from the title, in
+            the current directory.
+    """
+    # Before the parse, not after: a destination the sandbox will refuse should
+    # cost nothing to find out about.
+    destination = resolve_output(output_path) if output_path else None
+
+    if doc_id:
+        result = _store.get(doc_id)
+    elif source:
+        resolved = resolve_source(source)
+        options = _server_options()
+        cached = _store.find(resolved, options)
+        if cached:
+            doc_id = cached
+            result = _store.get(cached)
+        else:
+            doc_id = make_doc_id(resolved, options)
+            result = await _to_thread(
+                parse_document,
+                resolved,
+                password=password,
+                **options,
+            )
+            # Cached like any other parse, so a later parse/read/search on the
+            # same document does not pay for it twice either.
+            _store.put(doc_id, result, resolved, options)
+    else:
+        raise ValueError("Pass either source (a path or URL) or doc_id from a previous parse.")
+
+    markdown = await _to_thread(result.export_to_markdown)
+
+    if destination is None:
+        title = result.metadata.title or "document"
+        safe_title = "".join(c if c.isalnum() or c in "-_ " else "" for c in title)
+        safe_title = safe_title.strip().replace(" ", "_")[:50] or "document"
+        # Under a sandbox the working directory is often outside it, so the
+        # default lands in the root itself rather than somewhere that resolves
+        # to a refusal the caller did not ask for.
+        base = allowed_root() or Path.cwd()
+        destination = resolve_output(str(base / f"{safe_title}.md"))
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    await _to_thread(destination.write_text, markdown, encoding="utf-8")
+
+    meta = result.metadata
+    return {
+        "doc_id": doc_id,
+        "title": meta.title,
+        "pages": meta.page_count,
+        "output_path": str(destination),
+        "markdown_size_bytes": len(markdown),
+        "tokens": meta.token_count,
+    }
 
 
 # ===========================================================================
@@ -864,7 +833,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--port", type=int, default=8000, help="Bind port for http/sse.")
     parser.add_argument(
         "--root",
-        help="Restrict file sources to this directory tree (sets DOCSLICER_MCP_ROOT).",
+        help="Restrict file sources and outputs to this directory tree (sets DOCSLICER_MCP_ROOT).",
     )
     parser.add_argument("--version", action="version", version=f"docslicer {__version__}")
     args = parser.parse_args(argv)
@@ -877,12 +846,7 @@ def main(argv: list[str] | None = None) -> None:
         return
 
     transport = "streamable-http" if args.transport == "http" else "sse"
-    if _MCP_V2:
-        mcp.run(transport=transport, host=args.host, port=args.port)
-    else:  # pragma: no cover - mcp 1.x took host/port off settings
-        mcp.settings.host = args.host
-        mcp.settings.port = args.port
-        mcp.run(transport=transport)
+    mcp.run(transport=transport, host=args.host, port=args.port)
 
 
 if __name__ == "__main__":  # pragma: no cover

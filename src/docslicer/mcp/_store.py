@@ -11,6 +11,7 @@ handle. Follow-up tools re-hydrate the ParseResult from memory (hot) or disk
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -24,6 +25,8 @@ from .._result import ParseResult
 
 _MEMORY_LIMIT = 8  # ParseResults kept hot in RAM
 
+_CACHE_LIMIT_MB = 2048  # Disk the persisted ParseResults may occupy, before pruning
+
 
 def cache_dir() -> Path:
     """Directory holding persisted ParseResults. Override with DOCSLICER_MCP_CACHE."""
@@ -31,6 +34,16 @@ def cache_dir() -> Path:
     base = Path(env) if env else Path.home() / ".cache" / "docslicer-mcp"
     base.mkdir(parents=True, exist_ok=True)
     return base
+
+
+def cache_limit_bytes() -> int:
+    """Cache size ceiling in bytes. Override with DOCSLICER_MCP_CACHE_MAX_MB; 0 disables pruning."""
+    env = os.environ.get("DOCSLICER_MCP_CACHE_MAX_MB")
+    try:
+        megabytes = int(env) if env else _CACHE_LIMIT_MB
+    except ValueError:
+        megabytes = _CACHE_LIMIT_MB
+    return max(0, megabytes) * 1024 * 1024
 
 
 def allowed_root() -> Path | None:
@@ -91,6 +104,30 @@ def resolve_source(source: str) -> str:
             "Copy the file inside that directory or adjust DOCSLICER_MCP_ROOT."
         )
     return str(resolved)
+
+
+def resolve_output(path: str) -> Path:
+    """Validate a destination the server is about to write to, against the sandbox.
+
+    The counterpart to ``resolve_source`` for the write direction: a root that
+    restricts what may be read but lets a caller write anywhere on the machine
+    is not a sandbox. Kept separate because the two validate opposite things —
+    a source must already exist, a destination must not have to.
+
+    Only the existing part of the path can be resolved, so the check lands on
+    the nearest ancestor that exists. That is the boundary symlinks are
+    resolved at, and where an escape would have to be built.
+    """
+    target = Path(path).expanduser()
+    resolved = Path(target if target.is_absolute() else Path.cwd() / target).resolve()
+
+    root = allowed_root()
+    if root is not None and root not in resolved.parents:
+        raise SourceNotAllowed(
+            f"Cannot write to {resolved}: it is outside the allowed root {root}. "
+            "Choose an output_path inside that directory or adjust DOCSLICER_MCP_ROOT."
+        )
+    return resolved
 
 
 def make_doc_id(source: str, options: dict) -> str:
@@ -174,7 +211,48 @@ class DocumentStore:
             json.dumps(entry.to_dict(), indent=2), encoding="utf-8"
         )
         self._remember(doc_id, result)
+        self._prune(keep=doc_id)
         return entry
+
+    def _prune(self, keep: str) -> None:
+        """Drop the least recently parsed documents until the cache is under its limit.
+
+        Nothing else evicts: a long-lived server parses documents forever and a
+        single filing's serialised ParseResult runs to tens of megabytes, so
+        without a ceiling the cache is an unbounded write to the user's disk.
+
+        Size is the axis that matters rather than a document count — one filing
+        outweighs a hundred memos. Walks the result files rather than ``list()``
+        so that a result whose sidecar failed to write is still pruned; such an
+        orphan is invisible to every other read path and would otherwise be a
+        leak that never comes back.
+        """
+        limit = cache_limit_bytes()
+        if not limit:
+            return
+
+        entries: list[tuple[float, int, str]] = []
+        for path in cache_dir().glob("*.json"):
+            if path.name.endswith(".meta.json"):
+                continue
+            doc_id = path.stem
+            try:
+                size = path.stat().st_size
+                age = path.stat().st_mtime
+            except OSError:
+                continue
+            with contextlib.suppress(OSError):
+                size += self._meta_path(doc_id).stat().st_size
+            entries.append((age, size, doc_id))
+
+        entries.sort(reverse=True)  # newest first; the tail is what goes
+        total = 0
+        for _, size, doc_id in entries:
+            total += size
+            # The document just parsed always survives, whatever it weighs — it
+            # is the one the caller is about to read from.
+            if total > limit and doc_id != keep:
+                self.forget(doc_id)
 
     def _remember(self, doc_id: str, result: ParseResult) -> None:
         self._hot[doc_id] = result

@@ -66,7 +66,7 @@ parquet = [
     "pyarrow>=18.0",
 ]
 mcp = [
-    "mcp>=1.2",
+    "mcp>=2.0",
 ]
 dev = [
     "pytest>=8.0",
