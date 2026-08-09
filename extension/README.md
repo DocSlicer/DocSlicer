@@ -27,26 +27,42 @@ extension folder, so `pyproject.toml` would be ignored and the import of
 
 ## Dependency source
 
-PyPI currently has 0.2.0 only, while `pyproject.toml` pins `>=0.2.1`, so the
-bundle ships the 0.2.1 wheel and `[tool.uv.sources]` points at it with a path
-relative to `pyproject.toml` — which resolves inside the installed extension
-directory on any machine. `uv.lock` is packed alongside it so installs are
-reproducible.
+`pyproject.toml` declares `docslicer[mcp,html]>=0.2.1` and uv resolves it from
+PyPI at install time. No wheel is vendored — `.mcpbignore` excludes `*.whl`, and
+the `uv` server type forbids shipping a resolved environment.
 
-Once 0.2.1 is on PyPI: delete the `[tool.uv.sources]` table, drop the wheel
-from `extension/`, re-add `*.whl` to `.mcpbignore`, regenerate `uv.lock`, and
-repack. The bundle then falls back to ~20 kB.
+`uv.lock` ships in the archive and is what makes installs reproducible: it pins
+`docslicer` and every transitive dependency to an exact version and hash, so the
+open-ended `>=0.2.1` in `pyproject.toml` never floats. Regenerate it whenever the
+version changes, and keep it committed.
 
 ## Build
 
+`docslicer` X.Y.Z must be on PyPI *before* the bundle is packed — the lock
+resolves against the registry.
+
 ```bash
-python -m build                        # refresh dist/docslicer-X.Y.Z-py3-none-any.whl
-cp dist/docslicer-X.Y.Z-py3-none-any.whl extension/
-cd extension && mcpb pack . ../dist/docslicer-X.Y.Z.mcpb
+cd extension
+uv lock                                 # pin the new release by hash
+mcpb pack . ../dist/docslicer-X.Y.Z.mcpb
 ```
 
-Install: Claude Desktop → Settings → Extensions → Advanced settings →
-Extension Developer → "Install Extension…" → pick the `.mcpb`.
+The archive holds six files and is ~500 kB, almost all of it `uv.lock`:
+
+```
+README.md  icon-512.png  manifest.json  pyproject.toml  src/server.py  uv.lock
+```
+
+## Install
+
+Users install a released `.mcpb` any of three ways:
+
+- **Double-click** the `.mcpb` file
+- **Drag and drop** it onto the Claude Desktop window
+- **Settings** → Extensions → Advanced settings → Install Extension… → pick the file
+
+For a locally built bundle, use Settings → Extensions → Advanced settings →
+Extension Developer → "Install Extension…".
 
 Verify the archive contains `src/server.py` before installing — a bundle
 missing it installs cleanly and then fails at spawn time with
@@ -126,7 +142,25 @@ to local files only.
 **Contact.** Privacy questions: jelle@docslicer.ai. Issues:
 https://github.com/DocSlicer/DocSlicer/issues
 
-## Publishing build
+## Release checklist
 
-Publish `docslicer` 0.2.1 to PyPI, then follow the cleanup in
-[Dependency source](#dependency-source) and repack.
+1. Bump `version` in the root `pyproject.toml`, `extension/pyproject.toml`, and
+   `extension/manifest.json` — all three must match
+2. Publish `docslicer` X.Y.Z to PyPI
+3. `cd extension && uv lock` — must resolve from
+   `registry = "https://pypi.org/simple"`, never a local path. Commit the result.
+4. `mcpb pack . ../dist/docslicer-X.Y.Z.mcpb`
+5. Verify the packed lock before releasing:
+
+   ```bash
+   unzip -p ../dist/docslicer-X.Y.Z.mcpb uv.lock | grep -A2 '^name = "docslicer"$'
+   ```
+
+6. Tag, then attach the `.mcpb` to the GitHub release:
+
+   ```bash
+   gh release create vX.Y.Z ../dist/docslicer-X.Y.Z.mcpb
+   ```
+
+7. Install the released file from its download URL on a machine **without `uv`**
+   before announcing

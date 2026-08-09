@@ -346,7 +346,7 @@ wheels = [
 [[package]]
 name = "docslicer"
 version = "0.2.1"
-source = { path = "docslicer-0.2.1-py3-none-any.whl" }
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "beautifulsoup4" },
     { name = "httpx" },
@@ -361,8 +361,9 @@ dependencies = [
     { name = "pypdfium2" },
     { name = "pyyaml" },
 ]
+sdist = { url = "https://files.pythonhosted.org/packages/9a/f2/a226b6221808c2821591b2c2397ef03371d820587efed25774d6e41dc5fa/docslicer-0.2.1.tar.gz", hash = "sha256:92ac9cc1666d1fafa88c36b5112ba2ba03cfbb63691d8fa48b75c3026c19aed6", size = 632615, upload-time = "2026-08-09T04:49:03.036Z" }
 wheels = [
-    { filename = "docslicer-0.2.1-py3-none-any.whl", hash = "sha256:6c910862f1ac07d67b4588c02e825e1b7a39f8f04d052519f86c4e3774b6a4cf" },
+    { url = "https://files.pythonhosted.org/packages/93/4e/f589402b4a158a5553964768ba06b35e98e3c068905dd687e3a99a530833/docslicer-0.2.1-py3-none-any.whl", hash = "sha256:4f6f857a8e3c53ca05e8769a581ad2f4ea19b3b6eb85e92c4133e6b81d2450a2", size = 684261, upload-time = "2026-08-09T04:49:01.531Z" },
 ]
 
 [package.optional-dependencies]
@@ -374,31 +375,6 @@ mcp = [
     { name = "tiktoken" },
 ]
 
-[package.metadata]
-requires-dist = [
-    { name = "beautifulsoup4", specifier = ">=4.12" },
-    { name = "httpx", specifier = ">=0.28" },
-    { name = "langdetect", specifier = ">=1.0" },
-    { name = "lxml", specifier = ">=5.0" },
-    { name = "mcp", marker = "extra == 'mcp'", specifier = ">=2.0" },
-    { name = "msoffcrypto-tool", marker = "extra == 'crypto'", specifier = ">=5.0" },
-    { name = "numpy", specifier = ">=1.26" },
-    { name = "opencv-python", marker = "extra == 'ocr'", specifier = ">=4.8" },
-    { name = "pandas", specifier = ">=2.0" },
-    { name = "pikepdf", specifier = ">=8.0" },
-    { name = "pillow", marker = "extra == 'ocr'", specifier = ">=10.0" },
-    { name = "playwright", marker = "extra == 'html'", specifier = ">=1.49" },
-    { name = "pyarrow", marker = "extra == 'parquet'", specifier = ">=18.0" },
-    { name = "pypdfium2", specifier = ">=5.12" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
-    { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.24" },
-    { name = "pyyaml", specifier = ">=6.0" },
-    { name = "tesserocr", marker = "extra == 'ocr'", specifier = ">=2.6" },
-    { name = "tiktoken", marker = "extra == 'llm'", specifier = ">=0.10" },
-    { name = "tiktoken", marker = "extra == 'mcp'", specifier = ">=0.10" },
-]
-provides-extras = ["llm", "html", "ocr", "crypto", "parquet", "mcp", "dev"]
-
 [[package]]
 name = "docslicer-mcpb"
 version = "0.2.1"
@@ -408,7 +384,7 @@ dependencies = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "docslicer", extras = ["mcp", "html"], path = "docslicer-0.2.1-py3-none-any.whl" }]
+requires-dist = [{ name = "docslicer", extras = ["mcp", "html"], specifier = ">=0.2.1" }]
 
 [[package]]
 name = "exceptiongroup"
