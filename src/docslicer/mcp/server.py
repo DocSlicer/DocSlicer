@@ -24,11 +24,15 @@ from __future__ import annotations
 
 import argparse
 import functools
+import io
 import math
 import os
 import re
+import sys
+import tempfile
 from collections import Counter
 from pathlib import Path
+from typing import TextIO
 
 import anyio
 
@@ -37,13 +41,16 @@ from .._result import Chunk, HierarchyNode
 from ._store import (
     DocumentStore,
     allowed_root,
+    is_url,
     make_doc_id,
     resolve_output,
     resolve_source,
+    slug,
 )
 
 try:
     from mcp.server import MCPServer as _Server
+    from mcp.types import ToolAnnotations
 except ImportError as exc:  # pragma: no cover - depends on installed SDK
     raise ImportError(
         "The MCP server requires the 'mcp' package (2.0 or newer). Install it with:\n"
@@ -59,7 +66,7 @@ To answer questions from a document:
 2. `read` the headings that look relevant, all in one call. Stop if the answer
    is there; otherwise read more — the outline is still valid.
 3. `search` when no heading in the outline looks relevant to the question — 
-   whether because all headings are non-descriptive ("Acticle 14"), the hierarchy is 
+   whether because all headings are non-descriptive ("Article 14"), the hierarchy is 
    malformed, or target facts aren't named in headings. It returns headings 
    to `read`, not answers.
 4. `get_outline` if the outline scrolls out of your context. Cheap.
@@ -90,6 +97,10 @@ def _server_options() -> dict:
         "table_representation": "markdown",
         "include_headers_footers": False,
         "include_comments": False,
+        # The outline's token figures are what the model budgets against, and
+        # chars/4 misses by up to a third either way. Ships with the `mcp` extra;
+        # degrades to estimation on its own if it cannot be used here.
+        "exact_tokens": True,
     }
 
 
@@ -102,7 +113,14 @@ async def _to_thread(func, *args, **kwargs):
 # ===========================================================================
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Parse document",
+        read_only_hint=True,
+        # Accepts http(s) sources, so it can reach outside the local machine.
+        open_world_hint=True,
+    )
+)
 async def parse(
     source: str,
     password: str | None = None,
@@ -115,7 +133,12 @@ async def parse(
     that heading — "~48k" is a section to descend into, "~900" one to just
     read. The figure includes subsections, so a parent never costs less than
     the children under it. Use it to choose how deep to go before spending the
-    context.
+    context. `document_tokens` sizes the whole document, not this response —
+    it is what reading everything would cost.
+
+    HTML only: `renderer: "static"` means no browser rendered the page —
+    scripts never ran and heading detection is weaker, so a thin outline may be
+    incomplete.
 
     Args:
         source: File path or URL to parse.
@@ -139,17 +162,29 @@ async def parse(
         _store.put(doc_id, result, resolved, options)
 
     meta = result.metadata
-    return {
+    payload = {
         "doc_id": doc_id,
         "title": meta.title,
         "pages": meta.page_count,
         "outline": _outline(result),
         "headings": len(result.hierarchy.flatten()),
-        "tokens": meta.token_count,
+        # Named for the document, not this response: nothing but the outline
+        # entered context here, and the two figures are wildly different.
+        "document_tokens": meta.token_count,
     }
+    # HTML only — every other format has a single extraction path.
+    if meta.renderer is not None:
+        payload["renderer"] = meta.renderer
+    return payload
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Get outline",
+        read_only_hint=True,
+        open_world_hint=False,
+    )
+)
 async def get_outline(doc_id: str) -> dict:
     """Re-fetch a parsed document's outline, with per-heading read costs.
 
@@ -168,7 +203,13 @@ async def get_outline(doc_id: str) -> dict:
     }
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Read sections",
+        read_only_hint=True,
+        open_world_hint=False,
+    )
+)
 async def read(doc_id: str, headings: list[str]) -> dict:
     """Return the text under one or more headings, chosen from the outline.
 
@@ -192,8 +233,9 @@ async def read(doc_id: str, headings: list[str]) -> dict:
     """
     result = _store.get(doc_id)
 
+    sizes = _size_map(result)
     sections: list[str] = []
-    body_chars = 0
+    tokens = 0
     seen: set[int] = set()
     for heading in headings:
         for node in _resolve(result, heading):
@@ -206,17 +248,25 @@ async def read(doc_id: str, headings: list[str]) -> dict:
                 body = f"{_page_marker(merged)}\n\n{_slice_merged(merged, node.text)}"
             else:
                 body = _join_chunks(result.chunks_under(node))
-            body_chars += len(body)
+            # The same per-heading figure the outline quoted for this node, so
+            # what a read cost matches what it was advertised to cost.
+            tokens += sizes.get(node.heading_id, 0)
             sections.append(_format(node, body))
 
     return {
         "doc_id": doc_id,
         "text": "\n\n".join(sections),
-        "tokens": body_chars // 4,  # the chunk builder's own default estimate
+        "tokens_returned": tokens,
     }
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Search document",
+        read_only_hint=True,
+        open_world_hint=False,
+    )
+)
 async def search(doc_id: str, query: str, limit: int = 8) -> dict:
     """Find where something is discussed. Use when the outline is not enough.
 
@@ -267,7 +317,18 @@ async def search(doc_id: str, query: str, limit: int = 8) -> dict:
     return response
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Export to markdown file",
+        # Writes to the filesystem and replaces an existing file at the
+        # destination, so it is neither read-only nor non-destructive.
+        read_only_hint=False,
+        destructive_hint=True,
+        # Re-running with the same arguments lands the same file.
+        idempotent_hint=True,
+        open_world_hint=True,
+    )
+)
 async def to_markdown(
     source: str | None = None,
     doc_id: str | None = None,
@@ -284,17 +345,32 @@ async def to_markdown(
         source: File path or URL. Omit if passing doc_id.
         doc_id: Handle from a previous parse — reuses it instead of parsing again.
         password: For an encrypted document. Ignored with doc_id.
-        output_path: Where to write it. Defaults to a name from the title, in
-            the current directory.
+        output_path: Where to write it. Absolute paths are used as given;
+            relative paths resolve against the source file's directory.
+            Defaults to the source filename with a .md extension, written next
+            to the source (for a URL source, to a temp directory). Parent
+            directories are created. An existing file is overwritten without
+            prompting; the response sets `overwrote: true` when that happened,
+            which is worth telling the user about. The absolute path is always
+            returned.
     """
-    # Before the parse, not after: a destination the sandbox will refuse should
-    # cost nothing to find out about.
-    destination = resolve_output(output_path) if output_path else None
+    # The source a doc_id was parsed from is carried on its cache record, so a
+    # handle picks the same destination a fresh source would.
+    if doc_id:
+        origin = _store.source_of(doc_id)
+    elif source:
+        origin = resolve_source(source)
+    else:
+        raise ValueError("Pass either source (a path or URL) or doc_id from a previous parse.")
+
+    # Resolved before the parse, not after: a destination the sandbox will
+    # refuse should cost nothing to find out about.
+    destination = _destination(output_path, origin)
 
     if doc_id:
         result = _store.get(doc_id)
-    elif source:
-        resolved = resolve_source(source)
+    else:
+        resolved = origin
         options = _server_options()
         cached = _store.find(resolved, options)
         if cached:
@@ -311,20 +387,12 @@ async def to_markdown(
             # Cached like any other parse, so a later parse/read/search on the
             # same document does not pay for it twice either.
             _store.put(doc_id, result, resolved, options)
-    else:
-        raise ValueError("Pass either source (a path or URL) or doc_id from a previous parse.")
 
     markdown = await _to_thread(result.export_to_markdown)
 
-    if destination is None:
-        title = result.metadata.title or "document"
-        safe_title = "".join(c if c.isalnum() or c in "-_ " else "" for c in title)
-        safe_title = safe_title.strip().replace(" ", "_")[:50] or "document"
-        # Under a sandbox the working directory is often outside it, so the
-        # default lands in the root itself rather than somewhere that resolves
-        # to a refusal the caller did not ask for.
-        base = allowed_root() or Path.cwd()
-        destination = resolve_output(str(base / f"{safe_title}.md"))
+    # Checked before the write, so the caller can tell the user a file was
+    # replaced rather than created.
+    overwrote = destination.exists()
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     await _to_thread(destination.write_text, markdown, encoding="utf-8")
@@ -336,7 +404,8 @@ async def to_markdown(
         "pages": meta.page_count,
         "output_path": str(destination),
         "markdown_size_bytes": len(markdown),
-        "tokens": meta.token_count,
+        "overwrote": overwrote,
+        "document_tokens": meta.token_count,
     }
 
 
@@ -412,8 +481,12 @@ def _merged_shares(result) -> dict[str, int]:
         parts = [p.strip() for p in (chunk.heading or "").split(_MERGED_SEP)]
         if len(parts) < 2:
             continue
+        # Split the chunk's own token count by each heading's share of its
+        # characters, rather than re-estimating the slices: a merged heading is
+        # then counted on the same basis as every other one.
+        chars = len(chunk.text) or 1
         for part in parts:
-            shares[part] = len(_slice_merged(chunk, part)) // 4
+            shares[part] = round(chunk.token_count * len(_slice_merged(chunk, part)) / chars)
     return shares
 
 
@@ -813,9 +886,63 @@ def _format(node: HierarchyNode, body: str) -> str:
     return f"{path}\n\n{body}"
 
 
+def _destination(output_path: str | None, origin: str | None) -> Path:
+    """Where to_markdown writes, anchored on the source rather than our cwd.
+
+    The caller cannot see this process's working directory, so anything derived
+    from it — a bare default, or a relative output_path — produces a path they
+    can neither predict beforehand nor find afterwards. The source file's own
+    directory is a location both sides can name.
+
+    The name comes from the source filename, not the document title: titles run
+    long and carry `/`, `:` and newlines, and `azn.pdf -> azn.md` is what a
+    caller would guess. A URL has no directory to sit beside, so it falls back
+    to the sandbox root if one is configured and a temp directory otherwise,
+    with the name slugified from the URL's last segment.
+    """
+    local = Path(origin) if origin and not is_url(origin) else None
+    base = local.parent if local else (allowed_root() or Path(tempfile.gettempdir()))
+
+    if output_path:
+        return resolve_output(output_path, base=base)
+
+    stem = local.stem if local else slug(origin or "document")
+    return resolve_output(str(base / f"{stem}.md"))
+
+
 # ===========================================================================
 # Entrypoint
 # ===========================================================================
+
+
+class _StdoutToStderr(io.TextIOBase):
+    """Text writes go to stderr; ``.buffer`` still points at the real stdout.
+
+    Under stdio transport, stdout is the JSON-RPC wire: one stray ``print`` from
+    the parsing pipeline (or any dependency) lands mid-frame and the client fails
+    to parse the message. The transport writes frames through ``.buffer``, so it
+    keeps the wire while everything text-level is pushed onto stderr, where a
+    client shows it as server logs.
+    """
+
+    def __init__(self, real: TextIO) -> None:
+        self._real = real
+
+    @property
+    def buffer(self):  # what the transport claims for the wire
+        return self._real.buffer
+
+    def write(self, s: str) -> int:
+        return sys.stderr.write(s)
+
+    def flush(self) -> None:
+        sys.stderr.flush()
+
+    def isatty(self) -> bool:
+        return False
+
+    def writable(self) -> bool:
+        return True
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -842,6 +969,7 @@ def main(argv: list[str] | None = None) -> None:
         os.environ["DOCSLICER_MCP_ROOT"] = args.root
 
     if args.transport == "stdio":
+        sys.stdout = _StdoutToStderr(sys.stdout)
         mcp.run(transport="stdio")
         return
 

@@ -5,6 +5,7 @@
 # d01_box_extractor.py
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -17,12 +18,23 @@ from docslicer.scraping.config import (
     STEALTH_INIT_JS_PATH,
 )
 
+_log = logging.getLogger(__name__)
+
 # ====== CONFIG ======
 HEADLESS = True  # set False to debug visually
 
 # JS lives beside this HTML extraction step.
 PIPELINE_DIR = Path(__file__).parent
 EXTRACTOR_JS_PATH = PIPELINE_DIR / "extract_boxes.js"
+
+
+class BrowserUnavailableError(RuntimeError):
+    """No browser could be launched (binaries not installed, sandbox, missing libs).
+
+    Distinct from a navigation or extraction failure: the browser itself is
+    unusable, so retrying through Playwright cannot help and callers should
+    fall back to the static extractor.
+    """
 
 
 # ----------------------------
@@ -46,12 +58,19 @@ class BrowserSession:
 
     def _ensure_browser(self):
         if self._browser is None:
-            self._pw = sync_playwright().start()
-            # Prefer real Chrome (less detectable) and fall back to bundled Chromium.
             try:
-                self._browser = self._pw.chromium.launch(headless=HEADLESS, channel="chrome", args=BROWSER_ARGS)
-            except Exception:
-                self._browser = self._pw.chromium.launch(headless=HEADLESS, args=BROWSER_ARGS)
+                if self._pw is None:
+                    self._pw = sync_playwright().start()
+                # Prefer real Chrome (less detectable) and fall back to bundled Chromium.
+                try:
+                    self._browser = self._pw.chromium.launch(headless=HEADLESS, channel="chrome", args=BROWSER_ARGS)
+                except Exception:
+                    self._browser = self._pw.chromium.launch(headless=HEADLESS, args=BROWSER_ARGS)
+            except Exception as e:
+                # Playwright the package is installed but no browser can run here —
+                # binaries never downloaded (`playwright install chromium`), missing
+                # system libraries, or a sandbox that forbids launching one.
+                raise BrowserUnavailableError(str(e)) from e
         return self._browser
 
     def extract(
@@ -159,7 +178,7 @@ def _extract_with_browser(
             except Exception as e:
                 # If we have html as fallback, use it
                 if html:
-                    print(f"Warning: Failed to navigate to {source_url}, falling back to set_content: {e}")
+                    _log.warning("Failed to navigate to %s, falling back to set_content: %s", source_url, e)
                     page.set_content(html, wait_until="load")
                 else:
                     raise RuntimeError(f"Failed to load URL {source_url}: {e}") from e

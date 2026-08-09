@@ -64,6 +64,7 @@ def _resolve_metadata(
         source_url=source_url,
         file_size_bytes=file_size_bytes,
         is_password_protected=bool(discovered.get("is_password_protected", False)),
+        renderer=discovered.get("renderer"),
         page_count=int(discovered.get("page_count") or 0),
         page_width=discovered.get("page_width"),
         page_height=discovered.get("page_height"),
@@ -435,8 +436,11 @@ def _build_result(
     doc_token_count: int | None = None
     doc_token_count_exact = False
     if not df_chunks.empty and "token_count" in df_chunks.columns:
+        from .shared.step_08_chunk_builder import token_encoder
         doc_token_count = int(df_chunks["token_count"].fillna(0).sum())
-        doc_token_count_exact = bool(config.exact_tokens)
+        # Requesting exact counts is not getting them: tiktoken may be missing, or
+        # unable to fetch its vocabulary. Report what the counter actually did.
+        doc_token_count_exact = bool(config.exact_tokens) and token_encoder() is not None
 
     metadata = _resolve_metadata(
         discovered_metadata, source_url, source_filename, file_size_bytes, run_id, df_blocks,

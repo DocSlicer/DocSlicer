@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "docslicer"
-version = "0.2.0"
+version = "0.2.1"
 description = "Deterministic hierarchical document parser and chunker"
 readme = "README.md"
 license = "AGPL-3.0-only"
@@ -67,6 +67,9 @@ parquet = [
 ]
 mcp = [
     "mcp>=2.0",
+    # The server reports token costs the model budgets against, so it counts
+    # exactly rather than estimating. Falls back to chars/4 if unusable.
+    "tiktoken>=0.10",
 ]
 dev = [
     "pytest>=8.0",

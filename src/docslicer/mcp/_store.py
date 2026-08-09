@@ -68,7 +68,7 @@ class UnknownDocument(KeyError):
         return self.args[0] if self.args else ""
 
 
-def _slug(value: str) -> str:
+def slug(value: str) -> str:
     stem = Path(value).stem or "doc"
     stem = re.sub(r"[^a-zA-Z0-9]+", "-", stem).strip("-").lower()
     return (stem[:32] or "doc")
@@ -106,7 +106,7 @@ def resolve_source(source: str) -> str:
     return str(resolved)
 
 
-def resolve_output(path: str) -> Path:
+def resolve_output(path: str, base: Path | None = None) -> Path:
     """Validate a destination the server is about to write to, against the sandbox.
 
     The counterpart to ``resolve_source`` for the write direction: a root that
@@ -114,12 +114,18 @@ def resolve_output(path: str) -> Path:
     is not a sandbox. Kept separate because the two validate opposite things —
     a source must already exist, a destination must not have to.
 
+    ``base`` anchors a relative path. Callers pass the source document's
+    directory: the model cannot see this process's working directory, so a
+    relative path resolved against the cwd lands somewhere it can neither
+    predict beforehand nor find afterwards.
+
     Only the existing part of the path can be resolved, so the check lands on
     the nearest ancestor that exists. That is the boundary symlinks are
     resolved at, and where an escape would have to be built.
     """
     target = Path(path).expanduser()
-    resolved = Path(target if target.is_absolute() else Path.cwd() / target).resolve()
+    anchor = base or Path.cwd()
+    resolved = Path(target if target.is_absolute() else anchor / target).resolve()
 
     root = allowed_root()
     if root is not None and root not in resolved.parents:
@@ -141,7 +147,7 @@ def make_doc_id(source: str, options: dict) -> str:
         except OSError:
             pass
     blob = json.dumps(fingerprint, sort_keys=True, default=str).encode("utf-8")
-    return f"{_slug(source)}-{hashlib.sha256(blob).hexdigest()[:8]}"
+    return f"{slug(source)}-{hashlib.sha256(blob).hexdigest()[:8]}"
 
 
 @dataclass
@@ -275,6 +281,19 @@ class DocumentStore:
         result = ParseResult.load(path)
         self._remember(doc_id, result)
         return result
+
+    def source_of(self, doc_id: str) -> str | None:
+        """The source a cached document was parsed from, or None if unrecorded.
+
+        Lets a doc_id resolve an output path the same way a fresh source does,
+        so `to_markdown(doc_id=...)` and `to_markdown(source=...)` write to the
+        same place for the same document.
+        """
+        try:
+            record = json.loads(self._meta_path(doc_id).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        return record.get("source") or None
 
     def find(self, source: str, options: dict) -> str | None:
         """Return an existing doc_id for this exact (source, options) pair, if cached."""

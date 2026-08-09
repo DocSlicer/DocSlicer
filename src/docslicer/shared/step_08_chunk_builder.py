@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import logging
 import time
@@ -1244,8 +1245,9 @@ def _rebuild_merged_chunks(chunks_df: pd.DataFrame) -> pd.DataFrame:
     Rebuild the complete dataframe based on merging of chunks.
     
     For merged chunks (where merged_chunk_id is not NA):
-    - merge_mode = parent_plus_children: 
-      - chunk_heading becomes the parent only
+    - merge_mode = parent_plus_children:
+      - chunk_heading becomes the parent followed by the absorbed children's
+        headings, pipe delimited (parent first)
       - text includes the children's texts (which already have ## headings inside)
     - merge_mode = children_tail:
       - chunk_heading becomes the children's headings pipe delimited
@@ -1323,12 +1325,29 @@ def _rebuild_merged_chunks(chunks_df: pd.DataFrame) -> pd.DataFrame:
                 # Sort children by chunk_index to maintain order
                 if "chunk_index" in children_chunks.columns and not children_chunks.empty:
                     children_chunks = children_chunks.sort_values("chunk_index", kind="mergesort")
-                
+
+                # The absorbed children's headings must survive into chunk_heading,
+                # exactly as in children_tail. The merged row keeps the parent's
+                # heading_id (registry "first"), so a child folded in here is named
+                # nowhere else: its own heading node ends up with no chunk_ids, and
+                # consumers that split chunk_heading on " | " to attribute a merged
+                # chunk across its headings would report zero content beneath it.
+                child_headings: List[str] = []
                 for _, child_row in children_chunks.iterrows():
+                    child_heading = str(child_row.get("chunk_heading", "") or "").strip()
+                    if child_heading:
+                        child_headings.append(child_heading)
+
                     child_text = str(child_row.get("text", "") or "").strip()
                     if child_text:
                         text_parts.append(child_text)
-                
+
+                if child_headings:
+                    parent_heading_text = str(new_chunk_heading or "").strip()
+                    new_chunk_heading = " | ".join(
+                        ([parent_heading_text] if parent_heading_text else []) + child_headings
+                    )
+
                 new_text = "\n\n".join(text_parts)
                 
                 # Aggregate all fields across the merged chunks (bbox, counts, styles, etc.)
@@ -1430,9 +1449,10 @@ def _enforce_max_chunk_chars(chunks_df: pd.DataFrame, cfg: ChunkSizeConfig) -> p
     if not bool(oversize.any()):
         return chunks_df
 
-    print(
-        f"[chunk_builder] WARNING: {int(oversize.sum())} chunk(s) exceeded "
-        f"max_chunk_chars={max_chunk_chars} (largest={int(lengths.max())}); splitting to enforce the ceiling."
+    # Never print: stdout is the JSON-RPC wire when we run under the MCP stdio server.
+    _log.warning(
+        "%d chunk(s) exceeded max_chunk_chars=%d (largest=%d); splitting to enforce the ceiling.",
+        int(oversize.sum()), max_chunk_chars, int(lengths.max()),
     )
 
     rows_out: List[pd.Series] = []
@@ -1460,12 +1480,30 @@ def _enforce_max_chunk_chars(chunks_df: pd.DataFrame, cfg: ChunkSizeConfig) -> p
 # STEP 4: Add Token Count & Chunk IDs
 # =======================================================================================================================
 
+@functools.lru_cache(maxsize=1)
+def token_encoder():
+    """The cl100k_base encoder, or None if exact counting is unavailable here.
+
+    Two ways this comes back None: tiktoken is not installed, or it is but the
+    first ``get_encoding`` cannot fetch its BPE vocabulary (offline, sandboxed,
+    no cache). Both are survivable — callers fall back to estimation — so the
+    result is cached to keep one failed network attempt from repeating per
+    document, and to keep every caller's answer consistent within a process.
+    """
+    try:
+        import tiktoken as _tiktoken
+        return _tiktoken.get_encoding("cl100k_base")
+    except Exception as e:
+        _log.info("Exact token counting unavailable (%s) — estimating as chars/4.", e)
+        return None
+
+
 def _add_token_count(chunks_df: pd.DataFrame, exact_tokens: bool = False) -> pd.DataFrame:
     """
     Add token_count to each chunk.
 
-    If exact_tokens=True, lazily imports tiktoken (cl100k_base) and falls back to
-    char-count estimation if the package is not installed.
+    If exact_tokens=True, uses tiktoken (cl100k_base) and falls back to
+    char-count estimation when it is unavailable.
     If exact_tokens=False, always uses embed_char_count // 4.
     """
     if chunks_df is None or chunks_df.empty:
@@ -1475,16 +1513,9 @@ def _add_token_count(chunks_df: pd.DataFrame, exact_tokens: bool = False) -> pd.
 
     df = chunks_df.copy()
 
-    exact = False
-    if exact_tokens:
-        try:
-            import tiktoken as _tiktoken
-            encoding = _tiktoken.get_encoding("cl100k_base")
-            exact = True
-        except Exception:
-            encoding = None
+    encoding = token_encoder() if exact_tokens else None
 
-    if exact:
+    if encoding is not None:
         df["token_count"] = df["text"].apply(
             lambda t: len(encoding.encode(str(t) if pd.notna(t) else ""))
         )
