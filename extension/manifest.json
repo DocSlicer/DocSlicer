@@ -1,5 +1,5 @@
 {
-  "manifest_version": "0.3",
+  "manifest_version": "0.4",
   "name": "docslicer",
   "display_name": "DocSlicer",
   "version": "0.2.1",
@@ -21,28 +21,19 @@
   "privacy_policies": ["https://docslicer.ai/privacy"],
   "keywords": ["pdf", "docx", "pptx", "html", "document-parsing", "chunking", "rag"],
   "server": {
-    "type": "python",
-    "entry_point": "docslicer-0.2.1-py3-none-any.whl",
+    "type": "uv",
+    "entry_point": "src/server.py",
     "mcp_config": {
-      "command": "uvx",
+      "command": "uv",
       "args": [
-        "--from",
-        "${__dirname}/docslicer-0.2.1-py3-none-any.whl[mcp,html]",
-        "docslicer-mcp"
+        "run",
+        "--project",
+        "${__dirname}",
+        "${__dirname}/src/server.py"
       ],
       "env": {
-        "PATH": "${HOME}/.local/bin:/opt/homebrew/bin:/usr/local/bin:${HOME}/.cargo/bin:/usr/bin:/bin:/usr/sbin:/sbin",
         "DOCSLICER_MCP_ROOT": "${user_config.root_dir}",
         "DOCSLICER_MCP_ALLOW_URLS": "${user_config.allow_urls}"
-      },
-      "platform_overrides": {
-        "win32": {
-          "env": {
-            "PATH": "${HOME}\\.local\\bin;${HOME}\\.cargo\\bin;C:\\Windows\\System32;C:\\Windows",
-            "DOCSLICER_MCP_ROOT": "${user_config.root_dir}",
-            "DOCSLICER_MCP_ALLOW_URLS": "${user_config.allow_urls}"
-          }
-        }
       }
     }
   },
@@ -70,8 +61,7 @@
     }
   },
   "compatibility": {
-    "claude_desktop": ">=0.10.0",
-    "platforms": ["darwin", "win32", "linux"],
+    "platforms": ["darwin", "win32"],
     "runtimes": { "python": ">=3.10" }
   }
 }

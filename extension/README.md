@@ -2,13 +2,45 @@
 
 Packages the MCP server for one-click install in Claude Desktop / Cowork.
 
-## Local testing build (no PyPI)
+## How the runtime is resolved
 
-The bundled manifest points `uvx` at a wheel shipped **inside** the archive, so
-nothing needs to be published to test it.
+`server.type` is `uv` (manifest 0.4+). Dependencies are declared in
+`pyproject.toml` and installed by the host with uv; no `server/lib` and no
+`server/venv` ship in the archive. The user needs no Python of their own — uv
+provisions an interpreter satisfying `requires-python`.
+
+This replaces an earlier `type: python` manifest that invoked `uvx` against a
+bundled wheel. That approach depended on `uv` being on the PATH of a GUI
+process, which on macOS does not include `/opt/homebrew/bin`, so it worked from
+a terminal and failed when Claude Desktop spawned it. The hand-written `PATH`
+in `mcp_config.env` was a workaround for exactly that, and is gone.
+
+`mcp_config` is retained even though the spec calls it optional for this type:
+the v0.4 schema lists it in `server.required` and `command` in its own
+`required`, so a manifest without it fails validation. It is also what maps
+`user_config` into `DOCSLICER_MCP_ROOT` and `DOCSLICER_MCP_ALLOW_URLS`.
+
+`--project ${__dirname}` is load-bearing. `uv run <script>` alone resolves
+against the working directory, which the host sets to something other than the
+extension folder, so `pyproject.toml` would be ignored and the import of
+`docslicer` would fail.
+
+## Dependency source
+
+PyPI currently has 0.2.0 only, while `pyproject.toml` pins `>=0.2.1`, so the
+bundle ships the 0.2.1 wheel and `[tool.uv.sources]` points at it with a path
+relative to `pyproject.toml` — which resolves inside the installed extension
+directory on any machine. `uv.lock` is packed alongside it so installs are
+reproducible.
+
+Once 0.2.1 is on PyPI: delete the `[tool.uv.sources]` table, drop the wheel
+from `extension/`, re-add `*.whl` to `.mcpbignore`, regenerate `uv.lock`, and
+repack. The bundle then falls back to ~20 kB.
+
+## Build
 
 ```bash
-python -m build                       # produces dist/docslicer-X.Y.Z-py3-none-any.whl
+python -m build                        # refresh dist/docslicer-X.Y.Z-py3-none-any.whl
 cp dist/docslicer-X.Y.Z-py3-none-any.whl extension/
 cd extension && mcpb pack . ../dist/docslicer-X.Y.Z.mcpb
 ```
@@ -16,14 +48,27 @@ cd extension && mcpb pack . ../dist/docslicer-X.Y.Z.mcpb
 Install: Claude Desktop → Settings → Extensions → Advanced settings →
 Extension Developer → "Install Extension…" → pick the `.mcpb`.
 
-Requires `uv` on the machine (`brew install uv`). Claude Desktop bundles Node,
-not Python, so the uvx path is what makes this cross-platform.
+Verify the archive contains `src/server.py` before installing — a bundle
+missing it installs cleanly and then fails at spawn time with
+`No such file or directory (os error 2)`:
+
+```bash
+unzip -l ../dist/docslicer-X.Y.Z.mcpb
+```
+
+Smoke-test the exact command the manifest runs, without Claude Desktop:
+
+```bash
+printf '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}\n' \
+  | uv run --project extension extension/src/server.py
+```
 
 ## HTML rendering
 
-`uvx` resolves the extras in `--from` into a fresh, isolated environment — a
+uv resolves the bundle's dependencies into a fresh, isolated environment — a
 Playwright installed anywhere else on the machine is invisible to the server.
-That is why the manifest asks for `[mcp,html]` and not just `[mcp]`.
+That is why `pyproject.toml` asks for `docslicer[mcp,html]` and not just
+`[mcp]`.
 
 The `html` extra installs the Playwright *package*; browsers are a separate
 download, and which build satisfies Playwright is pinned to its version (1.62
@@ -83,9 +128,5 @@ https://github.com/DocSlicer/DocSlicer/issues
 
 ## Publishing build
 
-Once the package is on PyPI, drop the bundled wheel and change the manifest's
-`--from` argument to `docslicer[mcp,html]` so users get updates from PyPI:
-
-```jsonc
-"args": ["--from", "docslicer[mcp,html]", "docslicer-mcp"]
-```
+Publish `docslicer` 0.2.1 to PyPI, then follow the cleanup in
+[Dependency source](#dependency-source) and repack.

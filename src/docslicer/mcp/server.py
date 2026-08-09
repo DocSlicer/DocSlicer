@@ -15,6 +15,9 @@ Run with::
 
 Environment:
     DOCSLICER_MCP_CACHE         Where parsed results are persisted.
+    DOCSLICER_MCP_FULL_TEXT     Token ceiling under which parse returns the whole
+                                document instead of an outline (default 6000; 0
+                                disables and always returns the outline).
     DOCSLICER_MCP_CACHE_MAX_MB  Cache size ceiling (default 2048; 0 disables pruning).
     DOCSLICER_MCP_ROOT          Restrict file sources and outputs to this directory tree.
     DOCSLICER_MCP_ALLOW_URLS    Set to 0 to reject http(s) sources.
@@ -62,7 +65,8 @@ INSTRUCTIONS = """\
 To answer questions from a document:
 
 1. `parse` it — you get a doc_id and the heading outline, each line marked with
-   what reading it costs.
+   what reading it costs. A short document comes back as its full text instead,
+   marked `is_complete: true`; you already have everything, so answer from it.
 2. `read` the headings that look relevant, all in one call. Stop if the answer
    is there; otherwise read more — the outline is still valid.
 3. `search` when no heading in the outline looks relevant to the question — 
@@ -86,6 +90,15 @@ _MERGED_SEP = " | "
 
 # Separates a heading from its ancestors, both in requests and in path lines.
 _PATH_SEP = ">"
+
+# Under this many tokens, `parse` returns the document rather than its outline.
+# Navigating costs an outline plus a round trip, and on a short document that
+# overhead approaches what the whole text costs — while the outline it buys is
+# a handful of lines that resolve nothing. See `_serve_whole`.
+_FULL_TEXT_TOKENS = 6_000
+
+# The ceiling the ratio rule in `_serve_whole` may reach, never the token gate.
+_FULL_TEXT_CEILING = 2 * _FULL_TEXT_TOKENS
 
 
 def _server_options() -> dict:
@@ -128,8 +141,14 @@ async def parse(
 ) -> dict:
     """Parse a document and return its heading outline. Call this first.
 
-    Local path or http(s) URL, format detected automatically. Returns the
-    outline, not the text. Each line carries the tokens `read` would return for
+    Local path or http(s) URL, format detected automatically.
+
+    A short document returns as `text` — the whole thing, with `is_complete:
+    true`. There is nothing left to fetch: `read` and `search` on it would
+    return only what you are already holding. Answer from it directly.
+
+    Everything else returns the outline, not the text. Each line carries the
+    tokens `read` would return for
     that heading — "~48k" is a section to descend into, "~900" one to just
     read. The figure includes subsections, so a parent never costs less than
     the children under it. Use it to choose how deep to go before spending the
@@ -166,12 +185,24 @@ async def parse(
         "doc_id": doc_id,
         "title": meta.title,
         "pages": meta.page_count,
-        "outline": _outline(result),
         "headings": len(result.hierarchy.flatten()),
-        # Named for the document, not this response: nothing but the outline
-        # entered context here, and the two figures are wildly different.
         "document_tokens": meta.token_count,
     }
+    if _serve_whole(result):
+        # The whole document, in `read`'s format — so a citation drawn from it
+        # means what a citation drawn from `read` means.
+        payload["text"] = _join_chunks(result.chunks)
+        payload["is_complete"] = True
+        payload["note"] = (
+            "Short document — this is its full text, not an outline."
+            " Nothing further to read; `read` and `search` would only return"
+            " what is already here."
+        )
+    else:
+        payload["outline"] = _outline(result)
+        # Named for the document, not this response: nothing but the outline
+        # entered context here, and the two figures are wildly different.
+        payload["is_complete"] = False
     # HTML only — every other format has a single extraction path.
     if meta.renderer is not None:
         payload["renderer"] = meta.renderer
@@ -412,6 +443,56 @@ async def to_markdown(
 # ===========================================================================
 # Outline sizing
 # ===========================================================================
+
+
+def _serve_whole(result) -> bool:
+    """Whether `parse` should return the text itself rather than an outline.
+
+    Two conditions, both bounded by a token ceiling that is never crossed —
+    over-returning is the one failure mode that cannot be walked back, since
+    the text is in the caller's context before they can judge it.
+
+    The first is size. An outline earns its round trip by letting most of a
+    document go unread; on a two-page memo there is nothing to leave out, and
+    the outline plus a `read` call costs more than the memo did.
+
+    The second is that the outline says nothing. A document with two headings,
+    or one whose headings are so dense they cost a quarter of the text they
+    index, is not navigable by outline whatever its size — that is the case
+    where the outline is not merely wasteful but actively misleading, offering
+    a structure to choose from that does not carve the document anywhere.
+    """
+    budget = _full_text_budget()
+    if not budget:
+        return False
+
+    tokens = result.metadata.token_count or 0
+    if tokens <= budget:
+        return True
+
+    if tokens > min(_FULL_TEXT_CEILING, 2 * budget):
+        return False
+
+    headings = len(result.hierarchy.flatten())
+    # Estimated rather than counted: this is a ratio test against a quarter of
+    # the document, and chars/4 is nowhere near that margin of error.
+    outline_tokens = len(_outline(result)) // 4
+    return headings < 3 or outline_tokens * 4 >= tokens
+
+
+def _full_text_budget() -> int:
+    """The token ceiling for returning whole text, overridable per deployment.
+
+    A client with a 200k window and one with 32k do not want the same cutoff,
+    and the operator knows which they are running.
+    """
+    raw = os.environ.get("DOCSLICER_MCP_FULL_TEXT")
+    if raw is None:
+        return _FULL_TEXT_TOKENS
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return _FULL_TEXT_TOKENS
 
 
 def _outline(result) -> str:
