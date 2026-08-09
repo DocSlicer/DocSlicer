@@ -79,6 +79,25 @@ class PdfPipelineResult(NamedTuple):
     debug_steps: Dict[str, pd.DataFrame]
 
 
+def _page_clause(pdf_path, discovered_metadata: Dict[str, Any]) -> str:
+    """Return " (N pages)" for an OCR-unavailable message, "" if unknown.
+
+    Sizing the document is what makes that message actionable — it is the
+    difference between a stray fax and a 300-page report worth installing OCR
+    for. The scanned branch that skips add_page_and_ocr_info has no count yet,
+    so fall back to the page tree, which is readable with no text layer.
+    """
+    pages = discovered_metadata.get("page_count") or 0
+    if not pages:
+        try:
+            import pikepdf
+            with pikepdf.open(str(pdf_path)) as _pk:
+                pages = len(_pk.pages)
+        except Exception:
+            return ""
+    return f" ({pages} page{'s' if pages != 1 else ''})" if pages else ""
+
+
 def run_pipeline(
     pdf_bytes: bytes,
     source_url: str = None,
@@ -175,6 +194,21 @@ def run_pipeline(
             )
 
         if discovered_metadata.get("needs_ocr"):
+            # Checked before the OCR import, so a missing extra is reported as
+            # "this document needs OCR and OCR is not installed" rather than as
+            # an ImportError raised three modules deep. Returning an empty parse
+            # instead would be worse: no headings is indistinguishable from a
+            # genuinely empty document, and this is recoverable by installing.
+            from ..ocr import OcrUnavailableError, ocr_unavailable_reason
+
+            reason = ocr_unavailable_reason()
+            if reason:
+                raise OcrUnavailableError(
+                    f"{source_filename or 'This PDF'} is a scanned document"
+                    f"{_page_clause(pdf_path, discovered_metadata)} with no "
+                    f"usable text layer, so reading it requires OCR, but {reason}"
+                )
+
             import warnings
             warnings.warn(
                 "Scanned PDF detected — running OCR pipeline. "

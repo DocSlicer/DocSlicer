@@ -101,6 +101,7 @@ pip install 'docslicer[ocr]'     # scanned PDF support via Tesseract + OpenCV
 # Linux:  apt install tesseract-ocr
 # macOS:  brew install tesseract
 
+pip install 'docslicer[mcp]'     # MCP server for LLM clients (Claude, Cursor, …)
 pip install 'docslicer[llm]'     # exact token counts via tiktoken (exact_tokens=True)
 pip install 'docslicer[crypto]'  # password-protected Office files (msoffcrypto-tool)
 pip install 'docslicer[parquet]' # Parquet export support
@@ -487,6 +488,96 @@ pip install 'docslicer[ocr]'
 # Linux:  apt install tesseract-ocr libtesseract-dev libleptonica-dev pkg-config
 # macOS:  brew install tesseract leptonica
 ```
+
+---
+
+## MCP server
+
+DocSlicer ships an [MCP](https://modelcontextprotocol.io) server, so LLM clients
+(Claude Desktop, Claude Code, Cursor, …) can parse and read documents directly.
+
+```bash
+pip install 'docslicer[mcp]'
+docslicer-mcp                    # stdio — what desktop clients launch
+docslicer-mcp --transport http --port 8000
+```
+
+Register it with a client by adding to its MCP config:
+
+```jsonc
+{
+  "mcpServers": {
+    "docslicer": {
+      "command": "docslicer-mcp",
+      "env": { "DOCSLICER_MCP_ROOT": "/Users/you/Documents" }
+    }
+  }
+}
+```
+
+### How it works
+
+A parsed document is far larger than a model's context window, so the server
+never returns one in a single call. `parse` registers the document and hands
+back a `doc_id` handle plus a heading outline. Every other tool takes that
+handle and returns a bounded slice — the model pulls in only what it needs.
+
+| Tool | Returns |
+| --- | --- |
+| `parse` | `doc_id` handle, title, page count, heading outline |
+| `get_outline` | The outline again, for when it scrolls out of context |
+| `read` | The text under one or more headings, named from the outline |
+| `search` | Headings to `read`, ranked, each with a snippet |
+| `to_markdown` | Writes the whole document to disk; returns the path |
+
+Every outline line carries what reading it would cost:
+
+```
+- Financial statements  ~48k
+  - Note 14 — Segment reporting  ~900
+  - Note 15 — Income taxes  ~2.1k
+```
+
+That figure is the same estimate `read` reports back, so a budget made from the
+outline holds when it is spent. Sizes are cumulative — a parent never costs less
+than the children beneath it — which is what makes "descend or just read it" a
+decision the model can make before spending the context rather than after.
+
+`read` takes heading text exactly as the outline prints it. Where a heading
+appears twice, prefixing any ancestor disambiguates it (`"Notes > Revenue"`);
+the full chain is never required. Returned text is interleaved with `[Page X]`
+markers using the document's own page labels (`S-23`, `iv`), so a quotation can
+be cited to the page it actually came from rather than to wherever its section
+began.
+
+`search` is the fallback for when the outline does not settle the question —
+headings that name nothing useful (`Note 14`, `Item 7A`), or a figure buried in
+a table no heading mentions. It combines a whole-word literal match with BM25
+over the chunks, and returns *places*, not answers: each hit is a heading to
+pass to `read`. Query terms that appear nowhere in the document are reported
+back, so a query that scored well on one rare word can be recognised as the bad
+query it was.
+
+`to_markdown` is the escape hatch for when the user wants the document itself
+rather than an answer drawn from it. It writes to disk and returns a path, so
+nothing enters the model's context and document size stops mattering.
+
+Parsed results are cached on disk, so re-parsing the same file with the same
+options is free. The cache key includes the file's size and mtime — edit the
+document and the next `parse` re-parses it automatically.
+
+### Configuration
+
+| Variable | Effect |
+| --- | --- |
+| `DOCSLICER_MCP_ROOT` | Restrict file sources **and** written output to this directory tree |
+| `DOCSLICER_MCP_ALLOW_URLS` | Set to `0` to reject `http(s)` sources |
+| `DOCSLICER_MCP_CACHE` | Where parsed results are persisted (default `~/.cache/docslicer-mcp`) |
+| `DOCSLICER_MCP_CACHE_MAX_MB` | Cache size ceiling, oldest pruned first (default `2048`; `0` disables) |
+
+Set `DOCSLICER_MCP_ROOT` when exposing the server to anything but yourself —
+without it, any readable path on the machine is parseable, and `to_markdown`
+can write anywhere the server process can.
 
 ---
 

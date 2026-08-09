@@ -35,6 +35,7 @@ class DocumentMetadata:
     source_url: Optional[str] = None
     file_size_bytes: Optional[int] = None
     is_password_protected: bool = False
+    renderer: Optional[str] = None         # html only: browser | static
 
     # ------------------------------------------------------------------
     # Page geometry + OCR (after extraction)
@@ -112,6 +113,7 @@ class DocumentMetadata:
             source_url=d.get("source_url"),
             file_size_bytes=d.get("file_size_bytes"),
             is_password_protected=d.get("is_password_protected", False),
+            renderer=d.get("renderer"),
             page_count=d.get("page_count"),
             page_width=d.get("page_width"),
             page_height=d.get("page_height"),
@@ -152,6 +154,8 @@ class DocumentMetadata:
         if self.file_size_bytes is not None:
             out["file_size_bytes"] = self.file_size_bytes
         out["is_password_protected"] = self.is_password_protected
+        if self.renderer is not None:
+            out["renderer"] = self.renderer
         out["page_count"] = self.page_count
         if self.page_width is not None:
             out["page_width"] = self.page_width

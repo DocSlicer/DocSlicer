@@ -20,7 +20,7 @@ try:
     from importlib.metadata import version as _pkg_version
     __version__ = _pkg_version("docslicer")
 except Exception:
-    __version__ = "0.2.0"
+    __version__ = "0.2.1"
 
 from ._config import ParseConfig
 from ._result import ParseResult, Chunk, Block, Table, TableCell, Chart, ChartPoint, BBox, HierarchyNode, HierarchyTree

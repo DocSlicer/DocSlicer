@@ -1,0 +1,12 @@
+# The uv server type forbids shipping a resolved environment — the host
+# installs from pyproject.toml instead.
+.venv/
+venv/
+server/lib/
+server/venv/
+
+*.whl
+
+__pycache__/
+*.py[cod]
+.DS_Store

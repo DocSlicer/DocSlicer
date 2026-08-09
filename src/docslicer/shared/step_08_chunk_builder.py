@@ -6,7 +6,10 @@
 
 from __future__ import annotations
 
+import functools
 import hashlib
+import logging
+import time
 import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -14,6 +17,8 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import numpy as np
 import pandas as pd
 from .._utils.df_aggregation.registry_aggregator import Agg, aggregate_to, group_join
+
+_log = logging.getLogger(__name__)
 
 # =======================================================================================================================
 # CONFIG
@@ -353,12 +358,52 @@ def _split_text_into_parts(
     return parts
 
 
+def _heading_block_mask(g: pd.DataFrame) -> pd.Series:
+    """Boolean mask of rows whose block_type counts as a heading."""
+    block_types = (
+        g.get("block_type", pd.Series([""] * len(g), index=g.index))
+        .astype("string")
+        .str.strip()
+        .str.lower()
+    )
+    return block_types.isin(_HEADING_BLOCK_TYPES).fillna(False)
+
+
+def _group_heading_chars(g: pd.DataFrame, heading_mask: Optional[pd.Series] = None) -> int:
+    """Chars contributed by the heading blocks — prepended to EVERY chunk of the group."""
+    if heading_mask is None:
+        heading_mask = _heading_block_mask(g)
+    if not bool(heading_mask.any()):
+        return 0
+    return int(g.loc[heading_mask, "embed_char_count"].astype(int).sum())
+
+
+def _content_budget_chars(heading_chars: int, cfg: ChunkSizeConfig) -> int:
+    """
+    Room left for content once the heading is accounted for.
+
+    Every chunk in a heading group carries the heading text, so the ceiling that
+    content blocks must respect is max - heading_chars, never max. Floored at
+    min_chunk_chars so a pathologically long heading still yields a usable budget.
+    """
+    return max(int(cfg.min_chunk_chars), int(cfg.max_chunk_chars) - int(heading_chars))
+
+
 def _explode_oversize_blocks_within_group(
     group_df: pd.DataFrame,
     cfg: ChunkSizeConfig,
+    budget_chars: Optional[int] = None,
 ) -> pd.DataFrame:
     """
-    Replace any row with embed_char_count > max_chunk_chars by multiple "virtual" rows.
+    Replace any content row with embed_char_count > budget_chars by multiple "virtual" rows.
+
+    budget_chars defaults to max_chunk_chars, but callers that know the group's
+    heading overhead must pass max_chunk_chars - heading_chars instead. A block
+    that slips under max yet over the budget stays un-split and then makes every
+    candidate partition infeasible in _partition_blocks_dp.
+
+    Heading rows are never split: their chars land in heading_chars either way, so
+    splitting them buys nothing and only fabricates extra rows.
 
     Adds:
       - sub_block_index (0 for original non-split blocks, 1..N for split parts)
@@ -366,9 +411,9 @@ def _explode_oversize_blocks_within_group(
       - orig_row_id (stable id within this function)
     Keeps order by original sort + sub_block_index.
     """
-    max_chunk_chars = cfg.max_chunk_chars
-    optimal_chunk_chars = cfg.optimal_chunk_chars
-    softmin_chunk_chars = cfg.softmin_chunk_chars
+    max_chunk_chars = int(budget_chars) if budget_chars is not None else cfg.max_chunk_chars
+    optimal_chunk_chars = min(cfg.optimal_chunk_chars, max_chunk_chars)
+    softmin_chunk_chars = min(cfg.softmin_chunk_chars, optimal_chunk_chars)
 
     g = group_df.copy()
 
@@ -380,11 +425,13 @@ def _explode_oversize_blocks_within_group(
     g["sub_block_index"] = 0
     g["is_virtual_sub_block"] = False
 
+    is_heading = _heading_block_mask(g)
+
     rows_out: List[pd.Series] = []
 
-    for _, row in g.iterrows():
+    for pos, (_, row) in enumerate(g.iterrows()):
         L = int(row["embed_char_count"])
-        if L <= max_chunk_chars:
+        if L <= max_chunk_chars or bool(is_heading.iloc[pos]):
             rows_out.append(row)
             continue
 
@@ -571,9 +618,16 @@ def _partition_blocks_dp(
                 best_cost = final_cost
                 best_cuts = cuts
 
-    # Fallback: single chunk
+    # Fallback: greedy packing.
+    # Reached when no partition scores finite — i.e. at least one atom is longer
+    # than the ceiling once heading_chars is added, so _score_chunk_len_vec returns
+    # inf for every candidate group containing it and `final_cost < best_cost` never
+    # fires. Emitting [(0, n-1)] here (the previous behaviour) collapsed the ENTIRE
+    # heading group into one chunk, turning a block that overshot by a few chars
+    # into a chunk many times over max. Greedy still cuts at the ceiling, so the
+    # damage stays confined to the offending block.
     if best_cuts is None:
-        return [(0, n - 1)]
+        return _partition_blocks_greedy(block_lens, heading_chars, max_chunk_chars, optimal_chunk_chars)
     return best_cuts
 
 
@@ -634,8 +688,8 @@ def _assign_chunk_indices(
     if "embed_char_count" not in df0.columns:
         df0["embed_char_count"] = df0["text"].astype("string").fillna("").str.len().astype(int)
 
-    # Mark original oversize rows
-    df0["needs_block_split"] = df0["embed_char_count"].astype(int) > int(max_chunk_chars)
+    # Marked per heading group below, against that group's content budget
+    df0["needs_block_split"] = False
 
     # Stable sort
     sort_cols = [c for c in ["page_number", "block_id"] if c in df0.columns]
@@ -651,9 +705,17 @@ def _assign_chunk_indices(
     for active_hid, g in df0.groupby("active_heading_id", sort=False):
         g2 = g.copy().reset_index(drop=True)
 
+        # Content must fit under max MINUS the heading, since every chunk of this
+        # group is prefixed with the heading text.
+        heading_mask = _heading_block_mask(g2)
+        budget = _content_budget_chars(_group_heading_chars(g2, heading_mask), cfg)
+
+        oversize = (g2["embed_char_count"].astype(int) > budget) & ~heading_mask
+        g2["needs_block_split"] = oversize
+
         # If any oversize in this heading group, explode them into virtual rows (DP-friendly atoms)
-        if (g2["embed_char_count"].astype(int) > int(max_chunk_chars)).any():
-            g2 = _explode_oversize_blocks_within_group(g2, cfg)
+        if bool(oversize.any()):
+            g2 = _explode_oversize_blocks_within_group(g2, cfg, budget_chars=budget)
         else:
             # ensure expected columns exist
             if "sub_block_index" not in g2.columns:
@@ -675,15 +737,12 @@ def _assign_chunk_indices(
     for active_hid, g_indices in df.groupby("active_heading_id", sort=False).groups.items():
         g = df.loc[g_indices].copy()
 
-        block_types = g.get("block_type", pd.Series([""] * len(g), index=g.index)).astype("string").str.strip().str.lower()
-        heading_mask = block_types.isin(_HEADING_BLOCK_TYPES)
+        heading_mask = _heading_block_mask(g)
 
         heading_indices = g.index[heading_mask].tolist()
         content_indices = g.index[~heading_mask].tolist()
 
-        heading_chars = 0
-        if heading_indices:
-            heading_chars = int(df.loc[heading_indices, "embed_char_count"].sum())
+        heading_chars = _group_heading_chars(g, heading_mask)
 
         if not content_indices:
             df.loc[g.index, "chunk_index"] = global_chunk_idx
@@ -698,15 +757,20 @@ def _assign_chunk_indices(
             global_chunk_idx += 1
             continue
 
-        _t0_dp = __import__("time").perf_counter()
+        _t0_dp = time.perf_counter()
         cuts = _partition_blocks_dp(
             block_lens,
             heading_chars=heading_chars,
             cfg=cfg,
         )
-        _dp_elapsed = __import__("time").perf_counter() - _t0_dp
+        # Logged, not printed: stdout belongs to the caller. Under the MCP
+        # stdio transport it is the JSON-RPC channel itself.
+        _dp_elapsed = time.perf_counter() - _t0_dp
         if _dp_elapsed > 0.5:
-            print(f"[chunk_builder] SLOW DP: active_heading_id={active_hid!r}  n={len(block_lens)}  total_chars={total_len}  cuts={len(cuts)}  time={_dp_elapsed:.2f}s")
+            _log.warning(
+                "slow chunk partition: active_heading_id=%r n=%d total_chars=%d cuts=%d time=%.2fs",
+                active_hid, len(block_lens), total_len, len(cuts), _dp_elapsed,
+            )
 
         for local_idx, (a, b) in enumerate(cuts, start=1):
             segment_indices = content_indices[a : b + 1]
@@ -1181,8 +1245,9 @@ def _rebuild_merged_chunks(chunks_df: pd.DataFrame) -> pd.DataFrame:
     Rebuild the complete dataframe based on merging of chunks.
     
     For merged chunks (where merged_chunk_id is not NA):
-    - merge_mode = parent_plus_children: 
-      - chunk_heading becomes the parent only
+    - merge_mode = parent_plus_children:
+      - chunk_heading becomes the parent followed by the absorbed children's
+        headings, pipe delimited (parent first)
       - text includes the children's texts (which already have ## headings inside)
     - merge_mode = children_tail:
       - chunk_heading becomes the children's headings pipe delimited
@@ -1260,12 +1325,29 @@ def _rebuild_merged_chunks(chunks_df: pd.DataFrame) -> pd.DataFrame:
                 # Sort children by chunk_index to maintain order
                 if "chunk_index" in children_chunks.columns and not children_chunks.empty:
                     children_chunks = children_chunks.sort_values("chunk_index", kind="mergesort")
-                
+
+                # The absorbed children's headings must survive into chunk_heading,
+                # exactly as in children_tail. The merged row keeps the parent's
+                # heading_id (registry "first"), so a child folded in here is named
+                # nowhere else: its own heading node ends up with no chunk_ids, and
+                # consumers that split chunk_heading on " | " to attribute a merged
+                # chunk across its headings would report zero content beneath it.
+                child_headings: List[str] = []
                 for _, child_row in children_chunks.iterrows():
+                    child_heading = str(child_row.get("chunk_heading", "") or "").strip()
+                    if child_heading:
+                        child_headings.append(child_heading)
+
                     child_text = str(child_row.get("text", "") or "").strip()
                     if child_text:
                         text_parts.append(child_text)
-                
+
+                if child_headings:
+                    parent_heading_text = str(new_chunk_heading or "").strip()
+                    new_chunk_heading = " | ".join(
+                        ([parent_heading_text] if parent_heading_text else []) + child_headings
+                    )
+
                 new_text = "\n\n".join(text_parts)
                 
                 # Aggregate all fields across the merged chunks (bbox, counts, styles, etc.)
@@ -1340,15 +1422,88 @@ def _rebuild_merged_chunks(chunks_df: pd.DataFrame) -> pd.DataFrame:
 
 
 # =======================================================================================================================
+# Post-condition: enforce the hard character ceiling
+# =======================================================================================================================
+
+def _enforce_max_chunk_chars(chunks_df: pd.DataFrame, cfg: ChunkSizeConfig) -> pd.DataFrame:
+    """
+    Last line of defence: no chunk may leave this module longer than max_chunk_chars.
+
+    The partitioner and the small-chunk merger both aim to respect the ceiling, but
+    neither re-validates its own output, and an embedder rejects an over-length input
+    outright — so the invariant is enforced here rather than assumed. Any oversize
+    chunk is split in place into as many rows as needed; metadata is copied to each
+    part and chunk_index is left duplicated on purpose, since
+    _add_chunk_ids_and_reindex renumbers sequentially afterwards (the sort ahead of it
+    is stable, so part order holds).
+
+    Runs after merging so it also covers chunks that merging made too large.
+    """
+    if chunks_df is None or chunks_df.empty or "text" not in chunks_df.columns:
+        return chunks_df
+
+    max_chunk_chars = int(cfg.max_chunk_chars)
+
+    lengths = chunks_df["text"].astype("string").fillna("").str.len()
+    oversize = lengths > max_chunk_chars
+    if not bool(oversize.any()):
+        return chunks_df
+
+    # Never print: stdout is the JSON-RPC wire when we run under the MCP stdio server.
+    _log.warning(
+        "%d chunk(s) exceeded max_chunk_chars=%d (largest=%d); splitting to enforce the ceiling.",
+        int(oversize.sum()), max_chunk_chars, int(lengths.max()),
+    )
+
+    rows_out: List[pd.Series] = []
+    for pos, (_, row) in enumerate(chunks_df.iterrows()):
+        if not bool(oversize.iloc[pos]):
+            rows_out.append(row)
+            continue
+
+        parts = _split_text_into_parts(
+            text=str(row.get("text", "") or ""),
+            max_chars=max_chunk_chars,
+            target_chars=cfg.optimal_chunk_chars,
+            softmin_chars=cfg.softmin_chunk_chars,
+        )
+        for part in parts:
+            r2 = row.copy()
+            r2["text"] = part
+            r2["embed_char_count"] = int(len(part))
+            rows_out.append(r2)
+
+    return pd.DataFrame(rows_out).reset_index(drop=True)
+
+
+# =======================================================================================================================
 # STEP 4: Add Token Count & Chunk IDs
 # =======================================================================================================================
+
+@functools.lru_cache(maxsize=1)
+def token_encoder():
+    """The cl100k_base encoder, or None if exact counting is unavailable here.
+
+    Two ways this comes back None: tiktoken is not installed, or it is but the
+    first ``get_encoding`` cannot fetch its BPE vocabulary (offline, sandboxed,
+    no cache). Both are survivable — callers fall back to estimation — so the
+    result is cached to keep one failed network attempt from repeating per
+    document, and to keep every caller's answer consistent within a process.
+    """
+    try:
+        import tiktoken as _tiktoken
+        return _tiktoken.get_encoding("cl100k_base")
+    except Exception as e:
+        _log.info("Exact token counting unavailable (%s) — estimating as chars/4.", e)
+        return None
+
 
 def _add_token_count(chunks_df: pd.DataFrame, exact_tokens: bool = False) -> pd.DataFrame:
     """
     Add token_count to each chunk.
 
-    If exact_tokens=True, lazily imports tiktoken (cl100k_base) and falls back to
-    char-count estimation if the package is not installed.
+    If exact_tokens=True, uses tiktoken (cl100k_base) and falls back to
+    char-count estimation when it is unavailable.
     If exact_tokens=False, always uses embed_char_count // 4.
     """
     if chunks_df is None or chunks_df.empty:
@@ -1358,16 +1513,9 @@ def _add_token_count(chunks_df: pd.DataFrame, exact_tokens: bool = False) -> pd.
 
     df = chunks_df.copy()
 
-    exact = False
-    if exact_tokens:
-        try:
-            import tiktoken as _tiktoken
-            encoding = _tiktoken.get_encoding("cl100k_base")
-            exact = True
-        except Exception:
-            encoding = None
+    encoding = token_encoder() if exact_tokens else None
 
-    if exact:
+    if encoding is not None:
         df["token_count"] = df["text"].apply(
             lambda t: len(encoding.encode(str(t) if pd.notna(t) else ""))
         )
@@ -1720,6 +1868,11 @@ def build_chunks(
         # Rebuild the complete df based on the merging of chunks
         chunks_df = _rebuild_merged_chunks(chunks_df)
     
+    # -------------------------
+    # STEP 6b: ENFORCE HARD CEILING
+    # -------------------------
+    chunks_df = _enforce_max_chunk_chars(chunks_df, size_cfg)
+
     # -------------------------
     # STEP 7: ADD TOKEN COUNT
     # -------------------------

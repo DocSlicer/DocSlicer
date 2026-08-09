@@ -13,7 +13,8 @@ class ParseConfig:
     """User-facing configuration for a parse.
 
     Chunking: ``max_chunk_size`` / ``optimal_chunk_size`` / ``min_chunk_size``
-    bound chunk length (in characters, or tokens when ``exact_tokens=True``);
+    bound chunk length in characters (always — ``exact_tokens`` changes how the
+    resulting chunks are *counted*, not where they are cut);
     ``chunking`` toggles chunking entirely and ``merge_small_chunks`` folds
     undersized chunks into neighbours. ``table_representation`` selects how
     tables are serialized ("markdown", "jsonl", or "melted"). ``extra_fields``

@@ -1145,6 +1145,25 @@ def _add_heading_decision(
 _NUMBERED_HIERARCHY_TYPES = {"numbered_heading", "roman_numbered_heading"}
 
 
+def _dense_rank_keep_na(values: pd.Series) -> pd.Series:
+    """Dense-rank the non-null values of an Int64 column, leaving nulls null.
+
+    Not ``values.rank(method="dense", na_option="keep")``: on nullable (masked)
+    dtypes pandas 2 ignores ``na_option`` and ranks NA as if it were a value, so
+    every null row comes back as rank 1 — a real id, indistinguishable from a
+    detected one. Downstream that reads as "every line belongs to the same
+    heading", which collapses whole sections into a single block. pandas 3 keeps
+    the nulls, so the bug only shows up on installs that resolve pandas 2 (any
+    Python 3.10 environment, since pandas 3 requires 3.11+). Ranking the
+    non-null subset gives the same answer on every supported pandas.
+    """
+    out = pd.Series(pd.NA, index=values.index, dtype="Int64")
+    known = values.notna()
+    if known.any():
+        out[known] = values[known].astype("int64").rank(method="dense").astype("int64")
+    return out
+
+
 def _parse_numbered_value(marker: str) -> tuple | None:
     """
     Parses a numbered section marker into a comparable int tuple.
@@ -1324,11 +1343,7 @@ def _assign_numbered_heading_groups(lines_df: pd.DataFrame) -> pd.DataFrame:
     # Singletons → stray (null group); dense-rank survivors so groups start at 1
     vc = raw_group.value_counts()
     grp_size = raw_group.map(vc)
-    final_group = (
-        raw_group.where(grp_size > 1)
-        .rank(method="dense", na_option="keep")
-        .astype("Int64")
-    )
+    final_group = _dense_rank_keep_na(raw_group.where(grp_size > 1))
 
     out["numbered_heading_group"] = pd.NA
     out.loc[cand.index, "numbered_heading_group"] = final_group
@@ -1947,11 +1962,7 @@ def _suppress_headings(df: pd.DataFrame) -> pd.DataFrame:
     # Suppression blanks whole units, which would otherwise leave holes in a
     # field that is public API (HierarchyNode.heading_id).
     if "heading_id" in out.columns and out["heading_id"].notna().any():
-        out["heading_id"] = (
-            out["heading_id"]
-            .rank(method="dense", na_option="keep")
-            .astype("Int64")
-        )
+        out["heading_id"] = _dense_rank_keep_na(out["heading_id"])
 
     return out
 

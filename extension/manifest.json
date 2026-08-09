@@ -1,0 +1,67 @@
+{
+  "manifest_version": "0.4",
+  "name": "docslicer",
+  "display_name": "DocSlicer",
+  "version": "0.2.1",
+  "description": "Deterministic hierarchical document parser and chunker for PDF, DOCX, PPTX and HTML.",
+  "long_description": "DocSlicer parses documents into a heading hierarchy and lets the model pull in only the slices it needs. `parse` registers a document and returns a doc_id plus an outline; `read`, `search` and `get_outline` return bounded slices against that handle; `to_markdown` writes the whole document to disk without loading it into context.",
+  "author": {
+    "name": "Market Framer Inc.",
+    "email": "jelle@docslicer.ai"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/DocSlicer/DocSlicer.git"
+  },
+  "homepage": "https://docslicer.ai",
+  "documentation": "https://docslicer.ai/docs",
+  "support": "https://github.com/DocSlicer/DocSlicer/issues",
+  "license": "AGPL-3.0-only",
+  "icon": "icon-512.png",
+  "privacy_policies": ["https://docslicer.ai/privacy"],
+  "keywords": ["pdf", "docx", "pptx", "html", "document-parsing", "chunking", "rag"],
+  "server": {
+    "type": "uv",
+    "entry_point": "src/server.py",
+    "mcp_config": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--project",
+        "${__dirname}",
+        "${__dirname}/src/server.py"
+      ],
+      "env": {
+        "DOCSLICER_MCP_ROOT": "${user_config.root_dir}",
+        "DOCSLICER_MCP_ALLOW_URLS": "${user_config.allow_urls}"
+      }
+    }
+  },
+  "tools": [
+    { "name": "parse", "description": "Parse a document and return a doc_id plus heading outline" },
+    { "name": "get_outline", "description": "Re-fetch the heading outline for a parsed document" },
+    { "name": "read", "description": "Read the chunks under one or more headings" },
+    { "name": "search", "description": "Rank headings by relevance to a query, with snippets" },
+    { "name": "to_markdown", "description": "Write the full document to disk as markdown" }
+  ],
+  "user_config": {
+    "root_dir": {
+      "type": "directory",
+      "title": "Document folder",
+      "description": "DocSlicer can only read files from, and write files to, this folder.",
+      "required": true,
+      "default": "${DOCUMENTS}"
+    },
+    "allow_urls": {
+      "type": "string",
+      "title": "Allow http(s) sources",
+      "description": "Set to 0 to reject remote URLs and only permit local files.",
+      "default": "1",
+      "required": false
+    }
+  },
+  "compatibility": {
+    "platforms": ["darwin", "win32"],
+    "runtimes": { "python": ">=3.10" }
+  }
+}

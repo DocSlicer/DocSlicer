@@ -140,7 +140,11 @@ def run_pipeline(
         _playwright_available = False
     else:
         try:
-            from .step_01_box_extractor import BrowserSession, extract_boxes_with_playwright
+            from .step_01_box_extractor import (
+                BrowserSession,
+                BrowserUnavailableError,
+                extract_boxes_with_playwright,
+            )
             _playwright_available = True
         except ImportError:
             logger.warning(
@@ -175,24 +179,46 @@ def run_pipeline(
             with timed_step(step_name, logger=logger):
                 if _playwright_available:
                     try:
-                        boxes, rendered_html = extract_boxes_with_playwright(
-                            html, source_url, wait_until=wait_until, session=session
-                        )
-                    except Exception as e:
-                        # Navigation failed: fetch the bytes ourselves and render them
-                        # statically. Drop source_url so we don't retry navigation.
-                        if not source_url:
+                        try:
+                            boxes, rendered_html = extract_boxes_with_playwright(
+                                html, source_url, wait_until=wait_until, session=session
+                            )
+                        except BrowserUnavailableError:
+                            # No browser at all — the http_fetcher retry below would
+                            # launch the same doomed browser, so degrade instead.
                             raise
-                        logger.warning(f"Playwright navigation failed for {source_url}, falling back to http_fetcher: {e}")
-                        scraped = fetch_url(source_url)
-                        html = scraped.raw_bytes.decode(scraped.encoding or "utf-8", errors="replace")
-                        html = _inject_base_url(html, scraped.final_url)
-                        source_url = None
-                        boxes, rendered_html = extract_boxes_with_playwright(html, source_url=None, session=session)
-                else:
+                        except Exception as e:
+                            # Navigation failed: fetch the bytes ourselves and render them
+                            # statically. Drop source_url so we don't retry navigation.
+                            if not source_url:
+                                raise
+                            logger.warning(f"Playwright navigation failed for {source_url}, falling back to http_fetcher: {e}")
+                            scraped = fetch_url(source_url)
+                            html = scraped.raw_bytes.decode(scraped.encoding or "utf-8", errors="replace")
+                            html = _inject_base_url(html, scraped.final_url)
+                            source_url = None
+                            boxes, rendered_html = extract_boxes_with_playwright(html, source_url=None, session=session)
+                    except BrowserUnavailableError as e:
+                        logger.warning(
+                            f"Playwright is installed but no browser could be launched ({e}) — "
+                            "falling back to static box extractor. Run `playwright install chromium`. "
+                            "Accuracy will be degraded: layout coordinates are unavailable and CSS-class styles are not resolved. "
+                            "Bold or styled headings may go undetected, which can degrade chunk boundaries and hierarchy quality."
+                        )
+                        _playwright_available = False
+
+                if not _playwright_available:
                     if html is None:
-                        # No Playwright to navigate, must have HTML content to proceed.
-                        raise ValueError("Playwright is not installed and no HTML content was provided — cannot extract boxes.")
+                        # No browser to navigate for us, so fetch the bytes ourselves.
+                        # Reached when the browser died after the fetch step above left
+                        # a live URL for page.goto to resolve.
+                        if not source_url:
+                            raise ValueError("No HTML content and no source URL — cannot extract boxes.")
+                        with timed_step("fetch_html_http", logger=logger):
+                            scraped = fetch_url(source_url)
+                            html = scraped.raw_bytes.decode(scraped.encoding or "utf-8", errors="replace")
+                            html = _inject_base_url(html, scraped.final_url)
+                            source_url = None
                     from .step_01_static_box_extractor import extract_boxes_static
                     boxes = extract_boxes_static(html)
                     rendered_html = html
@@ -229,6 +255,9 @@ def run_pipeline(
 
     discovered_metadata: Dict[str, Any] = {}
     discovered_metadata["rendered_html"] = rendered_html
+    # Which extractor actually ran, after any mid-parse degradation — the fidelity
+    # of everything downstream depends on it, so it travels with the document.
+    discovered_metadata["renderer"] = "browser" if _playwright_available else "static"
 
     with timed_step("page_info", logger=logger):
         # HTML has no scanned/OCR concept — page geometry + char totals only.

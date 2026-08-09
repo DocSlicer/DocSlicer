@@ -502,24 +502,44 @@ def _collect_block_ids(node: HierarchyNode, recursive: bool) -> set[str]:
     return ids
 
 
-def _prettify_table(markdown: str) -> str:
-    """Reformat a markdown table so pipe characters are vertically aligned."""
+def _split_table_row(line: str) -> list[str]:
+    """Split one pipe-table line into stripped cells, dropping the outer pipes."""
+    cells = line.strip().split("|")
+    if cells and cells[0].strip() == "":
+        cells = cells[1:]
+    if cells and cells[-1].strip() == "":
+        cells = cells[:-1]
+    return [c.strip() for c in cells]
+
+
+def _is_sep_cell(cell: str) -> bool:
+    return bool(cell) and all(c in "-:" for c in cell)
+
+
+def _is_sep_row(row: list[str]) -> bool:
+    return any(row) and all(_is_sep_cell(c) for c in row if c)
+
+
+def _gfm_normalize_table(markdown: str) -> str:
+    """Rewrite a table so it renders under GitHub-flavored Markdown.
+
+    ``_format_table_markdown`` is faithful to the source grid: it draws the
+    separator under the *last* header row, and omits it entirely for tables with
+    no header cells. GFM instead requires exactly one header row followed by one
+    separator, so:
+
+      * multiple header rows collapse into one, joined per column with " > "
+        (the convention ``_format_table_melted`` already uses for header paths), and
+      * headerless tables gain a blank header row, which keeps every source row
+        in the body rather than promoting one to a header the detector rejected.
+
+    Text that is not a pipe table passes through untouched.
+    """
     lines = markdown.strip().splitlines()
-    if not lines:
+    if not lines or any(l.strip() and not l.strip().startswith("|") for l in lines):
         return markdown
 
-    def _split_row(line: str) -> list[str]:
-        cells = line.strip().split("|")
-        if cells and cells[0].strip() == "":
-            cells = cells[1:]
-        if cells and cells[-1].strip() == "":
-            cells = cells[:-1]
-        return [c.strip() for c in cells]
-
-    def _is_sep(cell: str) -> bool:
-        return bool(cell) and all(c in "-:" for c in cell)
-
-    rows = [_split_row(l) for l in lines if l.strip().startswith("|")]
+    rows = [_split_table_row(l) for l in lines if l.strip().startswith("|")]
     if not rows:
         return markdown
 
@@ -528,7 +548,44 @@ def _prettify_table(markdown: str) -> str:
         while len(row) < n_cols:
             row.append("")
 
-    sep_indices = {i for i, row in enumerate(rows) if all(_is_sep(c) for c in row if c)}
+    sep = ["---"] * n_cols
+    first_sep = next((i for i, row in enumerate(rows) if _is_sep_row(row)), None)
+
+    if first_sep is None:
+        rows = [[""] * n_cols, sep] + rows
+    elif first_sep == 0:
+        rows = [[""] * n_cols] + rows
+    elif first_sep > 1:
+        header = []
+        for col in range(n_cols):
+            parts: list[str] = []
+            for row in rows[:first_sep]:
+                # A rowspan header cell repeats down the header rows — "Region >
+                # Region" carries no more than "Region" does.
+                if row[col] and (not parts or parts[-1] != row[col]):
+                    parts.append(row[col])
+            header.append(" > ".join(parts))
+        rows = [header, sep] + rows[first_sep + 1:]
+
+    return "\n".join("| " + " | ".join(row) + " |" for row in rows)
+
+
+def _prettify_table(markdown: str) -> str:
+    """Reformat a markdown table so pipe characters are vertically aligned."""
+    lines = markdown.strip().splitlines()
+    if not lines:
+        return markdown
+
+    rows = [_split_table_row(l) for l in lines if l.strip().startswith("|")]
+    if not rows:
+        return markdown
+
+    n_cols = max(len(r) for r in rows)
+    for row in rows:
+        while len(row) < n_cols:
+            row.append("")
+
+    sep_indices = {i for i, row in enumerate(rows) if _is_sep_row(row)}
     col_widths = [3] * n_cols
     for i, row in enumerate(rows):
         if i not in sep_indices:
@@ -664,8 +721,16 @@ class ParseResult:
         include_toc: bool = True,
         include_furniture: bool = True,
         prettify: bool = True,
+        gfm_tables: bool = True,
     ) -> str:
-        """Render the document as Markdown using blocks as the source of truth."""
+        """Render the document as Markdown using blocks as the source of truth.
+
+        ``gfm_tables`` rewrites tables to the one-header-row-plus-separator shape
+        GitHub-flavored Markdown renderers require. Pass ``False`` for the faithful
+        grid — multiple header rows, and no separator for tables that genuinely
+        have no header — which is what ``Table.markdown`` and the block text always
+        carry regardless of this flag.
+        """
         _HEADING_ROLES = {
             "heading", "toc_heading", "exhibit_heading", "hybrid_heading_paragraph",
         }
@@ -704,6 +769,8 @@ class ParseResult:
                 if include_tables:
                     table = tables_by_id.get(block.table_ids[0]) if block.table_ids else None
                     raw = table.markdown if table else text
+                    if gfm_tables:
+                        raw = _gfm_normalize_table(raw)
                     parts.append(_prettify_table(raw) if prettify else raw)
             elif block.type == "chart":
                 if text:

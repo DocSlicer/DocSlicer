@@ -1,0 +1,12 @@
+# Dependency declaration for the MCPB bundle only — this is not the package
+# build. The host installs these with uv at extension install time, which is
+# what removes the need for a user-supplied Python or a vendored venv.
+#
+# The `html` extra pulls in the Playwright package. Browsers remain a separate
+# download; without one the pipeline falls back to the static extractor.
+[project]
+name = "docslicer-mcpb"
+version = "0.2.1"
+description = "MCPB bundle for the DocSlicer MCP server."
+requires-python = ">=3.10"
+dependencies = ["docslicer[mcp,html]>=0.2.1"]

@@ -16,8 +16,11 @@ known limitations:
     * Inline `style` attributes on the element and its ancestors
     * Semantic tags: <b>, <strong>, <i>, <em>, <u>, <h1>-<h6>
 
-- One box per block element (no intra-element inline splits). bold_ratio and
-  italic_ratio reflect whether the element or any descendant carries that style.
+- Block elements are split into runs at inline-context boundaries (mirroring the
+  Playwright extractor's INLINE_SPLIT_TAGS walk), so bold_ratio / italic_ratio are
+  per-run rather than per-block. Styles are resolved from the text node's own
+  parent upward, so a `<span style="font-weight:700">` inside a plain `<div>` is
+  detected as bold.
 
 Works well for documents that use inline styles — SEC filings, Word-exported
 HTML, legal documents. Less useful for modern CSS-class-heavy pages.
@@ -57,12 +60,20 @@ _NAMED_SIZES: Dict[str, float] = {
 _DEFAULT_FONT_PX = 16.0
 _DEFAULT_VIEWPORT_WIDTH = 1280
 
-# Inline tags that create a segment boundary within a block element.
-# Conservative subset: only tags carrying meaningful semantic style changes.
-# <span>/<font> are excluded — too frequent on CSS-styled pages, causes fragmentation.
-_SEGMENT_SPLIT_TAGS: frozenset[str] = frozenset({
-    "strong", "b", "em", "i", "u", "a", "mark", "s", "del", "ins",
-    "strike", "sup", "sub",  # strike → strikethrough; sup/sub → script_type
+# Inline tags that open a new inline context inside a block element (mirrors the
+# JS extractor's INLINE_SPLIT_TAGS). A text run is anchored on its nearest such
+# ancestor; when that anchor changes, a new box starts.
+#
+# <span>/<font> are included deliberately: styling in SEC filings, Word exports and
+# legal HTML lives on the span, so anchoring there is what makes bold/italic/font
+# detection work at all. Boxes from the same block element are re-merged downstream
+# by struct_tag_id (step_02), so finer splits do not fragment the output.
+_INLINE_SPLIT_TAGS: frozenset[str] = frozenset({
+    "strong", "b", "em", "i", "u", "mark",
+    "a", "code", "kbd", "samp", "var",
+    "del", "ins", "s", "strike", "small", "big",
+    "span", "font", "tt", "label",
+    "sup", "sub",  # split so script_type (superscript/subscript) is tagged per box
 })
 
 
@@ -93,12 +104,16 @@ def _css_size_to_px(value: str) -> Optional[float]:
     unit = m.group(2) or "px"
     if unit == "px":
         return n
+    # Not rounded: getComputedStyle reports 8pt as 10.6667px, and the orchestrator
+    # multiplies font_size by 0.75 to get points back. Rounding here to 2 decimals
+    # made 8pt round-trip to 8.0025pt and broke exact comparison with the
+    # Playwright path.
     if unit == "pt":
-        return round(n * 96.0 / 72.0, 2)
+        return n * 96.0 / 72.0
     if unit in ("em", "rem"):
-        return round(n * _DEFAULT_FONT_PX, 2)
+        return n * _DEFAULT_FONT_PX
     if unit == "%":
-        return round(n / 100.0 * _DEFAULT_FONT_PX, 2)
+        return n / 100.0 * _DEFAULT_FONT_PX
     return n
 
 
@@ -117,27 +132,52 @@ def _is_bold_weight(fw: str) -> bool:
 def _resolve_style(el: Tag) -> Dict[str, Any]:
     """
     Walk el and its ancestors resolving typography from inline styles and semantic
-    tag names. Call this on _style_anchor(block_el) so the walk starts at the
-    innermost text-wrapping element (e.g. the <span>) and naturally inherits
-    upward through all wrappers to the block.
+    tag names. Call this on the element that directly wraps the text (the text
+    node's parent) so the walk passes through every inline wrapper — <span>, <font>,
+    <b>, … — before reaching the block, mirroring how a browser resolves
+    getComputedStyle on a text node.
+
+    Inherited properties (font-size, font-family, font-weight, font-style, color,
+    text-align) take the innermost declaration: once resolved, ancestors cannot
+    override it, and neither can a semantic tag. `<b><span style="font-weight:400">`
+    is therefore not bold, matching CSS cascade order.
+
+    Non-inherited decorations (underline, line-through) are OR-ed up the tree
+    instead: a browser paints an ancestor's decoration over descendant text, so
+    `text-decoration:none` on the child does not remove it.
     """
     font_size: Optional[float] = None
     font_family: Optional[str] = None
     font_weight: Optional[str] = None
     bold = False
     italic = False
+    italic_resolved = False   # an explicit font-style was found at some level
     underline = False
     strikethrough = False
     script_type = ""   # "superscript" | "subscript" | ""
-    text_align: Optional[str] = None
     color: Optional[str] = None
 
     node: Any = el
     while node is not None and isinstance(node, Tag) and node.name:
         tag = node.name.lower()
 
-        # Semantic signals
-        if tag in ("b", "strong"):
+        # Inline style wins over this element's own semantic default, so read it first.
+        props = _parse_style(node.get("style", "") or "")
+
+        if font_weight is None and "font-weight" in props:
+            fw = props["font-weight"].strip().lower()
+            if fw not in ("inherit", "initial", "unset", ""):
+                font_weight = fw
+                bold = _is_bold_weight(fw)
+
+        if not italic_resolved:
+            fs = props.get("font-style", "").strip().lower()
+            if fs in ("italic", "oblique", "normal"):
+                italic = fs != "normal"
+                italic_resolved = True
+
+        # Semantic signals — only where the cascade has not already decided.
+        if font_weight is None and tag in ("b", "strong"):
             bold = True
         if tag in ("s", "strike", "del"):
             strikethrough = True
@@ -148,16 +188,15 @@ def _resolve_style(el: Tag) -> Dict[str, Any]:
             script_type = "subscript"
         if tag in _HEADING_FONT_PX:
             # h1-h6 are bold and have a default font size in every browser stylesheet
-            bold = True
+            if font_weight is None:
+                bold = True
             if font_size is None:
                 font_size = _HEADING_FONT_PX[tag]
-        if tag in ("i", "em"):
+        if not italic_resolved and tag in ("i", "em"):
             italic = True
+            italic_resolved = True
         if tag == "u":
             underline = True
-
-        # Inline style
-        props = _parse_style(node.get("style", "") or "")
 
         if font_size is None and "font-size" in props:
             font_size = _css_size_to_px(props["font-size"])
@@ -167,21 +206,8 @@ def _resolve_style(el: Tag) -> Dict[str, Any]:
             if fam:
                 font_family = fam
 
-        if font_weight is None and "font-weight" in props:
-            font_weight = props["font-weight"].lower()
-            if not bold and _is_bold_weight(font_weight):
-                bold = True
-
-        if text_align is None and "text-align" in props:
-            text_align = props["text-align"].lower()
-
         if color is None and "color" in props:
             color = props["color"].lower()
-
-        if not italic:
-            fs = props.get("font-style", "").lower()
-            if fs in ("italic", "oblique"):
-                italic = True
 
         td = (props.get("text-decoration", "") or props.get("text-decoration-line", "")).lower()
         if not underline and "underline" in td:
@@ -196,12 +222,13 @@ def _resolve_style(el: Tag) -> Dict[str, Any]:
             elif va == "sub":
                 script_type = "subscript"
 
-        # Legacy align attribute
-        if text_align is None and node.get("align"):
-            text_align = str(node["align"]).strip().lower()
-
-        if all(v is not None for v in [font_size, font_family, font_weight, text_align, color]):
-            break
+        # Legacy presentational attributes
+        if font_family is None and tag == "font" and node.get("face"):
+            fam = str(node["face"]).split(",")[0].strip().strip("'\"")
+            if fam:
+                font_family = fam
+        if color is None and tag == "font" and node.get("color"):
+            color = str(node["color"]).strip().lower()
 
         node = node.parent
 
@@ -214,9 +241,50 @@ def _resolve_style(el: Tag) -> Dict[str, Any]:
         "underline": underline,
         "strikethrough": strikethrough,
         "script_type": script_type,
-        "text_align": text_align or "",
         "color": color or "",
     }
+
+
+def _resolve_block_text_align(el: Tag) -> str:
+    """
+    Resolve text-align for a block element, walking up for the inherited value.
+
+    text-align is a block-level property, so it is resolved once per structure
+    element rather than per inline run (a `text-align` on a <span> has no effect in
+    a browser). Logical and vendor-prefixed values are normalized exactly as the JS
+    extractor does, so both paths emit the same vocabulary — notably
+    "justify" → "justified".
+    """
+    node: Any = el
+    align = ""
+    direction = ""
+    while node is not None and isinstance(node, Tag) and node.name:
+        props = _parse_style(node.get("style", "") or "")
+        if not align:
+            align = (props.get("text-align", "") or str(node.get("align", "") or "")).strip().lower()
+        if not direction:
+            d = props.get("direction", "").strip().lower() or str(node.get("dir", "") or "").strip().lower()
+            if d in ("ltr", "rtl"):
+                direction = d
+        if align and direction:
+            break
+        node = node.parent
+    direction = direction or "ltr"
+
+    align = re.sub(r"^-(webkit|moz|ms|o)-", "", align)
+    if not align:
+        # Browser UA default: `text-align: start` everywhere, `center` for <th>.
+        # getComputedStyle always reports a value, so emitting "" here would leave a
+        # systematic gap against the Playwright path on documents that never declare
+        # text-align inline.
+        align = "center" if (el.name or "").lower() == "th" else "start"
+    if align == "start":
+        return "right" if direction == "rtl" else "left"
+    if align == "end":
+        return "left" if direction == "rtl" else "right"
+    if align == "justify":
+        return "justified"
+    return align
 
 
 def _resolve_x_left(el: Tag) -> float:
@@ -234,22 +302,20 @@ def _resolve_x_left(el: Tag) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Style anchor — find the innermost element that wraps the first text node
+# Inline context — nearest inline-split ancestor of a text node
 # ---------------------------------------------------------------------------
 
-def _style_anchor(el: Tag) -> Tag:
+def _inline_split_parent(start: Any, block: Tag) -> Tag:
     """
-    Return the deepest element that directly wraps the first non-empty text node
-    inside `el`. Starting _resolve_style from here means the upward walk passes
-    through all wrapping inline tags (span, font, b, …) before reaching the block,
-    mirroring how a browser resolves getComputedStyle on a text node.
+    Return the nearest ancestor of `start` (inclusive) that is an inline-split tag,
+    or `block` itself when there is none. Mirrors the JS findInlineSplitParent.
     """
-    for string in el.strings:
-        if string.strip():
-            parent = string.parent
-            if isinstance(parent, Tag):
-                return parent
-    return el
+    node: Any = start
+    while node is not None and isinstance(node, Tag) and node is not block:
+        if (node.name or "").lower() in _INLINE_SPLIT_TAGS:
+            return node
+        node = node.parent
+    return block
 
 
 # ---------------------------------------------------------------------------
@@ -332,8 +398,17 @@ def _table_context(
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _link_url(el: Tag) -> str:
-    a = el.find("a", href=True) or el.find_parent("a", href=True)
+def _link_url(el: Tag, allow_descendants: bool = True) -> str:
+    """
+    Resolve the href covering `el`: el itself, then (optionally) a descendant
+    <a>, then an ancestor <a>.
+
+    `allow_descendants=False` is used for plain text runs anchored on the block
+    element — a sibling <a> deeper in the block does not link that text.
+    """
+    if (el.name or "").lower() == "a" and el.has_attr("href"):
+        return str(el["href"])
+    a = (el.find("a", href=True) if allow_descendants else None) or el.find_parent("a", href=True)
     return str(a["href"]) if a else ""
 
 
@@ -389,7 +464,6 @@ def _base_box(
     dom_order: Dict[int, int],
 ) -> Dict[str, Any]:
     """Fields common to all box types."""
-    style = _resolve_style(_style_anchor(el))
     dom_class_raw = el.get("class", [])
     dom_class = " ".join(dom_class_raw) if isinstance(dom_class_raw, list) else str(dom_class_raw or "")
     return {
@@ -413,8 +487,6 @@ def _base_box(
         "page_format": "html_static",
         **_table_context(el, table_id_map, row_id_map),
         **_ancestor_meta(el, dom_order),
-        # style fields — caller may override
-        "_style": style,
     }
 
 
@@ -422,7 +494,7 @@ def _base_box(
 # Inline segment walker
 # ---------------------------------------------------------------------------
 
-def _pre_line_segments(el: Tag) -> List[tuple[str, Tag, str]]:
+def _pre_line_segments(el: Tag) -> List[tuple[str, Tag, Tag, str]]:
     """
     Segment a <pre> block into one segment per code line.
 
@@ -442,69 +514,104 @@ def _pre_line_segments(el: Tag) -> List[tuple[str, Tag, str]]:
         elif isinstance(d, Tag) and (d.name or "").lower() == "br":
             parts.append("\n")
 
-    segments: List[tuple[str, Tag, str]] = []
+    segments: List[tuple[str, Tag, Tag, str]] = []
     for raw_line in "".join(parts).split("\n"):
         line = raw_line.rstrip()
         if line.strip():
-            segments.append((line, el, "code_line"))
+            segments.append((line, el, el, "code_line"))
     return segments
 
 
-def _iter_inline_segments(el: Tag) -> List[tuple[str, Tag, str]]:
+def _iter_inline_segments(el: Tag) -> List[tuple[str, Tag, Tag, str]]:
     """
-    Walk el's content and return (text, style_anchor, split_reason) tuples.
+    Walk el's content in document order and return
+    (text, inline_anchor, style_element, split_reason) tuples.
 
     <pre> blocks are delegated to :func:`_pre_line_segments` (one segment per
     code line, indentation preserved).
 
-    A new segment is started at:
-    - <br>  → split_reason "br_tag"  (step_02 respects this and won't re-merge)
-    - _SEGMENT_SPLIT_TAGS (strong, b, em, i, u, a, …) → each gets its own segment
-      with the inline tag as the style anchor so _resolve_style picks up its styles.
+    Port of the JS extractor's text-node walk: text accumulates into the current
+    box until the *inline context* changes, where the context is the triple
+    (nearest _INLINE_SPLIT_TAGS ancestor, covering href, iXBRL id of the direct
+    parent). <br>, <hr> and <img> force a break as well.
 
-    Plain text runs between split tags use `el` (the block) as the style anchor.
+    `inline_anchor` is that context element (becomes wrapping_tag); `style_element`
+    is the direct parent of the segment's first text node, which is where
+    :func:`_resolve_style` starts so the innermost inline styles are picked up even
+    when they sit on a tag that is not itself a split tag (e.g. <ix:nonnumeric>).
     """
     if (el.name or "").lower() == "pre":
         return _pre_line_segments(el)
 
-    segments: List[tuple[str, Tag, str]] = []
-    current_parts: List[str] = []
+    segments: List[tuple[str, Tag, Tag, str]] = []
+    parts: List[str] = []
 
-    def flush(anchor: Tag, split_reason: str = "static_extractor") -> None:
-        text = re.sub(r"\s+", " ", " ".join(current_parts)).strip()
-        current_parts.clear()
+    anchor: Tag = el          # current inline context element
+    style_el: Tag = el        # direct parent of this segment's first text node
+    link_url = ""
+    ixbrl_id = ""
+    split_reason = "new_structure"
+    pending_space = False     # a whitespace-only text node separated two runs
+
+    def flush() -> None:
+        nonlocal parts
+        text = re.sub(r"\s+", " ", "".join(parts)).strip()
+        parts = []
         if text:
-            segments.append((text, anchor, split_reason))
+            segments.append((text, anchor, style_el, split_reason))
 
-    def walk(node: Tag, anchor: Tag) -> None:
-        for child in node.children:
-            if isinstance(child, Comment):
-                continue
-            if isinstance(child, NavigableString):
-                t = str(child).strip()
-                if t:
-                    current_parts.append(t)
-            elif isinstance(child, Tag):
-                child_tag = (child.name or "").lower()
-                if child_tag == "br":
-                    flush(anchor, "br_tag")
-                elif child_tag in _SEGMENT_SPLIT_TAGS:
-                    flush(anchor)
-                    inner = re.sub(r"\s+", " ", child.get_text() or "").strip()
-                    if inner:
-                        segments.append((inner, child, "static_extractor"))
-                elif child_tag.startswith("ix:") or child_tag.startswith("ix-"):
-                    # iXBRL element — flush current buffer and emit as its own segment
-                    # so seg_anchor == the ix: element and _ixbrl_id picks up its id
-                    flush(anchor)
-                    inner = re.sub(r"\s+", " ", child.get_text() or "").strip()
-                    if inner:
-                        segments.append((inner, child, "static_extractor"))
-                else:
-                    walk(child, anchor)
+    for node in el.descendants:
+        if isinstance(node, Comment):
+            continue
 
-    walk(el, el)
-    flush(el)
+        if isinstance(node, Tag):
+            tag = (node.name or "").lower()
+            if tag in ("br", "hr", "img"):
+                flush()
+                anchor = el
+                style_el = el
+                link_url = ""
+                ixbrl_id = ""
+                pending_space = False
+                split_reason = {"br": "br_tag", "hr": "after_hr", "img": "after_image"}[tag]
+            continue
+
+        raw = str(node)
+        if not raw.strip():
+            # Whitespace between two runs still separates words; remember it rather
+            # than dropping the node, and let the next run carry it.
+            if raw:
+                pending_space = True
+            continue
+
+        parent = node.parent
+        if not isinstance(parent, Tag):
+            continue
+
+        new_anchor = _inline_split_parent(parent, el)
+        new_link = _link_url(parent, allow_descendants=False)
+        new_ixbrl = _ixbrl_id(parent)
+
+        if new_anchor is not anchor or new_link != link_url or new_ixbrl != ixbrl_id:
+            had_text = bool("".join(parts).strip())
+            flush()
+            if had_text:
+                if new_ixbrl and new_ixbrl != ixbrl_id:
+                    split_reason = "ixbrl_change"
+                elif new_link and new_link != link_url:
+                    split_reason = "link_change"
+                elif new_anchor is not anchor:
+                    split_reason = "inline_exit" if new_anchor is el else "inline_tag"
+            anchor, link_url, ixbrl_id = new_anchor, new_link, new_ixbrl
+            style_el = parent
+            pending_space = False
+
+        if pending_space and parts:
+            parts.append(" ")
+        parts.append(raw)
+        pending_space = False
+
+    flush()
     return segments
 
 
@@ -565,7 +672,6 @@ def extract_boxes_static(html: str) -> List[Dict[str, Any]]:
             box_counter += 1
             base = _base_box(el, struct_counter, table_id_map, row_id_map, dom_order)
             base["box_id"] = box_counter
-            base.pop("_style")
 
             if kind == "hr":
                 hr_width = (
@@ -606,6 +712,8 @@ def extract_boxes_static(html: str) -> List[Dict[str, Any]]:
                 continue
 
             tag = el.name.lower()
+            # text-align is block-level: resolve once per structure element, not per run.
+            block_text_align = _resolve_block_text_align(el)
 
             # For <pre> blocks, anchor ancestry on a direct <code> wrapper when
             # present (pre > code is the standard highlighter structure), so
@@ -636,9 +744,9 @@ def extract_boxes_static(html: str) -> List[Dict[str, Any]]:
                 **_ancestor_meta(ancestor_el, dom_order),
             }
 
-            for seg_text, seg_anchor, seg_split_reason in segments:
+            for seg_text, seg_anchor, seg_style_el, seg_split_reason in segments:
                 box_counter += 1
-                style = _resolve_style(seg_anchor)
+                style = _resolve_style(seg_style_el)
                 font_size_px = style["font_size"] or _DEFAULT_FONT_PX
                 fw_raw = style["font_weight_raw"]
                 if fw_raw is not None:
@@ -653,11 +761,12 @@ def extract_boxes_static(html: str) -> List[Dict[str, Any]]:
                     **shared,
                     "box_id": box_counter,
                     "struct_tag_id": struct_counter,
-                    "ixbrl_id": _ixbrl_id(seg_anchor),
+                    "ixbrl_id": _ixbrl_id(seg_style_el),
                     "wrapping_tag": wrapping,
                     "split_reason": seg_split_reason,
                     "text": seg_text,
-                    "font_size": f"{font_size_px:.2f}px",
+                    # 4 decimals mirrors getComputedStyle ("10.6667px" for 8pt)
+                    "font_size": f"{font_size_px:.4f}px",
                     "font_family": style["font_family"],
                     "font_weight": font_weight,
                     "bold_ratio": 1.0 if style["bold"] else 0.0,
@@ -667,8 +776,8 @@ def extract_boxes_static(html: str) -> List[Dict[str, Any]]:
                     "is_strikethrough": bool(style["strikethrough"]),
                     "script_type": style["script_type"],
                     "non_stroking_color": style["color"],
-                    "text_align": style["text_align"],
-                    "link_url": _link_url(seg_anchor if seg_anchor is not el else el),
+                    "text_align": block_text_align,
+                    "link_url": _link_url(seg_style_el, allow_descendants=False),
                     "img_alt": "", "img_src": "",
                 })
 
