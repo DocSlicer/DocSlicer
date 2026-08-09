@@ -5,8 +5,7 @@ venv/
 server/lib/
 server/venv/
 
-# NOTE: *.whl is deliberately NOT ignored. The bundle ships the wheel that
-# [tool.uv.sources] resolves against until 0.2.1 reaches PyPI.
+*.whl
 
 __pycache__/
 *.py[cod]

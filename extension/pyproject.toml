@@ -10,10 +10,3 @@ version = "0.2.1"
 description = "MCPB bundle for the DocSlicer MCP server."
 requires-python = ">=3.10"
 dependencies = ["docslicer[mcp,html]>=0.2.1"]
-
-# Until 0.2.1 is on PyPI (only 0.2.0 is published), resolve from a wheel
-# shipped in the bundle. The path is relative to this file, so it resolves
-# inside the installed extension directory on any machine.
-# Delete this table and the bundled wheel once 0.2.1 is published.
-[tool.uv.sources]
-docslicer = { path = "docslicer-0.2.1-py3-none-any.whl" }
