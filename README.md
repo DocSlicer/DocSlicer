@@ -1,6 +1,8 @@
 # DocSlicer
 
-[![PyPI](https://img.shields.io/pypi/v/docslicer.svg)](https://pypi.org/project/docslicer/) [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE) [![Commercial license available](https://img.shields.io/badge/License-Commercial-green.svg)](LICENSE-COMMERCIAL.md)
+[![PyPI](https://img.shields.io/pypi/v/docslicer.svg)](https://pypi.org/project/docslicer/) [![Python versions](https://img.shields.io/pypi/pyversions/docslicer.svg)](https://pypi.org/project/docslicer/) [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE) [![Commercial license available](https://img.shields.io/badge/License-Commercial-green.svg)](LICENSE-COMMERCIAL.md)
+
+[![Install in VS Code](https://img.shields.io/badge/VS_Code-Install_MCP_server-0098FF?logo=visualstudiocode&logoColor=white)](https://insiders.vscode.dev/redirect/mcp/install?name=docslicer&config=%7B%22name%22%3A%22docslicer%22%2C%22command%22%3A%22uvx%22%2C%22args%22%3A%5B%22--from%22%2C%22docslicer%5Bmcp%5D%22%2C%22docslicer-mcp%22%5D%7D) [![Add to Cursor](https://img.shields.io/badge/Cursor-Add_MCP_server-000000?logo=cursor&logoColor=white)](https://cursor.com/install-mcp?name=docslicer&config=eyJjb21tYW5kIjoidXZ4IiwiYXJncyI6WyItLWZyb20iLCJkb2NzbGljZXJbbWNwXSIsImRvY3NsaWNlci1tY3AiXX0%3D) [![Download .mcpb for Claude Desktop](https://img.shields.io/badge/Claude_Desktop-Download_.mcpb-D97757?logo=claude&logoColor=white)](https://github.com/DocSlicer/DocSlicer/releases/latest)
 
 Lightning-fast (31 pages/sec), deterministic document parser and chunker for business documents. No LLM calls or heavy ML models.
 
@@ -8,9 +10,12 @@ DocSlicer turns PDFs, Word documents, HTML pages, and PowerPoint files into clea
 
 Top score on [BizDocBench](https://github.com/DocSlicer/BizDocBench) (0.88 overall vs 0.70 for the next-best tool). 0.80 table accuracy, 0.98 content faithfulness, 0.85 heading recognition and hierarchy preservation, and 0.76 RAG retrieval performance.
 
-**Add DocSlicer to your AI pipeline:**
-- Classic RAG: the layout-aware chunker gives you clean non-overlapping chunks, each carrying its full heading breadcrumb, ready to embed.
-- Vectorless RAG: for when you want an answer out of a document right now. The agent pulls the outline, picks the section it needs, and navigates to the correct section of text without embedding the whole document
+**Two ways to use it:**
+
+- **As a Python library — classic RAG.** The layout-aware chunker gives you clean, non-overlapping chunks, each carrying its full heading breadcrumb, ready to embed. [Jump to the API ↓](#parsing)
+- **As an MCP server — vectorless RAG.** For when you want an answer out of a document right now. Claude, Cursor, or VS Code pulls the outline, picks the section it needs, and reads only that — no embedding, and no 200-page document in the context window. [Jump to setup ↓](#mcp-server)
+
+### Quick start
 
 ```python
 import docslicer
@@ -502,18 +507,48 @@ docslicer-mcp                    # stdio — what desktop clients launch
 docslicer-mcp --transport http --port 8000
 ```
 
-Register it with a client by adding to its MCP config:
+### Claude Desktop / Cowork — one-click install
+
+Download `docslicer-X.Y.Z.mcpb` from the
+[latest release](https://github.com/DocSlicer/DocSlicer/releases/latest) and
+double-click it, or drag it onto the Claude Desktop window. You pick the folder
+DocSlicer is allowed to read and write during install; no config file, and no
+Python of your own — `uv` provisions the interpreter.
+
+### Other clients
+
+Every client below launches the server over stdio. `uvx` needs nothing
+installed ahead of time:
 
 ```jsonc
 {
   "mcpServers": {
     "docslicer": {
-      "command": "docslicer-mcp",
+      "command": "uvx",
+      "args": ["--from", "docslicer[mcp]", "docslicer-mcp"],
       "env": { "DOCSLICER_MCP_ROOT": "/Users/you/Documents" }
     }
   }
 }
 ```
+
+If you'd rather install it once and skip the resolve on every launch, use
+`pip install 'docslicer[mcp]'` (or `uv tool install`) and set
+`"command": "docslicer-mcp"` with no `args`.
+
+| Client | Where the config goes |
+| --- | --- |
+| Claude Code | `claude mcp add docslicer -- uvx --from 'docslicer[mcp]' docslicer-mcp` |
+| Cursor | `~/.cursor/mcp.json`, or `.cursor/mcp.json` per project |
+| VS Code | `.vscode/mcp.json` (use a `servers` key instead of `mcpServers`) |
+| Windsurf | `~/.codeium/windsurf/mcp_config.json` |
+| Zed | `settings.json`, under `context_servers` |
+
+> **On GUI-launched clients, prefer the `.mcpb`.** An app started from the dock
+> does not inherit your shell `PATH` — on macOS that excludes
+> `/opt/homebrew/bin` — so a bare `uvx` or `docslicer-mcp` can work in a
+> terminal and fail when the client spawns it. Use an absolute path
+> (`which uvx`) if you hit this. The extension sidesteps it entirely.
 
 ### How it works
 
@@ -592,6 +627,47 @@ docslicer.parse_docx("contract.docx")
 docslicer.parse_pptx("deck.pptx")
 docslicer.parse_html("filing.html")
 ```
+
+---
+
+## Privacy Policy
+
+Full policy: <https://docslicer.ai/privacy>
+
+**What is collected.** Nothing. DocSlicer has no telemetry, analytics, crash
+reporting, or usage tracking, and requires no account, licence key, or
+registration.
+
+**How your documents are used.** Parsing runs entirely on your own machine, in a
+local process. Document contents are used only to produce the outline, text
+slices, search results, and markdown you ask for, and are returned only to the
+caller. Documents are never uploaded to DocSlicer or to any third party. When
+running as an MCP server, `DOCSLICER_MCP_ROOT` bounds which directory tree may
+be read from and written to.
+
+**Where data is stored, and for how long.** Parsed results are cached on your
+own disk — by default `~/.cache/docslicer-mcp`, configurable with
+`DOCSLICER_MCP_CACHE`. The cache is pruned to a size ceiling
+(`DOCSLICER_MCP_CACHE_MAX_MB`, default 2048 MB); otherwise it persists until you
+delete it, and deleting the directory removes it permanently with no copy
+retained elsewhere. Nothing is written outside the cache directory and any
+output path you supply.
+
+**Network access and third parties.** No network request is made for a local
+file. Requests leave your machine only when you pass an `http(s)` source: that
+URL is fetched directly from the host you named, and for HTML pages Playwright
+may load the subresources that page references, exactly as a browser would.
+Requests to `sec.gov` send a `User-Agent` header identifying the client, as the
+SEC fair-access policy requires. These hosts are third parties chosen by you,
+not by DocSlicer, and their own policies govern what they log. Set
+`DOCSLICER_MCP_ALLOW_URLS=0` to reject remote sources entirely.
+
+**Third-party clients.** When DocSlicer runs as an MCP server, the client
+(Claude, Cursor, …) handles the conversation under its own privacy policy.
+DocSlicer is not a party to that and receives nothing from it.
+
+**Contact.** Privacy questions: jelle@docslicer.ai · Issues:
+<https://github.com/DocSlicer/DocSlicer/issues>
 
 ---
 
