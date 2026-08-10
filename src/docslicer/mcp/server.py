@@ -34,13 +34,14 @@ import re
 import sys
 import tempfile
 from collections import Counter
+from collections.abc import Iterator
 from pathlib import Path
 from typing import TextIO
 
 import anyio
 
 from .. import __version__, parse_document
-from .._result import Chunk, HierarchyNode
+from .._result import Block, Chunk, HierarchyNode
 from ._store import (
     DocumentStore,
     allowed_root,
@@ -87,6 +88,25 @@ _store = DocumentStore()
 
 # What merge_small_chunks joins absorbed headings with (step_08_chunk_builder).
 _MERGED_SEP = " | "
+
+# Block roles the chunk builder treats as headings, and the ones it drops before
+# assembling chunk text (`_HEADING_BLOCK_TYPES` / `_NOISE_BLOCK_TYPES` in
+# step_08_chunk_builder). Mirrored here because `read` renders blocks directly:
+# what it returns should be what the same text looked like coming from a chunk.
+_HEADING_BLOCKS = frozenset({
+    "heading",
+    "toc_heading",
+    "exhibit_heading",
+    "hybrid_heading_paragraph",
+})
+_NOISE_BLOCKS = frozenset({
+    "hr",
+    "page_label",
+    "image",
+    "suppressed_repeated_heading",
+    "navigation",
+    "vertical_text",
+})
 
 # Separates a heading from its ancestors, both in requests and in path lines.
 _PATH_SEP = ">"
@@ -191,7 +211,7 @@ async def parse(
     if _serve_whole(result):
         # The whole document, in `read`'s format — so a citation drawn from it
         # means what a citation drawn from `read` means.
-        payload["text"] = _join_chunks(result.chunks)
+        payload["text"] = _whole_text(result)
         payload["is_complete"] = True
         payload["note"] = (
             "Short document — this is its full text, not an outline."
@@ -248,6 +268,10 @@ async def read(doc_id: str, headings: list[str]) -> dict:
     its subsections, so it returns roughly the tokens the outline printed
     against it — prefer a subsection when the parent is large.
 
+    Asking for a heading and one nested under it returns the ancestor alone,
+    since its text already carries the other; the ones folded in are listed
+    back as "already_included".
+
     Outline indentation shows nesting. If a heading appears in more than one
     place, prefix any ancestor with ">" to pick one — "Notes > Revenue". The
     full chain is not needed. Unqualified, it returns every match.
@@ -265,30 +289,47 @@ async def read(doc_id: str, headings: list[str]) -> dict:
     result = _store.get(doc_id)
 
     sizes = _size_map(result)
-    sections: list[str] = []
-    tokens = 0
+    blocks = _heading_blocks(result) if _has_blocks(result) else None
+
+    resolved: list[HierarchyNode] = []
     seen: set[int] = set()
     for heading in headings:
         for node in _resolve(result, heading):
             if node.heading_id in seen:
                 continue
             seen.add(node.heading_id)
+            resolved.append(node)
 
-            merged = _merged_chunk(result, node.text)
-            if merged is not None:
-                body = f"{_page_marker(merged)}\n\n{_slice_merged(merged, node.text)}"
-            else:
-                body = _join_chunks(result.chunks_under(node))
-            # The same per-heading figure the outline quoted for this node, so
-            # what a read cost matches what it was advertised to cost.
-            tokens += sizes.get(node.heading_id, 0)
-            sections.append(_format(node, body))
+    nodes, absorbed = _drop_nested(resolved)
 
-    return {
+    sections: list[str] = []
+    tokens = 0
+    for node in nodes:
+        if blocks is not None:
+            body = _render(result.blocks_under(node), blocks)
+        else:
+            body = _join_chunks(result.chunks_under(node))
+        # The same per-heading figure the outline quoted for this node, so
+        # what a read cost matches what it was advertised to cost.
+        tokens += sizes.get(node.heading_id, 0)
+        sections.append(_format(node, body))
+
+    response = {
         "doc_id": doc_id,
         "text": "\n\n".join(sections),
         "tokens_returned": tokens,
     }
+    if absorbed:
+        response["already_included"] = [
+            {"heading": child.text, "returned_under": parent.text}
+            for child, parent in absorbed
+        ]
+        response["note"] = (
+            "Headings listed in 'already_included' were not returned separately:"
+            " each sits under a section you also asked for, whose text contains"
+            " it. Nothing is missing — read the ancestor's text for them."
+        )
+    return response
 
 
 @mcp.tool(
@@ -521,22 +562,36 @@ def _outline(result) -> str:
     return "\n".join(lines)
 
 
-def _size_map(result) -> dict[int, int]:
-    """Estimated tokens per heading_id, subsections included.
+def _has_blocks(result) -> bool:
+    """Whether the hierarchy carries block ids, the basis for reading a heading.
 
-    Mirrors what ``read`` assembles: ``chunks_under`` recursively, less the
-    double counting of merged chunks, which name several headings but are
-    attributed to the first of them alone.
+    They are populated for every format the pipeline handles, but a document
+    parsed without them would send ``blocks_under`` to its page-range fallback,
+    which returns whatever shares a page with the section — silently, and often
+    far more than was asked for. Reading chunks is the worse answer for a
+    heading the chunk builder merged away; guessing is worse than both.
     """
-    tokens = {chunk.id: chunk.token_count for chunk in result.chunks}
-    shares = _merged_shares(result)
+    return any(node.block_ids for node in result.hierarchy.flatten())
+
+
+def _size_map(result) -> dict[int, int]:
+    """Tokens per heading_id, subsections included.
+
+    Counts what ``read`` renders: the blocks under a heading, the same ones and
+    with the same furniture dropped. Blocks belong to exactly one heading, so
+    each node's own content is a plain sum and the descent adds the rest — no
+    heading can be credited with another's text, however they are named.
+    """
+    by_blocks = _has_blocks(result)
+    if by_blocks:
+        tokens = {block.id: block.token_count for block in result.blocks if _readable(block)}
+    else:
+        tokens = {chunk.id: chunk.token_count for chunk in result.chunks}
+
     totals: dict[int, int] = {}
 
     def _visit(node: HierarchyNode) -> int:
-        if node.text in shares:
-            own = shares[node.text]
-        else:
-            own = sum(tokens.get(cid, 0) for cid in node.chunk_ids)
+        own = sum(tokens.get(i, 0) for i in (node.block_ids if by_blocks else node.chunk_ids))
         total = own + sum(_visit(child) for child in node.children)
         totals[node.heading_id] = total
         return total
@@ -544,31 +599,6 @@ def _size_map(result) -> dict[int, int]:
     for root in result.hierarchy.roots:
         _visit(root)
     return totals
-
-
-def _merged_shares(result) -> dict[str, int]:
-    """Per-heading token share of every merged chunk, keyed by heading text.
-
-    Without this, a merged chunk counts once in full against whichever heading
-    it was attributed to and zero against the rest — so one heading in the
-    outline looks expensive and its neighbours look empty. Splitting the chunk
-    the way ``read`` splits it puts each share on the right line.
-
-    Keying by text is what ``_merged_chunk`` already does, and inherits its
-    limit: two headings with identical text share one figure.
-    """
-    shares: dict[str, int] = {}
-    for chunk in result.chunks:
-        parts = [p.strip() for p in (chunk.heading or "").split(_MERGED_SEP)]
-        if len(parts) < 2:
-            continue
-        # Split the chunk's own token count by each heading's share of its
-        # characters, rather than re-estimating the slices: a merged heading is
-        # then counted on the same basis as every other one.
-        chars = len(chunk.text) or 1
-        for part in parts:
-            shares[part] = round(chunk.token_count * len(_slice_merged(chunk, part)) / chars)
-    return shares
 
 
 def _human(tokens: int) -> str:
@@ -860,6 +890,43 @@ def _resolve(result, query: str) -> list[HierarchyNode]:
     return matches
 
 
+def _drop_nested(
+    nodes: list[HierarchyNode],
+) -> tuple[list[HierarchyNode], list[tuple[HierarchyNode, HierarchyNode]]]:
+    """Requested headings with the ones an ancestor already returns removed.
+
+    A heading returns its subsections, so asking for "Results of Operations"
+    and "Revenues" — where the second is under the first — renders the second
+    twice: once inside its parent's text and once on its own. The duplicate is
+    invisible in the request, since the outline is what shows the nesting and
+    the two headings name unrelated-sounding things.
+
+    Only strict containment is dropped, and always in favour of the ancestor:
+    it is the one whose text is a superset, so nothing the caller asked for
+    goes unread. Order is the caller's, and a child under an ancestor several
+    levels up is caught the same as a direct one.
+    """
+    requested = {node.heading_id: node for node in nodes}
+    covered: dict[int, HierarchyNode] = {}
+    for node in nodes:
+        for descendant in _walk(node):
+            if descendant.heading_id == node.heading_id:
+                continue
+            if descendant.heading_id in requested:
+                covered.setdefault(descendant.heading_id, node)
+
+    kept = [node for node in nodes if node.heading_id not in covered]
+    absorbed = [(requested[hid], parent) for hid, parent in covered.items()]
+    return kept, absorbed
+
+
+def _walk(node: HierarchyNode) -> Iterator[HierarchyNode]:
+    """The node and every heading beneath it."""
+    yield node
+    for child in node.children:
+        yield from _walk(child)
+
+
 def _under(node: HierarchyNode, ancestors: list[str]) -> bool:
     """Whether the node's path contains these ancestors, in order."""
     remaining = [a.casefold() for a in ancestors]
@@ -869,55 +936,112 @@ def _under(node: HierarchyNode, ancestors: list[str]) -> bool:
     return not remaining
 
 
-def _merged_chunk(result, heading: str) -> Chunk | None:
-    """The chunk several small headings were folded into, if this is one of them.
+def _whole_text(result) -> str:
+    """The entire document in the format ``read`` returns a section in.
 
-    merge_small_chunks joins the headings it absorbs with " | " into a single
-    chunk_heading, and attributes the chunk to the first of them only — every
-    other heading is left with no chunk_ids at all. Finding the chunk by its
-    heading is what keeps those headings readable.
+    Every block in document order rather than a walk of the hierarchy: text
+    ahead of the first heading belongs to no node, and on a short document —
+    the only kind served whole — that is regularly the part worth reading.
     """
-    for chunk in result.chunks:
-        parts = [p.strip() for p in (chunk.heading or "").split(_MERGED_SEP)]
-        if len(parts) > 1 and heading in parts:
-            return chunk
-    return None
+    if _has_blocks(result):
+        return _render(result.blocks, _heading_blocks(result))
+    return _join_chunks(result.chunks)
 
 
-def _slice_merged(chunk: Chunk, heading: str) -> str:
-    """The one heading's share of a merged chunk, from its marker to the next.
+def _readable(block: Block) -> bool:
+    """Whether a block is text a reader wants, rather than layout furniture.
 
-    Falls back to the whole chunk when the marker is missing: over-returning is
-    recoverable, returning nothing is not.
+    Page-number blocks, rules and images carry nothing to read — the chunk
+    builder drops them before assembling chunk text, and a page number rendered
+    into the middle of a section reads as body text.
+
+    Sections are not filtered, though ``search`` skips several of them. Skipping
+    a table of contents there keeps it from outranking every section it names;
+    skipping it here would answer a request to read it with nothing at all, and
+    a heading in the outline that returns empty is a dead end.
     """
-    lines = chunk.text.splitlines()
-    marker = f"## {heading}"
-    try:
-        start = lines.index(marker)
-    except ValueError:
-        return chunk.text
-
-    end = len(lines)
-    for i in range(start + 1, len(lines)):
-        if lines[i].startswith("## "):
-            end = i
-            break
-    return "\n".join(lines[start:end]).strip()
+    return block.type not in _NOISE_BLOCKS and bool(block.text.strip())
 
 
-def _join_chunks(chunks: list[Chunk]) -> str:
-    """Chunks joined into one contiguous run, marked where the page turns.
+def _heading_blocks(result) -> dict[str, str]:
+    """Heading text keyed by the block it is written in.
 
-    A heading whose content spans several chunks is repeated at the top of each
-    one — right for RAG, where a chunk is retrieved alone, redundant here where
-    the chunks are joined back together. Consecutive repeats are dropped; a new
-    subsection heading is kept, since it is real structure.
+    A heading block holds the heading as it appeared on the page; the hierarchy
+    holds it as a heading. Usually those are the same string, but a
+    ``hybrid_heading_paragraph`` is a paragraph that opens with its own heading
+    ("Risk factors. The Group is exposed to…"), and only the hierarchy knows
+    where the heading ends and the sentence begins.
+
+    A node's ``block_ids`` open with its heading block, in document order — the
+    same order ``blocks_under`` returns, since both come from the blocks frame.
+    """
+    order = {block.id: i for i, block in enumerate(result.blocks)}
+    kinds = {block.id: block.type for block in result.blocks}
+
+    texts: dict[str, str] = {}
+    for node in result.hierarchy.flatten():
+        own = [bid for bid in node.block_ids if kinds.get(bid) in _HEADING_BLOCKS]
+        if own:
+            texts[min(own, key=lambda bid: order.get(bid, 0))] = node.text
+    return texts
+
+
+def _render(blocks: list[Block], headings: dict[str, str]) -> str:
+    """Blocks as readable markdown, marked where the page turns.
+
+    Assembled the way the chunk builder assembles chunk text — headings under a
+    ``##`` marker, everything else joined as it stands, tables already carrying
+    their markdown — so a section reads the same whichever produced it. What it
+    does not reproduce is the chunk builder repeating a heading at the top of
+    every chunk it spans, which is right for RAG, where a chunk is retrieved
+    alone, and noise here.
 
     Page markers are what make the result citable. A section is regularly a
     dozen pages long, so a single page attributed to the whole of it would be
     wrong for everything after the first — a citation the reader follows to a
     page that does not hold the figure. Marking each turn lets a claim be
     traced to the page it actually came from.
+    """
+    parts: list[str] = []
+    page = None
+    for block in blocks:
+        if not _readable(block):
+            continue
+
+        if block.page_number != page:
+            page = block.page_number
+            parts.append(_page_marker(block))
+
+        text = block.text.strip()
+        if block.type in _HEADING_BLOCKS:
+            # For a hybrid block the heading is a prefix of the paragraph; the
+            # sentence it opens is body text and follows the marker.
+            heading = headings.get(block.id, text)
+            body = text[len(heading):].strip() if text.startswith(heading) else ""
+            parts.append(f"## {heading}")
+            if body:
+                parts.append(body)
+        else:
+            parts.append(text)
+    return "\n\n".join(parts)
+
+
+def _join_chunks(chunks: list[Chunk]) -> str:
+    """Chunks joined into one contiguous run, marked where the page turns.
+
+    The fallback for a document whose hierarchy carries no block ids; ``_render``
+    is the path everything else takes. Chunks are a lossy unit to read a heading
+    from — the chunk builder merges small sections together and attributes the
+    result to one of them — so this returns nothing for a heading that was
+    merged away, and the whole merged run for the heading that kept it.
+
+    A heading whose content spans several chunks is repeated at the top of each
+    one — right for RAG, where a chunk is retrieved alone, redundant here where
+    the chunks are joined back together. Consecutive repeats are dropped; a new
+    subsection heading is kept, since it is real structure.
+
+    Page markers are placed as ``_render`` places them, and for the same reason,
+    but only as finely as chunk boundaries allow.
     """
     parts: list[str] = []
     previous = ""
@@ -938,8 +1062,8 @@ def _join_chunks(chunks: list[Chunk]) -> str:
     return "\n\n".join(parts)
 
 
-def _page_ref(chunk: Chunk) -> str:
-    """How the document itself refers to the page a chunk is on.
+def _page_ref(chunk: Chunk | Block) -> str:
+    """How the document itself refers to the page a chunk or block is on.
 
     The label when there is one, the ordinal only as a fallback. On a filing
     whose 245th page prints "S-23", the ordinal is the one number a reader
@@ -950,7 +1074,7 @@ def _page_ref(chunk: Chunk) -> str:
     return chunk.page_label or str(chunk.page_number)
 
 
-def _page_marker(chunk: Chunk) -> str:
+def _page_marker(chunk: Chunk | Block) -> str:
     """Marks the text below it as being on this page.
 
     Deliberately not ``export_to_markdown``'s ``<!-- page 19 -->``, which reads

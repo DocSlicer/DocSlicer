@@ -134,6 +134,7 @@ class Block:
     link_url: list[str]                              # unique URLs found in block
     table_ids: list[str]                             # table IDs referenced in block
     chart_ids: list[str] = field(default_factory=list)  # chart IDs referenced in block (docx/pptx)
+    token_count: int = 0                             # counted like Chunk.token_count, for budgeting a read
     extra: dict = field(default_factory=dict)        # caller-requested extra fields from the pipeline df
 
     @classmethod
@@ -151,6 +152,7 @@ class Block:
             link_url=d.get("link_url", []),
             table_ids=[_norm_id(v) for v in d.get("table_ids", [])],
             chart_ids=[_norm_id(v) for v in d.get("chart_ids", [])],
+            token_count=d.get("token_count", 0),
             extra=d.get("extra", {}),
         )
 

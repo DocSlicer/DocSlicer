@@ -306,6 +306,7 @@ def _build_blocks(df_blocks: pd.DataFrame, extra_fields: list[str] | None = None
             link_url=_str_list(row, "link_url"),
             table_ids=_str_list(row, "table_id"),
             chart_ids=_str_list(row, "chart_id"),
+            token_count=int(row.get("token_count", 0) or 0),
             extra=_extra(row, _extra_fields),
         ))
     return out

@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.os }} · py${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Every interpreter on Linux; the two endpoints on macOS and Windows.
+        # The middle versions differ from their neighbours only in ways the
+        # OS matrix does not interact with, so pinning all fifteen buys
+        # queue time rather than signal.
+        os: [ubuntu-latest]
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        include:
+          - os: macos-latest
+            python-version: "3.10"
+          - os: macos-latest
+            python-version: "3.14"
+          - os: windows-latest
+            python-version: "3.10"
+          - os: windows-latest
+            python-version: "3.14"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      # No [html]: the HTML tests parse a local file with the static
+      # extractor, and installing Playwright would add a browser download to
+      # every job in the matrix. No [ocr]: tesserocr needs system Tesseract,
+      # and the scanned-PDF fixture already skips when it is absent.
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[mcp,llm,dev]'
+
+      - name: Test
+        run: pytest -q
+
+  build:
+    name: Build distributions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build wheel + sdist
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m build
+
+      # Catches the metadata faults that only surface at upload time —
+      # a malformed README renders as a blank PyPI page, and the fix is
+      # another release.
+      - name: Check metadata
+        run: twine check dist/*
+
+  extension-lock:
+    name: Extension lock is current
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+
+      # The bundle pins docslicer and every transitive dependency by hash, and
+      # nothing at install time re-resolves it. A lock left behind by a version
+      # bump ships the previous release to everyone who installs the .mcpb, so
+      # a drifted lock fails here rather than in someone's Claude Desktop.
+      - name: uv lock --check
+        working-directory: extension
+        run: uv lock --check
