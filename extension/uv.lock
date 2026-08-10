@@ -345,7 +345,7 @@ wheels = [
 
 [[package]]
 name = "docslicer"
-version = "0.2.1"
+version = "0.2.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "beautifulsoup4" },
@@ -361,9 +361,9 @@ dependencies = [
     { name = "pypdfium2" },
     { name = "pyyaml" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/9a/f2/a226b6221808c2821591b2c2397ef03371d820587efed25774d6e41dc5fa/docslicer-0.2.1.tar.gz", hash = "sha256:92ac9cc1666d1fafa88c36b5112ba2ba03cfbb63691d8fa48b75c3026c19aed6", size = 632615, upload-time = "2026-08-09T04:49:03.036Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/ec/a3/c2379f079e5288452d27cd593216b4109153075bc13085f637b938a0c7f9/docslicer-0.2.2.tar.gz", hash = "sha256:af91f592dbe4326902089d7d14589d43be96dfe3dc9a6f2a78f705f111e97a8f", size = 650071, upload-time = "2026-08-10T01:05:11.214Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/93/4e/f589402b4a158a5553964768ba06b35e98e3c068905dd687e3a99a530833/docslicer-0.2.1-py3-none-any.whl", hash = "sha256:4f6f857a8e3c53ca05e8769a581ad2f4ea19b3b6eb85e92c4133e6b81d2450a2", size = 684261, upload-time = "2026-08-09T04:49:01.531Z" },
+    { url = "https://files.pythonhosted.org/packages/62/cf/afb3f675577aeed287accc43947932c465ce58d177a7371aafb0c80f5d52/docslicer-0.2.2-py3-none-any.whl", hash = "sha256:ca14710fb89e47dcbc92ca4adc1c1289f5496713720cf74fc26133c0cf6c7f31", size = 688741, upload-time = "2026-08-10T01:05:09.424Z" },
 ]
 
 [package.optional-dependencies]
@@ -377,14 +377,14 @@ mcp = [
 
 [[package]]
 name = "docslicer-mcpb"
-version = "0.2.1"
+version = "0.2.2"
 source = { virtual = "." }
 dependencies = [
     { name = "docslicer", extra = ["html", "mcp"] },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "docslicer", extras = ["mcp", "html"], specifier = ">=0.2.1" }]
+requires-dist = [{ name = "docslicer", extras = ["mcp", "html"], specifier = ">=0.2.2" }]
 
 [[package]]
 name = "exceptiongroup"
