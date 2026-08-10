@@ -21,6 +21,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 
+from .. import __version__
 from .._result import ParseResult
 
 _MEMORY_LIMIT = 8  # ParseResults kept hot in RAM
@@ -137,8 +138,14 @@ def resolve_output(path: str, base: Path | None = None) -> Path:
 
 
 def make_doc_id(source: str, options: dict) -> str:
-    """Stable handle for a (source, options, file-version) triple."""
-    fingerprint = {"source": source, "options": options}
+    """Stable handle for a (source, options, file-version, docslicer-version) quad.
+
+    The version is in the fingerprint because a cached parse is a snapshot of
+    what the pipeline produced at the time, fields and all. A release that adds
+    one — block token counts, say — would otherwise be served stale records
+    missing it, and a missing field reads as a zero rather than an error.
+    """
+    fingerprint = {"source": source, "options": options, "docslicer": __version__}
     if not is_url(source):
         try:
             stat = Path(source).stat()

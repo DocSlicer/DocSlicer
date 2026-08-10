@@ -2,7 +2,7 @@
   "manifest_version": "0.4",
   "name": "docslicer",
   "display_name": "DocSlicer",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Deterministic hierarchical document parser and chunker for PDF, DOCX, PPTX and HTML.",
   "long_description": "DocSlicer parses documents into a heading hierarchy and lets the model pull in only the slices it needs. `parse` registers a document and returns a doc_id plus an outline; `read`, `search` and `get_outline` return bounded slices against that handle; `to_markdown` writes the whole document to disk without loading it into context.",
   "author": {
@@ -61,7 +61,6 @@
     }
   },
   "compatibility": {
-    "platforms": ["darwin", "win32"],
-    "runtimes": { "python": ">=3.10" }
+    "platforms": ["darwin", "win32"]
   }
 }

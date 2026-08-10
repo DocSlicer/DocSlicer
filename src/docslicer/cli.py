@@ -112,10 +112,15 @@ def main():
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
 
-    out = json.dumps([c.to_dict() for c in result.chunks], indent=2)
+    # --no-chunking stops the pipeline before chunks exist, so blocks are the
+    # unit it has to return; serializing chunks regardless printed an empty
+    # list for the one flag whose whole purpose is to produce output faster.
+    records = result.blocks if args.no_chunking else result.chunks
+    label = "blocks" if args.no_chunking else "chunks"
+    out = json.dumps([r.to_dict() for r in records], indent=2)
 
     if args.output:
         Path(args.output).write_text(out, encoding="utf-8")
-        print(f"Wrote {len(result.chunks)} chunks to {args.output}")
+        print(f"Wrote {len(records)} {label} to {args.output}")
     else:
         print(out)

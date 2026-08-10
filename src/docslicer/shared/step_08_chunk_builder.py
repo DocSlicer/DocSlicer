@@ -1498,20 +1498,20 @@ def token_encoder():
         return None
 
 
-def _add_token_count(chunks_df: pd.DataFrame, exact_tokens: bool = False) -> pd.DataFrame:
+def add_token_count(df: pd.DataFrame, exact_tokens: bool = False) -> pd.DataFrame:
     """
-    Add token_count to each chunk.
+    Add token_count to each row of a text-bearing frame (chunks or blocks).
 
     If exact_tokens=True, uses tiktoken (cl100k_base) and falls back to
     char-count estimation when it is unavailable.
     If exact_tokens=False, always uses embed_char_count // 4.
     """
-    if chunks_df is None or chunks_df.empty:
-        chunks_df = chunks_df.copy() if chunks_df is not None else pd.DataFrame()
-        chunks_df["token_count"] = 0
-        return chunks_df
+    if df is None or df.empty:
+        df = df.copy() if df is not None else pd.DataFrame()
+        df["token_count"] = 0
+        return df
 
-    df = chunks_df.copy()
+    df = df.copy()
 
     encoding = token_encoder() if exact_tokens else None
 
@@ -1524,6 +1524,10 @@ def _add_token_count(chunks_df: pd.DataFrame, exact_tokens: bool = False) -> pd.
         df["token_count"] = (char_counts.fillna(0).astype(int) // 4).astype(int)
 
     return df
+
+
+# Kept for the in-module call sites that only ever pass chunks.
+_add_token_count = add_token_count
 
 
 def _add_chunk_ids_and_reindex(chunks_df: pd.DataFrame) -> pd.DataFrame:

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "docslicer"
-version = "0.2.1"
+version = "0.2.2"
 description = "Deterministic hierarchical document parser and chunker"
 readme = "README.md"
 license = "AGPL-3.0-only"

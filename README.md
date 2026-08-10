@@ -616,6 +616,22 @@ can write anywhere the server process can.
 
 ---
 
+## Command line
+
+`docslicer` parses one document to JSON on stdout — for a quick look at a file,
+or to pipe into `jq`.
+
+```bash
+docslicer report.pdf                   # chunks as JSON
+docslicer report.pdf -o chunks.json    # write to a file
+docslicer report.pdf --no-chunking     # blocks instead of chunks
+```
+
+It takes the same parsing and chunking options as `parse_document`; run
+`docslicer --help` for the full list.
+
+---
+
 ## Format-specific functions
 
 If you know the format upfront and want explicit failure on unexpected input, use the
@@ -679,3 +695,15 @@ DocSlicer is **dual-licensed**:
 - **[Commercial license](LICENSE-COMMERCIAL.md)** — for embedding DocSlicer in a closed-source or proprietary product, or offering it as part of a hosted/SaaS service without releasing your source.
 
 See [LICENSE-COMMERCIAL.md](LICENSE-COMMERCIAL.md) for details, or reach out about a commercial license.
+
+---
+
+<!--
+  Ownership marker for the official MCP registry (registry.modelcontextprotocol.io).
+  The registry verifies a PyPI package by looking for this exact line in the
+  project description, which is this README — so it only takes effect once a
+  release carrying it is published. Namespace matches the GitHub org that owns
+  the repository. Leave it in place; removing it breaks re-publication.
+-->
+
+mcp-name: io.github.DocSlicer/docslicer

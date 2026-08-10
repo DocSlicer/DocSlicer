@@ -33,7 +33,7 @@ from .step_06_hierarchy_builder import assign_doc_hierarchy
 
 # Shared Pipeline Steps
 from .step_07_block_merger import merge_blocks
-from .step_08_chunk_builder import build_chunks
+from .step_08_chunk_builder import add_token_count, build_chunks
 
 # Config loaders
 from .._utils.io.yaml_loader import load_yamls
@@ -135,6 +135,12 @@ def run_pipeline(
             chart_points_df,
             table_representation=config.table_representation,
         )
+
+    # Blocks are a retrieval unit in their own right — consumers that read a
+    # heading's blocks rather than its chunks need to budget the same way, and
+    # a merged chunk cannot be attributed back to the headings it absorbed.
+    # Counted on the same basis as chunks so the two figures are comparable.
+    df_blocks = add_token_count(df_blocks, exact_tokens=config.exact_tokens)
 
     # Step 07 - Chunk Building (blocks -> chunks)
     if not config.chunking:
