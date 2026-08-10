@@ -85,7 +85,7 @@ def test_export_charts_csv(pptx_result, tmp_path):
     path = tmp_path / "charts.csv"
     pptx_result.export_charts_csv(path)
     assert path.exists()
-    lines = path.read_text().splitlines()
+    lines = path.read_text(encoding="utf-8").splitlines()
     # header + one row per datapoint
     assert len(lines) == 1 + sum(len(c.points) for c in pptx_result.charts)
 

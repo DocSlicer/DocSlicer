@@ -1,0 +1,275 @@
+name: Release
+
+# Cutting a release is five artifacts that must agree with each other: the tag,
+# the PyPI distributions, the extension lockfile, the .mcpb bundle, and the
+# registry metadata that names the bundle by URL and hash. Every past release
+# drifted somewhere in that chain, so the chain runs here rather than by hand.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  # Nothing downstream is reversible: PyPI refuses a re-upload of a version, and
+  # the MCP registry refuses a re-publish of one. So every version string in the
+  # tree is checked against the tag before anything is published.
+  verify:
+    name: Versions agree with the tag
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: v
+        name: Extract version from tag
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+
+      - name: Check every version string
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          set -euo pipefail
+          fail=0
+          check() {
+            if [ "$2" != "$VERSION" ]; then
+              echo "::error::$1 is '$2', expected '$VERSION'"
+              fail=1
+            fi
+          }
+
+          check "pyproject.toml"           "$(python -c 'import tomllib;print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])')"
+          check "extension/pyproject.toml" "$(python -c 'import tomllib;print(tomllib.load(open("extension/pyproject.toml","rb"))["project"]["version"])')"
+          check "extension/manifest.json"  "$(jq -r .version extension/manifest.json)"
+          check "server.json"              "$(jq -r .version server.json)"
+          check "server.json pypi pkg"     "$(jq -r '.packages[]|select(.registryType=="pypi").version' server.json)"
+          check "server.json mcpb pkg"     "$(jq -r '.packages[]|select(.registryType=="mcpb").version' server.json)"
+
+          # The uvx pin and the bundle URL embed the version inside a longer
+          # string, where a stale value is easiest to miss by eye.
+          uvx_pin="$(jq -r '.packages[]|select(.registryType=="pypi")|.runtimeArguments[]|select(.name=="--from").value' server.json)"
+          check "server.json uvx --from pin" "${uvx_pin##*==}"
+
+          mcpb_url="$(jq -r '.packages[]|select(.registryType=="mcpb").identifier' server.json)"
+          expected_url="https://github.com/DocSlicer/DocSlicer/releases/download/v$VERSION/docslicer-$VERSION.mcpb"
+          if [ "$mcpb_url" != "$expected_url" ]; then
+            echo "::error::server.json mcpb identifier is '$mcpb_url', expected '$expected_url'"
+            fail=1
+          fi
+
+          exit $fail
+
+  build:
+    name: Build wheel + sdist
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m build
+          twine check dist/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: distributions
+          path: dist/*
+
+  pypi:
+    name: Publish to PyPI
+    needs: [verify, build]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write # Trusted Publishing — no API token stored anywhere.
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: distributions
+          path: dist
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  # The bundle pins docslicer by hash through extension/uv.lock, so it can only
+  # be locked after the release exists on PyPI. That ordering is why the lock has
+  # historically drifted: it is inherently a post-publish step.
+  bundle:
+    name: Pack and attach the .mcpb
+    needs: [verify, pypi]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # Creates the release and uploads the bundle.
+    outputs:
+      sha256: ${{ steps.hash.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "lts/*"
+
+      # PyPI's CDN serves a new release to the JSON API before uv can always
+      # resolve it. Without this wait the lock silently pins the previous
+      # version, which is exactly the failure this workflow exists to prevent.
+      - name: Wait for the release to be resolvable on PyPI
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 30); do
+            if curl -sf "https://pypi.org/pypi/docslicer/$VERSION/json" > /dev/null; then
+              echo "docslicer $VERSION is live on PyPI (attempt $attempt)"
+              exit 0
+            fi
+            echo "not yet visible; retrying in 10s (attempt $attempt/30)"
+            sleep 10
+          done
+          echo "::error::docslicer $VERSION never appeared on PyPI after 5 minutes"
+          exit 1
+
+      - name: Relock the extension against the published release
+        working-directory: extension
+        run: uv lock --upgrade-package docslicer
+
+      - name: Confirm the lock actually moved to this version
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+          locked="$(python -c 'import tomllib;print(next(p["version"] for p in tomllib.load(open("extension/uv.lock","rb"))["package"] if p["name"]=="docslicer"))')"
+          if [ "$locked" != "$VERSION" ]; then
+            echo "::error::extension/uv.lock pins docslicer $locked, expected $VERSION"
+            exit 1
+          fi
+
+      - name: Pack the bundle
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          npx --yes @anthropic-ai/mcpb@2 validate extension/manifest.json
+          npx --yes @anthropic-ai/mcpb@2 pack extension "dist/docslicer-$VERSION.mcpb"
+
+      - id: hash
+        name: Hash the bundle
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+          sha="$(sha256sum "dist/docslicer-$VERSION.mcpb" | cut -d' ' -f1)"
+          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+          echo "sha256($VERSION.mcpb) = $sha"
+
+      - name: Create or update the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+          if gh release view "v$VERSION" > /dev/null 2>&1; then
+            gh release upload "v$VERSION" "dist/docslicer-$VERSION.mcpb" --clobber
+          else
+            gh release create "v$VERSION" "dist/docslicer-$VERSION.mcpb" \
+              --title "v$VERSION" --generate-notes
+          fi
+
+      # Carries the refreshed lock to the follow-up PR job.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: extension-lock
+          path: extension/uv.lock
+
+  registry:
+    name: Publish to the MCP Registry
+    needs: [verify, bundle]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # OIDC grants io.github.DocSlicer/* from repository_owner.
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      # The committed fileSha256 is a placeholder: the bundle it describes does
+      # not exist until the job above builds it. Clients refuse a download whose
+      # hash does not match, so a stale or placeholder value here is worse than
+      # not being listed at all.
+      - name: Inject the bundle hash into server.json
+        env:
+          SHA256: ${{ needs.bundle.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$SHA256" | grep -Eq '^[0-9a-f]{64}$'; then
+            echo "::error::refusing to publish: '$SHA256' is not a sha256 digest"
+            exit 1
+          fi
+          if [ "$SHA256" = "0000000000000000000000000000000000000000000000000000000000000000" ]; then
+            echo "::error::refusing to publish the placeholder hash"
+            exit 1
+          fi
+          jq --arg s "$SHA256" \
+            '(.packages[] | select(.registryType=="mcpb")).fileSha256 = $s' \
+            server.json > server.tmp && mv server.tmp server.json
+          jq . server.json
+
+      - name: Install mcp-publisher
+        run: |
+          curl -L "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar xz mcp-publisher
+
+      - name: Authenticate
+        run: ./mcp-publisher login github-oidc
+
+      - name: Publish
+        run: ./mcp-publisher publish
+
+  # extension/uv.lock can only be correct after the release is on PyPI, so the
+  # committed copy is always one release behind at this point and the
+  # extension-lock CI job will fail on main until it is refreshed. That refresh
+  # has been a manual chore commit after every release; this opens it instead.
+  relock-pr:
+    name: Open the lockfile refresh PR
+    needs: [verify, bundle, registry]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: extension-lock
+          path: extension
+
+      - name: Open the PR if the lock moved
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- extension/uv.lock; then
+            echo "Lock already current on main; nothing to do."
+            exit 0
+          fi
+          branch="chore/relock-$VERSION"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git add extension/uv.lock
+          git commit -m "chore: relock extension against PyPI $VERSION"
+          git push origin "$branch"
+          gh pr create --base main --head "$branch" \
+            --title "chore: relock extension against PyPI $VERSION" \
+            --body "Refreshes \`extension/uv.lock\` against docslicer $VERSION, now published to PyPI. Opened automatically by the release workflow; the lock cannot be resolved before the release exists."

@@ -1,0 +1,79 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.DocSlicer/docslicer",
+  "title": "DocSlicer",
+  "description": "Answer questions from documents too large to fit in context, reading only the sections you need.",
+  "repository": {
+    "url": "https://github.com/DocSlicer/DocSlicer",
+    "source": "github"
+  },
+  "websiteUrl": "https://docslicer.ai",
+  "icons": [
+    {
+      "src": "https://raw.githubusercontent.com/DocSlicer/DocSlicer/main/extension/icon-512.png",
+      "mimeType": "image/png",
+      "sizes": ["512x512"]
+    }
+  ],
+  "version": "0.2.3",
+  "packages": [
+    {
+      "registryType": "mcpb",
+      "identifier": "https://github.com/DocSlicer/DocSlicer/releases/download/v0.2.3/docslicer-0.2.3.mcpb",
+      "version": "0.2.3",
+      "fileSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "DOCSLICER_MCP_ROOT",
+          "description": "Restrict file sources and outputs to this directory tree.",
+          "isRequired": true,
+          "format": "filepath"
+        },
+        {
+          "name": "DOCSLICER_MCP_ALLOW_URLS",
+          "description": "Set to 0 to reject http(s) sources and only permit local files.",
+          "default": "1"
+        }
+      ]
+    },
+    {
+      "registryType": "pypi",
+      "registryBaseUrl": "https://pypi.org",
+      "identifier": "docslicer",
+      "version": "0.2.3",
+      "runtimeHint": "uvx",
+      "transport": {
+        "type": "stdio"
+      },
+      "runtimeArguments": [
+        {
+          "type": "named",
+          "name": "--from",
+          "value": "docslicer[mcp]==0.2.3",
+          "isRequired": true
+        },
+        {
+          "type": "positional",
+          "value": "docslicer-mcp",
+          "isRequired": true
+        }
+      ],
+      "environmentVariables": [
+        {
+          "name": "DOCSLICER_MCP_ROOT",
+          "description": "Restrict file sources and outputs to this directory tree.",
+          "isRequired": true,
+          "format": "filepath"
+        },
+        {
+          "name": "DOCSLICER_MCP_ALLOW_URLS",
+          "description": "Set to 0 to reject http(s) sources and only permit local files.",
+          "default": "1"
+        }
+      ]
+    }
+  ]
+}

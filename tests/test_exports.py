@@ -65,7 +65,7 @@ def test_export_chunks_jsonl(pdf_result, tmp_path):
     path = tmp_path / "chunks.jsonl"
     pdf_result.export_chunks_jsonl(path)
     assert path.exists()
-    lines = path.read_text().splitlines()
+    lines = path.read_text(encoding="utf-8").splitlines()
     assert len(lines) == len(pdf_result.chunks)
     assert json.loads(lines[0])["id"] == pdf_result.chunks[0].id
 
@@ -102,7 +102,7 @@ def test_hierarchy_save(pdf_result, tmp_path):
     path = tmp_path / "hierarchy.json"
     pdf_result.hierarchy.save(path)
     assert path.exists()
-    data = json.loads(path.read_text())
+    data = json.loads(path.read_text(encoding="utf-8"))
     assert isinstance(data, list)
 
 
@@ -110,7 +110,7 @@ def test_hierarchy_save_minimal(pdf_result, tmp_path):
     path = tmp_path / "hierarchy_minimal.json"
     pdf_result.hierarchy.save(path, minimal=True)
     assert path.exists()
-    data = json.loads(path.read_text())
+    data = json.loads(path.read_text(encoding="utf-8"))
     assert isinstance(data, list)
     if data:
         assert set(data[0].keys()) <= {"text", "children"}
@@ -120,7 +120,7 @@ def test_hierarchy_save_outline(pdf_result, tmp_path):
     path = tmp_path / "outline.md"
     pdf_result.hierarchy.save_outline(path)
     assert path.exists()
-    content = path.read_text()
+    content = path.read_text(encoding="utf-8")
     assert isinstance(content, str)
 
 

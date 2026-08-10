@@ -1110,7 +1110,8 @@ class ParseResult:
             if self.charts:
                 _to_parquet(self.charts_df(), path / "charts.parquet")
             (path / "metadata.json").write_text(
-                json.dumps(self.metadata.to_dict(), indent=2, ensure_ascii=False)
+                json.dumps(self.metadata.to_dict(), indent=2, ensure_ascii=False),
+                encoding="utf-8",
             )
             return
 
@@ -1129,20 +1130,29 @@ class ParseResult:
         if stem == "metadata":
             if suffix != ".json":
                 raise ValueError("metadata can only be saved as .json")
-            path.write_text(json.dumps(self.metadata.to_dict(), indent=2, ensure_ascii=False))
+            path.write_text(
+                json.dumps(self.metadata.to_dict(), indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
             return
 
         # Unknown stem (e.g. "result") → full document export
         if stem not in level_map:
             if suffix != ".json":
                 raise ValueError(f"Unknown stem {stem!r}: use chunks/blocks/tables/charts/metadata, or a .json path for a full export")
-            path.write_text(json.dumps(self.to_dict(), indent=2, ensure_ascii=False))
+            path.write_text(
+                json.dumps(self.to_dict(), indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
             return
 
         rows_fn = level_map[stem]
 
         if suffix == ".json":
-            path.write_text(json.dumps(rows_fn(), indent=2, ensure_ascii=False))
+            path.write_text(
+                json.dumps(rows_fn(), indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
         elif suffix == ".jsonl":
             with path.open("w", encoding="utf-8") as f:
                 for row in rows_fn():

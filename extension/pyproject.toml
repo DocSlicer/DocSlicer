@@ -6,7 +6,12 @@
 # download; without one the pipeline falls back to the static extractor.
 [project]
 name = "docslicer-mcpb"
-version = "0.2.2"
+version = "0.2.3"
 description = "MCPB bundle for the DocSlicer MCP server."
 requires-python = ">=3.10"
+# Floor, not a pin. The exact version shipped in the bundle is fixed by
+# uv.lock, which the release workflow refreshes against PyPI after publishing.
+# Marching this in lockstep with each release deadlocks CI: the lock cannot
+# resolve a floor that is not on PyPI yet, and it cannot reach PyPI without a
+# green build.
 dependencies = ["docslicer[mcp,html]>=0.2.2"]

@@ -2,9 +2,9 @@
   "manifest_version": "0.4",
   "name": "docslicer",
   "display_name": "DocSlicer",
-  "version": "0.2.2",
-  "description": "Deterministic hierarchical document parser and chunker for PDF, DOCX, PPTX and HTML.",
-  "long_description": "DocSlicer parses documents into a heading hierarchy and lets the model pull in only the slices it needs. `parse` registers a document and returns a doc_id plus an outline; `read`, `search` and `get_outline` return bounded slices against that handle; `to_markdown` writes the whole document to disk without loading it into context.",
+  "version": "0.2.3",
+  "description": "Answer questions from documents too large to fit in context, reading only the sections you need.",
+  "long_description": "Answer questions from documents too large to fit in context. `parse` returns a heading outline with the token cost of each section; `read` pulls back exactly the sections you pick, tables and page numbers intact for citation. A revenue question against a 500-page, 500k-token filing costs roughly 3.5k tokens — just the section that answers it. No embeddings, no fuzzy recall: same query, same text, every time. PDF, DOCX, PPTX and HTML, local file or URL.",
   "author": {
     "name": "Market Framer Inc.",
     "email": "jelle@docslicer.ai"

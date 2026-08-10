@@ -377,7 +377,7 @@ mcp = [
 
 [[package]]
 name = "docslicer-mcpb"
-version = "0.2.2"
+version = "0.2.3"
 source = { virtual = "." }
 dependencies = [
     { name = "docslicer", extra = ["html", "mcp"] },
