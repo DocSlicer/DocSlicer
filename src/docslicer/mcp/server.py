@@ -33,6 +33,7 @@ Environment:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import functools
 import io
 import math
@@ -62,6 +63,7 @@ from ._store import (
 
 try:
     from mcp.server import MCPServer as _Server
+    from mcp.server.mcpserver import Context
     from mcp.types import ToolAnnotations
 except ImportError as exc:  # pragma: no cover - depends on installed SDK
     raise ImportError(
@@ -149,6 +151,74 @@ async def _to_thread(func, *args, **kwargs):
     return await anyio.to_thread.run_sync(functools.partial(func, *args, **kwargs))
 
 
+# Only one parse runs at a time, however many the caller asks for at once.
+#
+# The pipeline opens documents through pdfium (steps 02, 03, 04, 10 and the
+# struct context), and pdfium keeps process-global state that pypdfium2 does no
+# locking around. Two parses on two threads therefore call into it
+# concurrently and corrupt the heap: the process dies with a SIGSEGV, wherever
+# the next allocation happens to land, and every in-flight request dies with
+# it. To the client that reads as "Request timed out" on all of them — the
+# server is gone, so nothing ever answers.
+#
+# Serialising costs no throughput. A single parse already fans its page-level
+# stages out across every performance core, so the second one was never running
+# in parallel with the first in any useful sense — it was contending with it.
+_PARSING = anyio.Lock()
+
+# How long a parse may hold the lock before the wait itself is the problem.
+# Progress notifications keep a queued caller's timeout from firing, but a
+# client that ignores them still has one, and a caller told to try again is
+# better served than one left holding a request that cannot land.
+_PARSE_QUEUE_TIMEOUT = 300
+
+
+async def _parse(source: str, password: str | None, options: dict, ctx: Context | None):
+    """Run one parse, queued behind any other, reporting progress while it waits.
+
+    Progress is what makes the queue survivable. A client resets its request
+    timeout whenever a progress notification arrives, so a caller waiting for
+    the lock is waiting visibly rather than running down a clock it cannot see.
+    Both phases report: queueing is most of the wait when two arrive together,
+    and the parse is most of it when one arrives alone.
+    """
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(_heartbeat, ctx, "Queued behind another parse")
+        with anyio.fail_after(_PARSE_QUEUE_TIMEOUT):
+            await _PARSING.acquire()
+        tg.cancel_scope.cancel()
+
+    try:
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(_heartbeat, ctx, f"Parsing {Path(source).name}")
+            result = await _to_thread(parse_document, source, password=password, **options)
+            tg.cancel_scope.cancel()
+    finally:
+        _PARSING.release()
+    return result
+
+
+async def _heartbeat(ctx: Context | None, message: str, every: float = 5.0) -> None:
+    """Tell the client the request is still alive, until cancelled.
+
+    Sent on a timer rather than at pipeline milestones: the point is to prove
+    the server is responsive, and a stage that runs long without emitting
+    anything is exactly when that proof is needed. `progress` climbs without
+    ever reaching `total`, because how far along a parse is is not knowable
+    before it finishes — the number is a liveness signal, not an estimate.
+    """
+    if ctx is None:
+        return
+    elapsed = 0.0
+    while True:
+        await anyio.sleep(every)
+        elapsed += every
+        with contextlib.suppress(Exception):
+            # A client that never sent a progressToken makes this a no-op, and
+            # a failure to report progress must not fail the parse itself.
+            await ctx.report_progress(elapsed, None, message)
+
+
 # ===========================================================================
 # Tools
 # ===========================================================================
@@ -166,6 +236,7 @@ async def parse(
     source: str,
     password: str | None = None,
     refresh: bool = False,
+    ctx: Context | None = None,
 ) -> dict:
     """Parse a document and return its heading outline. Call this first.
 
@@ -200,13 +271,11 @@ async def parse(
     if cached:
         result = _store.get(cached)
     else:
-        result = await _to_thread(
-            parse_document,
-            resolved,
-            password=password,
-            **options,
-        )
-        _store.put(doc_id, result, resolved, options)
+        result = await _parse(resolved, password, options, ctx)
+        # Serialising a filing's ParseResult runs to tens of megabytes; on the
+        # event loop that stalls every other request, the progress
+        # notifications included.
+        await _to_thread(_store.put, doc_id, result, resolved, options)
 
     meta = result.metadata
     payload = {
@@ -414,6 +483,7 @@ async def to_markdown(
     doc_id: str | None = None,
     password: str | None = None,
     output_path: str | None = None,
+    ctx: Context | None = None,
 ) -> dict:
     """Write the whole document to disk as markdown. Returns a path, not the text.
 
@@ -458,15 +528,10 @@ async def to_markdown(
             result = _store.get(cached)
         else:
             doc_id = make_doc_id(resolved, options)
-            result = await _to_thread(
-                parse_document,
-                resolved,
-                password=password,
-                **options,
-            )
+            result = await _parse(resolved, password, options, ctx)
             # Cached like any other parse, so a later parse/read/search on the
             # same document does not pay for it twice either.
-            _store.put(doc_id, result, resolved, options)
+            await _to_thread(_store.put, doc_id, result, resolved, options)
 
     markdown = await _to_thread(result.export_to_markdown)
 
