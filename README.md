@@ -605,7 +605,8 @@ document and the next `parse` re-parses it automatically.
 
 | Variable | Effect |
 | --- | --- |
-| `DOCSLICER_MCP_ROOT` | Restrict file sources **and** written output to this directory tree |
+| `DOCSLICER_MCP_ROOT` | Restrict file sources **and** written output to this directory tree. Several may be given, separated by `:` (`;` on Windows) |
+| `DOCSLICER_MCP_ALLOW_CLAUDE_DIR` | Set to `0` to drop the Claude desktop app's own directory from the allowed roots (default `1`) |
 | `DOCSLICER_MCP_ALLOW_URLS` | Set to `0` to reject `http(s)` sources |
 | `DOCSLICER_MCP_CACHE` | Where parsed results are persisted (default `~/.cache/docslicer-mcp`) |
 | `DOCSLICER_MCP_CACHE_MAX_MB` | Cache size ceiling, oldest pruned first (default `2048`; `0` disables) |
@@ -613,6 +614,21 @@ document and the next `parse` re-parses it automatically.
 Set `DOCSLICER_MCP_ROOT` when exposing the server to anything but yourself —
 without it, any readable path on the machine is parseable, and `to_markdown`
 can write anywhere the server process can.
+
+**Documents dropped into a chat.** Attaching a file to a Claude conversation
+does not hand the server the path you know it by: the app first copies it into
+a per-session workspace under its own data directory (`~/Library/Application
+Support/Claude` on macOS, `%APPDATA%\Claude` on Windows), which is nowhere near
+the folder you would have picked as your root. That directory is therefore
+allowed alongside `DOCSLICER_MCP_ROOT`, so both routes work — the folder you
+chose, and whatever you drop into the chat. It is only ever *added* to a root
+you set; leaving `DOCSLICER_MCP_ROOT` unset still means no sandbox at all, not
+a sandbox of that one directory. Set `DOCSLICER_MCP_ALLOW_CLAUDE_DIR=0` to opt
+out and accept only your own roots.
+
+`to_markdown` writes beside the source document, except for a document dropped
+into a chat: that copy lives in a session folder you cannot navigate to, so the
+markdown goes to your first `DOCSLICER_MCP_ROOT` instead.
 
 ---
 

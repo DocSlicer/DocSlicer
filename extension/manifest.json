@@ -33,6 +33,7 @@
       ],
       "env": {
         "DOCSLICER_MCP_ROOT": "${user_config.root_dir}",
+        "DOCSLICER_MCP_ALLOW_CLAUDE_DIR": "${user_config.allow_claude_dir}",
         "DOCSLICER_MCP_ALLOW_URLS": "${user_config.allow_urls}"
       }
     }
@@ -48,9 +49,16 @@
     "root_dir": {
       "type": "directory",
       "title": "Document folder",
-      "description": "DocSlicer can only read files from, and write files to, this folder.",
+      "description": "DocSlicer can only read files from, and write files to, this folder — plus the files you drop into a chat, unless you turn that off below.",
       "required": true,
       "default": "${DOCUMENTS}"
+    },
+    "allow_claude_dir": {
+      "type": "string",
+      "title": "Allow files dropped into a chat",
+      "description": "Claude copies a document you attach to a chat into its own folder, outside the one above. Set to 0 to refuse those and only read the folder above.",
+      "default": "1",
+      "required": false
     },
     "allow_urls": {
       "type": "string",

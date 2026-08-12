@@ -28,9 +28,14 @@
       "environmentVariables": [
         {
           "name": "DOCSLICER_MCP_ROOT",
-          "description": "Restrict file sources and outputs to this directory tree.",
+          "description": "Restrict file sources and outputs to this directory tree. Several may be given, separated by the platform path separator.",
           "isRequired": true,
           "format": "filepath"
+        },
+        {
+          "name": "DOCSLICER_MCP_ALLOW_CLAUDE_DIR",
+          "description": "Set to 0 to refuse documents dropped into a Claude chat, which the app copies into its own directory outside DOCSLICER_MCP_ROOT.",
+          "default": "1"
         },
         {
           "name": "DOCSLICER_MCP_ALLOW_URLS",
@@ -64,9 +69,14 @@
       "environmentVariables": [
         {
           "name": "DOCSLICER_MCP_ROOT",
-          "description": "Restrict file sources and outputs to this directory tree.",
+          "description": "Restrict file sources and outputs to this directory tree. Several may be given, separated by the platform path separator.",
           "isRequired": true,
           "format": "filepath"
+        },
+        {
+          "name": "DOCSLICER_MCP_ALLOW_CLAUDE_DIR",
+          "description": "Set to 0 to refuse documents dropped into a Claude chat, which the app copies into its own directory outside DOCSLICER_MCP_ROOT.",
+          "default": "1"
         },
         {
           "name": "DOCSLICER_MCP_ALLOW_URLS",

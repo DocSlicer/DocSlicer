@@ -16,6 +16,7 @@ import hashlib
 import json
 import os
 import re
+import sys
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -47,10 +48,94 @@ def cache_limit_bytes() -> int:
     return max(0, megabytes) * 1024 * 1024
 
 
-def allowed_root() -> Path | None:
-    """Optional sandbox root. When DOCSLICER_MCP_ROOT is set, only files beneath it parse."""
-    env = os.environ.get("DOCSLICER_MCP_ROOT")
-    return Path(env).expanduser().resolve() if env else None
+def configured_roots() -> tuple[Path, ...]:
+    """The sandbox roots the operator named in DOCSLICER_MCP_ROOT.
+
+    More than one may be given, separated by the platform's path separator
+    (``:`` on macOS and Linux, ``;`` on Windows) — the same convention as PATH,
+    so a host that can only hand the server one string can still hand it
+    several directories. Empty when the variable is unset, which means no
+    sandbox at all.
+    """
+    env = os.environ.get("DOCSLICER_MCP_ROOT") or ""
+    parts = [p.strip() for p in env.split(os.pathsep)]
+    return tuple(Path(p).expanduser().resolve() for p in parts if p)
+
+
+def claude_dir_allowed() -> bool:
+    """Whether the Claude desktop app's data directory joins the sandbox. Disable with
+    DOCSLICER_MCP_ALLOW_CLAUDE_DIR=0."""
+    return os.environ.get("DOCSLICER_MCP_ALLOW_CLAUDE_DIR", "1").lower() not in (
+        "0",
+        "false",
+        "no",
+    )
+
+
+def claude_dir() -> Path | None:
+    """Where the Claude desktop app keeps its own files, or None if it is not there.
+
+    A document dropped into a Claude chat is not read from wherever the user
+    keeps it; the app copies it into a per-session workspace under this
+    directory and gives the model that path. So a root pointing at the user's
+    Documents or Desktop — the folder they would think to pick — matches none
+    of the files they actually hand the server, and every drop is refused as
+    outside the sandbox. This is the second root that makes the first usable.
+    """
+    if sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support" / "Claude"
+    elif sys.platform == "win32":
+        appdata = os.environ.get("APPDATA")
+        if not appdata:
+            return None
+        base = Path(appdata) / "Claude"
+    else:
+        config = os.environ.get("XDG_CONFIG_HOME")
+        base = (Path(config) if config else Path.home() / ".config") / "Claude"
+
+    try:
+        resolved = base.expanduser().resolve(strict=True)
+    except OSError:
+        return None
+    return resolved if resolved.is_dir() else None
+
+
+def allowed_roots() -> tuple[Path, ...]:
+    """Every directory tree this server may read from and write to.
+
+    Empty means unrestricted. That is what an unset DOCSLICER_MCP_ROOT has
+    always meant, and the Claude directory is added only alongside a root the
+    operator set — a server told to sandbox nothing must not find itself
+    sandboxed to one directory because the app happens to be installed.
+    """
+    roots = configured_roots()
+    if not roots or not claude_dir_allowed():
+        return roots
+
+    extra = claude_dir()
+    if extra is None or any(_within(extra, root) for root in roots):
+        return roots
+    return roots + (extra,)
+
+
+def primary_root() -> Path | None:
+    """The root a path with nowhere else to go belongs in — the first one configured.
+
+    Only the operator's own roots qualify: the Claude directory is a place
+    files arrive from, not somewhere to file a document the caller asked for.
+    """
+    roots = configured_roots()
+    return roots[0] if roots else None
+
+
+def _within(path: Path, root: Path) -> bool:
+    """Whether a resolved path is the root or sits beneath it."""
+    return path == root or root in path.parents
+
+
+def _root_list(roots: tuple[Path, ...]) -> str:
+    """The allowed roots as an error message names them."""
+    return ", ".join(str(r) for r in roots)
 
 
 def urls_allowed() -> bool:
@@ -98,11 +183,11 @@ def resolve_source(source: str) -> str:
     except FileNotFoundError:
         raise FileNotFoundError(f"No such file: {source}") from None
 
-    root = allowed_root()
-    if root is not None and root not in resolved.parents and resolved != root:
+    roots = allowed_roots()
+    if roots and not any(_within(resolved, root) for root in roots):
         raise SourceNotAllowed(
-            f"Access to {resolved} is outside the allowed root {root}. "
-            "Copy the file inside that directory or adjust DOCSLICER_MCP_ROOT."
+            f"Access to {resolved} is outside the allowed roots: {_root_list(roots)}. "
+            "Copy the file inside one of those directories or adjust DOCSLICER_MCP_ROOT."
         )
     return str(resolved)
 
@@ -128,11 +213,11 @@ def resolve_output(path: str, base: Path | None = None) -> Path:
     anchor = base or Path.cwd()
     resolved = Path(target if target.is_absolute() else anchor / target).resolve()
 
-    root = allowed_root()
-    if root is not None and root not in resolved.parents:
+    roots = allowed_roots()
+    if roots and not any(root in resolved.parents for root in roots):
         raise SourceNotAllowed(
-            f"Cannot write to {resolved}: it is outside the allowed root {root}. "
-            "Choose an output_path inside that directory or adjust DOCSLICER_MCP_ROOT."
+            f"Cannot write to {resolved}: it is outside the allowed roots: {_root_list(roots)}. "
+            "Choose an output_path inside one of those directories or adjust DOCSLICER_MCP_ROOT."
         )
     return resolved
 

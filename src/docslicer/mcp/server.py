@@ -19,7 +19,14 @@ Environment:
                                 document instead of an outline (default 6000; 0
                                 disables and always returns the outline).
     DOCSLICER_MCP_CACHE_MAX_MB  Cache size ceiling (default 2048; 0 disables pruning).
-    DOCSLICER_MCP_ROOT          Restrict file sources and outputs to this directory tree.
+    DOCSLICER_MCP_ROOT          Restrict file sources and outputs to this directory
+                                tree. Several may be given, separated by the
+                                platform path separator (":" / ";").
+    DOCSLICER_MCP_ALLOW_CLAUDE_DIR
+                                Set to 0 to drop the Claude desktop app's own
+                                directory from the allowed roots. It is included
+                                alongside DOCSLICER_MCP_ROOT by default, because a
+                                document dropped into a chat is copied there.
     DOCSLICER_MCP_ALLOW_URLS    Set to 0 to reject http(s) sources.
 """
 
@@ -44,8 +51,9 @@ from .. import __version__, parse_document
 from .._result import Block, Chunk, HierarchyNode
 from ._store import (
     DocumentStore,
-    allowed_root,
+    claude_dir,
     is_url,
+    primary_root,
     make_doc_id,
     resolve_output,
     resolve_source,
@@ -1104,15 +1112,39 @@ def _destination(output_path: str | None, origin: str | None) -> Path:
     caller would guess. A URL has no directory to sit beside, so it falls back
     to the sandbox root if one is configured and a temp directory otherwise,
     with the name slugified from the URL's last segment.
+
+    A source inside the Claude app's own directory is the one local case that
+    does not sit beside anything: it is a copy the app made in a per-session
+    workspace, a path the user cannot navigate to and would not think to look
+    in. That falls back to the configured root too — the folder they picked is
+    where they will go looking for the file they asked for.
     """
     local = Path(origin) if origin and not is_url(origin) else None
-    base = local.parent if local else (allowed_root() or Path(tempfile.gettempdir()))
+    elsewhere = primary_root() or Path(tempfile.gettempdir())
+    base = elsewhere if local is None or _is_app_copy(local) else local.parent
 
     if output_path:
         return resolve_output(output_path, base=base)
 
     stem = local.stem if local else slug(origin or "document")
     return resolve_output(str(base / f"{stem}.md"))
+
+
+def _is_app_copy(path: Path) -> bool:
+    """Whether a local source is the Claude app's own copy of a dropped document.
+
+    Only ever true for a file the user handed to a chat, since nothing else
+    lives under the app's directory — and the point of asking is that such a
+    file has no meaningful directory to write beside.
+    """
+    app = claude_dir()
+    if app is None:
+        return False
+    try:
+        resolved = path.resolve()
+    except OSError:
+        return False
+    return app in resolved.parents
 
 
 # ===========================================================================
@@ -1165,13 +1197,17 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--port", type=int, default=8000, help="Bind port for http/sse.")
     parser.add_argument(
         "--root",
-        help="Restrict file sources and outputs to this directory tree (sets DOCSLICER_MCP_ROOT).",
+        action="append",
+        help="Restrict file sources and outputs to this directory tree (sets"
+        " DOCSLICER_MCP_ROOT). Repeatable. The Claude desktop app's own directory,"
+        " where a document dropped into a chat is copied, is allowed alongside it"
+        " unless DOCSLICER_MCP_ALLOW_CLAUDE_DIR=0.",
     )
     parser.add_argument("--version", action="version", version=f"docslicer {__version__}")
     args = parser.parse_args(argv)
 
     if args.root:
-        os.environ["DOCSLICER_MCP_ROOT"] = args.root
+        os.environ["DOCSLICER_MCP_ROOT"] = os.pathsep.join(args.root)
 
     if args.transport == "stdio":
         sys.stdout = _StdoutToStderr(sys.stdout)
