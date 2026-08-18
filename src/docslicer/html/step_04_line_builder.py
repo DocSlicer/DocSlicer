@@ -20,17 +20,32 @@ from docslicer._utils.df_aggregation.text_merge import (
 # Build Line Text
 # =================================
 
-def _build_line_text(df: pd.DataFrame) -> pd.Series:
+def _build_line_text(df: pd.DataFrame, stacked: np.ndarray | None = None) -> pd.Series:
     """
     Build the text for each line: boxes sorted by x_left, non-table lines joined
     with spaces, table lines joined with pipes so downstream shared stages see a
     row-shaped representation. Inline markup (script/strikethrough) is already
     baked into box text by the box cleaner.
 
+    Args:
+        df: box-level frame carrying line_id.
+        stacked: optional boolean mask of boxes that stack vertically inside
+            their line (the layout-table cells split by
+            :func:`_split_layout_table_cell_lines`). Those boxes order by y first,
+            because a centred paragraph's x_left depends on its rendered width
+            and would otherwise come out widest-first. None (the normal case)
+            keeps the plain x_left sort.
+
     Returns:
         Series of joined text indexed by line_id.
     """
-    ordered = df.sort_values(["line_id", "x_left"], kind="stable")
+    if stacked is None:
+        ordered = df.sort_values(["line_id", "x_left"], kind="stable")
+    else:
+        # 0.0 everywhere else, so unstacked lines sort on x_left exactly as before.
+        df = df.assign(_stack_y=np.where(stacked, df["y_top"].to_numpy(dtype=float), 0.0))
+        ordered = df.sort_values(["line_id", "_stack_y", "x_left"], kind="stable")
+        ordered = ordered.drop(columns="_stack_y")
     texts = ordered["text"].astype("string").fillna("")
     # <pre> code-line boxes keep their leading whitespace — indentation is
     # semantically meaningful in code. Everything else is stripped as before.
@@ -58,6 +73,100 @@ def _build_line_text(df: pd.DataFrame) -> pd.Series:
     line_text = prose_text.copy()
     line_text.loc[table_text.index] = table_text
     return line_text
+
+
+# =================================
+# Layout-table cells
+# =================================
+
+def _split_layout_table_cell_lines(df: pd.DataFrame) -> tuple[pd.DataFrame, np.ndarray | None]:
+    """
+    Give every ``<td>`` of a single-row *layout* table its own line_id.
+
+    A single-row table whose cells stack several paragraphs on top of each other
+    is a layout device, not data — the multi-column signature block where each
+    cell holds one law firm. ``assign_line_id`` merges a whole ``<tr>`` into one
+    line, which is right for a data row but here glues four firms into one line
+    and makes it impossible to tell which people belong to which firm. Splitting
+    per cell yields one line per column, in document (left-to-right) order.
+
+    ``_remove_single_row_tables`` dissolves these tables a few steps later, so no
+    downstream table stage ever sees the split rows.
+
+    The detection is a linear neighbour scan over the table boxes only: cells are
+    contiguous within a line, so a line has a multi-box cell iff two adjacent
+    boxes share (line_id, table_cell_index), and spans several cells iff two
+    adjacent boxes share line_id but not table_cell_index. Both must hold before
+    anything heavier than that scan runs, which on ordinary documents is never.
+
+    Returns:
+        (df, stacked_mask) — df with the split line_ids applied, and a boolean
+        mask of the boxes that were split (None when nothing qualified, i.e. the
+        frame is untouched).
+    """
+    needed = ("line_id", "table_id", "table_row_id", "table_cell_index")
+    if any(c not in df.columns for c in needed):
+        return df, None
+
+    is_table = df["table_id"].notna().to_numpy()
+    if not is_table.any():
+        return df, None
+
+    pos = np.flatnonzero(is_table)
+    line = df["line_id"].to_numpy()[pos]
+    cell = pd.to_numeric(df["table_cell_index"], errors="coerce").to_numpy(dtype=float)[pos]
+
+    same_line = line[1:] == line[:-1]
+    same_cell = cell[1:] == cell[:-1]
+    multi_box_cell = same_line & same_cell     # a cell holding >1 box
+    multi_cell_line = same_line & ~same_cell   # a line spanning >1 cell
+    if not (multi_box_cell.any() and multi_cell_line.any()):
+        return df, None
+
+    # Lines that are both — the only candidates worth a closer look.
+    candidates = np.intersect1d(line[1:][multi_box_cell], line[1:][multi_cell_line])
+    if candidates.size == 0:
+        return df, None
+
+    # Keep only candidates whose table is single-row: a wrapped cell in a real
+    # multi-row table looks identical to the scan above but must stay one line
+    # per row (step_05 relies on that).
+    line_all = df["line_id"].to_numpy()
+    on_candidate_line = is_table & np.isin(line_all, candidates)
+    cand_tables = df.loc[on_candidate_line, "table_id"].unique()
+    in_cand_tables = df["table_id"].isin(cand_tables)
+    rows_per_table = df.loc[in_cand_tables].groupby("table_id")["table_row_id"].nunique()
+    single_row = set(rows_per_table[rows_per_table == 1].index)
+    if not single_row:
+        return df, None
+
+    stacked = on_candidate_line & df["table_id"].isin(single_row).to_numpy()
+    if not stacked.any():
+        return df, None
+
+    # Renumber: a new line starts wherever line_id changes, plus at every cell
+    # boundary inside a split line. Boxes are in document order, so the cumsum
+    # keeps line_ids ascending exactly as assign_line_id left them.
+    cell_all = pd.to_numeric(df["table_cell_index"], errors="coerce").to_numpy(dtype=float)
+    starts = np.empty(len(df), dtype=bool)
+    starts[0] = True
+    starts[1:] = line_all[1:] != line_all[:-1]
+    cell_break = np.zeros(len(df), dtype=bool)
+    cell_break[1:] = stacked[1:] & stacked[:-1] & (cell_all[1:] != cell_all[:-1])
+
+    out = df.copy()
+    out["line_id"] = np.cumsum(starts | cell_break)
+
+    # top_bucket is derived from line_id by the merger; refresh it for the boxes
+    # whose line changed (it is dropped at aggregation, but the box-level frame
+    # is exported for debugging).
+    if "top_bucket" in out.columns:
+        split = out.loc[stacked]
+        out.loc[stacked, "top_bucket"] = (
+            split["line_id"].map(split.groupby("line_id")["y_top"].min().round().astype("Int64"))
+        )
+
+    return out, stacked
 
 
 # =================================
@@ -268,6 +377,7 @@ def _add_layout_id(df: pd.DataFrame) -> pd.DataFrame:
        group key (new id when entering/leaving/switching groups). A line's
        group key is, in order of precedence:
        - its table_id
+       - its layout_cell_group (sibling <td>s of a dissolved layout table)
        - its deepest ul/ol or h1-h6 struct ancestor (see
          :func:`_struct_layout_groups`), so list items and multi-line
          headings stay together
@@ -300,6 +410,9 @@ def _add_layout_id(df: pd.DataFrame) -> pd.DataFrame:
 
     # Rule 3: group key — table_id wins over the struct list/heading group
     group_key = _struct_layout_groups(df)
+    if "layout_cell_group" in df.columns:
+        cell_group = df["layout_cell_group"].astype("string")
+        group_key = group_key.mask(cell_group.notna(), "cells_" + cell_group)
     if "table_id" in df.columns:
         has_table = df["table_id"].notna()
         group_key = group_key.mask(has_table, "table_" + df["table_id"].astype(str))
@@ -340,7 +453,8 @@ def merge_boxes_to_lines(
 ) -> pd.DataFrame:
     """
     Merge boxes into lines:
-    1. Assign line_id using line_merger
+    1. Assign line_id using line_merger, then split the cells of single-row
+       layout tables into their own lines
     2. Merge text within each line (sorted by x_left) via text_merge
     3. Aggregate the remaining columns via the registry aggregator
     4. Optionally remove single-row tables and reindex
@@ -391,12 +505,16 @@ def merge_boxes_to_lines(
         boxes_df["y_bottom"] = synthetic_y
 
     boxes_with_lines = assign_line_id(boxes_df, y_alignment="top")
-    
+
+    # Step 1b: Split the cells of single-row layout tables into their own lines
+    # (no-op, after one linear scan, on everything else).
+    boxes_with_lines, stacked = _split_layout_table_cell_lines(boxes_with_lines)
+
     # Step 2: Create text for each line (sorted by x_left, joined with spaces,
     # pipe-joined on table lines). Text is merged from the x-sorted view while
     # aggregation runs on the frame in document order, so "first"/dominant
     # columns keep picking the same source boxes as before.
-    line_text = _build_line_text(boxes_with_lines)
+    line_text = _build_line_text(boxes_with_lines, stacked=stacked)
 
     # Step 3: Aggregate everything else via the central column registry
     lines_df = aggregate_to(
@@ -405,6 +523,15 @@ def merge_boxes_to_lines(
         size_as="box_count",
     )
     lines_df["text"] = lines_df["line_id"].map(line_text)
+
+    # Sibling cells of one layout table share a layout group, so the columns stay
+    # in one layout after _remove_single_row_tables clears their table_id.
+    if stacked is not None:
+        split = boxes_with_lines.loc[stacked]
+        group = (
+            split["table_id"].astype(str) + ":" + split["table_row_id"].astype(str)
+        ).groupby(split["line_id"]).first()
+        lines_df["layout_cell_group"] = lines_df["line_id"].map(group)
 
     # Step 4: Remove single-row tables if requested
     if remove_single_row_tables:

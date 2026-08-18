@@ -101,6 +101,7 @@ MASTER_COLUMN_ORDER: List[str] = [
     "cell_id",
     "line_id",
     "layout_id",
+    "layout_cell_group",
     "cell_count",
     "paragraph_id",
     "gutter_id",
