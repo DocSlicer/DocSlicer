@@ -6,7 +6,7 @@
 # download; without one the pipeline falls back to the static extractor.
 [project]
 name = "docslicer-mcpb"
-version = "0.2.3"
+version = "0.2.4"
 description = "MCPB bundle for the DocSlicer MCP server."
 requires-python = ">=3.10"
 # Floor, not a pin. The exact version shipped in the bundle is fixed by

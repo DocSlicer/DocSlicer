@@ -2,7 +2,7 @@
   "manifest_version": "0.4",
   "name": "docslicer",
   "display_name": "DocSlicer",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "Answer questions from documents too large to fit in context, reading only the sections you need.",
   "long_description": "Answer questions from documents too large to fit in context. `parse` returns a heading outline with the token cost of each section; `read` pulls back exactly the sections you pick, tables and page numbers intact for citation. A revenue question against a 500-page, 500k-token filing costs roughly 3.5k tokens — just the section that answers it. No embeddings, no fuzzy recall: same query, same text, every time. PDF, DOCX, PPTX and HTML, local file or URL.",
   "author": {

@@ -15,12 +15,12 @@
       "sizes": ["512x512"]
     }
   ],
-  "version": "0.2.3",
+  "version": "0.2.4",
   "packages": [
     {
       "registryType": "mcpb",
-      "identifier": "https://github.com/DocSlicer/DocSlicer/releases/download/v0.2.3/docslicer-0.2.3.mcpb",
-      "version": "0.2.3",
+      "identifier": "https://github.com/DocSlicer/DocSlicer/releases/download/v0.2.4/docslicer-0.2.4.mcpb",
+      "version": "0.2.4",
       "fileSha256": "0000000000000000000000000000000000000000000000000000000000000000",
       "transport": {
         "type": "stdio"
@@ -48,7 +48,7 @@
       "registryType": "pypi",
       "registryBaseUrl": "https://pypi.org",
       "identifier": "docslicer",
-      "version": "0.2.3",
+      "version": "0.2.4",
       "runtimeHint": "uvx",
       "transport": {
         "type": "stdio"
@@ -57,7 +57,7 @@
         {
           "type": "named",
           "name": "--from",
-          "value": "docslicer[mcp]==0.2.3",
+          "value": "docslicer[mcp]==0.2.4",
           "isRequired": true
         },
         {
